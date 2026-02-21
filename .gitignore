@@ -1,0 +1,14 @@
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+coverage.xml
+.coverage
+*.py[oc]
+build/
+dist/
+*.egg-info
+.venv
+*.db
+*.db-shm
+*.db-wal
