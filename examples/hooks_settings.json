@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{
+          "type": "command",
+          "command": "$HOME/Code/entropy-meter/entropy_hook.py"
+        }]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{
+          "type": "command",
+          "command": "$HOME/Code/entropy-meter/entropy_hook.py"
+        }]
+      }
+    ]
+  }
+}

@@ -49,7 +49,7 @@ class FileMetrics:
     tier_mask: int = TIER_0
 
 
-def measure_file(path: Path, content: str | None = None) -> FileMetrics:
+def measure_file(path: Path | None = None, content: str | None = None) -> FileMetrics:
     """Measure all available metrics for a file.
 
     If content is provided, use it directly (for measuring git blob content).
