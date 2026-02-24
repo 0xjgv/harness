@@ -46,6 +46,12 @@ def main(argv: list[str] | None = None) -> None:
     """Entry point for `harness` command."""
     args_list = argv if argv is not None else sys.argv[1:]
 
+    # hook-run is internal (invoked by Claude Code hooks) — intercept before
+    # argparse so it never appears in help/choices.
+    if len(args_list) >= 2 and args_list[0] == "entropy" and args_list[1] == "hook-run":
+        _dispatch_entropy("hook-run", args_list[2:])
+        return
+
     parser = argparse.ArgumentParser(
         prog="harness",
         description="Code complexity metrics engine.",
@@ -91,13 +97,6 @@ def main(argv: list[str] | None = None) -> None:
     entropy_sub.add_parser(
         "seed",
         help="Establish baseline entropy measurements for the project",
-        add_help=False,
-    )
-
-    # harness entropy hook-run (internal — invoked by Claude Code hooks)
-    entropy_sub.add_parser(
-        "hook-run",
-        help=argparse.SUPPRESS,
         add_help=False,
     )
 

@@ -39,6 +39,15 @@ class TestRouterHelp:
         assert "uninstall" in out
         assert "seed" in out
 
+    def test_hook_run_hidden_from_help(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit):
+            main(["entropy"])
+        out = capsys.readouterr().out
+        assert "hook-run" not in out
+
 
 # ---------------------------------------------------------------------------
 # Subcommand dispatch
@@ -75,6 +84,11 @@ class TestRouterDispatch:
     def test_dispatch_hook_run(self, mock_main: MagicMock) -> None:
         main(["entropy", "hook-run"])
         mock_main.assert_called_once_with([])
+
+    @patch("harness.cli.hook.hook_run_main")
+    def test_dispatch_hook_run_with_args(self, mock_main: MagicMock) -> None:
+        main(["entropy", "hook-run", "--verbose"])
+        mock_main.assert_called_once_with(["--verbose"])
 
 
 # ---------------------------------------------------------------------------
