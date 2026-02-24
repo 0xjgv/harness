@@ -230,6 +230,8 @@ def install_main(argv: list[str] | None = None) -> None:
     print("\nEntropy will be measured automatically during Claude Code sessions.")
     if not args.project:
         print("To share with your team, re-run with: harness entropy install --project")
+    print("\nTo establish a baseline for accurate delta tracking:")
+    print("  harness entropy seed")
 
 
 def uninstall_main(argv: list[str] | None = None) -> None:
