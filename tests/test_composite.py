@@ -1,12 +1,12 @@
-"""Tests for entropy_meter.core.composite — compute_entropy_index and measure_and_score."""
+"""Tests for harness.core.composite — compute_entropy_index and measure_and_score."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from entropy_meter.config import DEFAULT_WEIGHTS, TIER_0
-from entropy_meter.core.composite import compute_entropy_index, measure_and_score
-from entropy_meter.core.metrics import FileMetrics, measure_file
+from harness.config import DEFAULT_WEIGHTS, TIER_0
+from harness.core.composite import compute_entropy_index, measure_and_score
+from harness.core.metrics import FileMetrics, measure_file
 
 
 class TestComputeEntropyIndex:

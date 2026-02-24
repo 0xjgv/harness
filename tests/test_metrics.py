@@ -1,10 +1,10 @@
-"""Tests for entropy_meter.core.metrics — FileMetrics and measure_file."""
+"""Tests for harness.core.metrics — FileMetrics and measure_file."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from entropy_meter.core.metrics import FileMetrics, measure_file
+from harness.core.metrics import FileMetrics, measure_file
 
 
 class TestMeasureSimpleCode:

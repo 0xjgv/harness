@@ -32,10 +32,10 @@ def _emit(feedback: str) -> None:
     print(json.dumps(output))
 
 
-def _ensure_entropy_meter() -> bool:
-    """Check if entropy_meter is importable."""
+def _ensure_harness() -> bool:
+    """Check if harness is importable."""
     try:
-        import entropy_meter  # noqa: F401, PLC0415
+        import harness  # noqa: F401, PLC0415
 
         return True
     except ImportError:
@@ -72,14 +72,14 @@ def _measure_files(
 
     Returns list of (path, before_ei, after_ei, delta).
     """
-    from entropy_meter.core.composite import compute_entropy_index  # noqa: PLC0415
-    from entropy_meter.core.db import (  # noqa: PLC0415
+    from harness.core.composite import compute_entropy_index  # noqa: PLC0415
+    from harness.core.db import (  # noqa: PLC0415
         Measurement,
         get_previous_measurement,
         store_measurement,
     )
-    from entropy_meter.core.metrics import measure_file  # noqa: PLC0415
-    from entropy_meter.git import get_file_at_commit  # noqa: PLC0415
+    from harness.core.metrics import measure_file  # noqa: PLC0415
+    from harness.git import get_file_at_commit  # noqa: PLC0415
 
     deltas: list[tuple[str, float, float, float]] = []
 
@@ -135,7 +135,7 @@ def _format_feedback(
     file_deltas: list[tuple[str, float, float, float]],
 ) -> str:
     """Build human-readable entropy feedback string."""
-    from entropy_meter.config import (  # noqa: PLC0415
+    from harness.config import (  # noqa: PLC0415
         DELTA_POSITIVE_FLOOR,
         DELTA_SUGGESTION_CEILING,
         DELTA_WARNING_CEILING,
@@ -184,16 +184,16 @@ def _format_feedback(
 
 def handle_commit() -> int:
     """Measure entropy changes for the latest commit."""
-    if not _ensure_entropy_meter():
+    if not _ensure_harness():
         return 0
 
-    from entropy_meter.config import (  # noqa: PLC0415
+    from harness.config import (  # noqa: PLC0415
         DELTA_NEUTRAL_CEILING,
         DELTA_POSITIVE_FLOOR,
         get_db_path,
     )
-    from entropy_meter.core.db import get_connection  # noqa: PLC0415
-    from entropy_meter.git import (  # noqa: PLC0415
+    from harness.core.db import get_connection  # noqa: PLC0415
+    from harness.git import (  # noqa: PLC0415
         get_changed_files,
         get_current_commit,
     )
@@ -237,11 +237,11 @@ def handle_commit() -> int:
 
 def handle_session_summary() -> int:
     """Provide session summary of entropy changes on Stop."""
-    if not _ensure_entropy_meter():
+    if not _ensure_harness():
         return 0
 
-    from entropy_meter.config import get_db_path  # noqa: PLC0415
-    from entropy_meter.core.db import (  # noqa: PLC0415
+    from harness.config import get_db_path  # noqa: PLC0415
+    from harness.core.db import (  # noqa: PLC0415
         get_connection,
         get_trend,
     )

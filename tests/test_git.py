@@ -1,4 +1,4 @@
-"""Tests for entropy_meter.git — git helper functions using real temp repos."""
+"""Tests for harness.git — git helper functions using real temp repos."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from entropy_meter.git import (
+from harness.git import (
     get_changed_files,
     get_current_commit,
     get_file_at_commit,

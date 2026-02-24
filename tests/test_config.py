@@ -1,4 +1,4 @@
-"""Tests for entropy_meter.config — project root, DB path, config loading."""
+"""Tests for harness.config — project root, DB path, config loading."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
-from entropy_meter.config import (
+from harness.config import (
     find_project_root,
     get_current_commit,
     get_db_path,
@@ -77,16 +77,16 @@ class TestGetProjectConfig:
         assert config == {}
 
     def test_pyproject_without_tool_section(self, tmp_path: Path) -> None:
-        """Should return empty dict if no [tool.entropy-meter] section."""
+        """Should return empty dict if no [tool.harness] section."""
         (tmp_path / "pyproject.toml").write_text('[project]\nname = "test"\n')
         config = get_project_config(tmp_path)
         assert config == {}
 
     def test_pyproject_with_config(self, tmp_path: Path) -> None:
-        """Should return config from [tool.entropy-meter] section."""
+        """Should return config from [tool.harness] section."""
         toml_content = (
             '[project]\nname = "test"\n\n'
-            "[tool.entropy-meter]\n"
+            "[tool.harness]\n"
             "warn_threshold = 70\n"
             "alert_threshold = 90\n"
         )
@@ -141,7 +141,7 @@ class TestConfigGetCurrentCommit:
                 kwargs["cwd"] = str(tmp_path)
             return original_run(cmd, **kwargs)
 
-        with patch("entropy_meter.config.subprocess.run", side_effect=mock_run):
+        with patch("harness.config.subprocess.run", side_effect=mock_run):
             result = get_current_commit()
             assert result is not None
             assert len(result) == 40
@@ -149,7 +149,7 @@ class TestConfigGetCurrentCommit:
     def test_returns_none_outside_git(self) -> None:
         """Should return None when git fails."""
         with patch(
-            "entropy_meter.config.subprocess.run",
+            "harness.config.subprocess.run",
             side_effect=subprocess.CalledProcessError(1, "git"),
         ):
             result = get_current_commit()

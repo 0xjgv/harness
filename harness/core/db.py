@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from entropy_meter.config import get_db_path
+from harness.config import get_db_path
 
 if TYPE_CHECKING:
     from pathlib import Path

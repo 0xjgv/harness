@@ -25,7 +25,7 @@ install-global: ## Install as global CLI tool
 .PHONY: uninstall-global
 uninstall-global: ## Uninstall global CLI tool
 	@$(SILENT_HELPER) && \
-		run_silent "Uninstall global tool" "uv tool uninstall entropy-meter"
+		run_silent "Uninstall global tool" "uv tool uninstall harness"
 
 ##@ Code Quality
 
@@ -43,7 +43,7 @@ lint: ## Lint code with ruff
 
 .PHONY: typecheck
 typecheck: ## Type-check with basedpyright
-	@$(SILENT_HELPER) && run_silent "Type check" "uv run basedpyright entropy_meter/"
+	@$(SILENT_HELPER) && run_silent "Type check" "uv run basedpyright harness/"
 
 .PHONY: check
 check: ## Run all quality checks (fix, format, lint, typecheck)
@@ -55,7 +55,7 @@ check: ## Run all quality checks (fix, format, lint, typecheck)
 
 .PHONY: check-fast
 check-fast: ## Run quality checks on staged Python files only
-	@files=$$(git diff --name-only --cached | grep -E '^(entropy_meter|tests)/.*\.py$$' | tr '\n' ' '); \
+	@files=$$(git diff --name-only --cached | grep -E '^(harness|tests)/.*\.py$$' | tr '\n' ' '); \
 	if [ -z "$$files" ]; then \
 		echo "No staged Python files — skipping checks"; \
 	else \
@@ -63,7 +63,7 @@ check-fast: ## Run quality checks on staged Python files only
 		run_silent "Fix lint errors" "uv run ruff check --fix $$files" && \
 		run_silent "Format code" "uv run ruff format $$files" && \
 		run_silent "Lint check" "uv run ruff check $$files" && \
-		run_silent "Type check" "uv run basedpyright entropy_meter/"; \
+		run_silent "Type check" "uv run basedpyright harness/"; \
 	fi
 
 ##@ Testing
@@ -81,7 +81,7 @@ test-cov: ## Run tests with coverage (80% minimum)
 .PHONY: pre-commit
 pre-commit: ## Run pre-commit checks (quality gates + tests if source files staged)
 	@$(MAKE) check-fast
-	@if git diff --cached --name-only | grep -qE '^(entropy_meter|tests)/.*\.py$$'; then \
+	@if git diff --cached --name-only | grep -qE '^(harness|tests)/.*\.py$$'; then \
 		$(MAKE) test; \
 	fi
 

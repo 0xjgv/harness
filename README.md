@@ -1,4 +1,4 @@
-# entropy-meter
+# harness
 
 Code complexity metrics engine for Python. Computes an **Entropy Index (0-100)** per file — higher means more complex. Zero required dependencies; optional extras unlock deeper analysis.
 
@@ -8,7 +8,7 @@ Designed to run as a post-commit hook for [Claude Code](https://docs.anthropic.c
 
 ### Global (recommended)
 
-Installs `entropy-measure` and `entropy-report` as global commands available in all repos:
+Installs `harness-measure` and `harness-report` as global commands available in all repos:
 
 ```bash
 make install-global
@@ -30,28 +30,28 @@ make install    # uv sync with all extras + dev deps
 
 ```bash
 # Measure specific files
-entropy-measure src/app.py src/utils.py
+harness-measure src/app.py src/utils.py
 
 # Measure files changed in the last commit
-entropy-measure --commit HEAD
+harness-measure --commit HEAD
 
 # Measure all Python files in a project
-entropy-measure --all
+harness-measure --all
 
 # Store results for trend tracking
-entropy-measure --commit HEAD --store
+harness-measure --commit HEAD --store
 
 # View trends
-entropy-report
-entropy-report --hotspots
-entropy-report --file src/app.py
+harness-report
+harness-report --hotspots
+harness-report --file src/app.py
 ```
 
 ### Python API
 
 ```python
 from pathlib import Path
-from entropy_meter import measure_file, compute_entropy_index
+from harness import measure_file, compute_entropy_index
 
 metrics = measure_file(Path("src/app.py"))
 ei = compute_entropy_index(metrics)
@@ -90,7 +90,7 @@ With Tier 0 only, the two Tier 0 metrics share 100% of the weight (0.625 and 0.3
 
 ## Claude Code Integration
 
-entropy-meter is designed to power a post-commit hook in Claude Code projects. The hook:
+harness is designed to power a post-commit hook in Claude Code projects. The hook:
 
 1. Fires after every `git commit`
 2. Measures changed Python files
@@ -109,7 +109,7 @@ entropy-meter is designed to power a post-commit hook in Claude Code projects. T
 
 No files to copy per project. All projects point at the single canonical script in this repo.
 
-1. Install entropy-meter globally (if not already): `make install-global`
+1. Install harness globally (if not already): `make install-global`
 
 2. Merge the hook config into the project's `.claude/settings.local.json` (snippet in [`examples/hooks_settings.json`](examples/hooks_settings.json)):
 
@@ -121,7 +121,7 @@ No files to copy per project. All projects point at the single canonical script 
         "matcher": "Bash",
         "hooks": [{
           "type": "command",
-          "command": "$HOME/Code/entropy-meter/entropy_hook.py"
+          "command": "$HOME/Code/harness/harness_hook.py"
         }]
       }
     ],
@@ -129,7 +129,7 @@ No files to copy per project. All projects point at the single canonical script 
       {
         "hooks": [{
           "type": "command",
-          "command": "$HOME/Code/entropy-meter/entropy_hook.py"
+          "command": "$HOME/Code/harness/harness_hook.py"
         }]
       }
     ]
@@ -149,7 +149,7 @@ Remove the `hooks` entries from `.claude/settings.local.json`. Optionally delete
 
 | File | Purpose |
 |------|---------|
-| [`entropy_hook.py`](entropy_hook.py) | Canonical hook script — referenced by all projects |
+| [`harness_hook.py`](harness_hook.py) | Canonical hook script — referenced by all projects |
 | [`examples/hooks_settings.json`](examples/hooks_settings.json) | Settings snippet to merge into `.claude/settings.local.json` |
 
 ## Data Storage
@@ -161,11 +161,11 @@ Measurements are stored in `.claude/entropy.db` (project-local, gitignored). SQL
 Per-project via `pyproject.toml`:
 
 ```toml
-[tool.entropy-meter]
+[tool.harness]
 exclude = ["migrations/**", "vendor/**"]
 extensions = [".py"]
 
-[tool.entropy-meter.thresholds]
+[tool.harness.thresholds]
 warn = 65
 alert = 80
 ```

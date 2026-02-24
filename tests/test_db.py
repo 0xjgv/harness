@@ -1,4 +1,4 @@
-"""Tests for entropy_meter.core.db — SQLite storage operations."""
+"""Tests for harness.core.db — SQLite storage operations."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from entropy_meter.core.db import (
+from harness.core.db import (
     SCHEMA_VERSION,
     Measurement,
     get_commit_summary,

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 from radon.complexity import cc_visit
 from radon.metrics import h_visit, mi_visit
 
-from entropy_meter.config import TIER_0, TIER_1
+from harness.config import TIER_0, TIER_1
 
 if TYPE_CHECKING:
     from pathlib import Path

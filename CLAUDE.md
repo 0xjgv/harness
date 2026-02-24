@@ -1,4 +1,4 @@
-# entropy-meter
+# harness
 
 Standalone code complexity metrics engine. Zero required dependencies (Tier 0 uses stdlib only). Computes an Entropy Index (0-100, higher = more complex) per file.
 
@@ -10,13 +10,13 @@ Standalone code complexity metrics engine. Zero required dependencies (Tier 0 us
 
 ## Structure
 
-- `entropy_meter/config.py` — Constants, defaults, weight vectors, DB path resolution
-- `entropy_meter/core/db.py` — SQLite storage (schema v1, migrations)
-- `entropy_meter/core/metrics.py` — Tier 0/1 metric computation
-- `entropy_meter/core/composite.py` — Entropy Index aggregation (0-100)
-- `entropy_meter/cli/measure.py` — `entropy-measure` CLI entry point
-- `entropy_meter/cli/report.py` — `entropy-report` CLI entry point
-- `entropy_meter/git.py` — Git helpers (changed files, before/after content)
+- `harness/config.py` — Constants, defaults, weight vectors, DB path resolution
+- `harness/core/db.py` — SQLite storage (schema v1, migrations)
+- `harness/core/metrics.py` — Tier 0/1 metric computation
+- `harness/core/composite.py` — Entropy Index aggregation (0-100)
+- `harness/cli/measure.py` — `harness-measure` CLI entry point
+- `harness/cli/report.py` — `harness-report` CLI entry point
+- `harness/git.py` — Git helpers (changed files, before/after content)
 - `tests/` — pytest suite
 
 ## Commands
@@ -24,7 +24,7 @@ Standalone code complexity metrics engine. Zero required dependencies (Tier 0 us
 - `make install` — install with uv (development)
 - `make install-global` — install as global CLI tool via `uv tool install`
 - `make test` — run pytest
-- `make check` — ruff + mypy
+- `make check` — ruff + basedpyright
 - `make test-cov` — tests with 80% coverage minimum
 
 ## Patterns

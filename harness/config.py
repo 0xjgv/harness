@@ -66,7 +66,7 @@ def get_db_path(project_root: Path | None = None) -> Path:
 
 
 def get_project_config(project_root: Path | None = None) -> dict[str, object]:
-    """Read [tool.entropy-meter] from pyproject.toml if present."""
+    """Read [tool.harness] from pyproject.toml if present."""
     root = project_root or find_project_root()
     toml_path = root / "pyproject.toml"
     if not toml_path.exists():
@@ -81,7 +81,7 @@ def get_project_config(project_root: Path | None = None) -> dict[str, object]:
             return {}
     with toml_path.open("rb") as f:
         data = tomllib.load(f)
-    return dict(data.get("tool", {}).get("entropy-meter", {}))
+    return dict(data.get("tool", {}).get("harness", {}))
 
 
 def get_current_commit() -> str | None:

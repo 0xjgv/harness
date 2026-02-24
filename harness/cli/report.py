@@ -1,4 +1,4 @@
-"""entropy-report CLI — show trends, hotspots, and history from stored measurements."""
+"""harness-report CLI — show trends, hotspots, and history from stored measurements."""
 
 from __future__ import annotations
 
@@ -8,18 +8,18 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from entropy_meter.config import find_project_root, get_db_path
-from entropy_meter.core.db import get_connection, get_file_history, get_hotspots, get_trend
+from harness.config import find_project_root, get_db_path
+from harness.core.db import get_connection, get_file_history, get_hotspots, get_trend
 
 if TYPE_CHECKING:
     from typing import Any
 
-    from entropy_meter.core.db import Measurement
+    from harness.core.db import Measurement
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="entropy-report",
+        prog="harness-report",
         description="Show entropy trends, hotspots, and file history from stored measurements.",
     )
     parser.add_argument(
@@ -77,7 +77,7 @@ def _print_trend(data: list[dict[str, Any]], output_json: bool) -> None:
         return
 
     if not data:
-        print("  No trend data available. Run 'entropy-measure --store' first.")
+        print("  No trend data available. Run 'harness-measure --store' first.")
         return
 
     # Compute deltas between consecutive commits (data is newest-first)
@@ -107,7 +107,7 @@ def _print_hotspots(data: list[dict[str, Any]], output_json: bool) -> None:
         return
 
     if not data:
-        print("  No hotspot data available. Run 'entropy-measure --store' first.")
+        print("  No hotspot data available. Run 'harness-measure --store' first.")
         return
 
     print(f"  {'File':<50s}  {'EI':>6s}  {'Commit':<10s}")
@@ -140,7 +140,7 @@ def _print_file_history(
         return
 
     if not measurements:
-        print(f"  No history for '{file_path}'. Run 'entropy-measure --store' first.")
+        print(f"  No history for '{file_path}'. Run 'harness-measure --store' first.")
         return
 
     print(f"  History for: {file_path}")
@@ -171,7 +171,7 @@ def main() -> None:
 
     if not db_path.exists():
         print(
-            "  No entropy database found. Run 'entropy-measure --store' first.",
+            "  No entropy database found. Run 'harness-measure --store' first.",
             file=sys.stderr,
         )
         sys.exit(1)

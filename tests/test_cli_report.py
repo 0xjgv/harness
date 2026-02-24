@@ -1,4 +1,4 @@
-"""Tests for entropy_meter.cli.report — in-process testing via monkeypatch + capsys."""
+"""Tests for harness.cli.report — in-process testing via monkeypatch + capsys."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from entropy_meter.cli.report import main
-from entropy_meter.core.db import Measurement, get_connection, store_measurement
+from harness.cli.report import main
+from harness.core.db import Measurement, get_connection, store_measurement
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -18,7 +18,7 @@ from entropy_meter.core.db import Measurement, get_connection, store_measurement
 
 def _run_report(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> None:
     """Run report main() with patched sys.argv."""
-    monkeypatch.setattr("sys.argv", ["entropy-report", *argv])
+    monkeypatch.setattr("sys.argv", ["harness-report", *argv])
     main()
 
 
@@ -276,18 +276,18 @@ class TestReportFileHistory:
 
 class TestReportHelpers:
     def test_short_hash_none(self) -> None:
-        from entropy_meter.cli.report import _short_hash
+        from harness.cli.report import _short_hash
 
         assert _short_hash(None) == "-------"
 
     def test_short_hash_value(self) -> None:
-        from entropy_meter.cli.report import _short_hash
+        from harness.cli.report import _short_hash
 
         assert _short_hash("abc1234567890") == "abc1234"
 
     def test_print_trend_with_deltas(self, capsys: pytest.CaptureFixture[str]) -> None:
         """Trend with multiple commits should show deltas."""
-        from entropy_meter.cli.report import _print_trend
+        from harness.cli.report import _print_trend
 
         data = [
             {"commit_hash": "aaa0002", "file_count": 3, "avg_ei": 50.0},

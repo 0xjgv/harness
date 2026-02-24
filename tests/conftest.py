@@ -1,4 +1,4 @@
-"""Shared fixtures for entropy-meter test suite."""
+"""Shared fixtures for harness test suite."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from entropy_meter.core.db import get_connection
+from harness.core.db import get_connection
 
 
 @pytest.fixture()

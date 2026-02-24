@@ -1,4 +1,4 @@
-"""entropy-measure CLI — measure entropy index for files, commits, or entire projects."""
+"""harness-measure CLI — measure entropy index for files, commits, or entire projects."""
 
 from __future__ import annotations
 
@@ -14,21 +14,21 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from typing import Any
 
-from entropy_meter.config import (
+from harness.config import (
     DEFAULT_EXCLUDES,
     DEFAULT_EXTENSIONS,
     find_project_root,
     get_db_path,
 )
-from entropy_meter.core.composite import compute_entropy_index
-from entropy_meter.core.db import Measurement, get_connection, store_measurement
-from entropy_meter.core.metrics import FileMetrics, measure_file
-from entropy_meter.git import get_changed_files
+from harness.core.composite import compute_entropy_index
+from harness.core.db import Measurement, get_connection, store_measurement
+from harness.core.metrics import FileMetrics, measure_file
+from harness.git import get_changed_files
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="entropy-measure",
+        prog="harness-measure",
         description="Measure code entropy index for files, commits, or projects.",
     )
     parser.add_argument(

@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from entropy_meter.config import DEFAULT_WEIGHTS, METRIC_CEILINGS, TIER_0, TIER_1, TIER_2
-from entropy_meter.core.metrics import FileMetrics, measure_file
+from harness.config import DEFAULT_WEIGHTS, METRIC_CEILINGS, TIER_0, TIER_1, TIER_2
+from harness.core.metrics import FileMetrics, measure_file
 
 if TYPE_CHECKING:
     from pathlib import Path

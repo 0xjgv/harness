@@ -1,4 +1,4 @@
-"""Tests for entropy_meter.cli.measure — in-process testing via monkeypatch + capsys."""
+"""Tests for harness.cli.measure — in-process testing via monkeypatch + capsys."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from entropy_meter.cli.measure import main
+from harness.cli.measure import main
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -18,7 +18,7 @@ from entropy_meter.cli.measure import main
 
 def _run_main(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> None:
     """Run measure main() with patched sys.argv."""
-    monkeypatch.setattr("sys.argv", ["entropy-measure", *argv])
+    monkeypatch.setattr("sys.argv", ["harness-measure", *argv])
     main()
 
 
@@ -103,11 +103,11 @@ class TestMeasureCommitFlag:
         fake_hash = "abc1234567890"
 
         monkeypatch.setattr(
-            "entropy_meter.cli.measure._resolve_commit_hash",
+            "harness.cli.measure._resolve_commit_hash",
             lambda commit, cwd=None: fake_hash,
         )
         monkeypatch.setattr(
-            "entropy_meter.cli.measure.get_changed_files",
+            "harness.cli.measure.get_changed_files",
             lambda commit, cwd=None: ["changed.py"],
         )
 
@@ -127,7 +127,7 @@ class TestMeasureCommitFlag:
     ) -> None:
         """Unresolvable commit should exit with error."""
         monkeypatch.setattr(
-            "entropy_meter.cli.measure._resolve_commit_hash",
+            "harness.cli.measure._resolve_commit_hash",
             lambda commit, cwd=None: None,
         )
         with pytest.raises(SystemExit) as exc_info:
@@ -151,11 +151,11 @@ class TestMeasureCommitFlag:
 
         fake_hash = "def456789"
         monkeypatch.setattr(
-            "entropy_meter.cli.measure._resolve_commit_hash",
+            "harness.cli.measure._resolve_commit_hash",
             lambda commit, cwd=None: fake_hash,
         )
         monkeypatch.setattr(
-            "entropy_meter.cli.measure.get_changed_files",
+            "harness.cli.measure.get_changed_files",
             lambda commit, cwd=None: ["mod.py"],
         )
 
@@ -285,7 +285,7 @@ class TestMeasureNoArgs:
 class TestMainModule:
     def test_main_module_imports(self) -> None:
         """Verify __main__.py can be imported (covers lines 3-6)."""
-        import entropy_meter.__main__  # noqa: F401
+        import harness.__main__  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +295,7 @@ class TestMainModule:
 
 class TestInternalHelpers:
     def test_ei_tier_labels(self) -> None:
-        from entropy_meter.cli.measure import _ei_tier_label
+        from harness.cli.measure import _ei_tier_label
 
         assert _ei_tier_label(10) == "low"
         assert _ei_tier_label(30) == "moderate"
@@ -303,28 +303,28 @@ class TestInternalHelpers:
         assert _ei_tier_label(80) == "very high"
 
     def test_is_excluded(self) -> None:
-        from entropy_meter.cli.measure import _is_excluded
+        from harness.cli.measure import _is_excluded
 
         excludes = frozenset({"migrations/**", "vendor/**"})
         assert _is_excluded("migrations/0001.py", excludes) is True
         assert _is_excluded("src/main.py", excludes) is False
 
     def test_has_valid_extension(self) -> None:
-        from entropy_meter.cli.measure import _has_valid_extension
+        from harness.cli.measure import _has_valid_extension
 
         exts = frozenset({".py"})
         assert _has_valid_extension("foo.py", exts) is True
         assert _has_valid_extension("foo.txt", exts) is False
 
     def test_resolve_commit_hash_failure(self) -> None:
-        from entropy_meter.cli.measure import _resolve_commit_hash
+        from harness.cli.measure import _resolve_commit_hash
 
         result = _resolve_commit_hash("nonexistent_ref_abc123", cwd=Path("/tmp"))
         assert result is None
 
     def test_metrics_to_dict(self) -> None:
-        from entropy_meter.cli.measure import _metrics_to_dict
-        from entropy_meter.core.metrics import FileMetrics
+        from harness.cli.measure import _metrics_to_dict
+        from harness.core.metrics import FileMetrics
 
         metrics = FileMetrics(
             file_size_bytes=100,
@@ -349,8 +349,8 @@ class TestInternalHelpers:
         assert result["tier"] == "moderate"
 
     def test_metrics_to_measurement(self) -> None:
-        from entropy_meter.cli.measure import _metrics_to_measurement
-        from entropy_meter.core.metrics import FileMetrics
+        from harness.cli.measure import _metrics_to_measurement
+        from harness.core.metrics import FileMetrics
 
         metrics = FileMetrics(
             file_size_bytes=100,
@@ -370,7 +370,7 @@ class TestInternalHelpers:
         assert m.measured_at == ts
 
     def test_collect_all_files(self, tmp_path: Path) -> None:
-        from entropy_meter.cli.measure import _collect_all_files
+        from harness.cli.measure import _collect_all_files
 
         (tmp_path / "a.py").write_text("x = 1\n")
         (tmp_path / "sub").mkdir()
