@@ -1,4 +1,5 @@
 """Tests for entropy_meter.git — git helper functions using real temp repos."""
+
 from __future__ import annotations
 
 import subprocess
@@ -41,9 +42,13 @@ def git_repo(tmp_path: Path) -> Path:
     subprocess.run(
         [
             "git",
-            "-c", "user.name=Test",
-            "-c", "user.email=test@test.com",
-            "commit", "-m", "initial commit",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@test.com",
+            "commit",
+            "-m",
+            "initial commit",
         ],
         cwd=str(tmp_path),
         capture_output=True,
@@ -93,9 +98,13 @@ class TestGetChangedFiles:
         subprocess.run(
             [
                 "git",
-                "-c", "user.name=Test",
-                "-c", "user.email=test@test.com",
-                "commit", "-m", "second commit",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@test.com",
+                "commit",
+                "-m",
+                "second commit",
             ],
             cwd=str(git_repo),
             capture_output=True,
@@ -119,9 +128,13 @@ class TestGetChangedFiles:
         subprocess.run(
             [
                 "git",
-                "-c", "user.name=Test",
-                "-c", "user.email=test@test.com",
-                "commit", "-m", "delete file",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@test.com",
+                "commit",
+                "-m",
+                "delete file",
             ],
             cwd=str(git_repo),
             capture_output=True,
@@ -200,9 +213,13 @@ class TestGetParentCommit:
         subprocess.run(
             [
                 "git",
-                "-c", "user.name=Test",
-                "-c", "user.email=test@test.com",
-                "commit", "-m", "second",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@test.com",
+                "commit",
+                "-m",
+                "second",
             ],
             cwd=str(git_repo),
             capture_output=True,
@@ -241,9 +258,13 @@ class TestGetRecentCommits:
             subprocess.run(
                 [
                     "git",
-                    "-c", "user.name=Test",
-                    "-c", "user.email=test@test.com",
-                    "commit", "-m", f"commit {i}",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@test.com",
+                    "commit",
+                    "-m",
+                    f"commit {i}",
                 ],
                 cwd=str(git_repo),
                 capture_output=True,
@@ -271,9 +292,13 @@ class TestGetRecentCommits:
         subprocess.run(
             [
                 "git",
-                "-c", "user.name=Test",
-                "-c", "user.email=test@test.com",
-                "commit", "-m", "extra",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@test.com",
+                "commit",
+                "-m",
+                "extra",
             ],
             cwd=str(git_repo),
             capture_output=True,

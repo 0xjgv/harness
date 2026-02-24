@@ -11,14 +11,17 @@ import math
 import statistics
 from collections import Counter
 from dataclasses import dataclass
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from entropy_meter.config import TIER_0, TIER_1
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
 # --- Tier 1 availability ---
 try:
-    from radon.complexity import cc_visit
-    from radon.metrics import h_visit, mi_visit
+    from radon.complexity import cc_visit  # pyright: ignore[reportMissingImports]
+    from radon.metrics import h_visit, mi_visit  # pyright: ignore[reportMissingImports]
 
     HAS_RADON = True
 except ImportError:  # pragma: no cover
@@ -56,6 +59,8 @@ def measure_file(path: Path | None = None, content: str | None = None) -> FileMe
     Otherwise read from path.
     """
     if content is None:
+        if path is None:
+            raise ValueError("Either 'path' or 'content' must be provided.")
         content = path.read_text(encoding="utf-8", errors="replace")
 
     content_bytes = content.encode("utf-8")
@@ -161,12 +166,15 @@ def _halstead_volume(source: str) -> float:
     # or a single object for the whole module depending on version.
     if isinstance(report, list):
         for item in report:
-            if hasattr(item, "volume") and item.volume is not None:
-                total += item.volume
+            vol = getattr(item, "volume", None)
+            if isinstance(vol, (int, float)):
+                total += float(vol)
     elif hasattr(report, "total") and report.total is not None:
         vol = getattr(report.total, "volume", None)
-        if vol is not None:
-            total = vol
-    elif hasattr(report, "volume") and report.volume is not None:
-        total = report.volume
+        if isinstance(vol, (int, float)):
+            total = float(vol)
+    else:
+        vol = getattr(report, "volume", None)
+        if isinstance(vol, (int, float)):
+            total = float(vol)
     return total

@@ -1,4 +1,5 @@
 """Tests for entropy_meter.cli.report — in-process testing via monkeypatch + capsys."""
+
 from __future__ import annotations
 
 import json
@@ -63,9 +64,7 @@ class TestReportNoDb:
     ) -> None:
         """When no DB exists, report should print error to stderr and exit 1."""
         with pytest.raises(SystemExit) as exc_info:
-            _run_report(
-                monkeypatch, ["--project-root", str(tmp_path)]
-            )
+            _run_report(monkeypatch, ["--project-root", str(tmp_path)])
         assert exc_info.value.code == 1
         err = capsys.readouterr().err
         assert "No entropy database found" in err
@@ -104,9 +103,7 @@ class TestReportTrend:
         db_dir.mkdir()
         _seed_db(db_dir / "entropy.db")
 
-        _run_report(
-            monkeypatch, ["--json", "--project-root", str(tmp_path)]
-        )
+        _run_report(monkeypatch, ["--json", "--project-root", str(tmp_path)])
         out = capsys.readouterr().out
         data = json.loads(out)
         assert isinstance(data, list)
@@ -235,9 +232,11 @@ class TestReportFileHistory:
         _run_report(
             monkeypatch,
             [
-                "--file", "pkg/mod0.py",
+                "--file",
+                "pkg/mod0.py",
                 "--json",
-                "--project-root", str(tmp_path),
+                "--project-root",
+                str(tmp_path),
             ],
         )
         out = capsys.readouterr().out
@@ -260,8 +259,10 @@ class TestReportFileHistory:
         _run_report(
             monkeypatch,
             [
-                "--file", "nonexistent.py",
-                "--project-root", str(tmp_path),
+                "--file",
+                "nonexistent.py",
+                "--project-root",
+                str(tmp_path),
             ],
         )
         out = capsys.readouterr().out
@@ -284,9 +285,7 @@ class TestReportHelpers:
 
         assert _short_hash("abc1234567890") == "abc1234"
 
-    def test_print_trend_with_deltas(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_print_trend_with_deltas(self, capsys: pytest.CaptureFixture[str]) -> None:
         """Trend with multiple commits should show deltas."""
         from entropy_meter.cli.report import _print_trend
 

@@ -21,7 +21,8 @@ Standalone code complexity metrics engine. Zero required dependencies (Tier 0 us
 
 ## Commands
 
-- `make install` — install with uv
+- `make install` — install with uv (development)
+- `make install-global` — install as global CLI tool via `uv tool install`
 - `make test` — run pytest
 - `make check` — ruff + mypy
 - `make test-cov` — tests with 80% coverage minimum

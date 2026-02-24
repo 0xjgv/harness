@@ -25,12 +25,12 @@ DEFAULT_WEIGHTS: dict[str, tuple[float, int]] = {
 
 # --- Normalization ceilings (raw value → 1.0) ---
 METRIC_CEILINGS: dict[str, float] = {
-    "compression_ratio": 1.0,       # 0.0 (incompressible) to 1.0 (fully redundant)
-    "line_entropy": 5.0,            # bits per character, Shannon entropy
-    "cyclomatic": 30.0,             # per-function average
-    "maintainability": 100.0,       # radon MI (inverted: higher MI = less complex)
-    "halstead_volume": 5000.0,      # typical ceiling for a single file
-    "ast_entropy": 4.0,             # Shannon entropy of AST node-type distribution
+    "compression_ratio": 1.0,  # 0.0 (incompressible) to 1.0 (fully redundant)
+    "line_entropy": 5.0,  # bits per character, Shannon entropy
+    "cyclomatic": 30.0,  # per-function average
+    "maintainability": 100.0,  # radon MI (inverted: higher MI = less complex)
+    "halstead_volume": 5000.0,  # typical ceiling for a single file
+    "ast_entropy": 4.0,  # Shannon entropy of AST node-type distribution
 }
 
 # --- Feedback thresholds ---
@@ -38,10 +38,10 @@ DEFAULT_WARN_THRESHOLD = 65
 DEFAULT_ALERT_THRESHOLD = 80
 
 # --- Asymmetric neutral band for delta feedback ---
-DELTA_POSITIVE_FLOOR = -5.0    # Below this: positive reinforcement
-DELTA_NEUTRAL_CEILING = 2.0    # Above this: informational
+DELTA_POSITIVE_FLOOR = -5.0  # Below this: positive reinforcement
+DELTA_NEUTRAL_CEILING = 2.0  # Above this: informational
 DELTA_SUGGESTION_CEILING = 10.0  # Above this: actionable suggestion
-DELTA_WARNING_CEILING = 25.0   # Above this: warning
+DELTA_WARNING_CEILING = 25.0  # Above this: warning
 
 # --- File filtering ---
 DEFAULT_EXTENSIONS = frozenset({".py"})
@@ -79,7 +79,7 @@ def get_project_config(project_root: Path | None = None) -> dict[str, object]:
             import tomli as tomllib  # type: ignore[no-redef]
         except ModuleNotFoundError:
             return {}
-    with open(toml_path, "rb") as f:
+    with toml_path.open("rb") as f:
         data = tomllib.load(f)
     return dict(data.get("tool", {}).get("entropy-meter", {}))
 

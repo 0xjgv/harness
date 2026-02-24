@@ -1,4 +1,5 @@
 """Tests for entropy_meter.cli.measure — in-process testing via monkeypatch + capsys."""
+
 from __future__ import annotations
 
 import json
@@ -230,9 +231,7 @@ class TestMeasureAllFlag:
         (tmp_path / "readme.txt").write_text("hello")
 
         with pytest.raises(SystemExit) as exc_info:
-            _run_main(
-                monkeypatch, ["--all", "--project-root", str(tmp_path)]
-            )
+            _run_main(monkeypatch, ["--all", "--project-root", str(tmp_path)])
         assert exc_info.value.code == 0
         err = capsys.readouterr().err
         assert "No files to measure" in err
@@ -320,9 +319,7 @@ class TestInternalHelpers:
     def test_resolve_commit_hash_failure(self) -> None:
         from entropy_meter.cli.measure import _resolve_commit_hash
 
-        result = _resolve_commit_hash(
-            "nonexistent_ref_abc123", cwd=Path("/tmp")
-        )
+        result = _resolve_commit_hash("nonexistent_ref_abc123", cwd=Path("/tmp"))
         assert result is None
 
     def test_metrics_to_dict(self) -> None:

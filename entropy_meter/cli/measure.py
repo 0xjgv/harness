@@ -9,6 +9,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Any
 
 from entropy_meter.config import (
     DEFAULT_EXCLUDES,
@@ -107,7 +111,7 @@ def _metrics_to_dict(
     metrics: FileMetrics,
     ei: float,
     commit_hash: str | None,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Convert file metrics + EI to a serializable dict."""
     return {
         "file": filepath,
@@ -220,7 +224,7 @@ def main() -> None:
         sys.exit(0)
 
     # Measure each file
-    results: list[dict[str, object]] = []
+    results: list[dict[str, Any]] = []
     measured_at = time.time()
     conn = None
     if args.store:
@@ -246,9 +250,7 @@ def main() -> None:
         results.append(result)
 
         if conn is not None:
-            measurement = _metrics_to_measurement(
-                rel_path, metrics, ei, commit_hash, measured_at
-            )
+            measurement = _metrics_to_measurement(rel_path, metrics, ei, commit_hash, measured_at)
             store_measurement(conn, measurement)
 
     if conn is not None:

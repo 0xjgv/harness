@@ -8,12 +8,6 @@ dependencies = []
 [project.optional-dependencies]
 radon = ["radon>=5.1"]
 all = ["entropy-meter[radon]"]
-dev = [
-    "pytest>=8.0",
-    "pytest-cov>=4.0",
-    "ruff>=0.4",
-    "mypy>=1.10",
-]
 
 [project.scripts]
 entropy-measure = "entropy_meter.cli.measure:main"
@@ -23,23 +17,105 @@ entropy-report = "entropy_meter.cli.report:main"
 build-backend = "hatchling.build"
 requires = ["hatchling"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
+[dependency-groups]
+dev = [
+    "basedpyright>=1.28",
+    "pytest>=9.0",
+    "pytest-cov>=7.0",
+    "ruff>=0.15",
+]
+
+# ── Ruff (lint + format) ────────────────────────────────────────────
 
 [tool.ruff]
 target-version = "py310"
 line-length = 99
+preview = true
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort (import sorting)
+    "UP",   # pyupgrade (modern Python syntax)
+    "B",    # flake8-bugbear (common bugs)
+    "SIM",  # flake8-simplify (simple > complex)
+    "RUF",  # ruff-specific rules
+    "C4",   # flake8-comprehensions
+    "PTH",  # flake8-use-pathlib
+    "TCH",  # type-checking imports
+    "ARG",  # unused arguments
+    "PL",   # pylint subset
+    "ANN",  # type annotations
+    "ERA",  # flake8-eradicate (commented-out code)
+    "PIE",  # flake8-pie (unnecessary placeholders)
+]
+ignore = [
+    "ANN401",   # dynamically-typed-expressions (Any)
+    "PLR0912",  # too-many-branches
+    "PLR0913",  # too-many-arguments
+    "PLR0914",  # too-many-local-variables
+    "PLR0915",  # too-many-statements
+    "PLR0917",  # too-many-positional-arguments
+    "PLR2004",  # magic-value-comparison (too noisy)
+    "PLR6201",  # use-set-literal
+    "PLR6301",  # method-could-be-function
+]
 
-[tool.mypy]
-python_version = "3.10"
-strict = true
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "ANN",      # type annotations relaxed in tests
+    "ARG",      # unused arguments common in fixtures
+    "PLC0415",  # late imports fine in tests
+    "PLC1901",  # compare-to-empty-string
+    "PLC2701",  # private-name-import (testing internal behavior)
+    "PIE810",   # single-starts-ends-with
+    "PLR2004",  # magic values fine in tests
+    "RUF069",   # float equality comparisons fine in tests
+    "SIM105",   # contextlib.suppress suggestion
+    "TCH",      # type-checking imports (fixtures need runtime types)
+]
+"entropy_meter/config.py" = [
+    "ERA001",   # descriptive comments on data structures
+    "PLC0415",  # conditional imports for Python 3.10 compat
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["entropy_meter"]
+
+# ── Basedpyright ───────────────────────────────────────────────────
+
+[tool.basedpyright]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
+reportAny = false
+reportUnusedCallResult = false
+reportMissingTypeStubs = false
+reportUnknownVariableType = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportConstantRedefinition = false
+reportPossiblyUnboundVariable = false
+
+# ── Pytest ─────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+# ── Coverage ───────────────────────────────────────────────────────
 
 [tool.coverage.run]
 source = ["entropy_meter"]
+branch = true
 
 [tool.coverage.report]
 fail_under = 80
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@abstractmethod",
+]
+show_missing = true

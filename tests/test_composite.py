@@ -1,4 +1,5 @@
 """Tests for entropy_meter.core.composite — compute_entropy_index and measure_and_score."""
+
 from __future__ import annotations
 
 from pathlib import Path

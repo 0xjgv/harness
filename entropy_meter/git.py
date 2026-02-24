@@ -1,8 +1,12 @@
 """Git helpers: changed files, before/after content retrieval."""
+
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def is_git_repo(path: Path | None = None) -> bool:
@@ -11,7 +15,9 @@ def is_git_repo(path: Path | None = None) -> bool:
     try:
         subprocess.run(
             ["git", "rev-parse", "--git-dir"],
-            capture_output=True, check=True, cwd=cwd,
+            capture_output=True,
+            check=True,
+            cwd=cwd,
         )
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -31,7 +37,10 @@ def get_changed_files(commit: str = "HEAD", cwd: Path | None = None) -> list[str
     try:
         result = subprocess.run(
             ["git", "diff-tree", "--no-commit-id", "--name-status", "-r", commit],
-            capture_output=True, text=True, check=True, cwd=work_dir,
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=work_dir,
         )
     except subprocess.CalledProcessError:
         return []
@@ -59,7 +68,10 @@ def get_file_at_commit(filepath: str, commit: str, cwd: Path | None = None) -> s
     try:
         result = subprocess.run(
             ["git", "show", f"{commit}:{filepath}"],
-            capture_output=True, text=True, check=True, cwd=work_dir,
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=work_dir,
         )
         return result.stdout
     except subprocess.CalledProcessError:
@@ -72,7 +84,10 @@ def get_current_commit(cwd: Path | None = None) -> str | None:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, check=True, cwd=work_dir,
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=work_dir,
         )
         return result.stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -85,7 +100,10 @@ def get_parent_commit(commit: str = "HEAD", cwd: Path | None = None) -> str | No
     try:
         result = subprocess.run(
             ["git", "rev-parse", f"{commit}~1"],
-            capture_output=True, text=True, check=True, cwd=work_dir,
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=work_dir,
         )
         return result.stdout.strip()
     except subprocess.CalledProcessError:
@@ -98,7 +116,10 @@ def get_recent_commits(n: int = 10, cwd: Path | None = None) -> list[str]:
     try:
         result = subprocess.run(
             ["git", "log", f"-{n}", "--format=%H"],
-            capture_output=True, text=True, check=True, cwd=work_dir,
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=work_dir,
         )
         return [h for h in result.stdout.strip().splitlines() if h]
     except (subprocess.CalledProcessError, FileNotFoundError):

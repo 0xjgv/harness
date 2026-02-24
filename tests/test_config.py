@@ -1,4 +1,5 @@
 """Tests for entropy_meter.config — project root, DB path, config loading."""
+
 from __future__ import annotations
 
 import subprocess
@@ -77,9 +78,7 @@ class TestGetProjectConfig:
 
     def test_pyproject_without_tool_section(self, tmp_path: Path) -> None:
         """Should return empty dict if no [tool.entropy-meter] section."""
-        (tmp_path / "pyproject.toml").write_text(
-            '[project]\nname = "test"\n'
-        )
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "test"\n')
         config = get_project_config(tmp_path)
         assert config == {}
 
@@ -121,9 +120,13 @@ class TestConfigGetCurrentCommit:
         subprocess.run(
             [
                 "git",
-                "-c", "user.name=Test",
-                "-c", "user.email=test@test.com",
-                "commit", "-m", "init",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@test.com",
+                "commit",
+                "-m",
+                "init",
             ],
             cwd=str(tmp_path),
             capture_output=True,

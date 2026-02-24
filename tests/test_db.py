@@ -1,4 +1,5 @@
 """Tests for entropy_meter.core.db — SQLite storage operations."""
+
 from __future__ import annotations
 
 import sqlite3
@@ -75,9 +76,7 @@ class TestStoreAndRetrieve:
         assert row_id > 0
 
         # Retrieve by commit
-        cur = tmp_db.execute(
-            "SELECT * FROM measurements WHERE commit_hash = ?", ("commit_a",)
-        )
+        cur = tmp_db.execute("SELECT * FROM measurements WHERE commit_hash = ?", ("commit_a",))
         rows = cur.fetchall()
         assert len(rows) == 1
         assert rows[0]["file_path"] == "src/foo.py"
@@ -102,9 +101,7 @@ class TestStoreAndRetrieve:
 class TestGetPreviousMeasurement:
     def test_get_previous_measurement(self, tmp_db: sqlite3.Connection) -> None:
         t_base = 1000.0
-        m_old = _make_measurement(
-            commit_hash="old_commit", entropy_index=20.0, measured_at=t_base
-        )
+        m_old = _make_measurement(commit_hash="old_commit", entropy_index=20.0, measured_at=t_base)
         m_new = _make_measurement(
             commit_hash="new_commit", entropy_index=45.0, measured_at=t_base + 100
         )

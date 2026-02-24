@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import os
 import sqlite3
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from entropy_meter.config import get_db_path
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 SCHEMA_VERSION = 1
 
@@ -80,7 +81,7 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
     if is_new:
-        os.chmod(path, 0o600)
+        path.chmod(0o600)
     _migrate(conn)
     return conn
 
@@ -170,9 +171,7 @@ def get_previous_measurement(
     return _row_to_measurement(row) if row else None
 
 
-def get_measurements_by_commit(
-    conn: sqlite3.Connection, commit_hash: str
-) -> list[Measurement]:
+def get_measurements_by_commit(conn: sqlite3.Connection, commit_hash: str) -> list[Measurement]:
     """Get all measurements for a specific commit."""
     cur = conn.execute(
         "SELECT * FROM measurements WHERE commit_hash = ? ORDER BY file_path",
@@ -181,9 +180,7 @@ def get_measurements_by_commit(
     return [_row_to_measurement(row) for row in cur.fetchall()]
 
 
-def get_recent_measurements(
-    conn: sqlite3.Connection, limit: int = 50
-) -> list[Measurement]:
+def get_recent_measurements(conn: sqlite3.Connection, limit: int = 50) -> list[Measurement]:
     """Get recent measurements ordered by time descending."""
     cur = conn.execute(
         "SELECT * FROM measurements ORDER BY measured_at DESC LIMIT ?",
@@ -226,9 +223,7 @@ def get_commit_summary(conn: sqlite3.Connection, commit_hash: str) -> dict[str, 
     }
 
 
-def get_hotspots(
-    conn: sqlite3.Connection, limit: int = 10
-) -> list[dict[str, Any]]:
+def get_hotspots(conn: sqlite3.Connection, limit: int = 10) -> list[dict[str, Any]]:
     """Get files with highest current entropy index."""
     cur = conn.execute(
         """SELECT file_path, entropy_index, commit_hash, measured_at
@@ -244,9 +239,7 @@ def get_hotspots(
     return [dict(row) for row in cur.fetchall()]
 
 
-def get_trend(
-    conn: sqlite3.Connection, last_n_commits: int = 10
-) -> list[dict[str, Any]]:
+def get_trend(conn: sqlite3.Connection, last_n_commits: int = 10) -> list[dict[str, Any]]:
     """Get per-commit average EI for the last N distinct commits."""
     cur = conn.execute(
         """SELECT commit_hash, AVG(entropy_index) as avg_ei,

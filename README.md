@@ -6,15 +6,22 @@ Designed to run as a post-commit hook for [Claude Code](https://docs.anthropic.c
 
 ## Install
 
+### Global (recommended)
+
+Installs `entropy-measure` and `entropy-report` as global commands available in all repos:
+
 ```bash
-# Minimal (Tier 0 — stdlib only)
-pip install -e .
+make install-global
+# or manually:
+uv tool install --editable ".[all]" --force
+```
 
-# With structural analysis (Tier 1)
-pip install -e ".[radon]"
+Editable mode means source changes reflect immediately — no reinstall needed.
 
-# Everything
-pip install -e ".[all]"
+### Development
+
+```bash
+make install    # uv sync with all extras + dev deps
 ```
 
 ## Quick Start
@@ -102,11 +109,7 @@ entropy-meter is designed to power a post-commit hook in Claude Code projects. T
 
 No files to copy per project. All projects point at the single canonical script in this repo.
 
-1. Install entropy-meter in the target project's venv:
-
-```bash
-uv pip install -e ~/Code/entropy-meter
-```
+1. Install entropy-meter globally (if not already): `make install-global`
 
 2. Merge the hook config into the project's `.claude/settings.local.json` (snippet in [`examples/hooks_settings.json`](examples/hooks_settings.json)):
 
@@ -140,7 +143,7 @@ Measurements are stored project-locally at `.claude/entropy.db` — each project
 
 ### Uninstall
 
-Remove the `hooks` entries from `.claude/settings.local.json`. Optionally delete `.claude/entropy.db` and run `uv pip uninstall entropy-meter`.
+Remove the `hooks` entries from `.claude/settings.local.json`. Optionally delete `.claude/entropy.db` and run `make uninstall-global`.
 
 ### Files
 
@@ -170,8 +173,9 @@ alert = 80
 ## Development
 
 ```bash
-make install    # Install with all extras + dev deps
-make test       # Run pytest
-make check      # Ruff lint + format + mypy
-make test-cov   # Tests with 80% coverage minimum
+make install          # Install with all extras + dev deps
+make install-global   # Install as global CLI tool (uv tool)
+make test             # Run pytest
+make check            # Ruff lint + format + mypy
+make test-cov         # Tests with 80% coverage minimum
 ```

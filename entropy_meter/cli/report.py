@@ -6,9 +6,15 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from entropy_meter.config import find_project_root, get_db_path
 from entropy_meter.core.db import get_connection, get_file_history, get_hotspots, get_trend
+
+if TYPE_CHECKING:
+    from typing import Any
+
+    from entropy_meter.core.db import Measurement
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -64,7 +70,7 @@ def _short_hash(commit_hash: str | None) -> str:
     return commit_hash[:7]
 
 
-def _print_trend(data: list[dict[str, object]], output_json: bool) -> None:
+def _print_trend(data: list[dict[str, Any]], output_json: bool) -> None:
     """Print per-commit average EI trend."""
     if output_json:
         print(json.dumps(data, indent=2, default=str))
@@ -94,7 +100,7 @@ def _print_trend(data: list[dict[str, object]], output_json: bool) -> None:
         print(f"  {commit:<10s}  {files:>5d}  {avg_ei:>6.1f}  {delta_str:>7s}")
 
 
-def _print_hotspots(data: list[dict[str, object]], output_json: bool) -> None:
+def _print_hotspots(data: list[dict[str, Any]], output_json: bool) -> None:
     """Print files with highest entropy index."""
     if output_json:
         print(json.dumps(data, indent=2, default=str))
@@ -116,17 +122,17 @@ def _print_hotspots(data: list[dict[str, object]], output_json: bool) -> None:
 
 def _print_file_history(
     file_path: str,
-    measurements: list[object],
+    measurements: list[Measurement],
     output_json: bool,
 ) -> None:
     """Print measurement history for a specific file."""
     if output_json:
         data = [
             {
-                "file": m.file_path,  # type: ignore[union-attr]
-                "entropy_index": m.entropy_index,  # type: ignore[union-attr]
-                "commit": m.commit_hash,  # type: ignore[union-attr]
-                "measured_at": m.measured_at,  # type: ignore[union-attr]
+                "file": m.file_path,
+                "entropy_index": m.entropy_index,
+                "commit": m.commit_hash,
+                "measured_at": m.measured_at,
             }
             for m in measurements
         ]
@@ -143,11 +149,11 @@ def _print_file_history(
 
     # measurements are newest-first
     for i, m in enumerate(measurements):
-        commit = _short_hash(m.commit_hash)  # type: ignore[union-attr]
-        ei = float(m.entropy_index)  # type: ignore[union-attr]
+        commit = _short_hash(m.commit_hash)
+        ei = m.entropy_index
 
         if i + 1 < len(measurements):
-            prev_ei = float(measurements[i + 1].entropy_index)  # type: ignore[union-attr]
+            prev_ei = measurements[i + 1].entropy_index
             delta = ei - prev_ei
             delta_str = f"{delta:+.1f}"
         else:

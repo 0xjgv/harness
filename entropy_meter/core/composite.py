@@ -7,10 +7,13 @@ optional dependencies are installed.
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from entropy_meter.config import DEFAULT_WEIGHTS, METRIC_CEILINGS, TIER_0, TIER_1, TIER_2
 from entropy_meter.core.metrics import FileMetrics, measure_file
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # Map metric names (as used in DEFAULT_WEIGHTS) to FileMetrics field names.
 _METRIC_FIELD_MAP: dict[str, str] = {
