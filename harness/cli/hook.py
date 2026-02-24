@@ -61,10 +61,10 @@ def _measure_files(
     commit: str,
     project_root: Path,
     conn: sqlite3.Connection,
-) -> list[tuple[str, float, float, float]]:
+) -> list[tuple[str, float, float, float, bool]]:
     """Measure entropy for each file and return deltas.
 
-    Returns list of (path, before_ei, after_ei, delta).
+    Returns list of (path, before_ei, after_ei, delta, is_new_file).
     """
     from harness.core.composite import compute_entropy_index  # noqa: PLC0415
     from harness.core.db import (  # noqa: PLC0415
@@ -75,7 +75,7 @@ def _measure_files(
     from harness.core.metrics import measure_file  # noqa: PLC0415
     from harness.git import get_file_at_commit  # noqa: PLC0415
 
-    deltas: list[tuple[str, float, float, float]] = []
+    deltas: list[tuple[str, float, float, float, bool]] = []
 
     for filepath in py_files:
         content = get_file_at_commit(
@@ -116,9 +116,9 @@ def _measure_files(
         prev = get_previous_measurement(conn, filepath, commit)
         if prev:
             delta = ei - prev.entropy_index
-            deltas.append((filepath, prev.entropy_index, ei, delta))
+            deltas.append((filepath, prev.entropy_index, ei, delta, False))
         else:
-            deltas.append((filepath, 0.0, ei, ei))
+            deltas.append((filepath, 0.0, ei, 0.0, True))
 
     return deltas
 
@@ -126,7 +126,7 @@ def _measure_files(
 def _format_feedback(
     short_hash: str,
     total_delta: float,
-    file_deltas: list[tuple[str, float, float, float]],
+    file_deltas: list[tuple[str, float, float, float, bool]],
 ) -> str:
     """Build human-readable entropy feedback string."""
     from harness.config import (  # noqa: PLC0415
@@ -155,16 +155,20 @@ def _format_feedback(
         key=lambda x: abs(x[3]),
         reverse=True,
     )
-    for filepath, before_ei, after_ei, delta in ranked:
+    for filepath, before_ei, after_ei, delta, is_new in ranked:
+        if is_new:
+            lines.append(f"  {filepath}: EI {after_ei:.0f} (new file)")
+            continue
         if abs(delta) < 2.0:
             continue
         lines.append(
             f"  {filepath}: {delta:+.1f} EI ({before_ei:.0f} -> {after_ei:.0f})",
         )
 
-    # Guidance for large increases
-    if total_delta > DELTA_SUGGESTION_CEILING:
-        biggest = max(file_deltas, key=lambda x: x[3])
+    # Guidance for large increases (exclude new files)
+    non_new_deltas = [d for d in ranked if not d[4]]
+    if total_delta > DELTA_SUGGESTION_CEILING and non_new_deltas:
+        biggest = max(non_new_deltas, key=lambda x: x[3])
         if biggest[3] > 5:
             lines.append(
                 f"  Tip: Consider simplifying {biggest[0]}",
@@ -214,7 +218,9 @@ def handle_commit() -> None:
     if not file_deltas:
         return
 
-    total_delta = sum(d[3] for d in file_deltas)
+    # Only count real deltas (not new files) toward the neutral band check
+    non_new_deltas = [d for d in file_deltas if not d[4]]
+    total_delta = sum(d[3] for d in non_new_deltas)
 
     # Asymmetric neutral band: silence if within -5 to +2
     if DELTA_POSITIVE_FLOOR <= total_delta <= DELTA_NEUTRAL_CEILING:
