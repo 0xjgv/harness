@@ -26,7 +26,7 @@ from harness.core.metrics import FileMetrics, measure_file
 from harness.git import get_changed_files
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="harness-measure",
         description="Measure code entropy index for files, commits, or projects.",
@@ -175,9 +175,9 @@ def _collect_all_files(project_root: Path) -> list[Path]:
     return files
 
 
-def main() -> None:
-    parser = _build_parser()
-    args = parser.parse_args()
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     project_root = Path(args.project_root).resolve() if args.project_root else find_project_root()
     commit_hash: str | None = None

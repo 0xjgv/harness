@@ -1,10 +1,4 @@
-#!/usr/bin/env python3
-"""Post-commit entropy measurement hook for Claude Code.
-
-Fires on PostToolUse(Bash) when the command is a git commit.
-Measures entropy changes in committed files and provides feedback.
-Also fires on Stop to provide a session summary.
-"""
+"""Hook runner for Claude Code — reads stdin JSON, dispatches to PostToolUse/Stop handlers."""
 
 from __future__ import annotations
 
@@ -182,10 +176,10 @@ def _format_feedback(
 # -- Event handlers --------------------------------------------------
 
 
-def handle_commit() -> int:
+def handle_commit() -> None:
     """Measure entropy changes for the latest commit."""
     if not _ensure_harness():
-        return 0
+        return
 
     from harness.config import (  # noqa: PLC0415
         DELTA_NEUTRAL_CEILING,
@@ -201,12 +195,12 @@ def handle_commit() -> int:
     project_root = Path.cwd()
     commit = get_current_commit(cwd=project_root)
     if not commit:
-        return 0
+        return
 
     changed = get_changed_files(commit, cwd=project_root)
     py_files = [f for f in changed if f.endswith(".py")]
     if not py_files:
-        return 0
+        return
 
     conn = get_connection(get_db_path(project_root))
     file_deltas = _measure_files(
@@ -218,13 +212,13 @@ def handle_commit() -> int:
     conn.close()
 
     if not file_deltas:
-        return 0
+        return
 
     total_delta = sum(d[3] for d in file_deltas)
 
     # Asymmetric neutral band: silence if within -5 to +2
     if DELTA_POSITIVE_FLOOR <= total_delta <= DELTA_NEUTRAL_CEILING:
-        return 0
+        return
 
     feedback = _format_feedback(
         commit[:7],
@@ -232,13 +226,12 @@ def handle_commit() -> int:
         file_deltas,
     )
     _emit(feedback)
-    return 0
 
 
-def handle_session_summary() -> int:
+def handle_session_summary() -> None:
     """Provide session summary of entropy changes on Stop."""
     if not _ensure_harness():
-        return 0
+        return
 
     from harness.config import get_db_path  # noqa: PLC0415
     from harness.core.db import (  # noqa: PLC0415
@@ -249,14 +242,14 @@ def handle_session_summary() -> int:
     project_root = Path.cwd()
     db_path = get_db_path(project_root)
     if not db_path.exists():
-        return 0
+        return
 
     conn = get_connection(db_path)
     trend = get_trend(conn, last_n_commits=20)
     conn.close()
 
     if len(trend) < 2:
-        return 0
+        return
 
     lines = [f"[Entropy Summary] Last {len(trend)} commits:"]
     total_delta = 0.0
@@ -280,34 +273,28 @@ def handle_session_summary() -> int:
         lines.append(f"  Net: {total_delta:+.0f} EI")
 
     _emit("\n".join(lines))
-    return 0
 
 
 # -- Entrypoint ------------------------------------------------------
 
 
-def _dispatch_post_tool_use(data: dict[str, Any]) -> int:
+def _dispatch_post_tool_use(data: dict[str, Any]) -> None:
     """Handle PostToolUse events."""
     if not _is_git_commit(data):
-        return 0
-    return handle_commit()
+        return
+    handle_commit()
 
 
-def main() -> int:
-    """Entry point: read hook event from stdin, dispatch."""
+def hook_run_main(_argv: list[str] | None = None) -> None:
+    """Entry point for hook-run subcommand: read hook event from stdin, dispatch."""
     try:
         data = json.loads(sys.stdin.read())
     except (json.JSONDecodeError, EOFError):
-        return 0
+        return
 
     event = data.get("hook_event_name", "")
 
     if event == "PostToolUse":
-        return _dispatch_post_tool_use(data)
-    if event == "Stop":
-        return handle_session_summary()
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        _dispatch_post_tool_use(data)
+    elif event == "Stop":
+        handle_session_summary()

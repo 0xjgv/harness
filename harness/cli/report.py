@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from harness.core.db import Measurement
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="harness-report",
         description="Show entropy trends, hotspots, and file history from stored measurements.",
@@ -162,9 +162,9 @@ def _print_file_history(
         print(f"  {commit:<10s}  {ei:>6.1f}  {delta_str:>7s}")
 
 
-def main() -> None:
-    parser = _build_parser()
-    args = parser.parse_args()
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     project_root = Path(args.project_root).resolve() if args.project_root else find_project_root()
     db_path = get_db_path(project_root)

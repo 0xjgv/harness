@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 dependencies = ["radon>=5.1"]
 
 [project.scripts]
+harness = "harness.cli.main:main"
 harness-measure = "harness.cli.measure:main"
 harness-report = "harness.cli.report:main"
 

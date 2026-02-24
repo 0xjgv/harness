@@ -10,17 +10,24 @@ Standalone code complexity metrics engine. Zero required dependencies (Tier 0 us
 
 ## Structure
 
+- `harness/cli/main.py` — Top-level CLI router (`harness entropy ...`)
+- `harness/cli/measure.py` — `harness entropy measure` CLI entry point
+- `harness/cli/report.py` — `harness entropy report` CLI entry point
+- `harness/cli/install.py` — `harness entropy install`/`uninstall` CLI entry points
+- `harness/cli/hook.py` — Claude Code hook runner (stdin JSON dispatch)
 - `harness/config.py` — Constants, defaults, weight vectors, DB path resolution
 - `harness/core/db.py` — SQLite storage (schema v1, migrations)
 - `harness/core/metrics.py` — Tier 0/1 metric computation
 - `harness/core/composite.py` — Entropy Index aggregation (0-100)
-- `harness/cli/measure.py` — `harness-measure` CLI entry point
-- `harness/cli/report.py` — `harness-report` CLI entry point
 - `harness/git.py` — Git helpers (changed files, before/after content)
 - `tests/` — pytest suite
 
 ## Commands
 
+- `harness entropy measure` — measure entropy index for files
+- `harness entropy report` — show trends, hotspots, history
+- `harness entropy install` — install Claude Code hooks
+- `harness entropy uninstall` — remove Claude Code hooks
 - `make install` — install with uv (development)
 - `make install-global` — install as global CLI tool via `uv tool install`
 - `make test` — run pytest

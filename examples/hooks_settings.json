@@ -5,7 +5,7 @@
         "matcher": "Bash",
         "hooks": [{
           "type": "command",
-          "command": "$HOME/Code/harness/harness_hook.py"
+          "command": "harness entropy hook-run"
         }]
       }
     ],
@@ -13,7 +13,7 @@
       {
         "hooks": [{
           "type": "command",
-          "command": "$HOME/Code/harness/harness_hook.py"
+          "command": "harness entropy hook-run"
         }]
       }
     ]
