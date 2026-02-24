@@ -36,6 +36,7 @@ class TestRouterHelp:
         assert "report" in out
         assert "install" in out
         assert "uninstall" in out
+        assert "seed" in out
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +64,11 @@ class TestRouterDispatch:
     def test_dispatch_uninstall(self, mock_main: MagicMock) -> None:
         main(["entropy", "uninstall"])
         mock_main.assert_called_once_with([])
+
+    @patch("harness.cli.seed.seed_main")
+    def test_dispatch_seed(self, mock_main: MagicMock) -> None:
+        main(["entropy", "seed", "--project-root", "/tmp/test"])
+        mock_main.assert_called_once_with(["--project-root", "/tmp/test"])
 
     @patch("harness.cli.hook.hook_run_main")
     def test_dispatch_hook_run(self, mock_main: MagicMock) -> None:

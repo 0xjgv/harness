@@ -170,6 +170,7 @@ class TestInstallMain:
         install_main([])
         out = capsys.readouterr().out
         assert "Entropy tracking installed" in out
+        assert "harness entropy seed" in out
 
         settings_file = project / ".claude" / "settings.local.json"
         assert settings_file.exists()

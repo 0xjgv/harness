@@ -1,0 +1,235 @@
+"""Tests for harness.cli.seed — seed baseline entropy measurements."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from harness.cli.seed import seed_main
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+FAKE_HASH = "abc1234567890abcdef"
+
+
+def _create_py_files(root: Path, count: int = 3) -> list[Path]:
+    """Create simple Python files in the given directory."""
+    files = []
+    for i in range(count):
+        f = root / f"mod{i}.py"
+        f.write_text(f"def func{i}():\n    return {i}\n")
+        files.append(f)
+    return files
+
+
+# ---------------------------------------------------------------------------
+# Basic flow
+# ---------------------------------------------------------------------------
+
+
+class TestSeedBasicFlow:
+    def test_seed_measures_all_files(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _create_py_files(tmp_path, 3)
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: FAKE_HASH,
+        )
+
+        seed_main(["--project-root", str(tmp_path)])
+        out = capsys.readouterr().out
+        assert "Seeded 3 file(s)" in out
+        assert "avg EI:" in out
+
+        # Verify DB has 3 rows
+        db_path = tmp_path / ".claude" / "entropy.db"
+        assert db_path.exists()
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute("SELECT COUNT(*) FROM measurements").fetchone()
+        assert rows[0] == 3
+        conn.close()
+
+    def test_seed_shows_distribution(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _create_py_files(tmp_path, 2)
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: FAKE_HASH,
+        )
+
+        seed_main(["--project-root", str(tmp_path)])
+        out = capsys.readouterr().out
+        assert "Distribution:" in out
+
+    def test_seed_shows_commit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _create_py_files(tmp_path, 1)
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: FAKE_HASH,
+        )
+
+        seed_main(["--project-root", str(tmp_path)])
+        out = capsys.readouterr().out
+        assert "Commit: abc123456789" in out
+
+
+# ---------------------------------------------------------------------------
+# Empty project
+# ---------------------------------------------------------------------------
+
+
+class TestSeedEmptyProject:
+    def test_no_py_files_exits_cleanly(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (tmp_path / "readme.txt").write_text("hello")
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: FAKE_HASH,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            seed_main(["--project-root", str(tmp_path)])
+        assert exc_info.value.code == 0
+        err = capsys.readouterr().err
+        assert "No Python files found" in err
+
+
+# ---------------------------------------------------------------------------
+# Idempotent re-seed
+# ---------------------------------------------------------------------------
+
+
+class TestSeedIdempotent:
+    def test_same_commit_is_idempotent(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _create_py_files(tmp_path, 2)
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: FAKE_HASH,
+        )
+
+        seed_main(["--project-root", str(tmp_path)])
+        capsys.readouterr()
+
+        # Seed again on same commit
+        seed_main(["--project-root", str(tmp_path)])
+
+        db_path = tmp_path / ".claude" / "entropy.db"
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute("SELECT COUNT(*) FROM measurements").fetchone()
+        assert rows[0] == 2  # INSERT OR REPLACE keeps count the same
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# JSON output
+# ---------------------------------------------------------------------------
+
+
+class TestSeedJsonOutput:
+    def test_json_flag_produces_valid_json(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _create_py_files(tmp_path, 2)
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: FAKE_HASH,
+        )
+
+        seed_main(["--json", "--project-root", str(tmp_path)])
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert isinstance(data, list)
+        assert len(data) == 2
+        assert "entropy_index" in data[0]
+        assert "file" in data[0]
+        assert "tier" in data[0]
+        assert data[0]["commit"] == FAKE_HASH
+
+
+# ---------------------------------------------------------------------------
+# No git repo
+# ---------------------------------------------------------------------------
+
+
+class TestSeedNoGitRepo:
+    def test_seed_without_git(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _create_py_files(tmp_path, 1)
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: None,
+        )
+
+        seed_main(["--project-root", str(tmp_path)])
+        out = capsys.readouterr().out
+        assert "Seeded 1 file(s)" in out
+        assert "no git repo detected" in out
+
+        # Verify commit_hash is NULL in DB
+        db_path = tmp_path / ".claude" / "entropy.db"
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute("SELECT commit_hash FROM measurements LIMIT 1").fetchone()
+        assert row[0] is None
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# --project-root flag
+# ---------------------------------------------------------------------------
+
+
+class TestSeedProjectRoot:
+    def test_project_root_scopes_collection(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        sub = tmp_path / "subproject"
+        sub.mkdir()
+        (sub / "a.py").write_text("x = 1\n")
+        # File outside subproject should not be collected
+        (tmp_path / "outside.py").write_text("y = 2\n")
+
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: FAKE_HASH,
+        )
+
+        seed_main(["--project-root", str(sub)])
+        out = capsys.readouterr().out
+        assert "Seeded 1 file(s)" in out

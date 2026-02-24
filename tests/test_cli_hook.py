@@ -110,23 +110,51 @@ class TestEmit:
 
 class TestFormatFeedback:
     def test_simplified(self) -> None:
-        result = _format_feedback("abc1234", -10.0, [("a.py", 50.0, 40.0, -10.0)])
+        result = _format_feedback("abc1234", -10.0, [("a.py", 50.0, 40.0, -10.0, False)])
         assert "(simplified)" in result
         assert "abc1234" in result
 
     def test_neutral(self) -> None:
-        result = _format_feedback("abc1234", 5.0, [("a.py", 50.0, 55.0, 5.0)])
+        result = _format_feedback("abc1234", 5.0, [("a.py", 50.0, 55.0, 5.0, False)])
         assert "(simplified)" not in result
         assert "(increased complexity)" not in result
 
     def test_increased_complexity(self) -> None:
-        result = _format_feedback("abc1234", 15.0, [("a.py", 50.0, 65.0, 15.0)])
+        result = _format_feedback("abc1234", 15.0, [("a.py", 50.0, 65.0, 15.0, False)])
         assert "(increased complexity)" in result
 
     def test_significant_increase_with_tip(self) -> None:
-        result = _format_feedback("abc1234", 30.0, [("a.py", 50.0, 80.0, 30.0)])
+        result = _format_feedback("abc1234", 30.0, [("a.py", 50.0, 80.0, 30.0, False)])
         assert "(significant complexity increase)" in result
         assert "Tip: Consider simplifying" in result
+
+    def test_new_file_annotation(self) -> None:
+        result = _format_feedback("abc1234", 0.0, [("new.py", 0.0, 35.0, 0.0, True)])
+        assert "(new file)" in result
+        assert "new.py" in result
+        assert "EI 35" in result
+
+    def test_new_file_excluded_from_delta_total(self) -> None:
+        """New files should not inflate the total delta or trigger tips."""
+        deltas = [
+            ("existing.py", 50.0, 53.0, 3.0, False),
+            ("brand_new.py", 0.0, 60.0, 0.0, True),
+        ]
+        # total_delta is 3.0 (only from existing.py), which is in the neutral range
+        result = _format_feedback("abc1234", 3.0, deltas)
+        assert "(new file)" in result
+        assert "Tip:" not in result
+
+    def test_new_file_not_in_tip(self) -> None:
+        """Even with high EI, new files should not trigger the simplify tip."""
+        deltas = [
+            ("changed.py", 50.0, 80.0, 30.0, False),
+            ("huge_new.py", 0.0, 90.0, 0.0, True),
+        ]
+        result = _format_feedback("abc1234", 30.0, deltas)
+        assert "Tip: Consider simplifying changed.py" in result
+        # The tip should NOT point to the new file
+        assert "Tip: Consider simplifying huge_new.py" not in result
 
 
 # ---------------------------------------------------------------------------
