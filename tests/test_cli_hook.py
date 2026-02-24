@@ -399,3 +399,33 @@ class TestLogHookError:
 
         # Must not raise
         _log_hook_error("Stop", ValueError("test"))
+
+
+class TestMaybeHeal:
+    def test_handler_exception_triggers_heal(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """When a handler raises, _maybe_heal is called with (event, exc)."""
+        data = json.dumps({"hook_event_name": "Stop"})
+        monkeypatch.setattr("sys.stdin", io.StringIO(data))
+
+        def raise_error() -> None:
+            msg = "db exploded"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr("harness.cli.hook.handle_session_summary", raise_error)
+        monkeypatch.setattr("harness.cli.hook._log_hook_error", lambda *a: None)
+
+        heal_calls: list[tuple[str, Exception]] = []
+
+        def capture_heal(event: str, exc: Exception) -> None:
+            heal_calls.append((event, exc))
+
+        monkeypatch.setattr("harness.cli.hook._maybe_heal", capture_heal)
+
+        hook_run_main()
+        assert len(heal_calls) == 1
+        assert heal_calls[0][0] == "Stop"
+        assert isinstance(heal_calls[0][1], RuntimeError)

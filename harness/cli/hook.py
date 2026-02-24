@@ -339,3 +339,14 @@ def hook_run_main(_argv: list[str] | None = None) -> None:
             handle_session_summary()
     except Exception as exc:
         _log_hook_error(event, exc)
+        _maybe_heal(event, exc)
+
+
+def _maybe_heal(event: str, exc: Exception) -> None:
+    """Best-effort self-healing trigger. Never raises."""
+    try:
+        from harness.cli.heal import maybe_trigger_heal  # noqa: PLC0415
+
+        maybe_trigger_heal(event, exc)
+    except Exception:
+        pass

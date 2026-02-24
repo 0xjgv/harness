@@ -17,6 +17,7 @@ Standalone code complexity metrics engine. Zero required dependencies (Tier 0 us
 - `harness/cli/seed.py` — `harness entropy seed` CLI entry point
 - `harness/cli/context.py` — `harness context run` CLI entry point
 - `harness/cli/hook.py` — Claude Code hook runner (stdin JSON dispatch)
+- `harness/cli/heal.py` — Self-healing hook errors via background `claude -p`
 - `harness/scripts/context.sh` — Bundled context generation script (tree, git status, git log)
 - `harness/config.py` — Constants, defaults, weight vectors, DB path resolution
 - `harness/core/db.py` — SQLite storage (schema v1, migrations)
