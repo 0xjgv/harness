@@ -23,6 +23,7 @@ from harness.cli.install import (
 
 FAKE_HARNESS_PATH = "/usr/local/bin/harness"
 HOOK_COMMAND = f"{FAKE_HARNESS_PATH} entropy hook-run"
+CONTEXT_COMMAND = f"{FAKE_HARNESS_PATH} context run"
 
 
 @pytest.fixture()
@@ -85,9 +86,19 @@ class TestReadWriteSettings:
 class TestHookMergeLogic:
     def test_add_to_empty_settings(self) -> None:
         settings: dict[str, object] = {}
+        result = _add_harness_hooks(settings, HOOK_COMMAND, context_command=CONTEXT_COMMAND)
+        assert _has_harness_hooks(result)
+        hooks = result["hooks"]
+        assert "SessionStart" in hooks
+        assert "PostToolUse" in hooks
+        assert "Stop" in hooks
+
+    def test_add_without_context_command(self) -> None:
+        settings: dict[str, object] = {}
         result = _add_harness_hooks(settings, HOOK_COMMAND)
         assert _has_harness_hooks(result)
         hooks = result["hooks"]
+        assert "SessionStart" not in hooks
         assert "PostToolUse" in hooks
         assert "Stop" in hooks
 
@@ -99,7 +110,7 @@ class TestHookMergeLogic:
                 ],
             },
         }
-        result = _add_harness_hooks(settings, HOOK_COMMAND)
+        result = _add_harness_hooks(settings, HOOK_COMMAND, context_command=CONTEXT_COMMAND)
         post = result["hooks"]["PostToolUse"]
         assert len(post) == 2  # existing + harness
 
@@ -119,6 +130,9 @@ class TestHookMergeLogic:
     def test_remove_only_harness_hooks(self) -> None:
         settings: dict[str, object] = {
             "hooks": {
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": CONTEXT_COMMAND}]},
+                ],
                 "PostToolUse": [
                     {"matcher": "Write", "hooks": [{"type": "command", "command": "other-tool"}]},
                     {"matcher": "Bash", "hooks": [{"type": "command", "command": HOOK_COMMAND}]},
@@ -134,12 +148,16 @@ class TestHookMergeLogic:
         post = result["hooks"]["PostToolUse"]
         assert len(post) == 1
         assert post[0]["hooks"][0]["command"] == "other-tool"
-        # Stop should be removed entirely (was only harness)
+        # SessionStart and Stop should be removed entirely (were only harness)
+        assert "SessionStart" not in result["hooks"]
         assert "Stop" not in result["hooks"]
 
     def test_remove_cleans_up_empty_hooks(self) -> None:
         settings: dict[str, object] = {
             "hooks": {
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": CONTEXT_COMMAND}]},
+                ],
                 "PostToolUse": [
                     {"matcher": "Bash", "hooks": [{"type": "command", "command": HOOK_COMMAND}]},
                 ],
@@ -208,6 +226,7 @@ class TestInstallMain:
         # Verify no duplicate entries
         settings_file = project / ".claude" / "settings.local.json"
         data = json.loads(settings_file.read_text())
+        assert len(data["hooks"]["SessionStart"]) == 1
         assert len(data["hooks"]["PostToolUse"]) == 1
         assert len(data["hooks"]["Stop"]) == 1
 

@@ -6,6 +6,42 @@ import argparse
 import sys
 
 
+def _dispatch_entropy(command: str, argv: list[str]) -> None:
+    """Dispatch to the appropriate entropy subcommand."""
+    if command == "measure":
+        from harness.cli.measure import main as measure_main  # noqa: PLC0415
+
+        measure_main(argv)
+    elif command == "report":
+        from harness.cli.report import main as report_main  # noqa: PLC0415
+
+        report_main(argv)
+    elif command == "install":
+        from harness.cli.install import install_main  # noqa: PLC0415
+
+        install_main(argv)
+    elif command == "uninstall":
+        from harness.cli.install import uninstall_main  # noqa: PLC0415
+
+        uninstall_main(argv)
+    elif command == "seed":
+        from harness.cli.seed import seed_main  # noqa: PLC0415
+
+        seed_main(argv)
+    elif command == "hook-run":
+        from harness.cli.hook import hook_run_main  # noqa: PLC0415
+
+        hook_run_main(argv)
+
+
+def _dispatch_context(command: str, argv: list[str]) -> None:
+    """Dispatch to the appropriate context subcommand."""
+    if command == "run":
+        from harness.cli.context import run_main  # noqa: PLC0415
+
+        run_main(argv)
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry point for `harness` command."""
     args_list = argv if argv is not None else sys.argv[1:]
@@ -65,6 +101,20 @@ def main(argv: list[str] | None = None) -> None:
         add_help=False,
     )
 
+    # harness context ...
+    context_parser = subparsers.add_parser(
+        "context",
+        help="Codebase context generation",
+    )
+    context_sub = context_parser.add_subparsers(dest="context_command")
+
+    # harness context run
+    context_sub.add_parser(
+        "run",
+        help="Run bundled context.sh to gather codebase context",
+        add_help=False,
+    )
+
     # Parse only the first 1-2 args to determine routing
     args, remaining = parser.parse_known_args(args_list)
 
@@ -77,31 +127,8 @@ def main(argv: list[str] | None = None) -> None:
             entropy_parser.print_help()
             sys.exit(0)
         _dispatch_entropy(args.entropy_command, remaining)
-
-
-def _dispatch_entropy(command: str, argv: list[str]) -> None:
-    """Dispatch to the appropriate entropy subcommand."""
-    if command == "measure":
-        from harness.cli.measure import main as measure_main  # noqa: PLC0415
-
-        measure_main(argv)
-    elif command == "report":
-        from harness.cli.report import main as report_main  # noqa: PLC0415
-
-        report_main(argv)
-    elif command == "install":
-        from harness.cli.install import install_main  # noqa: PLC0415
-
-        install_main(argv)
-    elif command == "uninstall":
-        from harness.cli.install import uninstall_main  # noqa: PLC0415
-
-        uninstall_main(argv)
-    elif command == "seed":
-        from harness.cli.seed import seed_main  # noqa: PLC0415
-
-        seed_main(argv)
-    elif command == "hook-run":
-        from harness.cli.hook import hook_run_main  # noqa: PLC0415
-
-        hook_run_main(argv)
+    elif args.command == "context":
+        if args.context_command is None:
+            context_parser.print_help()
+            sys.exit(0)
+        _dispatch_context(args.context_command, remaining)

@@ -4,18 +4,20 @@ Standalone code complexity metrics engine. Zero required dependencies (Tier 0 us
 
 ## Stack
 
-- Python 3.10+, Hatchling build
+- Python 3.13+, Hatchling build
 - SQLite3 (WAL mode, 0600 perms)
 - radon (Tier 1 metrics)
 
 ## Structure
 
-- `harness/cli/main.py` — Top-level CLI router (`harness entropy ...`)
+- `harness/cli/main.py` — Top-level CLI router (`harness entropy ...`, `harness context ...`)
 - `harness/cli/measure.py` — `harness entropy measure` CLI entry point
 - `harness/cli/report.py` — `harness entropy report` CLI entry point
 - `harness/cli/install.py` — `harness entropy install`/`uninstall` CLI entry points
 - `harness/cli/seed.py` — `harness entropy seed` CLI entry point
+- `harness/cli/context.py` — `harness context run` CLI entry point
 - `harness/cli/hook.py` — Claude Code hook runner (stdin JSON dispatch)
+- `harness/scripts/context.sh` — Bundled context generation script (tree, git status, git log)
 - `harness/config.py` — Constants, defaults, weight vectors, DB path resolution
 - `harness/core/db.py` — SQLite storage (schema v1, migrations)
 - `harness/core/metrics.py` — Tier 0/1 metric computation
@@ -30,6 +32,7 @@ Standalone code complexity metrics engine. Zero required dependencies (Tier 0 us
 - `harness entropy install` — install Claude Code hooks
 - `harness entropy seed` — establish baseline measurements for the project
 - `harness entropy uninstall` — remove Claude Code hooks
+- `harness context run` — run bundled context.sh for codebase context
 - `make install` — install with uv (development)
 - `make install-global` — install as global CLI tool via `uv tool install`
 - `make test` — run pytest
@@ -42,3 +45,7 @@ Standalone code complexity metrics engine. Zero required dependencies (Tier 0 us
 - Tier 0+1 always available; Tier 2 redistributes weights when absent
 - DB location: `.claude/entropy.db` (project-local, gitignored)
 - All DB functions are sync
+
+## Coding Guidelines
+
+- Always write tests that reproduce the issue/bug we are fixing.

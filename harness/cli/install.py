@@ -88,9 +88,21 @@ def _has_harness_hooks(settings: dict[str, Any]) -> bool:
     return False
 
 
-def _add_harness_hooks(settings: dict[str, Any], command: str) -> dict[str, Any]:
-    """Merge harness PostToolUse and Stop hooks into settings, preserving existing hooks."""
+def _add_harness_hooks(
+    settings: dict[str, Any],
+    command: str,
+    *,
+    context_command: str | None = None,
+) -> dict[str, Any]:
+    """Merge harness hooks into settings, preserving existing hooks."""
     hooks = settings.setdefault("hooks", {})
+
+    # SessionStart: context generation
+    if context_command:
+        session_handlers: list[dict[str, Any]] = hooks.setdefault("SessionStart", [])
+        session_handlers.append({
+            "hooks": [_harness_hook_entry(context_command)],
+        })
 
     # PostToolUse: with Bash matcher
     post_tool_handlers: list[dict[str, Any]] = hooks.setdefault("PostToolUse", [])
@@ -219,13 +231,14 @@ def install_main(argv: list[str] | None = None) -> None:
         print("Harness hooks already configured.")
         return
 
-    _add_harness_hooks(settings, hook_command)
+    context_command = f"{harness_cmd} context run"
+    _add_harness_hooks(settings, hook_command, context_command=context_command)
     _write_settings(settings_file, settings)
 
     rel_settings = settings_file.relative_to(project_root)
     print("Entropy tracking installed.\n")
     print(f"  Settings: {rel_settings}")
-    print("  Events:   PostToolUse (Bash), Stop")
+    print("  Events:   SessionStart, PostToolUse (Bash), Stop")
     print(f"  Command:  {hook_command}")
     print("\nEntropy will be measured automatically during Claude Code sessions.")
     if not args.project:
@@ -261,4 +274,4 @@ def uninstall_main(argv: list[str] | None = None) -> None:
     rel_settings = settings_file.relative_to(project_root)
     print("Entropy tracking removed.\n")
     print(f"  Settings: {rel_settings}")
-    print("  Removed:  PostToolUse (Bash), Stop hooks")
+    print("  Removed:  SessionStart, PostToolUse (Bash), Stop hooks")

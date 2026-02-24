@@ -23,6 +23,7 @@ class TestRouterHelp:
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         assert "entropy" in out
+        assert "context" in out
 
     def test_entropy_no_subcommand_prints_help(
         self,
