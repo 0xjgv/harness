@@ -114,37 +114,42 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+_UPSERT_SQL = """INSERT OR REPLACE INTO measurements (
+    file_path, commit_hash, measured_at,
+    file_size_bytes, line_count, blank_lines, comment_lines,
+    compression_ratio, line_length_stddev,
+    cyclomatic_complexity, maintainability_index, halstead_volume,
+    ast_node_count, ast_depth_max, ast_entropy,
+    entropy_index, tier_mask
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+
+
+def _measurement_params(m: Measurement) -> tuple[Any, ...]:
+    """Build the parameter tuple for a Measurement upsert."""
+    return (
+        m.file_path,
+        m.commit_hash,
+        m.measured_at,
+        m.file_size_bytes,
+        m.line_count,
+        m.blank_lines,
+        m.comment_lines,
+        m.compression_ratio,
+        m.line_length_stddev,
+        m.cyclomatic_complexity,
+        m.maintainability_index,
+        m.halstead_volume,
+        m.ast_node_count,
+        m.ast_depth_max,
+        m.ast_entropy,
+        m.entropy_index,
+        m.tier_mask,
+    )
+
+
 def store_measurement(conn: sqlite3.Connection, m: Measurement) -> int:
     """Insert or replace a measurement. Returns the row ID."""
-    cur = conn.execute(
-        """INSERT OR REPLACE INTO measurements (
-            file_path, commit_hash, measured_at,
-            file_size_bytes, line_count, blank_lines, comment_lines,
-            compression_ratio, line_length_stddev,
-            cyclomatic_complexity, maintainability_index, halstead_volume,
-            ast_node_count, ast_depth_max, ast_entropy,
-            entropy_index, tier_mask
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            m.file_path,
-            m.commit_hash,
-            m.measured_at,
-            m.file_size_bytes,
-            m.line_count,
-            m.blank_lines,
-            m.comment_lines,
-            m.compression_ratio,
-            m.line_length_stddev,
-            m.cyclomatic_complexity,
-            m.maintainability_index,
-            m.halstead_volume,
-            m.ast_node_count,
-            m.ast_depth_max,
-            m.ast_entropy,
-            m.entropy_index,
-            m.tier_mask,
-        ),
-    )
+    cur = conn.execute(_UPSERT_SQL, _measurement_params(m))
     conn.commit()
     return cur.lastrowid or 0
 
@@ -158,35 +163,7 @@ def store_measurements_batch(conn: sqlite3.Connection, measurements: list[Measur
         return 0
     with conn:
         for m in measurements:
-            conn.execute(
-                """INSERT OR REPLACE INTO measurements (
-                    file_path, commit_hash, measured_at,
-                    file_size_bytes, line_count, blank_lines, comment_lines,
-                    compression_ratio, line_length_stddev,
-                    cyclomatic_complexity, maintainability_index, halstead_volume,
-                    ast_node_count, ast_depth_max, ast_entropy,
-                    entropy_index, tier_mask
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    m.file_path,
-                    m.commit_hash,
-                    m.measured_at,
-                    m.file_size_bytes,
-                    m.line_count,
-                    m.blank_lines,
-                    m.comment_lines,
-                    m.compression_ratio,
-                    m.line_length_stddev,
-                    m.cyclomatic_complexity,
-                    m.maintainability_index,
-                    m.halstead_volume,
-                    m.ast_node_count,
-                    m.ast_depth_max,
-                    m.ast_entropy,
-                    m.entropy_index,
-                    m.tier_mask,
-                ),
-            )
+            conn.execute(_UPSERT_SQL, _measurement_params(m))
     return len(measurements)
 
 
