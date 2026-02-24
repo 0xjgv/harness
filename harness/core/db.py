@@ -272,6 +272,12 @@ def get_trend(conn: sqlite3.Connection, last_n_commits: int = 10) -> list[dict[s
     return [dict(row) for row in cur.fetchall()]
 
 
+def has_measurements(conn: sqlite3.Connection) -> bool:
+    """Return True if the measurements table contains at least one row (O(1))."""
+    cur = conn.execute("SELECT EXISTS(SELECT 1 FROM measurements LIMIT 1)")
+    return bool(cur.fetchone()[0])
+
+
 def _row_to_measurement(row: sqlite3.Row) -> Measurement:
     """Convert a DB row to a Measurement dataclass."""
     return Measurement(

@@ -209,6 +209,93 @@ def _format_feedback(
     return "\n".join(lines)
 
 
+# -- SessionStart handlers -------------------------------------------
+
+
+def _auto_seed(project_root: Path) -> None:
+    """Seed project if no measurements exist yet."""
+    from harness.config import get_db_path  # noqa: PLC0415
+    from harness.core.db import get_connection, has_measurements  # noqa: PLC0415
+
+    db_path = get_db_path(project_root)
+    if db_path.exists():
+        conn = get_connection(db_path)
+        try:
+            if has_measurements(conn):
+                return
+        finally:
+            conn.close()
+
+    from harness.cli.seed import seed_project  # noqa: PLC0415
+
+    summary = seed_project(project_root, quiet=True)
+    print(
+        f"[Entropy] Auto-seeded {summary.files_measured} files "
+        f"(avg EI: {summary.avg_entropy_index:.1f})",
+    )
+
+
+def _auto_install_hooks(project_root: Path) -> None:
+    """Install per-project hooks if not already present."""
+    from harness.cli.install import (  # noqa: PLC0415
+        _find_harness_command,
+        _find_hook_command,
+        _has_harness_hooks,
+        _read_settings,
+        install_project,
+    )
+
+    settings_file = project_root / ".claude" / "settings.local.json"
+    try:
+        settings = _read_settings(settings_file)
+    except Exception:
+        settings = {}
+
+    if _has_harness_hooks(settings):
+        return
+
+    harness_cmd = _find_harness_command()
+    if harness_cmd is None:
+        return
+
+    hook_command = _find_hook_command() or f"{harness_cmd} entropy hook-run"
+    install_project(project_root, hook_command)
+    print("[Entropy] Auto-installed per-project hooks (active next session)")
+
+
+def handle_session_start() -> None:
+    """Handle SessionStart: run context script, auto-bootstrap Python projects."""
+    # 1. Always try context generation (output flows to Claude's context)
+    try:
+        from harness.cli.context import run_context_script  # noqa: PLC0415
+
+        run_context_script()
+    except Exception:
+        pass  # Context failure must not block bootstrap
+
+    # 2. Check if this is a Python project
+    if not _ensure_harness():
+        return
+
+    from harness.config import find_project_root, is_python_project  # noqa: PLC0415
+
+    project_root = find_project_root()
+    if not is_python_project(project_root):
+        return
+
+    # 3. Auto-seed if needed
+    try:
+        _auto_seed(project_root)
+    except Exception as exc:
+        _log_hook_error("SessionStart:auto_seed", exc)
+
+    # 4. Auto-install per-project hooks if needed
+    try:
+        _auto_install_hooks(project_root)
+    except Exception as exc:
+        _log_hook_error("SessionStart:auto_install", exc)
+
+
 # -- Event handlers --------------------------------------------------
 
 
@@ -333,7 +420,9 @@ def hook_run_main(_argv: list[str] | None = None) -> None:
     event = data.get("hook_event_name", "")
 
     try:
-        if event == "PostToolUse":
+        if event == "SessionStart":
+            handle_session_start()
+        elif event == "PostToolUse":
             _dispatch_post_tool_use(data)
         elif event == "Stop":
             handle_session_summary()

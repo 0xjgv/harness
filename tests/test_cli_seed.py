@@ -312,3 +312,81 @@ class TestSeedParallel:
         seed_main(["--project-root", str(tmp_path)])
         out = capsys.readouterr().out
         assert "Seeded 3 file(s)" in out
+
+
+# ---------------------------------------------------------------------------
+# seed_project (library function)
+# ---------------------------------------------------------------------------
+
+
+class TestSeedProject:
+    def test_returns_seed_summary(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from harness.cli.seed import SeedSummary, seed_project
+
+        _create_py_files(tmp_path, 3)
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: FAKE_HASH,
+        )
+
+        summary = seed_project(tmp_path)
+        assert isinstance(summary, SeedSummary)
+        assert summary.files_measured == 3
+        assert summary.files_skipped == 0
+        assert summary.avg_entropy_index >= 0
+        assert summary.commit_hash == FAKE_HASH
+        assert summary.db_path.exists()
+        assert len(summary.results) == 3
+
+    def test_no_files_raises(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from harness.cli.seed import seed_project
+
+        (tmp_path / "readme.txt").write_text("hello")
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: FAKE_HASH,
+        )
+
+        with pytest.raises(FileNotFoundError, match="No Python files"):
+            seed_project(tmp_path)
+
+    def test_quiet_suppresses_warnings(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from harness.cli.seed import seed_project
+
+        _create_py_files(tmp_path, 1)
+        # Create a file that will fail to measure
+        (tmp_path / "bad.py").write_text("")
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: FAKE_HASH,
+        )
+
+        seed_project(tmp_path, quiet=True)
+        err = capsys.readouterr().err
+        assert "warning" not in err
+
+    def test_seed_main_backward_compat(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """seed_main still works as the CLI entry point."""
+        _create_py_files(tmp_path, 2)
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: FAKE_HASH,
+        )
+
+        seed_main(["--project-root", str(tmp_path)])
+        out = capsys.readouterr().out
+        assert "Seeded 2 file(s)" in out

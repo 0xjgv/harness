@@ -100,6 +100,20 @@ def main(argv: list[str] | None = None) -> None:
         add_help=False,
     )
 
+    # harness install
+    subparsers.add_parser(
+        "install",
+        help="Install harness hooks (global + per-project + seed)",
+        add_help=False,
+    )
+
+    # harness uninstall
+    subparsers.add_parser(
+        "uninstall",
+        help="Remove harness hooks (global + per-project)",
+        add_help=False,
+    )
+
     # harness context ...
     context_parser = subparsers.add_parser(
         "context",
@@ -121,7 +135,15 @@ def main(argv: list[str] | None = None) -> None:
         parser.print_help()
         sys.exit(0)
 
-    if args.command == "entropy":
+    if args.command == "install":
+        from harness.cli.install import global_install_main  # noqa: PLC0415
+
+        global_install_main(remaining)
+    elif args.command == "uninstall":
+        from harness.cli.install import global_uninstall_main  # noqa: PLC0415
+
+        global_uninstall_main(remaining)
+    elif args.command == "entropy":
         if args.entropy_command is None:
             entropy_parser.print_help()
             sys.exit(0)

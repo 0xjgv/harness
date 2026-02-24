@@ -394,3 +394,207 @@ class TestUninstallMain:
         uninstall_main([])
         out = capsys.readouterr().out
         assert "No harness hooks found" in out
+
+
+# ---------------------------------------------------------------------------
+# install_global (library function)
+# ---------------------------------------------------------------------------
+
+
+class TestInstallGlobal:
+    def test_installs_session_start(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from harness.cli.install import install_global
+
+        global_path = tmp_path / "settings.json"
+        monkeypatch.setattr("harness.cli.install.GLOBAL_SETTINGS_PATH", global_path)
+
+        result = install_global(HOOK_COMMAND)
+        assert result is True
+        data = json.loads(global_path.read_text())
+        assert "SessionStart" in data["hooks"]
+        assert _has_harness_hooks(data)
+
+    def test_idempotent(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from harness.cli.install import install_global
+
+        global_path = tmp_path / "settings.json"
+        monkeypatch.setattr("harness.cli.install.GLOBAL_SETTINGS_PATH", global_path)
+
+        install_global(HOOK_COMMAND)
+        result = install_global(HOOK_COMMAND)
+        assert result is False
+
+        data = json.loads(global_path.read_text())
+        assert len(data["hooks"]["SessionStart"]) == 1
+
+    def test_preserves_existing_hooks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from harness.cli.install import install_global
+
+        global_path = tmp_path / "settings.json"
+        global_path.write_text(
+            json.dumps({
+                "hooks": {
+                    "PostToolUse": [
+                        {"hooks": [{"type": "command", "command": "other"}]},
+                    ],
+                },
+            })
+        )
+        monkeypatch.setattr("harness.cli.install.GLOBAL_SETTINGS_PATH", global_path)
+
+        install_global(HOOK_COMMAND)
+        data = json.loads(global_path.read_text())
+        assert len(data["hooks"]["PostToolUse"]) == 1
+        assert "SessionStart" in data["hooks"]
+
+
+# ---------------------------------------------------------------------------
+# install_project (library function)
+# ---------------------------------------------------------------------------
+
+
+class TestInstallProject:
+    def test_installs_per_project_hooks(self, project: Path) -> None:
+        from harness.cli.install import install_project
+
+        path = install_project(project, HOOK_COMMAND)
+        assert path.exists()
+        data = json.loads(path.read_text())
+        assert "PostToolUse" in data["hooks"]
+        assert "Stop" in data["hooks"]
+        # Per-project should NOT have SessionStart
+        assert "SessionStart" not in data["hooks"]
+
+    def test_idempotent(self, project: Path) -> None:
+        from harness.cli.install import install_project
+
+        install_project(project, HOOK_COMMAND)
+        path = install_project(project, HOOK_COMMAND)
+        data = json.loads(path.read_text())
+        assert len(data["hooks"]["PostToolUse"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# global_install_main
+# ---------------------------------------------------------------------------
+
+
+class TestGlobalInstallMain:
+    def test_full_flow(
+        self,
+        project: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from harness.cli.install import global_install_main
+
+        global_path = tmp_path / "global_settings.json"
+        monkeypatch.setattr("harness.cli.install.GLOBAL_SETTINGS_PATH", global_path)
+        _mock_which(monkeypatch)
+        monkeypatch.setattr("harness.cli.install.find_project_root", lambda: project)
+        # Create a Python file so seed works
+        (project / "app.py").write_text("x = 1\n")
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: "abc123",
+        )
+
+        global_install_main([])
+        out = capsys.readouterr().out
+        assert "Global hooks installed" in out
+        assert "Harness installed" in out
+
+    def test_skip_seed_flag(
+        self,
+        project: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from harness.cli.install import global_install_main
+
+        global_path = tmp_path / "global_settings.json"
+        monkeypatch.setattr("harness.cli.install.GLOBAL_SETTINGS_PATH", global_path)
+        _mock_which(monkeypatch)
+        monkeypatch.setattr("harness.cli.install.find_project_root", lambda: project)
+
+        global_install_main(["--skip-seed"])
+        out = capsys.readouterr().out
+        assert "Seeded" not in out
+
+    def test_skip_global_flag(
+        self,
+        project: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from harness.cli.install import global_install_main
+
+        global_path = tmp_path / "global_settings.json"
+        monkeypatch.setattr("harness.cli.install.GLOBAL_SETTINGS_PATH", global_path)
+        _mock_which(monkeypatch)
+        monkeypatch.setattr("harness.cli.install.find_project_root", lambda: project)
+
+        global_install_main(["--skip-global", "--skip-seed"])
+        assert not global_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# global_uninstall_main
+# ---------------------------------------------------------------------------
+
+
+class TestGlobalUninstallMain:
+    def test_removes_all_hooks(
+        self,
+        project: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from harness.cli.install import global_install_main, global_uninstall_main
+
+        global_path = tmp_path / "global_settings.json"
+        monkeypatch.setattr("harness.cli.install.GLOBAL_SETTINGS_PATH", global_path)
+        _mock_which(monkeypatch)
+        monkeypatch.setattr("harness.cli.install.find_project_root", lambda: project)
+
+        global_install_main(["--skip-seed"])
+        capsys.readouterr()
+
+        global_uninstall_main([])
+        out = capsys.readouterr().out
+        assert "Removed global hooks" in out
+        assert "Removed per-project hooks" in out
+
+    def test_noop_when_no_hooks(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from harness.cli.install import global_uninstall_main
+
+        monkeypatch.setattr("harness.cli.install.find_project_root", lambda: project)
+        monkeypatch.setattr(
+            "harness.cli.install.GLOBAL_SETTINGS_PATH",
+            project / "nonexistent.json",
+        )
+
+        global_uninstall_main([])
+        out = capsys.readouterr().out
+        assert "No harness hooks found" in out

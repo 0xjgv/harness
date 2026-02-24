@@ -110,3 +110,43 @@ class TestRouterIntegration:
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         assert "run" in out
+
+
+# ---------------------------------------------------------------------------
+# run_context_script (library function)
+# ---------------------------------------------------------------------------
+
+
+class TestRunContextScript:
+    @patch("harness.cli.context.subprocess.run")
+    def test_returns_exit_code(self, mock_run: MagicMock) -> None:
+        from harness.cli.context import run_context_script
+
+        mock_run.return_value = MagicMock(returncode=0)
+        assert run_context_script() == 0
+
+    @patch("harness.cli.context.subprocess.run")
+    def test_returns_nonzero_exit_code(self, mock_run: MagicMock) -> None:
+        from harness.cli.context import run_context_script
+
+        mock_run.return_value = MagicMock(returncode=42)
+        assert run_context_script() == 42
+
+    @patch("harness.cli.context.subprocess.run")
+    def test_forwards_args(self, mock_run: MagicMock) -> None:
+        from harness.cli.context import run_context_script
+
+        mock_run.return_value = MagicMock(returncode=0)
+        run_context_script(["--short", "/tmp/target"])
+        cmd = mock_run.call_args[0][0]
+        assert cmd[2:] == ["--short", "/tmp/target"]
+
+    def test_raises_on_missing_script(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from harness.cli.context import run_context_script
+
+        monkeypatch.setattr(
+            "harness.cli.context.SCRIPT_PATH",
+            Path("/nonexistent/context.sh"),
+        )
+        with pytest.raises(FileNotFoundError):
+            run_context_script()

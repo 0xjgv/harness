@@ -429,3 +429,254 @@ class TestMaybeHeal:
         assert len(heal_calls) == 1
         assert heal_calls[0][0] == "Stop"
         assert isinstance(heal_calls[0][1], RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# handle_session_start
+# ---------------------------------------------------------------------------
+
+
+class TestHandleSessionStart:
+    def test_runs_context_script(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from harness.cli.hook import handle_session_start
+
+        context_called = []
+        monkeypatch.setattr(
+            "harness.cli.context.run_context_script",
+            lambda *a, **kw: context_called.append(True) or 0,
+        )
+        monkeypatch.setattr("harness.cli.hook._ensure_harness", lambda: False)
+
+        handle_session_start()
+        assert len(context_called) == 1
+
+    def test_skips_non_python_project(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from harness.cli.hook import handle_session_start
+
+        monkeypatch.setattr(
+            "harness.cli.context.run_context_script",
+            lambda *a, **kw: 0,
+        )
+        monkeypatch.setattr("harness.cli.hook._ensure_harness", lambda: True)
+        monkeypatch.setattr(
+            "harness.config.is_python_project",
+            lambda root=None: False,
+        )
+        monkeypatch.setattr(
+            "harness.config.find_project_root",
+            lambda start=None: tmp_path,
+        )
+
+        # Should not raise, should not try to seed/install
+        handle_session_start()
+
+    def test_triggers_auto_seed_and_install(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from harness.cli.hook import handle_session_start
+
+        monkeypatch.setattr(
+            "harness.cli.context.run_context_script",
+            lambda *a, **kw: 0,
+        )
+        monkeypatch.setattr("harness.cli.hook._ensure_harness", lambda: True)
+        monkeypatch.setattr(
+            "harness.config.is_python_project",
+            lambda root=None: True,
+        )
+        monkeypatch.setattr(
+            "harness.config.find_project_root",
+            lambda start=None: tmp_path,
+        )
+
+        seed_calls = []
+        install_calls = []
+        monkeypatch.setattr(
+            "harness.cli.hook._auto_seed",
+            seed_calls.append,
+        )
+        monkeypatch.setattr(
+            "harness.cli.hook._auto_install_hooks",
+            install_calls.append,
+        )
+
+        handle_session_start()
+        assert seed_calls == [tmp_path]
+        assert install_calls == [tmp_path]
+
+    def test_context_failure_does_not_block(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from harness.cli.hook import handle_session_start
+
+        monkeypatch.setattr(
+            "harness.cli.context.run_context_script",
+            lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        monkeypatch.setattr("harness.cli.hook._ensure_harness", lambda: True)
+        monkeypatch.setattr(
+            "harness.config.is_python_project",
+            lambda root=None: True,
+        )
+        monkeypatch.setattr(
+            "harness.config.find_project_root",
+            lambda start=None: tmp_path,
+        )
+        monkeypatch.setattr("harness.cli.hook._auto_seed", lambda root: None)
+        monkeypatch.setattr(
+            "harness.cli.hook._auto_install_hooks",
+            lambda root: None,
+        )
+
+        handle_session_start()  # Must not raise
+
+
+# ---------------------------------------------------------------------------
+# _auto_seed
+# ---------------------------------------------------------------------------
+
+
+class TestAutoSeed:
+    def test_skips_if_measurements_exist(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from harness.cli.hook import _auto_seed
+        from harness.core.db import get_connection, store_measurement
+
+        db_path = tmp_path / ".claude" / "entropy.db"
+        db_path.parent.mkdir(parents=True)
+        monkeypatch.setattr("harness.config.get_db_path", lambda root=None: db_path)
+
+        conn = get_connection(db_path)
+        from tests.test_db import _make_measurement
+
+        store_measurement(conn, _make_measurement())
+        conn.close()
+
+        # Should return without calling seed_project
+        seed_calls = []
+        monkeypatch.setattr(
+            "harness.cli.seed.seed_project",
+            lambda root, **kw: seed_calls.append(root),
+        )
+        _auto_seed(tmp_path)
+        assert seed_calls == []
+
+    def test_seeds_if_empty(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from harness.cli.hook import _auto_seed
+        from harness.cli.seed import SeedSummary
+
+        monkeypatch.setattr(
+            "harness.config.get_db_path",
+            lambda root=None: tmp_path / ".claude" / "entropy.db",
+        )
+        monkeypatch.setattr(
+            "harness.cli.seed.seed_project",
+            lambda root, **kw: SeedSummary(
+                files_measured=5,
+                files_skipped=0,
+                avg_entropy_index=42.0,
+                commit_hash="abc",
+                db_path=tmp_path / ".claude" / "entropy.db",
+                results=[],
+            ),
+        )
+
+        _auto_seed(tmp_path)
+        out = capsys.readouterr().out
+        assert "[Entropy] Auto-seeded 5 files" in out
+
+
+# ---------------------------------------------------------------------------
+# _auto_install_hooks
+# ---------------------------------------------------------------------------
+
+
+class TestAutoInstallHooks:
+    def test_installs_per_project_hooks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from harness.cli.hook import _auto_install_hooks
+
+        monkeypatch.setattr(
+            "harness.cli.install._find_harness_command",
+            lambda: "/usr/bin/harness",
+        )
+        monkeypatch.setattr(
+            "harness.cli.install._find_hook_command",
+            lambda: "/usr/bin/harness-hook-run",
+        )
+
+        _auto_install_hooks(tmp_path)
+        out = capsys.readouterr().out
+        assert "[Entropy] Auto-installed per-project hooks" in out
+
+        settings_file = tmp_path / ".claude" / "settings.local.json"
+        assert settings_file.exists()
+        data = json.loads(settings_file.read_text())
+        assert "PostToolUse" in data["hooks"]
+        assert "Stop" in data["hooks"]
+        # Per-project auto-install should NOT add SessionStart
+        assert "SessionStart" not in data["hooks"]
+
+    def test_idempotent(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from harness.cli.hook import _auto_install_hooks
+
+        monkeypatch.setattr(
+            "harness.cli.install._find_harness_command",
+            lambda: "/usr/bin/harness",
+        )
+        monkeypatch.setattr(
+            "harness.cli.install._find_hook_command",
+            lambda: "/usr/bin/harness-hook-run",
+        )
+
+        _auto_install_hooks(tmp_path)
+        capsys.readouterr()  # Clear
+
+        _auto_install_hooks(tmp_path)
+        out = capsys.readouterr().out
+        assert out == ""  # No output on second call
+
+    def test_hook_run_dispatches_session_start(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """hook_run_main dispatches SessionStart to handle_session_start."""
+        data = json.dumps({"hook_event_name": "SessionStart"})
+        monkeypatch.setattr("sys.stdin", io.StringIO(data))
+
+        calls = []
+        monkeypatch.setattr(
+            "harness.cli.hook.handle_session_start",
+            lambda: calls.append(True),
+        )
+
+        hook_run_main()
+        assert len(calls) == 1

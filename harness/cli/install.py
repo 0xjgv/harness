@@ -14,6 +14,7 @@ from typing import Any
 from harness.config import find_project_root
 
 HARNESS_HOOK_MARKER = "harness"
+GLOBAL_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 
 
 def _find_harness_command() -> str | None:
@@ -161,6 +162,69 @@ def _remove_harness_hooks(settings: dict[str, Any]) -> dict[str, Any]:
     return settings
 
 
+def _add_per_project_hooks(settings: dict[str, Any], command: str) -> dict[str, Any]:
+    """Add PostToolUse + Stop hooks only (no SessionStart). For per-project settings."""
+    hooks = settings.setdefault("hooks", {})
+
+    post_tool_handlers: list[dict[str, Any]] = hooks.setdefault("PostToolUse", [])
+    post_tool_handlers.append({
+        "matcher": "Bash",
+        "hooks": [_harness_hook_entry(command)],
+    })
+
+    stop_handlers: list[dict[str, Any]] = hooks.setdefault("Stop", [])
+    stop_handlers.append({
+        "hooks": [_harness_hook_entry(command)],
+    })
+
+    return settings
+
+
+def _add_global_session_hook(settings: dict[str, Any], command: str) -> dict[str, Any]:
+    """Add SessionStart hook only. For global settings."""
+    hooks = settings.setdefault("hooks", {})
+
+    session_handlers: list[dict[str, Any]] = hooks.setdefault("SessionStart", [])
+    session_handlers.append({
+        "hooks": [_harness_hook_entry(command)],
+    })
+
+    return settings
+
+
+def install_global(hook_command: str) -> bool:
+    """Install SessionStart hook to ~/.claude/settings.json. Returns True if installed."""
+    try:
+        settings = _read_settings(GLOBAL_SETTINGS_PATH)
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+    if _has_harness_hooks(settings):
+        return False
+
+    _add_global_session_hook(settings, hook_command)
+    _write_settings(GLOBAL_SETTINGS_PATH, settings)
+    return True
+
+
+def install_project(
+    project_root: Path,
+    hook_command: str,
+    *,
+    project_wide: bool = False,
+) -> Path:
+    """Install PostToolUse + Stop hooks to per-project settings. Returns settings path."""
+    settings_file = _settings_path(project_root, project_wide=project_wide)
+    settings = _read_settings(settings_file)
+
+    if _has_harness_hooks(settings):
+        return settings_file
+
+    _add_per_project_hooks(settings, hook_command)
+    _write_settings(settings_file, settings)
+    return settings_file
+
+
 def _build_install_parser() -> argparse.ArgumentParser:
     """Build argparse parser for install subcommand."""
     parser = argparse.ArgumentParser(
@@ -275,3 +339,151 @@ def uninstall_main(argv: list[str] | None = None) -> None:
     print("Entropy tracking removed.\n")
     print(f"  Settings: {rel_settings}")
     print("  Removed:  SessionStart, PostToolUse (Bash), Stop hooks")
+
+
+# ---------------------------------------------------------------------------
+# Global install / uninstall (harness install / harness uninstall)
+# ---------------------------------------------------------------------------
+
+
+def _build_global_install_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="harness install",
+        description="Install harness hooks globally and in the current project.",
+    )
+    parser.add_argument(
+        "--project-root",
+        type=str,
+        default=None,
+        help="Override project root detection",
+    )
+    parser.add_argument(
+        "--project",
+        action="store_true",
+        help="Write per-project hooks to .claude/settings.json (team-wide)",
+    )
+    parser.add_argument(
+        "--skip-seed",
+        action="store_true",
+        help="Skip automatic baseline seeding",
+    )
+    parser.add_argument(
+        "--skip-global",
+        action="store_true",
+        help="Skip global SessionStart hook installation",
+    )
+    return parser
+
+
+def _build_global_uninstall_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="harness uninstall",
+        description="Remove harness hooks globally and from the current project.",
+    )
+    parser.add_argument(
+        "--project-root",
+        type=str,
+        default=None,
+        help="Override project root detection",
+    )
+    parser.add_argument(
+        "--project",
+        action="store_true",
+        help="Target .claude/settings.json (team-wide)",
+    )
+    parser.add_argument(
+        "--global-only",
+        action="store_true",
+        help="Only remove global hooks, leave per-project hooks",
+    )
+    return parser
+
+
+def global_install_main(argv: list[str] | None = None) -> None:
+    """Install global SessionStart hook + per-project hooks + seed."""
+    parser = _build_global_install_parser()
+    args = parser.parse_args(argv)
+
+    harness_cmd = _find_harness_command()
+    if harness_cmd is None:
+        print(
+            "Error: 'harness' not found on PATH. Install with: uv tool install harness",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    hook_command = _find_hook_command() or f"{harness_cmd} entropy hook-run"
+    project_root = Path(args.project_root).resolve() if args.project_root else find_project_root()
+
+    # 1. Global hooks
+    if not args.skip_global:
+        if install_global(hook_command):
+            print(f"Global hooks installed: {GLOBAL_SETTINGS_PATH}")
+        else:
+            print(f"Global hooks already configured: {GLOBAL_SETTINGS_PATH}")
+
+    # 2. Per-project hooks
+    settings_file = install_project(
+        project_root,
+        hook_command,
+        project_wide=args.project,
+    )
+    rel = settings_file.relative_to(project_root)
+    if _has_harness_hooks(_read_settings(settings_file)):
+        print(f"Per-project hooks: {rel}")
+
+    # 3. Seed
+    if not args.skip_seed:
+        try:
+            from harness.cli.seed import seed_project  # noqa: PLC0415
+
+            summary = seed_project(project_root, quiet=True)
+            print(
+                f"Seeded {summary.files_measured} file(s), "
+                f"avg EI: {summary.avg_entropy_index:.1f}",
+            )
+        except FileNotFoundError:
+            print("No Python files found — skipping seed.")
+        except Exception as exc:
+            print(f"Seed failed: {exc}", file=sys.stderr)
+
+    print("\nHarness installed. Entropy tracking is active.")
+
+
+def global_uninstall_main(argv: list[str] | None = None) -> None:
+    """Remove global and per-project harness hooks."""
+    parser = _build_global_uninstall_parser()
+    args = parser.parse_args(argv)
+
+    removed_any = False
+    project_root = Path(args.project_root).resolve() if args.project_root else find_project_root()
+
+    # Remove global hooks
+    try:
+        global_settings = _read_settings(GLOBAL_SETTINGS_PATH)
+        if _has_harness_hooks(global_settings):
+            _remove_harness_hooks(global_settings)
+            _write_settings(GLOBAL_SETTINGS_PATH, global_settings)
+            print(f"Removed global hooks: {GLOBAL_SETTINGS_PATH}")
+            removed_any = True
+    except (json.JSONDecodeError, ValueError, OSError):
+        pass
+
+    # Remove per-project hooks
+    if not args.global_only:
+        settings_file = _settings_path(project_root, project_wide=args.project)
+        try:
+            settings = _read_settings(settings_file)
+            if _has_harness_hooks(settings):
+                _remove_harness_hooks(settings)
+                _write_settings(settings_file, settings)
+                rel = settings_file.relative_to(project_root)
+                print(f"Removed per-project hooks: {rel}")
+                removed_any = True
+        except (json.JSONDecodeError, ValueError, OSError):
+            pass
+
+    if removed_any:
+        print("\nHarness hooks removed.")
+    else:
+        print("No harness hooks found.")

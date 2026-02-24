@@ -249,3 +249,16 @@ class TestStoreMeasurementsBatch:
             "SELECT COUNT(*) FROM measurements",
         ).fetchone()
         assert total[0] == 1
+
+
+class TestHasMeasurements:
+    def test_empty_db_returns_false(self, tmp_db: sqlite3.Connection) -> None:
+        from harness.core.db import has_measurements
+
+        assert has_measurements(tmp_db) is False
+
+    def test_with_data_returns_true(self, tmp_db: sqlite3.Connection) -> None:
+        from harness.core.db import has_measurements
+
+        store_measurement(tmp_db, _make_measurement())
+        assert has_measurements(tmp_db) is True

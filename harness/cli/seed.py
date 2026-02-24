@@ -30,6 +30,18 @@ _PARALLEL_THRESHOLD = 8
 
 
 @dataclass
+class SeedSummary:
+    """Result of seeding a project with baseline measurements."""
+
+    files_measured: int
+    files_skipped: int
+    avg_entropy_index: float
+    commit_hash: str | None
+    db_path: Path
+    results: list[_SeedResult]
+
+
+@dataclass
 class _SeedResult:
     """Successful measurement result from a worker process."""
 
@@ -84,21 +96,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def seed_main(argv: list[str] | None = None) -> None:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+def seed_project(
+    project_root: Path,
+    *,
+    commit: str = "HEAD",
+    quiet: bool = False,
+) -> SeedSummary:
+    """Establish baseline entropy measurements for all Python files in a project.
 
-    project_root = Path(args.project_root).resolve() if args.project_root else find_project_root()
+    Returns a SeedSummary with measurement results.
+    Raises FileNotFoundError if no Python files are found.
+    """
+    commit_hash = _resolve_commit_hash(commit, cwd=project_root)
 
-    # Resolve commit hash (None if not in a git repo)
-    commit_hash = _resolve_commit_hash(args.commit, cwd=project_root)
-    # Not an error if commit can't be resolved -- seed without commit tag
-
-    # Collect all Python files
     file_paths = _collect_all_files(project_root)
     if not file_paths:
-        print("No Python files found. Nothing to seed.", file=sys.stderr)
-        sys.exit(0)
+        msg = f"No Python files found in {project_root}"
+        raise FileNotFoundError(msg)
 
     measured_at = time.time()
     project_root_str = str(project_root)
@@ -114,16 +128,19 @@ def seed_main(argv: list[str] | None = None) -> None:
 
     # Separate successes from failures
     seed_results: list[_SeedResult] = []
+    files_skipped = 0
     for r in raw_results:
         if isinstance(r, _SeedResult):
             seed_results.append(r)
         else:
-            rel_path, error_msg = r
-            print(f"warning: skipping '{rel_path}': {error_msg}", file=sys.stderr)
+            files_skipped += 1
+            if not quiet:
+                rel_path, error_msg = r
+                print(f"warning: skipping '{rel_path}': {error_msg}", file=sys.stderr)
 
     if not seed_results:
-        print("No files could be measured.", file=sys.stderr)
-        sys.exit(1)
+        msg = f"No files could be measured in {project_root}"
+        raise FileNotFoundError(msg)
 
     # Batch-write to DB
     db_path = get_db_path(project_root)
@@ -141,26 +158,53 @@ def seed_main(argv: list[str] | None = None) -> None:
     store_measurements_batch(conn, measurements)
     conn.close()
 
+    avg_ei = sum(sr.entropy_index for sr in seed_results) / len(seed_results)
+
+    return SeedSummary(
+        files_measured=len(seed_results),
+        files_skipped=files_skipped,
+        avg_entropy_index=avg_ei,
+        commit_hash=commit_hash,
+        db_path=db_path,
+        results=seed_results,
+    )
+
+
+def seed_main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    project_root = Path(args.project_root).resolve() if args.project_root else find_project_root()
+
+    try:
+        summary = seed_project(project_root, commit=args.commit)
+    except FileNotFoundError as exc:
+        if "No Python files" in str(exc):
+            print("No Python files found. Nothing to seed.", file=sys.stderr)
+            sys.exit(0)
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+
     # Build output dicts
     results: list[dict[str, Any]] = [
-        _metrics_to_dict(sr.rel_path, sr.metrics, sr.entropy_index, commit_hash)
-        for sr in seed_results
+        _metrics_to_dict(sr.rel_path, sr.metrics, sr.entropy_index, summary.commit_hash)
+        for sr in summary.results
     ]
 
     # Output
     if args.output_json:
         print(json.dumps(results, indent=2, default=str))
     else:
-        avg_ei = sum(float(r["entropy_index"]) for r in results) / len(results)
         tier_counts = {"low": 0, "moderate": 0, "high": 0, "very high": 0}
         for r in results:
             tier_counts[r["tier"]] += 1
 
-        print(f"Seeded {len(results)} file(s), avg EI: {avg_ei:.1f}\n")
+        avg_ei = summary.avg_entropy_index
+        print(f"Seeded {summary.files_measured} file(s), avg EI: {avg_ei:.1f}\n")
         tier_parts = [f"{count} {label}" for label, count in tier_counts.items() if count > 0]
         print(f"  Distribution: {', '.join(tier_parts)}")
-        if commit_hash:
-            print(f"  Commit: {commit_hash[:12]}")
+        if summary.commit_hash:
+            print(f"  Commit: {summary.commit_hash[:12]}")
         else:
             print("  Commit: (none — no git repo detected)")
-        print(f"  Stored: {db_path}")
+        print(f"  Stored: {summary.db_path}")

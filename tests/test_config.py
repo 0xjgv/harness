@@ -154,3 +154,69 @@ class TestConfigGetCurrentCommit:
         ):
             result = get_current_commit()
             assert result is None
+
+
+# ---------------------------------------------------------------------------
+# is_python_project
+# ---------------------------------------------------------------------------
+
+
+class TestIsPythonProject:
+    def test_pyproject_toml(self, tmp_path: Path) -> None:
+        from harness.config import is_python_project
+
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\n')
+        assert is_python_project(tmp_path) is True
+
+    def test_setup_py(self, tmp_path: Path) -> None:
+        from harness.config import is_python_project
+
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "setup.py").write_text("from setuptools import setup\n")
+        assert is_python_project(tmp_path) is True
+
+    def test_requirements_txt(self, tmp_path: Path) -> None:
+        from harness.config import is_python_project
+
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "requirements.txt").write_text("flask\n")
+        assert is_python_project(tmp_path) is True
+
+    def test_root_py_files_fallback(self, tmp_path: Path) -> None:
+        """Root-level .py files detected when no explicit markers exist."""
+        from harness.config import is_python_project
+
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "app.py").write_text("x = 1\n")
+        assert is_python_project(tmp_path) is True
+
+    def test_no_git_no_pyproject(self, tmp_path: Path) -> None:
+        """Without .git or pyproject.toml, should return False."""
+        from harness.config import is_python_project
+
+        (tmp_path / "setup.py").write_text("from setuptools import setup\n")
+        assert is_python_project(tmp_path) is False
+
+    def test_git_but_no_python(self, tmp_path: Path) -> None:
+        """Git repo with no Python markers or files."""
+        from harness.config import is_python_project
+
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "main.go").write_text("package main\n")
+        assert is_python_project(tmp_path) is False
+
+    def test_nested_py_not_detected(self, tmp_path: Path) -> None:
+        """Nested .py files should NOT trigger detection (root-only glob)."""
+        from harness.config import is_python_project
+
+        (tmp_path / ".git").mkdir()
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "nested.py").write_text("x = 1\n")
+        assert is_python_project(tmp_path) is False
+
+    def test_returns_false_on_oserror(self) -> None:
+        from harness.config import is_python_project
+
+        assert is_python_project(Path("/nonexistent/path/xyz")) is False

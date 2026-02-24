@@ -24,6 +24,8 @@ class TestRouterHelp:
         out = capsys.readouterr().out
         assert "entropy" in out
         assert "context" in out
+        assert "install" in out
+        assert "uninstall" in out
 
     def test_entropy_no_subcommand_prints_help(
         self,
@@ -94,6 +96,18 @@ class TestRouterDispatch:
 # ---------------------------------------------------------------------------
 # __main__.py import
 # ---------------------------------------------------------------------------
+
+
+class TestTopLevelDispatch:
+    @patch("harness.cli.install.global_install_main")
+    def test_dispatch_install(self, mock_main: MagicMock) -> None:
+        main(["install", "--skip-seed"])
+        mock_main.assert_called_once_with(["--skip-seed"])
+
+    @patch("harness.cli.install.global_uninstall_main")
+    def test_dispatch_uninstall(self, mock_main: MagicMock) -> None:
+        main(["uninstall", "--global-only"])
+        mock_main.assert_called_once_with(["--global-only"])
 
 
 class TestMainModule:

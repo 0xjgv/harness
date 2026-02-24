@@ -46,11 +46,20 @@ DELTA_WARNING_CEILING = 25.0  # Above this: warning
 # --- File filtering ---
 DEFAULT_EXTENSIONS = frozenset({".py"})
 DEFAULT_EXCLUDES = frozenset({
-    ".venv/**", "venv/**", ".tox/**", ".nox/**",
-    "node_modules/**", "__pycache__/**",
-    "build/**", "dist/**", "*.egg-info/**",
-    ".git/**", ".claude/**",
-    "migrations/**", "vendor/**", "**/generated_*.py",
+    ".venv/**",
+    "venv/**",
+    ".tox/**",
+    ".nox/**",
+    "node_modules/**",
+    "__pycache__/**",
+    "build/**",
+    "dist/**",
+    "*.egg-info/**",
+    ".git/**",
+    ".claude/**",
+    "migrations/**",
+    "vendor/**",
+    "**/generated_*.py",
 })
 
 
@@ -88,6 +97,38 @@ def get_project_config(project_root: Path | None = None) -> dict[str, object]:
     with toml_path.open("rb") as f:
         data = tomllib.load(f)
     return dict(data.get("tool", {}).get("harness", {}))
+
+
+PYTHON_PROJECT_MARKERS = frozenset({
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "Pipfile",
+    "requirements.txt",
+    "tox.ini",
+    ".python-version",
+})
+
+
+def is_python_project(root: Path | None = None) -> bool:
+    """Detect whether `root` is a Python project.
+
+    Requires .git or pyproject.toml (prevents false positives in home/tmp dirs).
+    Then checks for Python markers, falling back to root-level *.py files.
+    """
+    try:
+        directory = (root or Path.cwd()).resolve()
+        # Gate: must look like a project directory
+        if not (directory / ".git").exists() and not (directory / "pyproject.toml").exists():
+            return False
+        # Check explicit Python markers
+        for marker in PYTHON_PROJECT_MARKERS:
+            if (directory / marker).exists():
+                return True
+        # Fallback: any root-level .py file (non-recursive)
+        return any(directory.glob("*.py"))
+    except OSError:
+        return False
 
 
 def get_current_commit() -> str | None:
