@@ -9,6 +9,7 @@ from __future__ import annotations
 import gzip
 import math
 import statistics
+import warnings
 from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -131,7 +132,9 @@ def _shannon_entropy(data: bytes) -> float:
 
 def _avg_cyclomatic(source: str) -> float:
     """Average per-function cyclomatic complexity via radon."""
-    blocks = cc_visit(source)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        blocks = cc_visit(source)
     if not blocks:
         return 0.0
     return sum(b.complexity for b in blocks) / len(blocks)
@@ -139,12 +142,16 @@ def _avg_cyclomatic(source: str) -> float:
 
 def _maintainability(source: str) -> float:
     """Maintainability Index via radon."""
-    return mi_visit(source, multi=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        return mi_visit(source, multi=True)
 
 
 def _halstead_volume(source: str) -> float:
     """Sum of Halstead volumes via radon."""
-    report = h_visit(source)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        report = h_visit(source)
     if not report:
         return 0.0
     total = 0.0

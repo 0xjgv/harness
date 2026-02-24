@@ -45,7 +45,13 @@ DELTA_WARNING_CEILING = 25.0  # Above this: warning
 
 # --- File filtering ---
 DEFAULT_EXTENSIONS = frozenset({".py"})
-DEFAULT_EXCLUDES = frozenset({"migrations/**", "vendor/**", "**/generated_*.py"})
+DEFAULT_EXCLUDES = frozenset({
+    ".venv/**", "venv/**", ".tox/**", ".nox/**",
+    "node_modules/**", "__pycache__/**",
+    "build/**", "dist/**", "*.egg-info/**",
+    ".git/**", ".claude/**",
+    "migrations/**", "vendor/**", "**/generated_*.py",
+})
 
 
 def find_project_root(start: Path | None = None) -> Path:
