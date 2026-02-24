@@ -45,6 +45,13 @@ def _parse_iso(s: str) -> datetime:
     return datetime.fromisoformat(s)
 
 
+def _heal_state_dir() -> Path:
+    """Return ~/.harness/, creating it if needed."""
+    d = Path.home() / ".harness"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 # -- Core functions ----------------------------------------------------------
 
 
@@ -203,9 +210,7 @@ def maybe_trigger_heal(event: str, exc: Exception) -> None:
         if not claude_path:
             return
 
-        from harness.config import find_project_root  # noqa: PLC0415
-
-        state_path = find_project_root() / ".claude" / HEAL_STATE_FILE
+        state_path = _heal_state_dir() / HEAL_STATE_FILE
         state = _read_heal_state(state_path)
 
         if _is_locked(state):

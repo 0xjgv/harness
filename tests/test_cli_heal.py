@@ -19,6 +19,7 @@ from harness.cli.heal import (
     _build_heal_prompt,
     _error_signature,
     _find_claude_cli,
+    _heal_state_dir,
     _is_locked,
     _read_heal_state,
     _record_attempt,
@@ -334,7 +335,7 @@ class TestMaybeTriggerHeal:
     ) -> None:
         """First occurrence of an error triggers a heal spawn."""
         monkeypatch.setattr("harness.cli.heal._find_claude_cli", lambda: "/usr/bin/claude")
-        monkeypatch.setattr("harness.config.find_project_root", lambda start=None: tmp_path)
+        monkeypatch.setattr("harness.cli.heal._heal_state_dir", lambda: tmp_path)
         mock_spawn = MagicMock()
         monkeypatch.setattr("harness.cli.heal._spawn_heal", mock_spawn)
 
@@ -342,13 +343,13 @@ class TestMaybeTriggerHeal:
         mock_spawn.assert_called_once()
 
         # Verify state was written
-        state_path = tmp_path / ".claude" / "harness-heal-state.json"
+        state_path = tmp_path / "harness-heal-state.json"
         assert state_path.exists()
 
     def test_cooldown_skips_heal(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Error within cooldown window does not trigger heal."""
         monkeypatch.setattr("harness.cli.heal._find_claude_cli", lambda: "/usr/bin/claude")
-        monkeypatch.setattr("harness.config.find_project_root", lambda start=None: tmp_path)
+        monkeypatch.setattr("harness.cli.heal._heal_state_dir", lambda: tmp_path)
         mock_spawn = MagicMock()
         monkeypatch.setattr("harness.cli.heal._spawn_heal", mock_spawn)
 
@@ -366,7 +367,7 @@ class TestMaybeTriggerHeal:
     ) -> None:
         """A different error triggers even when another is in cooldown."""
         monkeypatch.setattr("harness.cli.heal._find_claude_cli", lambda: "/usr/bin/claude")
-        monkeypatch.setattr("harness.config.find_project_root", lambda start=None: tmp_path)
+        monkeypatch.setattr("harness.cli.heal._heal_state_dir", lambda: tmp_path)
         mock_spawn = MagicMock()
         monkeypatch.setattr("harness.cli.heal._spawn_heal", mock_spawn)
 
@@ -375,7 +376,7 @@ class TestMaybeTriggerHeal:
 
         # Different error — but now there's a lock from the first call
         # We need to clear the lock for this test to work
-        state_path = tmp_path / ".claude" / "harness-heal-state.json"
+        state_path = tmp_path / "harness-heal-state.json"
         state = json.loads(state_path.read_text())
         state["lock"] = None
         state_path.write_text(json.dumps(state))
@@ -399,16 +400,32 @@ class TestMaybeTriggerHeal:
     def test_lock_skips_heal(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Active lock prevents healing."""
         monkeypatch.setattr("harness.cli.heal._find_claude_cli", lambda: "/usr/bin/claude")
-        monkeypatch.setattr("harness.config.find_project_root", lambda start=None: tmp_path)
+        monkeypatch.setattr("harness.cli.heal._heal_state_dir", lambda: tmp_path)
         mock_spawn = MagicMock()
         monkeypatch.setattr("harness.cli.heal._spawn_heal", mock_spawn)
 
         # Pre-create state with a recent lock
-        state_dir = tmp_path / ".claude"
-        state_dir.mkdir(parents=True)
         recent_lock = datetime.now(timezone.utc).isoformat()
         state = {"version": 1, "lock": recent_lock, "errors": {}}
-        (state_dir / "harness-heal-state.json").write_text(json.dumps(state))
+        (tmp_path / "harness-heal-state.json").write_text(json.dumps(state))
 
         maybe_trigger_heal("Stop", ValueError("test"))
         mock_spawn.assert_not_called()
+
+
+class TestHealStateDir:
+    def test_returns_dot_harness_in_home(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """_heal_state_dir returns ~/.harness/ and creates it."""
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        result = _heal_state_dir()
+        assert result == tmp_path / ".harness"
+        assert result.is_dir()
+
+    def test_idempotent(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Calling twice doesn't fail (exist_ok=True)."""
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        _heal_state_dir()
+        result = _heal_state_dir()
+        assert result == tmp_path / ".harness"
