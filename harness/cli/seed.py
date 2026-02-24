@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,8 +23,39 @@ from harness.cli.measure import (
 )
 from harness.config import find_project_root, get_db_path
 from harness.core.composite import compute_entropy_index
-from harness.core.db import get_connection, store_measurement
-from harness.core.metrics import measure_file
+from harness.core.db import get_connection, store_measurements_batch
+from harness.core.metrics import FileMetrics, measure_file
+
+_PARALLEL_THRESHOLD = 8
+
+
+@dataclass
+class _SeedResult:
+    """Successful measurement result from a worker process."""
+
+    rel_path: str
+    metrics: FileMetrics
+    entropy_index: float
+
+
+def _measure_one(args: tuple[str, str]) -> _SeedResult | tuple[str, str]:
+    """Measure a single file. Top-level for pickling compatibility.
+
+    Returns _SeedResult on success, (rel_path, error_msg) on failure.
+    """
+    file_path_str, project_root_str = args
+    path = Path(file_path_str)
+    project_root = Path(project_root_str)
+    try:
+        rel_path = str(path.relative_to(project_root))
+    except ValueError:
+        rel_path = str(path)
+    try:
+        metrics = measure_file(path)
+        ei = compute_entropy_index(metrics)
+        return _SeedResult(rel_path=rel_path, metrics=metrics, entropy_index=ei)
+    except Exception as exc:
+        return (rel_path, str(exc))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,34 +100,52 @@ def seed_main(argv: list[str] | None = None) -> None:
         print("No Python files found. Nothing to seed.", file=sys.stderr)
         sys.exit(0)
 
-    # Measure and store
-    db_path = get_db_path(project_root)
-    conn = get_connection(db_path)
-    results: list[dict[str, Any]] = []
     measured_at = time.time()
+    project_root_str = str(project_root)
 
-    for path in file_paths:
-        try:
-            metrics = measure_file(path)
-        except Exception as exc:
-            print(f"warning: skipping '{path}': {exc}", file=sys.stderr)
-            continue
+    # Measure: parallel above threshold, sequential below
+    if len(file_paths) >= _PARALLEL_THRESHOLD:
+        worker_args = [(str(p), project_root_str) for p in file_paths]
+        max_workers = min(os.cpu_count() or 1, len(file_paths))
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            raw_results = list(executor.map(_measure_one, worker_args))
+    else:
+        raw_results = [_measure_one((str(p), project_root_str)) for p in file_paths]
 
-        ei = compute_entropy_index(metrics)
-        try:
-            rel_path = str(path.relative_to(project_root))
-        except ValueError:
-            rel_path = str(path)
+    # Separate successes from failures
+    seed_results: list[_SeedResult] = []
+    for r in raw_results:
+        if isinstance(r, _SeedResult):
+            seed_results.append(r)
+        else:
+            rel_path, error_msg = r
+            print(f"warning: skipping '{rel_path}': {error_msg}", file=sys.stderr)
 
-        measurement = _metrics_to_measurement(rel_path, metrics, ei, commit_hash, measured_at)
-        store_measurement(conn, measurement)
-        results.append(_metrics_to_dict(rel_path, metrics, ei, commit_hash))
-
-    conn.close()
-
-    if not results:
+    if not seed_results:
         print("No files could be measured.", file=sys.stderr)
         sys.exit(1)
+
+    # Batch-write to DB
+    db_path = get_db_path(project_root)
+    conn = get_connection(db_path)
+    measurements = [
+        _metrics_to_measurement(
+            sr.rel_path,
+            sr.metrics,
+            sr.entropy_index,
+            commit_hash,
+            measured_at,
+        )
+        for sr in seed_results
+    ]
+    store_measurements_batch(conn, measurements)
+    conn.close()
+
+    # Build output dicts
+    results: list[dict[str, Any]] = [
+        _metrics_to_dict(sr.rel_path, sr.metrics, sr.entropy_index, commit_hash)
+        for sr in seed_results
+    ]
 
     # Output
     if args.output_json:

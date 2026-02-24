@@ -16,6 +16,7 @@ from harness.core.db import (
     get_previous_measurement,
     get_trend,
     store_measurement,
+    store_measurements_batch,
 )
 
 
@@ -197,3 +198,54 @@ class TestGetCommitSummary:
         summary = get_commit_summary(tmp_db, "nonexistent")
         assert summary["files"] == 0
         assert summary["avg_ei"] == 0.0
+
+
+class TestStoreMeasurementsBatch:
+    def test_batch_stores_all_rows(self, tmp_db: sqlite3.Connection) -> None:
+        t = time.time()
+        ms = [
+            _make_measurement("a.py", "c1", entropy_index=10.0, measured_at=t),
+            _make_measurement("b.py", "c1", entropy_index=20.0, measured_at=t),
+            _make_measurement("c.py", "c1", entropy_index=30.0, measured_at=t),
+        ]
+        count = store_measurements_batch(tmp_db, ms)
+        assert count == 3
+
+        rows = tmp_db.execute(
+            "SELECT COUNT(*) FROM measurements WHERE commit_hash = ?",
+            ("c1",),
+        ).fetchone()
+        assert rows[0] == 3
+
+    def test_empty_list_returns_zero(
+        self,
+        tmp_db: sqlite3.Connection,
+    ) -> None:
+        count = store_measurements_batch(tmp_db, [])
+        assert count == 0
+
+    def test_upsert_on_conflict(
+        self,
+        tmp_db: sqlite3.Connection,
+    ) -> None:
+        t = time.time()
+        first = [
+            _make_measurement("x.py", "c1", entropy_index=10.0, measured_at=t),
+        ]
+        store_measurements_batch(tmp_db, first)
+
+        updated = [
+            _make_measurement("x.py", "c1", entropy_index=99.0, measured_at=t),
+        ]
+        store_measurements_batch(tmp_db, updated)
+
+        row = tmp_db.execute(
+            "SELECT entropy_index FROM measurements WHERE file_path = ? AND commit_hash = ?",
+            ("x.py", "c1"),
+        ).fetchone()
+        assert row["entropy_index"] == 99.0
+
+        total = tmp_db.execute(
+            "SELECT COUNT(*) FROM measurements",
+        ).fetchone()
+        assert total[0] == 1

@@ -233,3 +233,82 @@ class TestSeedProjectRoot:
         seed_main(["--project-root", str(sub)])
         out = capsys.readouterr().out
         assert "Seeded 1 file(s)" in out
+
+
+# ---------------------------------------------------------------------------
+# Worker function
+# ---------------------------------------------------------------------------
+
+
+class TestMeasureOneWorker:
+    def test_success(self, tmp_path: Path) -> None:
+        from harness.cli.seed import _measure_one, _SeedResult
+
+        f = tmp_path / "ok.py"
+        f.write_text("x = 1\n")
+        result = _measure_one((str(f), str(tmp_path)))
+        assert isinstance(result, _SeedResult)
+        assert result.rel_path == "ok.py"
+        assert result.entropy_index >= 0
+
+    def test_failure_returns_tuple(self, tmp_path: Path) -> None:
+        from harness.cli.seed import _measure_one
+
+        missing = tmp_path / "gone.py"
+        result = _measure_one((str(missing), str(tmp_path)))
+        assert isinstance(result, tuple)
+        rel_path, error_msg = result
+        assert rel_path == "gone.py"
+        assert isinstance(error_msg, str)
+
+
+# ---------------------------------------------------------------------------
+# Parallel path
+# ---------------------------------------------------------------------------
+
+
+class TestSeedParallel:
+    def test_parallel_path_triggered(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """10+ files triggers the parallel path; all are measured."""
+        from harness.cli.seed import _PARALLEL_THRESHOLD
+
+        count = _PARALLEL_THRESHOLD + 2  # comfortably above
+        _create_py_files(tmp_path, count)
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: FAKE_HASH,
+        )
+
+        seed_main(["--project-root", str(tmp_path)])
+        out = capsys.readouterr().out
+        assert f"Seeded {count} file(s)" in out
+
+        db_path = tmp_path / ".claude" / "entropy.db"
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM measurements",
+        ).fetchone()
+        assert rows[0] == count
+        conn.close()
+
+    def test_sequential_path_below_threshold(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Below threshold, seed still works (sequential path)."""
+        _create_py_files(tmp_path, 3)
+        monkeypatch.setattr(
+            "harness.cli.seed._resolve_commit_hash",
+            lambda commit, cwd=None: FAKE_HASH,
+        )
+
+        seed_main(["--project-root", str(tmp_path)])
+        out = capsys.readouterr().out
+        assert "Seeded 3 file(s)" in out
