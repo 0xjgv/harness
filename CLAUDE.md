@@ -10,35 +10,17 @@ Standalone code complexity metrics engine. Zero required dependencies (Tier 0 us
 
 ## Structure
 
-- `harness/cli/main.py` — Top-level CLI router (`harness entropy ...`, `harness context ...`)
-- `harness/cli/measure.py` — `harness entropy measure` CLI entry point
-- `harness/cli/report.py` — `harness entropy report` CLI entry point
-- `harness/cli/install.py` — `harness entropy install`/`uninstall` CLI entry points
-- `harness/cli/seed.py` — `harness entropy seed` CLI entry point
-- `harness/cli/context.py` — `harness context run` CLI entry point
-- `harness/cli/hook.py` — Claude Code hook runner (stdin JSON dispatch)
-- `harness/cli/heal.py` — Self-healing hook errors via background `claude -p`
-- `harness/scripts/context.sh` — Bundled context generation script (tree, git status, git log)
-- `harness/config.py` — Constants, defaults, weight vectors, DB path resolution
-- `harness/core/db.py` — SQLite storage (schema v1, migrations)
-- `harness/core/metrics.py` — Tier 0/1 metric computation
-- `harness/core/composite.py` — Entropy Index aggregation (0-100)
+- `harness/cli/` — One module per subcommand + hook runner & self-healing
+- `harness/core/` — Metrics computation, composite scoring, SQLite storage
+- `harness/config.py` — Constants, weights, DB path resolution
 - `harness/git.py` — Git helpers (changed files, before/after content)
 - `tests/` — pytest suite
 
 ## Commands
 
-- `harness entropy measure` — measure entropy index for files
-- `harness entropy report` — show trends, hotspots, history
-- `harness entropy install` — install Claude Code hooks
-- `harness entropy seed` — establish baseline measurements for the project
-- `harness entropy uninstall` — remove Claude Code hooks
-- `harness context run` — run bundled context.sh for codebase context
-- `make install` — install with uv (development)
-- `make install-global` — install as global CLI tool via `uv tool install`
-- `make test` — run pytest
-- `make check` — ruff + basedpyright
-- `make test-cov` — tests with 80% coverage minimum
+- Build: `make install` (dev) / `make install-global` (global CLI)
+- Test: `make test` / `make test-cov` (80% minimum)
+- Lint: `make check` (ruff + basedpyright)
 
 ## Patterns
 
