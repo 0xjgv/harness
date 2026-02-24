@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from harness.cli.hook import (
-    _emit,
+    _emit_post_tool_use,
     _format_feedback,
     _is_git_commit,
+    _log_hook_error,
+    handle_session_summary,
     hook_run_main,
 )
 
@@ -91,15 +94,16 @@ class TestIsGitCommit:
 
 
 # ---------------------------------------------------------------------------
-# _emit
+# _emit_post_tool_use
 # ---------------------------------------------------------------------------
 
 
-class TestEmit:
+class TestEmitPostToolUse:
     def test_emit_output(self, capsys: pytest.CaptureFixture[str]) -> None:
-        _emit("test feedback")
+        _emit_post_tool_use("test feedback")
         out = capsys.readouterr().out
         data = json.loads(out)
+        assert data["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
         assert data["hookSpecificOutput"]["additionalContext"] == "test feedback"
 
 
@@ -187,3 +191,211 @@ class TestHookRunMain:
         })
         monkeypatch.setattr("sys.stdin", io.StringIO(data))
         hook_run_main()  # Should not raise, no-op for non-commit
+
+
+# ---------------------------------------------------------------------------
+# Stop output validation
+# ---------------------------------------------------------------------------
+
+
+class _FakeConn:
+    def close(self) -> None:
+        pass
+
+
+class TestStopOutput:
+    def test_stop_outputs_plain_text(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """Stop hook output must be plain text, not hookSpecificOutput JSON."""
+        monkeypatch.setattr("harness.cli.hook._ensure_harness", lambda: True)
+        # H3: Create a real db file in tmp_path instead of global Path.exists patch
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        fake_db = claude_dir / "entropy.db"
+        fake_db.write_text("")
+        # Patch at source modules since handle_session_summary uses lazy imports
+        monkeypatch.setattr("harness.config.get_db_path", lambda _: fake_db)
+        monkeypatch.setattr("harness.core.db.get_connection", lambda _: _FakeConn())
+        monkeypatch.setattr(
+            "harness.core.db.get_trend",
+            lambda _conn, last_n_commits: [
+                {"commit_hash": "abc1234def", "avg_ei": 52.0},
+                {"commit_hash": "def5678abc", "avg_ei": 50.0},
+            ],
+        )
+        monkeypatch.setattr("harness.cli.hook.Path.cwd", lambda: tmp_path)
+
+        handle_session_summary()
+        out = capsys.readouterr().out
+
+        # Must be plain text
+        assert "[Entropy Summary]" in out
+        # Must NOT be hookSpecificOutput JSON
+        assert "hookSpecificOutput" not in out
+        assert "hookEventName" not in out
+
+    def test_stop_no_output_when_insufficient_data(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """Stop hook produces nothing when fewer than 2 trend entries exist."""
+        monkeypatch.setattr("harness.cli.hook._ensure_harness", lambda: True)
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        fake_db = claude_dir / "entropy.db"
+        fake_db.write_text("")
+        monkeypatch.setattr("harness.config.get_db_path", lambda _: fake_db)
+        monkeypatch.setattr("harness.core.db.get_connection", lambda _: _FakeConn())
+        monkeypatch.setattr(
+            "harness.core.db.get_trend",
+            lambda _conn, last_n_commits: [
+                {"commit_hash": "abc1234def", "avg_ei": 52.0},
+            ],
+        )
+        monkeypatch.setattr("harness.cli.hook.Path.cwd", lambda: tmp_path)
+
+        handle_session_summary()
+        out = capsys.readouterr().out
+        assert out == ""
+
+
+# ---------------------------------------------------------------------------
+# Fault tolerance
+# ---------------------------------------------------------------------------
+
+
+class TestFaultTolerance:
+    def test_handler_exception_produces_no_output(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """When a handler raises, hook_run_main exits normally with no stdout."""
+        data = json.dumps({"hook_event_name": "Stop"})
+        monkeypatch.setattr("sys.stdin", io.StringIO(data))
+
+        # H5: Use raise_error() helper, not generator-throw idiom
+        def raise_error() -> None:
+            msg = "db exploded"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr("harness.cli.hook.handle_session_summary", raise_error)
+        monkeypatch.setattr("harness.cli.hook._log_hook_error", lambda *a: None)
+
+        hook_run_main()  # Must not raise
+        out = capsys.readouterr().out
+        assert out == ""
+
+    def test_handler_exception_logs_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When a handler raises, the error is logged to disk."""
+        data = json.dumps({"hook_event_name": "Stop"})
+        monkeypatch.setattr("sys.stdin", io.StringIO(data))
+
+        def raise_error() -> None:
+            msg = "db exploded"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr("harness.cli.hook.handle_session_summary", raise_error)
+
+        log_calls: list[tuple[str, Exception]] = []
+
+        def capture_log(event: str, exc: Exception) -> None:
+            log_calls.append((event, exc))
+
+        monkeypatch.setattr("harness.cli.hook._log_hook_error", capture_log)
+
+        hook_run_main()
+        assert len(log_calls) == 1
+        assert log_calls[0][0] == "Stop"
+        assert isinstance(log_calls[0][1], RuntimeError)
+
+    def test_system_exit_propagates(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """SystemExit must NOT be caught by the fault-tolerant wrapper."""
+        data = json.dumps({"hook_event_name": "Stop"})
+        monkeypatch.setattr("sys.stdin", io.StringIO(data))
+
+        def raise_error() -> None:
+            raise SystemExit(1)
+
+        monkeypatch.setattr("harness.cli.hook.handle_session_summary", raise_error)
+        monkeypatch.setattr("harness.cli.hook._log_hook_error", lambda *a: None)
+
+        with pytest.raises(SystemExit):
+            hook_run_main()
+
+    def test_keyboard_interrupt_propagates(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """KeyboardInterrupt must NOT be caught by the fault-tolerant wrapper."""
+        data = json.dumps({"hook_event_name": "Stop"})
+        monkeypatch.setattr("sys.stdin", io.StringIO(data))
+
+        def raise_error() -> None:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("harness.cli.hook.handle_session_summary", raise_error)
+        monkeypatch.setattr("harness.cli.hook._log_hook_error", lambda *a: None)
+
+        with pytest.raises(KeyboardInterrupt):
+            hook_run_main()
+
+
+# ---------------------------------------------------------------------------
+# _log_hook_error
+# ---------------------------------------------------------------------------
+
+
+class TestLogHookError:
+    def test_creates_log_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """First error creates the log file."""
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr("pathlib.Path.cwd", lambda: tmp_path)
+
+        exc = ValueError("test error")
+        _log_hook_error("PostToolUse", exc)
+
+        log_path = tmp_path / ".claude" / "harness-hook-errors.log"
+        assert log_path.exists()
+        content = log_path.read_text()
+        assert "PostToolUse" in content
+        assert "ValueError" in content
+        assert "test error" in content
+
+    def test_bounded_to_50_entries(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Log never exceeds 50 entries."""
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr("pathlib.Path.cwd", lambda: tmp_path)
+
+        for i in range(60):
+            exc = ValueError(f"error {i}")
+            _log_hook_error("Stop", exc)
+
+        log_path = tmp_path / ".claude" / "harness-hook-errors.log"
+        content = log_path.read_text()
+        delimiter = "\n=== ENTRY ===\n"
+        entries = [e for e in content.split(delimiter) if e.strip()]
+        assert len(entries) <= 50
+        # Most recent entry should be error 59
+        assert "error 59" in entries[-1]
+        # Oldest entries should be dropped
+        assert "error 0" not in content
+
+    def test_silent_on_write_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_log_hook_error never raises, even on filesystem errors."""
+        monkeypatch.setattr("pathlib.Path.cwd", lambda: Path("/nonexistent/path"))
+
+        # Must not raise
+        _log_hook_error("Stop", ValueError("test"))

@@ -16,14 +16,46 @@ if TYPE_CHECKING:
 # -- Helpers ---------------------------------------------------------
 
 
-def _emit(feedback: str) -> None:
-    """Print hookSpecificOutput JSON to stdout."""
+def _emit_post_tool_use(feedback: str) -> None:
+    """Print hookSpecificOutput JSON to stdout for PostToolUse hooks."""
     output = {
         "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
             "additionalContext": feedback,
         },
     }
     print(json.dumps(output))
+
+
+def _log_hook_error(event: str, exc: Exception) -> None:
+    """Best-effort error logging to .claude/harness-hook-errors.log (bounded, never raises)."""
+    try:
+        import traceback as _tb  # noqa: PLC0415
+        from datetime import datetime, timezone  # noqa: PLC0415
+
+        from harness.config import find_project_root  # noqa: PLC0415
+
+        project_root = find_project_root()
+
+        log_dir = project_root / ".claude"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "harness-hook-errors.log"
+
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        tb = _tb.format_exception(type(exc), exc, exc.__traceback__)
+        entry = f"[{ts}] event={event} error={type(exc).__name__}: {exc}\n{''.join(tb)}"
+
+        # Bounded: keep last 49 entries + new one = 50 max
+        delimiter = "\n=== ENTRY ===\n"
+        existing = ""
+        if log_path.exists():
+            existing = log_path.read_text(encoding="utf-8")
+        entries = [e for e in existing.split(delimiter) if e.strip()]
+        entries = entries[-(49):] if len(entries) >= 49 else entries
+        entries.append(entry)
+        log_path.write_text(delimiter.join(entries) + delimiter, encoding="utf-8")
+    except Exception:
+        pass  # Error handler must never raise
 
 
 def _ensure_harness() -> bool:
@@ -231,7 +263,7 @@ def handle_commit() -> None:
         total_delta,
         file_deltas,
     )
-    _emit(feedback)
+    _emit_post_tool_use(feedback)
 
 
 def handle_session_summary() -> None:
@@ -278,7 +310,7 @@ def handle_session_summary() -> None:
     if total_delta != 0:
         lines.append(f"  Net: {total_delta:+.0f} EI")
 
-    _emit("\n".join(lines))
+    print("\n".join(lines))
 
 
 # -- Entrypoint ------------------------------------------------------
@@ -300,7 +332,10 @@ def hook_run_main(_argv: list[str] | None = None) -> None:
 
     event = data.get("hook_event_name", "")
 
-    if event == "PostToolUse":
-        _dispatch_post_tool_use(data)
-    elif event == "Stop":
-        handle_session_summary()
+    try:
+        if event == "PostToolUse":
+            _dispatch_post_tool_use(data)
+        elif event == "Stop":
+            handle_session_summary()
+    except Exception as exc:
+        _log_hook_error(event, exc)
