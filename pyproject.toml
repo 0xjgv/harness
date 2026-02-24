@@ -3,11 +3,7 @@ name = "entropy-meter"
 version = "0.1.0"
 description = "Code complexity metrics engine with graceful degradation"
 requires-python = ">=3.10"
-dependencies = []
-
-[project.optional-dependencies]
-radon = ["radon>=5.1"]
-all = ["entropy-meter[radon]"]
+dependencies = ["radon>=5.1"]
 
 [project.scripts]
 entropy-measure = "entropy_meter.cli.measure:main"
@@ -19,10 +15,10 @@ requires = ["hatchling"]
 
 [dependency-groups]
 dev = [
-    "basedpyright>=1.28",
-    "pytest>=9.0",
-    "pytest-cov>=7.0",
-    "ruff>=0.15",
+    "basedpyright>=1.38.1",
+    "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.15.2",
 ]
 
 # ── Ruff (lint + format) ────────────────────────────────────────────
@@ -95,8 +91,6 @@ reportMissingTypeStubs = false
 reportUnknownVariableType = false
 reportUnknownMemberType = false
 reportUnknownArgumentType = false
-reportConstantRedefinition = false
-reportPossiblyUnboundVariable = false
 
 # ── Pytest ─────────────────────────────────────────────────────────
 

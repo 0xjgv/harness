@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from entropy_meter.core.metrics import FileMetrics, measure_file
 
 
@@ -83,21 +81,6 @@ class TestMeasureSimpleCode:
         m = measure_file(f)
 
         assert m.line_length_stddev == 0.0
-
-    def test_tier_mask_without_radon(
-        self, tmp_path: Path, sample_python_code: str, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import entropy_meter.core.metrics as metrics_mod
-
-        monkeypatch.setattr(metrics_mod, "HAS_RADON", False)
-        f = tmp_path / "no_radon.py"
-        f.write_text(sample_python_code)
-        m = measure_file(f)
-
-        assert m.tier_mask == 0b001
-        assert m.cyclomatic_complexity is None
-        assert m.maintainability_index is None
-        assert m.halstead_volume is None
 
     def test_measure_from_path(self, tmp_path: Path) -> None:
         content = "x = 42\ny = x + 1\n"

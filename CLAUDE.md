@@ -6,7 +6,7 @@ Standalone code complexity metrics engine. Zero required dependencies (Tier 0 us
 
 - Python 3.10+, Hatchling build
 - SQLite3 (WAL mode, 0600 perms)
-- Optional: radon (Tier 1 metrics)
+- radon (Tier 1 metrics)
 
 ## Structure
 
@@ -30,6 +30,6 @@ Standalone code complexity metrics engine. Zero required dependencies (Tier 0 us
 ## Patterns
 
 - Tiered metrics: Tier 0 (stdlib), Tier 1 (radon), Tier 2 (tree-sitter, future)
-- Unavailable tiers redistribute weights proportionally
+- Tier 0+1 always available; Tier 2 redistributes weights when absent
 - DB location: `.claude/entropy.db` (project-local, gitignored)
 - All DB functions are sync

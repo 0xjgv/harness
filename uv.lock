@@ -145,12 +145,7 @@ toml = [
 name = "entropy-meter"
 version = "0.1.0"
 source = { editable = "." }
-
-[package.optional-dependencies]
-all = [
-    { name = "radon" },
-]
-radon = [
+dependencies = [
     { name = "radon" },
 ]
 
@@ -163,18 +158,14 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "entropy-meter", extras = ["radon"], marker = "extra == 'all'" },
-    { name = "radon", marker = "extra == 'radon'", specifier = ">=5.1" },
-]
-provides-extras = ["radon", "all"]
+requires-dist = [{ name = "radon", specifier = ">=5.1" }]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "basedpyright", specifier = ">=1.28" },
-    { name = "pytest", specifier = ">=9.0" },
-    { name = "pytest-cov", specifier = ">=7.0" },
-    { name = "ruff", specifier = ">=0.15" },
+    { name = "basedpyright", specifier = ">=1.38.1" },
+    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "pytest-cov", specifier = ">=7.0.0" },
+    { name = "ruff", specifier = ">=0.15.2" },
 ]
 
 [[package]]

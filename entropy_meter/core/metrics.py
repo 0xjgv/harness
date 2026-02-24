@@ -1,7 +1,7 @@
 """Tier 0 + Tier 1 metric computation for a single file.
 
-Tier 0 uses only the stdlib and is always available.
-Tier 1 requires radon and degrades gracefully when absent.
+Tier 0 uses only the stdlib.
+Tier 1 uses radon for cyclomatic complexity, maintainability, and Halstead metrics.
 """
 
 from __future__ import annotations
@@ -13,19 +13,13 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from radon.complexity import cc_visit
+from radon.metrics import h_visit, mi_visit
+
 from entropy_meter.config import TIER_0, TIER_1
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-# --- Tier 1 availability ---
-try:
-    from radon.complexity import cc_visit  # pyright: ignore[reportMissingImports]
-    from radon.metrics import h_visit, mi_visit  # pyright: ignore[reportMissingImports]
-
-    HAS_RADON = True
-except ImportError:  # pragma: no cover
-    HAS_RADON = False
 
 
 @dataclass
@@ -40,11 +34,11 @@ class FileMetrics:
     compression_ratio: float
     line_length_stddev: float
     line_entropy: float
-    # Tier 1 (None if radon unavailable)
+    # Tier 1
     cyclomatic_complexity: float | None = None
     maintainability_index: float | None = None
     halstead_volume: float | None = None
-    # Tier 2 (None, reserved for future)
+    # Tier 2 (reserved for future)
     ast_node_count: int | None = None
     ast_depth_max: int | None = None
     ast_entropy: float | None = None
@@ -75,18 +69,10 @@ def measure_file(path: Path | None = None, content: str | None = None) -> FileMe
     line_length_stddev = _line_length_stddev(lines)
     line_entropy = _shannon_entropy(content_bytes)
 
-    tier_mask = TIER_0
-
-    # --- Tier 1: radon (if available) ---
-    cyclomatic_complexity: float | None = None
-    maintainability_index: float | None = None
-    halstead_volume: float | None = None
-
-    if HAS_RADON:
-        cyclomatic_complexity = _avg_cyclomatic(content)
-        maintainability_index = _maintainability(content)
-        halstead_volume = _halstead_volume(content)
-        tier_mask |= TIER_1
+    # --- Tier 1: radon ---
+    cyclomatic_complexity = _avg_cyclomatic(content)
+    maintainability_index = _maintainability(content)
+    halstead_volume = _halstead_volume(content)
 
     return FileMetrics(
         file_size_bytes=file_size_bytes,
@@ -99,7 +85,7 @@ def measure_file(path: Path | None = None, content: str | None = None) -> FileMe
         cyclomatic_complexity=cyclomatic_complexity,
         maintainability_index=maintainability_index,
         halstead_volume=halstead_volume,
-        tier_mask=tier_mask,
+        tier_mask=TIER_0 | TIER_1,
     )
 
 

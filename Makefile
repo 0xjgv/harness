@@ -15,12 +15,12 @@ help: ## Show this help message
 install: ## Install dependencies with uv
 	@$(SILENT_HELPER) && \
 		print_main_header "Installing Dependencies" && \
-		run_silent "Sync dependencies" "uv sync --all-extras"
+		run_silent "Sync dependencies" "uv sync"
 
 .PHONY: install-global
 install-global: ## Install as global CLI tool
 	@$(SILENT_HELPER) && \
-		run_silent "Install global tool" "uv tool install --editable '.[all]' --force"
+		run_silent "Install global tool" "uv tool install --editable . --force"
 
 .PHONY: uninstall-global
 uninstall-global: ## Uninstall global CLI tool
