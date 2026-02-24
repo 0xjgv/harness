@@ -51,6 +51,13 @@ def main(argv: list[str] | None = None) -> None:
         add_help=False,
     )
 
+    # harness entropy seed
+    entropy_sub.add_parser(
+        "seed",
+        help="Establish baseline entropy measurements for the project",
+        add_help=False,
+    )
+
     # harness entropy hook-run (internal — invoked by Claude Code hooks)
     entropy_sub.add_parser(
         "hook-run",
@@ -90,6 +97,10 @@ def _dispatch_entropy(command: str, argv: list[str]) -> None:
         from harness.cli.install import uninstall_main  # noqa: PLC0415
 
         uninstall_main(argv)
+    elif command == "seed":
+        from harness.cli.seed import seed_main  # noqa: PLC0415
+
+        seed_main(argv)
     elif command == "hook-run":
         from harness.cli.hook import hook_run_main  # noqa: PLC0415
 
