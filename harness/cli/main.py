@@ -51,6 +51,13 @@ def main(argv: list[str] | None = None) -> None:
         add_help=False,
     )
 
+    # harness entropy hook-run (internal — invoked by Claude Code hooks)
+    entropy_sub.add_parser(
+        "hook-run",
+        help=argparse.SUPPRESS,
+        add_help=False,
+    )
+
     # Parse only the first 1-2 args to determine routing
     args, remaining = parser.parse_known_args(args_list)
 
@@ -83,3 +90,7 @@ def _dispatch_entropy(command: str, argv: list[str]) -> None:
         from harness.cli.install import uninstall_main  # noqa: PLC0415
 
         uninstall_main(argv)
+    elif command == "hook-run":
+        from harness.cli.hook import hook_run_main  # noqa: PLC0415
+
+        hook_run_main(argv)

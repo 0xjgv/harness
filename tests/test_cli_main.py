@@ -64,6 +64,11 @@ class TestRouterDispatch:
         main(["entropy", "uninstall"])
         mock_main.assert_called_once_with([])
 
+    @patch("harness.cli.hook.hook_run_main")
+    def test_dispatch_hook_run(self, mock_main: MagicMock) -> None:
+        main(["entropy", "hook-run"])
+        mock_main.assert_called_once_with([])
+
 
 # ---------------------------------------------------------------------------
 # __main__.py import
