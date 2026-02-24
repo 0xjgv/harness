@@ -21,6 +21,11 @@ def _find_harness_command() -> str | None:
     return shutil.which("harness")
 
 
+def _find_hook_command() -> str | None:
+    """Resolve the harness-hook-run binary path via shutil.which()."""
+    return shutil.which("harness-hook-run")
+
+
 def _read_settings(path: Path) -> dict[str, Any]:
     """Read and parse a settings JSON file. Returns {} if file doesn't exist or is empty."""
     if not path.exists():
@@ -198,7 +203,7 @@ def install_main(argv: list[str] | None = None) -> None:
         )
         sys.exit(1)
 
-    hook_command = f"{harness_cmd} entropy hook-run"
+    hook_command = _find_hook_command() or f"{harness_cmd} entropy hook-run"
     settings_file = _settings_path(project_root, project_wide=args.project)
 
     try:

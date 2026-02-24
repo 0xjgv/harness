@@ -10,14 +10,6 @@ def main(argv: list[str] | None = None) -> None:
     """Entry point for `harness` command."""
     args_list = argv if argv is not None else sys.argv[1:]
 
-    # Hidden subcommand: harness entropy hook-run
-    # Handled before argparse to keep it out of help output entirely.
-    if len(args_list) >= 2 and args_list[0] == "entropy" and args_list[1] == "hook-run":
-        from harness.cli.hook import hook_run_main  # noqa: PLC0415
-
-        hook_run_main(args_list[2:])
-        return
-
     parser = argparse.ArgumentParser(
         prog="harness",
         description="Code complexity metrics engine.",
