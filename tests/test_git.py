@@ -11,6 +11,7 @@ from harness.git import (
     get_changed_files,
     get_current_commit,
     get_file_at_commit,
+    get_files_at_commit,
     get_parent_commit,
     get_recent_commits,
     is_git_repo,
@@ -312,3 +313,64 @@ class TestGetRecentCommits:
         """Non-repo should return empty list."""
         commits = get_recent_commits(n=10, cwd=tmp_path)
         assert commits == []
+
+
+# ---------------------------------------------------------------------------
+# get_files_at_commit
+# ---------------------------------------------------------------------------
+
+
+class TestGetFilesAtCommit:
+    def test_lists_files_at_head(self, git_repo: Path) -> None:
+        """Should list all files at HEAD."""
+        files = get_files_at_commit("HEAD", cwd=git_repo)
+        assert "initial.py" in files
+
+    def test_bad_ref_returns_empty(self, git_repo: Path) -> None:
+        """Invalid commit ref should return empty list."""
+        files = get_files_at_commit("nonexistent_ref", cwd=git_repo)
+        assert files == []
+
+    def test_historical_commit_shows_correct_files(self, git_repo: Path) -> None:
+        """A historical commit should only show files that existed then."""
+        initial_hash = get_current_commit(cwd=git_repo)
+        assert initial_hash is not None
+
+        # Add a second file in a new commit
+        (git_repo / "second.py").write_text("y = 2\n")
+        subprocess.run(
+            ["git", "add", "."],
+            cwd=str(git_repo),
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@test.com",
+                "commit",
+                "-m",
+                "add second",
+            ],
+            cwd=str(git_repo),
+            capture_output=True,
+            check=True,
+        )
+
+        # HEAD has both files
+        files_head = get_files_at_commit("HEAD", cwd=git_repo)
+        assert "initial.py" in files_head
+        assert "second.py" in files_head
+
+        # Initial commit only has initial.py
+        files_initial = get_files_at_commit(initial_hash, cwd=git_repo)
+        assert "initial.py" in files_initial
+        assert "second.py" not in files_initial
+
+    def test_not_a_repo(self, tmp_path: Path) -> None:
+        """Non-repo should return empty list."""
+        files = get_files_at_commit("HEAD", cwd=tmp_path)
+        assert files == []

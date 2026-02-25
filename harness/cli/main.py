@@ -5,51 +5,49 @@ from __future__ import annotations
 import argparse
 import sys
 
+# Lazy-import dispatch tables: each value is (module_path, function_name).
+# Resolved at dispatch time to avoid importing all subcommands eagerly.
+_ENTROPY_COMMANDS: dict[str, tuple[str, str]] = {
+    "measure": ("harness.cli.measure", "main"),
+    "report": ("harness.cli.report", "main"),
+    "install": ("harness.cli.install", "install_main"),
+    "uninstall": ("harness.cli.install", "uninstall_main"),
+    "seed": ("harness.cli.seed", "seed_main"),
+    "hook-run": ("harness.cli.hook", "hook_run_main"),
+}
 
-def _dispatch_entropy(command: str, argv: list[str]) -> None:
-    """Dispatch to the appropriate entropy subcommand."""
-    if command == "measure":
-        from harness.cli.measure import main as measure_main  # noqa: PLC0415
+_CONTEXT_COMMANDS: dict[str, tuple[str, str]] = {
+    "run": ("harness.cli.context", "run_main"),
+}
 
-        measure_main(argv)
-    elif command == "report":
-        from harness.cli.report import main as report_main  # noqa: PLC0415
-
-        report_main(argv)
-    elif command == "install":
-        from harness.cli.install import install_main  # noqa: PLC0415
-
-        install_main(argv)
-    elif command == "uninstall":
-        from harness.cli.install import uninstall_main  # noqa: PLC0415
-
-        uninstall_main(argv)
-    elif command == "seed":
-        from harness.cli.seed import seed_main  # noqa: PLC0415
-
-        seed_main(argv)
-    elif command == "hook-run":
-        from harness.cli.hook import hook_run_main  # noqa: PLC0415
-
-        hook_run_main(argv)
+_TOP_LEVEL_COMMANDS: dict[str, tuple[str, str]] = {
+    "install": ("harness.cli.install", "global_install_main"),
+    "uninstall": ("harness.cli.install", "global_uninstall_main"),
+}
 
 
-def _dispatch_context(command: str, argv: list[str]) -> None:
-    """Dispatch to the appropriate context subcommand."""
-    if command == "run":
-        from harness.cli.context import run_main  # noqa: PLC0415
+def _lazy_dispatch(
+    table: dict[str, tuple[str, str]],
+    command: str,
+    argv: list[str],
+) -> None:
+    """Import and call the handler for `command` from `table`."""
+    import importlib  # noqa: PLC0415
 
-        run_main(argv)
+    module_path, func_name = table[command]
+    module = importlib.import_module(module_path)
+    handler = getattr(module, func_name)
+    handler(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     """Entry point for `harness` command."""
     args_list = argv if argv is not None else sys.argv[1:]
 
-    # hook-run is internal (invoked by Claude Code hooks) — intercept before
+    # hook-run is internal (invoked by Claude Code hooks) -- intercept before
     # argparse so it never appears in help/choices.
     if len(args_list) >= 2 and args_list[0] == "entropy" and args_list[1] == "hook-run":
-        _dispatch_entropy("hook-run", args_list[2:])
+        _lazy_dispatch(_ENTROPY_COMMANDS, "hook-run", args_list[2:])
         return
 
     parser = argparse.ArgumentParser(
@@ -65,49 +63,21 @@ def main(argv: list[str] | None = None) -> None:
     )
     entropy_sub = entropy_parser.add_subparsers(dest="entropy_command")
 
-    # harness entropy measure
-    entropy_sub.add_parser(
-        "measure",
-        help="Measure entropy index for files",
-        add_help=False,
-    )
+    for name, help_text in [
+        ("measure", "Measure entropy index for files"),
+        ("report", "Show entropy trends and hotspots"),
+        ("install", "Install Claude Code hooks for entropy tracking"),
+        ("uninstall", "Remove Claude Code hooks"),
+        ("seed", "Establish baseline entropy measurements for the project"),
+    ]:
+        entropy_sub.add_parser(name, help=help_text, add_help=False)
 
-    # harness entropy report
-    entropy_sub.add_parser(
-        "report",
-        help="Show entropy trends and hotspots",
-        add_help=False,
-    )
-
-    # harness entropy install
-    entropy_sub.add_parser(
-        "install",
-        help="Install Claude Code hooks for entropy tracking",
-        add_help=False,
-    )
-
-    # harness entropy uninstall
-    entropy_sub.add_parser(
-        "uninstall",
-        help="Remove Claude Code hooks",
-        add_help=False,
-    )
-
-    # harness entropy seed
-    entropy_sub.add_parser(
-        "seed",
-        help="Establish baseline entropy measurements for the project",
-        add_help=False,
-    )
-
-    # harness install
+    # harness install / uninstall
     subparsers.add_parser(
         "install",
         help="Install harness hooks (global + per-project + seed)",
         add_help=False,
     )
-
-    # harness uninstall
     subparsers.add_parser(
         "uninstall",
         help="Remove harness hooks (global + per-project)",
@@ -120,36 +90,27 @@ def main(argv: list[str] | None = None) -> None:
         help="Codebase context generation",
     )
     context_sub = context_parser.add_subparsers(dest="context_command")
-
-    # harness context run
     context_sub.add_parser(
         "run",
         help="Run bundled context.sh to gather codebase context",
         add_help=False,
     )
 
-    # Parse only the first 1-2 args to determine routing
     args, remaining = parser.parse_known_args(args_list)
 
     if args.command is None:
         parser.print_help()
         sys.exit(0)
 
-    if args.command == "install":
-        from harness.cli.install import global_install_main  # noqa: PLC0415
-
-        global_install_main(remaining)
-    elif args.command == "uninstall":
-        from harness.cli.install import global_uninstall_main  # noqa: PLC0415
-
-        global_uninstall_main(remaining)
+    if args.command in _TOP_LEVEL_COMMANDS:
+        _lazy_dispatch(_TOP_LEVEL_COMMANDS, args.command, remaining)
     elif args.command == "entropy":
         if args.entropy_command is None:
             entropy_parser.print_help()
             sys.exit(0)
-        _dispatch_entropy(args.entropy_command, remaining)
+        _lazy_dispatch(_ENTROPY_COMMANDS, args.entropy_command, remaining)
     elif args.command == "context":
         if args.context_command is None:
             context_parser.print_help()
             sys.exit(0)
-        _dispatch_context(args.context_command, remaining)
+        _lazy_dispatch(_CONTEXT_COMMANDS, args.context_command, remaining)

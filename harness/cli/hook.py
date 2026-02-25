@@ -98,23 +98,17 @@ def _measure_files(
 
     Returns list of (path, before_ei, after_ei, delta, is_new_file).
     """
+    from harness.cli.measure import _metrics_to_measurement  # noqa: PLC0415
     from harness.core.composite import compute_entropy_index  # noqa: PLC0415
-    from harness.core.db import (  # noqa: PLC0415
-        Measurement,
-        get_previous_measurement,
-        store_measurement,
-    )
+    from harness.core.db import get_previous_measurement, store_measurement  # noqa: PLC0415
     from harness.core.metrics import measure_file  # noqa: PLC0415
     from harness.git import get_file_at_commit  # noqa: PLC0415
 
     deltas: list[tuple[str, float, float, float, bool]] = []
+    measured_at = time.time()
 
     for filepath in py_files:
-        content = get_file_at_commit(
-            filepath,
-            commit,
-            cwd=project_root,
-        )
+        content = get_file_at_commit(filepath, commit, cwd=project_root)
         if content is None:
             continue
 
@@ -124,25 +118,7 @@ def _measure_files(
         except Exception:
             continue
 
-        measurement = Measurement(
-            file_path=filepath,
-            commit_hash=commit,
-            measured_at=time.time(),
-            file_size_bytes=metrics.file_size_bytes,
-            line_count=metrics.line_count,
-            blank_lines=metrics.blank_lines,
-            comment_lines=metrics.comment_lines,
-            compression_ratio=metrics.compression_ratio,
-            line_length_stddev=metrics.line_length_stddev,
-            cyclomatic_complexity=metrics.cyclomatic_complexity,
-            maintainability_index=metrics.maintainability_index,
-            halstead_volume=metrics.halstead_volume,
-            ast_node_count=metrics.ast_node_count,
-            ast_depth_max=metrics.ast_depth_max,
-            ast_entropy=metrics.ast_entropy,
-            entropy_index=ei,
-            tier_mask=metrics.tier_mask,
-        )
+        measurement = _metrics_to_measurement(filepath, metrics, ei, commit, measured_at)
         store_measurement(conn, measurement)
 
         prev = get_previous_measurement(conn, filepath, commit)

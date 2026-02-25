@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 import subprocess
-import tempfile
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from harness.cli.utils import atomic_write_json
 
 # -- Constants ---------------------------------------------------------------
 
@@ -28,6 +28,11 @@ HEAL_SYSTEM_PROMPT = (
     "If you are unsure of the fix, do nothing. "
     "Verify your fix produces valid Python syntax before finishing."
 )
+
+
+def _default_state() -> dict:
+    """Return a fresh default heal state."""
+    return {"version": 1, "lock": None, "errors": {}}
 
 
 # -- Helpers -----------------------------------------------------------------
@@ -64,29 +69,19 @@ def _error_signature(event: str, exc: Exception) -> str:
 def _read_heal_state(state_path: Path) -> dict:
     """Read state from disk; returns default state on missing/corrupt."""
     if not state_path.exists():
-        return {"version": 1, "lock": None, "errors": {}}
+        return _default_state()
     try:
         data = json.loads(state_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
-            return {"version": 1, "lock": None, "errors": {}}
+            return _default_state()
         return data
     except (json.JSONDecodeError, OSError):
-        return {"version": 1, "lock": None, "errors": {}}
+        return _default_state()
 
 
 def _write_heal_state(state_path: Path, state: dict) -> None:
-    """Atomic write: tempfile in same dir + os.replace()."""
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(state_path.parent), suffix=".json")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(state, f, indent=2)
-            f.write("\n")
-        Path(tmp).replace(state_path)
-    except BaseException:
-        if Path(tmp).exists():
-            Path(tmp).unlink()
-        raise
+    """Atomic write of heal state JSON."""
+    atomic_write_json(state_path, state)
 
 
 def _is_locked(state: dict) -> bool:
@@ -106,12 +101,11 @@ def _should_heal(state: dict, sig: str) -> bool:
     errors = state.get("errors", {})
     entry = errors.get(sig)
     if entry is None:
-        return True  # First occurrence
+        return True
 
     if entry.get("status") == "exhausted":
         return False
 
-    # Check cooldown
     cooldown_until = entry.get("cooldown_until")
     if cooldown_until:
         try:
@@ -120,7 +114,6 @@ def _should_heal(state: dict, sig: str) -> bool:
         except (ValueError, TypeError):
             pass
 
-    # Check max attempts
     return entry.get("attempts", 0) < HEAL_MAX_ATTEMPTS
 
 
@@ -153,7 +146,6 @@ def _record_attempt(state: dict, sig: str, event: str, exc: Exception) -> None:
             "error_message": str(exc),
         }
 
-    # Set lock
     state["lock"] = now
 
 

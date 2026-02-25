@@ -110,6 +110,25 @@ def get_parent_commit(commit: str = "HEAD", cwd: Path | None = None) -> str | No
         return None
 
 
+def get_files_at_commit(commit: str, cwd: Path | None = None) -> list[str]:
+    """List all files at a specific commit using git ls-tree.
+
+    Returns relative paths. Returns [] on error (bad ref, not a repo).
+    """
+    work_dir = str(cwd) if cwd else None
+    try:
+        result = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", commit],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=work_dir,
+        )
+        return [f for f in result.stdout.strip().splitlines() if f]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+
+
 def get_recent_commits(n: int = 10, cwd: Path | None = None) -> list[str]:
     """Get the last N commit hashes, most recent first."""
     work_dir = str(cwd) if cwd else None
