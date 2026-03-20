@@ -1,0 +1,116 @@
+"""Tests for harness.cli.main — top-level CLI router."""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from harness.cli.main import main
+
+# ---------------------------------------------------------------------------
+# No args / help
+# ---------------------------------------------------------------------------
+
+
+class TestRouterHelp:
+    def test_no_args_prints_help(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            main([])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert "entropy" in out
+        assert "context" in out
+        assert "install" in out
+        assert "uninstall" in out
+
+    def test_entropy_no_subcommand_prints_help(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            main(["entropy"])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert "measure" in out
+        assert "report" in out
+        assert "install" in out
+        assert "uninstall" in out
+        assert "seed" in out
+
+    def test_hook_run_hidden_from_help(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit):
+            main(["entropy"])
+        out = capsys.readouterr().out
+        assert "hook-run" not in out
+
+
+# ---------------------------------------------------------------------------
+# Subcommand dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestRouterDispatch:
+    @patch("harness.cli.measure.main")
+    def test_dispatch_measure(self, mock_main: MagicMock) -> None:
+        main(["entropy", "measure", "--all", "--project-root", "/tmp/test"])
+        mock_main.assert_called_once_with(["--all", "--project-root", "/tmp/test"])
+
+    @patch("harness.cli.report.main")
+    def test_dispatch_report(self, mock_main: MagicMock) -> None:
+        main(["entropy", "report", "--hotspots"])
+        mock_main.assert_called_once_with(["--hotspots"])
+
+    @patch("harness.cli.install.install_main")
+    def test_dispatch_install(self, mock_main: MagicMock) -> None:
+        main(["entropy", "install", "--project"])
+        mock_main.assert_called_once_with(["--project"])
+
+    @patch("harness.cli.install.uninstall_main")
+    def test_dispatch_uninstall(self, mock_main: MagicMock) -> None:
+        main(["entropy", "uninstall"])
+        mock_main.assert_called_once_with([])
+
+    @patch("harness.cli.seed.seed_main")
+    def test_dispatch_seed(self, mock_main: MagicMock) -> None:
+        main(["entropy", "seed", "--project-root", "/tmp/test"])
+        mock_main.assert_called_once_with(["--project-root", "/tmp/test"])
+
+    @patch("harness.cli.hook.hook_run_main")
+    def test_dispatch_hook_run(self, mock_main: MagicMock) -> None:
+        main(["entropy", "hook-run"])
+        mock_main.assert_called_once_with([])
+
+    @patch("harness.cli.hook.hook_run_main")
+    def test_dispatch_hook_run_with_args(self, mock_main: MagicMock) -> None:
+        main(["entropy", "hook-run", "--verbose"])
+        mock_main.assert_called_once_with(["--verbose"])
+
+
+# ---------------------------------------------------------------------------
+# __main__.py import
+# ---------------------------------------------------------------------------
+
+
+class TestTopLevelDispatch:
+    @patch("harness.cli.install.global_install_main")
+    def test_dispatch_install(self, mock_main: MagicMock) -> None:
+        main(["install", "--skip-seed"])
+        mock_main.assert_called_once_with(["--skip-seed"])
+
+    @patch("harness.cli.install.global_uninstall_main")
+    def test_dispatch_uninstall(self, mock_main: MagicMock) -> None:
+        main(["uninstall", "--global-only"])
+        mock_main.assert_called_once_with(["--global-only"])
+
+
+class TestMainModule:
+    def test_main_module_imports(self) -> None:
+        """Verify __main__.py can be imported."""
+        import harness.__main__  # noqa: F401
