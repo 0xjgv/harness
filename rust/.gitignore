@@ -1,0 +1,15 @@
+# Build
+/target/
+
+# Coverage
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store

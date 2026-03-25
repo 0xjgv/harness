@@ -1,0 +1,2 @@
+[alias]
+harness = "run --bin harness --"

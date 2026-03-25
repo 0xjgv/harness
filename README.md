@@ -27,6 +27,7 @@ Every template implements exactly 3 scripts:
 | [Python](python/) | uv, ruff, basedpyright, pytest |
 | [Bun](bun/) | Bun, Biome, TypeScript |
 | [Go](go/) | Go, golangci-lint |
+| [Rust](rust/) | Rust, clippy, rustfmt |
 
 ## Getting Started
 
@@ -55,12 +56,20 @@ go run harness.go hooks
 # Start coding
 ```
 
+### Rust
+
+```bash
+cp -r rust/ my-project && cd my-project
+cargo build && cargo harness hooks
+# Start coding in src/
+```
+
 ## What Each Template Includes
 
 - **Single zero-dep task runner** (`harness.py` / `harness.ts` / `harness.go`) — no Makefile, no task framework
-- **Linter + formatter** — ruff (Python) / Biome (Bun) / golangci-lint (Go)
-- **Type checker** — basedpyright (Python) / tsc (Bun) / Go compiler (Go)
-- **Test runner** — pytest (Python) / bun test (Bun) / go test (Go)
+- **Linter + formatter** — ruff (Python) / Biome (Bun) / golangci-lint (Go) / clippy + rustfmt (Rust)
+- **Type checker** — basedpyright (Python) / tsc (Bun) / Go compiler (Go) / Rust compiler (Rust)
+- **Test runner** — pytest (Python) / bun test (Bun) / go test (Go) / cargo test (Rust)
 - **CLAUDE.md** — tells AI agents which commands to run and when
 
 ## Design Principles

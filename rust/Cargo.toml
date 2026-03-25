@@ -1,0 +1,37 @@
+[package]
+name = "my-project"
+version = "0.1.0"
+edition = "2024"
+description = "Rust project template with built-in harness: linting, formatting, and testing."
+autobins = false
+
+[lib]
+name = "my_project"
+path = "src/lib.rs"
+
+[[bin]]
+name = "my-project"
+path = "src/main.rs"
+
+[[bin]]
+name = "harness"
+path = "harness.rs"
+
+# ── Lints ─────────────────────────────────────────────────────────
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Pedantic false positives — too noisy for real-world code
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+needless_pass_by_value = "allow"
+# Complexity thresholds — same philosophy as Python template's PLR ignores
+too_many_lines = "allow"
+cognitive_complexity = "allow"
