@@ -116,11 +116,12 @@ def cmd_test_cov() -> None:
 
 
 def cmd_check() -> None:
-    """Fix, format, and typecheck the full repo."""
+    """Fix, format, typecheck, and test the full repo."""
     print("\n=== Quality Checks ===\n")
     cmd_fix()
     cmd_format()
     cmd_typecheck()
+    cmd_test()
 
 
 def cmd_pre_commit() -> None:
@@ -232,7 +233,7 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "format": (cmd_format, "Format code with ruff"),
     "lint": (cmd_lint, "Lint code with ruff (read-only)"),
     "typecheck": (cmd_typecheck, "Type-check with basedpyright"),
-    "check": (cmd_check, "Fix + format + typecheck (full repo)"),
+    "check": (cmd_check, "Fix + format + typecheck + test (full repo)"),
     "pre-commit": (cmd_pre_commit, "Staged checks + tests"),
     "ci": (cmd_ci, "Lint + format check + typecheck + tests with coverage"),
     "test": (cmd_test, "Run tests with pytest"),
@@ -246,7 +247,7 @@ def main() -> None:
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
 
     if not args or args[0] == "help":
-        print("Usage: uv run python dev.py <command> [--verbose]\n")
+        print("Usage: uv run python harness.py <command> [--verbose]\n")
         print("Commands:")
         for name, (_, desc) in TASKS.items():
             print(f"  {name:<14} {desc}")

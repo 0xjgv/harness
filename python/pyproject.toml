@@ -1,24 +1,24 @@
 [project]
-name = "guardrails"
+name = "harness"
 version = "0.1.0"
-description = "Python project template with built-in guardrails: linting, formatting, type-checking, and testing."
+description = "Python project template with built-in harness: linting, formatting, type-checking, and testing."
 requires-python = ">=3.13"
 dependencies = []
 
 [project.scripts]
-tasks = "dev:main"
-install = "dev:install_main"
-fix = "dev:fix_main"
-format = "dev:format_main"
-lint = "dev:lint_main"
-typecheck = "dev:typecheck_main"
-check = "dev:check_main"
-pre-commit = "dev:pre_commit_main"
-ci = "dev:ci_main"
-test = "dev:test_main"
-test-cov = "dev:test_cov_main"
-hooks = "dev:hooks_main"
-clean = "dev:clean_main"
+harness = "harness:main"
+install = "harness:install_main"
+fix = "harness:fix_main"
+format = "harness:format_main"
+lint = "harness:lint_main"
+typecheck = "harness:typecheck_main"
+check = "harness:check_main"
+pre-commit = "harness:pre_commit_main"
+ci = "harness:ci_main"
+test = "harness:test_main"
+test-cov = "harness:test_cov_main"
+hooks = "harness:hooks_main"
+clean = "harness:clean_main"
 
 
 [build-system]

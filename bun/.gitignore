@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+build/
+*.tsbuildinfo
+
+# Test / Coverage
+coverage/
+
+# Environment
+.env
+.env.*
+!.env.example

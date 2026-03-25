@@ -1,6 +1,8 @@
-# my-project
+# Python Template
 
-Python project template with built-in guardrails: linting, formatting, type-checking, and testing.
+> Rename this to your project name.
+
+Python project template with built-in harness: linting, formatting, type-checking, and testing.
 
 ## Setup
 
@@ -11,8 +13,10 @@ uv run hooks                      # Install git hooks
 
 ## Development
 
+See the [3-script contract](../README.md#the-3-script-contract) for the full rationale.
+
 ```bash
-uv run check                      # Fix + format + typecheck (after editing)
+uv run check                      # Fix + format + typecheck + tests (after editing)
 uv run pre-commit                 # Staged checks + tests (runs via git hook)
 uv run ci                         # Lint + format check + typecheck + tests with coverage
 ```
@@ -20,7 +24,7 @@ uv run ci                         # Lint + format check + typecheck + tests with
 All commands minimize output — only errors are shown. Add `--verbose` for full output via the CLI:
 
 ```bash
-uv run python dev.py check --verbose
+uv run python harness.py check --verbose
 ```
 
 ### Individual commands
@@ -34,7 +38,7 @@ uv run test                       # Run tests
 uv run test-cov                   # Tests with coverage (80% minimum)
 uv run install                    # Install dependencies
 uv run clean                      # Remove caches
-uv run python dev.py help         # List all commands
+uv run python harness.py help     # List all commands
 ```
 
 ## Project Structure
@@ -42,8 +46,7 @@ uv run python dev.py help         # List all commands
 ```
 src/          Source code
 tests/        Tests
-dev.py        Development task runner (zero dependencies)
-scripts/      Utility scripts
+harness.py    Development task runner (zero dependencies)
 ```
 
 ## Starting from This Template

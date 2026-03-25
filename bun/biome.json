@@ -1,0 +1,80 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.4.4/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true,
+    "defaultBranch": "main"
+  },
+  "files": {
+    "includes": ["**", "!!**/dist", "!!**/build"]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100,
+    "lineEnding": "lf"
+  },
+  "assist": { "enabled": true },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "correctness": {
+        "noUnusedVariables": "error",
+        "noUnusedImports": "error"
+      },
+      "style": {
+        "noDefaultExport": "error",
+        "useConst": "error",
+        "useTemplate": "error",
+        "useNodejsImportProtocol": "error",
+        "useImportType": "error",
+        "useConsistentArrowReturn": "error",
+        "noNegationElse": "warn"
+      },
+      "suspicious": {
+        "noExplicitAny": "warn",
+        "noConsole": "warn",
+        "noUnusedExpressions": "error",
+        "noImportCycles": "error"
+      },
+      "nursery": {
+        "noFloatingPromises": "error",
+        "noShadow": "warn"
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "trailingCommas": "all",
+      "semicolons": "always",
+      "arrowParentheses": "always"
+    }
+  },
+  "json": {
+    "formatter": { "trailingCommas": "none" }
+  },
+  "overrides": [
+    {
+      "includes": ["**/__tests__/**", "**/*.test.ts", "**/*.spec.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": { "noExplicitAny": "off", "noConsole": "off" },
+          "style": { "noNonNullAssertion": "off" }
+        }
+      }
+    },
+    {
+      "includes": ["scripts/**"],
+      "linter": {
+        "rules": {
+          "suspicious": { "noConsole": "off" },
+          "style": { "noDefaultExport": "off" }
+        }
+      }
+    }
+  ]
+}

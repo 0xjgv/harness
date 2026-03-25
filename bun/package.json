@@ -1,0 +1,20 @@
+{
+  "name": "harness",
+  "version": "0.1.0",
+  "description": "Bun project template with built-in harness: linting, formatting, type-checking, and testing.",
+  "scripts": {
+    "check": "bun harness.ts",
+    "fix": "bun harness.ts --fix",
+    "lint": "bunx biome check .",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "pre-commit": "bun harness.ts --pre-commit",
+    "ci": "bun harness.ts --ci",
+    "hooks": "bun harness.ts --hooks",
+    "clean": "bun harness.ts --clean"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.8",
+    "typescript": "^5.8.3"
+  }
+}
