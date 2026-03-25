@@ -22,12 +22,12 @@ Every template implements exactly 3 scripts:
 
 ## Available Templates
 
-| Template | Stack |
-|---|---|
-| [Python](python/) | uv, ruff, basedpyright, pytest |
-| [Bun](bun/) | Bun, Biome, TypeScript |
-| [Go](go/) | Go, golangci-lint |
-| [Rust](rust/) | Rust, clippy, rustfmt |
+| Template | Stack | Prerequisites |
+|---|---|---|
+| [Python](python/) | uv, ruff, basedpyright, pytest | [uv](https://docs.astral.sh/uv/) |
+| [Bun](bun/) | Bun, Biome, TypeScript | [Bun](https://bun.sh/) |
+| [Go](go/) | Go, golangci-lint | [Go](https://go.dev/dl/) 1.24+, [golangci-lint](https://golangci-lint.run/welcome/install/) v2+ |
+| [Rust](rust/) | Rust, clippy, rustfmt | [Rust](https://rustup.rs/) |
 
 ## Getting Started
 
@@ -50,6 +50,9 @@ bun install && bun run hooks
 ### Go
 
 ```bash
+# Install golangci-lint if you don't have it
+brew install golangci-lint  # or: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
 cp -r go/ my-project && cd my-project
 go mod edit -module my-project
 go run harness.go hooks
@@ -77,3 +80,7 @@ cargo build && cargo harness hooks
 - **Zero external dependencies in the runner** — stdlib/runtime APIs only
 - **Quiet by default** — only errors shown, `--verbose` for everything
 - **Fix what you can** — `check` and `pre-commit` auto-fix; `ci` is read-only
+
+## License
+
+[MIT](LICENSE)
