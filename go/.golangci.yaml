@@ -1,0 +1,34 @@
+version: "2"
+output:
+  formats:
+    text:
+      path: stdout
+linters:
+  enable:
+    - errcheck
+    - errname
+    - goconst
+    - gocritic
+    - gocyclo
+    - nakedret
+    - revive
+    - unconvert
+    - unparam
+  settings:
+    staticcheck:
+      checks:
+        - all
+    gocyclo:
+      min-complexity: 15
+    nakedret:
+      max-func-lines: 30
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax

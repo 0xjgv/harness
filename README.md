@@ -26,6 +26,7 @@ Every template implements exactly 3 scripts:
 |---|---|
 | [Python](python/) | uv, ruff, basedpyright, pytest |
 | [Bun](bun/) | Bun, Biome, TypeScript |
+| [Go](go/) | Go, golangci-lint |
 
 ## Getting Started
 
@@ -45,12 +46,21 @@ bun install && bun run hooks
 # Start coding in src/
 ```
 
+### Go
+
+```bash
+cp -r go/ my-project && cd my-project
+go mod edit -module my-project
+go run harness.go hooks
+# Start coding
+```
+
 ## What Each Template Includes
 
-- **Single zero-dep task runner** (`harness.py` / `harness.ts`) — no Makefile, no task framework
-- **Linter + formatter** — ruff (Python) / Biome (Bun)
-- **Type checker** — basedpyright (Python) / tsc (Bun)
-- **Test runner** — pytest (Python) / bun test (Bun)
+- **Single zero-dep task runner** (`harness.py` / `harness.ts` / `harness.go`) — no Makefile, no task framework
+- **Linter + formatter** — ruff (Python) / Biome (Bun) / golangci-lint (Go)
+- **Type checker** — basedpyright (Python) / tsc (Bun) / Go compiler (Go)
+- **Test runner** — pytest (Python) / bun test (Bun) / go test (Go)
 - **CLAUDE.md** — tells AI agents which commands to run and when
 
 ## Design Principles
