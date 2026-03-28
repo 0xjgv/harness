@@ -7,19 +7,6 @@ dependencies = []
 
 [project.scripts]
 harness = "harness:main"
-install = "harness:install_main"
-fix = "harness:fix_main"
-format = "harness:format_main"
-lint = "harness:lint_main"
-typecheck = "harness:typecheck_main"
-check = "harness:check_main"
-pre-commit = "harness:pre_commit_main"
-ci = "harness:ci_main"
-test = "harness:test_main"
-test-cov = "harness:test_cov_main"
-hooks = "harness:hooks_main"
-clean = "harness:clean_main"
-
 
 [build-system]
 requires = ["uv_build>=0.10.7,<0.11.0"]
@@ -34,7 +21,7 @@ dev = [
     "basedpyright>=1.38.1",
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
-    "ruff>=0.15.2",
+    "ruff>=0.15.8",
 ]
 
 # ── Ruff (lint + format) ────────────────────────────────────────────

@@ -7,8 +7,8 @@ Python project template with built-in harness: linting, formatting, type-checkin
 ## Setup
 
 ```bash
-uv sync                           # Install dependencies
-uv run hooks                      # Install git hooks
+uv sync                                # Install dependencies
+uv run harness setup-hooks # Install git pre-commit hook
 ```
 
 ## Development
@@ -16,34 +16,34 @@ uv run hooks                      # Install git hooks
 See the [3-script contract](../README.md#the-3-script-contract) for the full rationale.
 
 ```bash
-uv run check                      # Fix + format + typecheck + tests (after editing)
-uv run pre-commit                 # Staged checks + tests (runs via git hook)
-uv run ci                         # Lint + format check + typecheck + tests with coverage
+uv run harness check              # Fix + format + typecheck + tests (after editing)
+uv run harness pre-commit         # Staged checks + tests (runs via git hook)
+uv run harness ci                 # Lint + format check + typecheck + tests with coverage
 ```
 
-All commands minimize output — only errors are shown. Add `--verbose` for full output via the CLI:
+All commands minimize output — only errors are shown. Add `--verbose` for full output:
 
 ```bash
-uv run python harness.py check --verbose
+uv run harness check --verbose
 ```
 
 ### Individual commands
 
 ```bash
-uv run fix                        # Fix lint errors
-uv run format                     # Format code
-uv run lint                       # Lint check (read-only)
-uv run typecheck                  # Type-check with basedpyright
-uv run test                       # Run tests
-uv run test-cov                   # Tests with coverage (80% minimum)
-uv run install                    # Install dependencies
-uv run clean                      # Remove caches
-uv run python harness.py help     # List all commands
+uv run harness fix                # Fix lint errors
+uv run harness format             # Format code
+uv run harness lint               # Lint check (read-only)
+uv run harness typecheck          # Type-check with basedpyright
+uv run harness test               # Run tests
+uv run harness test-cov           # Tests with coverage (80% minimum)
+uv run harness install            # Install dependencies
+uv run harness clean              # Remove caches
+uv run harness help               # List all commands
 ```
 
 ## Project Structure
 
-```
+```bash
 src/          Source code
 tests/        Tests
 harness.py    Development task runner (zero dependencies)
@@ -53,5 +53,5 @@ harness.py    Development task runner (zero dependencies)
 
 1. Copy this directory
 2. Update `name` and `description` in `pyproject.toml`
-3. `uv sync && uv run hooks`
+3. `uv sync && uv run harness setup-hooks`
 4. Start coding in `src/`

@@ -222,7 +222,7 @@ const MODES: Record<string, [() => Promise<void>, string]> = {
   '--test': [cmdTest, 'Run tests'],
   '--pre-commit': [cmdPreCommit, 'Staged checks + tests'],
   '--ci': [cmdCi, 'Lint + typecheck + tests with coverage (CI verification)'],
-  '--hooks': [cmdHooks, 'Install git pre-commit hook'],
+  '--setup-hooks': [cmdHooks, 'Install git pre-commit hook'],
   '--clean': [cmdClean, 'Remove caches and build artifacts'],
 };
 

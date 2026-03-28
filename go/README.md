@@ -18,7 +18,7 @@ Opinionated Go project template with built-in quality guardrails.
 ```bash
 cp -r go/ my-project && cd my-project
 go mod edit -module my-project
-go run harness.go hooks
+go run harness.go setup-hooks
 # Start coding
 ```
 
@@ -40,7 +40,7 @@ go run harness.go hooks
 | `go run harness.go test` | Run tests |
 | `go run harness.go pre-commit` | Staged checks + tests |
 | `go run harness.go ci` | Lint + tests with race detector and coverage |
-| `go run harness.go hooks` | Install git pre-commit hook |
+| `go run harness.go setup-hooks` | Install git pre-commit hook |
 | `go run harness.go clean` | Remove coverage and test cache |
 
 Add `--verbose` to any command to see all output.

@@ -8,7 +8,7 @@ Rust project template with built-in harness: linting, formatting, and testing.
 
 ```bash
 cargo build                         # Build the project
-cargo harness hooks                 # Install git hooks
+cargo harness setup-hooks            # Install git hooks
 ```
 
 ## Development
@@ -34,7 +34,7 @@ cargo harness fix                  # Fix lint errors (clippy --fix) + format
 cargo harness lint                 # Lint + format check (read-only)
 cargo harness test                 # Run tests
 cargo harness test-cov             # Run tests (cargo-llvm-cov for coverage)
-cargo harness hooks                # Install git pre-commit hook
+cargo harness setup-hooks           # Install git pre-commit hook
 cargo harness clean                # Remove build artifacts
 ```
 
@@ -50,5 +50,5 @@ harness.rs    Development task runner (zero dependencies)
 
 1. Copy this directory
 2. Update `name` and `description` in `Cargo.toml`
-3. `cargo build && cargo harness hooks`
+3. `cargo build && cargo harness setup-hooks`
 4. Start coding in `src/`

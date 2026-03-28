@@ -9,7 +9,7 @@
 //!   cargo harness test-cov     # run tests (coverage note)
 //!   cargo harness pre-commit   # staged checks + tests
 //!   cargo harness ci           # CI gate
-//!   cargo harness hooks        # install git pre-commit hook
+//!   cargo harness setup-hooks   # install git pre-commit hook
 //!   cargo harness clean        # remove artifacts
 //!   cargo harness help         # show usage
 //!   cargo harness --verbose    # show all command output
@@ -370,7 +370,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("test-cov", "Run tests (install cargo-llvm-cov for coverage)"),
     ("pre-commit", "Staged checks + tests"),
     ("ci", "Clippy strict + format check + tests"),
-    ("hooks", "Install git pre-commit hook"),
+    ("setup-hooks", "Install git pre-commit hook"),
     ("clean", "Remove target/ and build cache"),
 ];
 
@@ -383,7 +383,7 @@ fn dispatch(command: &str) {
         "test-cov" => cmd_test_cov(),
         "pre-commit" => cmd_pre_commit(),
         "ci" => cmd_ci(),
-        "hooks" => cmd_hooks(),
+        "setup-hooks" => cmd_hooks(),
         "clean" => cmd_clean(),
         _ => {}
     }

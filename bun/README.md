@@ -8,7 +8,7 @@ Bun project template with built-in harness: linting, formatting, type-checking, 
 
 ```bash
 bun install                         # Install dependencies
-bun run hooks                       # Install git hooks
+bun run setup-hooks                 # Install hooks (pre-commit)
 ```
 
 ## Development
@@ -40,7 +40,7 @@ bun harness.ts --help               # Show all flags
 
 ## Project Structure
 
-```
+```bash
 src/          Source code
 tests/        Tests
 harness.ts    Pre-flight checks + development tasks (zero dependencies)
@@ -50,5 +50,5 @@ harness.ts    Pre-flight checks + development tasks (zero dependencies)
 
 1. Copy this directory
 2. Update `name` and `description` in `package.json`
-3. `bun install && bun run hooks`
+3. `bun install && bun run setup-hooks`
 4. Start coding in `src/`

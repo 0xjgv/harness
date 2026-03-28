@@ -10,7 +10,7 @@
     "test": "bun test",
     "pre-commit": "bun harness.ts --pre-commit",
     "ci": "bun harness.ts --ci",
-    "hooks": "bun harness.ts --hooks",
+    "setup-hooks": "bun harness.ts --setup-hooks",
     "clean": "bun harness.ts --clean"
   },
   "devDependencies": {

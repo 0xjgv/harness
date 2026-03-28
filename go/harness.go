@@ -306,14 +306,14 @@ var tasks = map[string]task{
 	"test-cov":   {func() { cmdTestCov() }, "Run tests with race detector and coverage"},
 	"pre-commit": {func() { cmdPreCommit() }, "Staged checks + tests"},
 	"ci":         {func() { cmdCi() }, "Lint + tests with race detector and coverage"},
-	"hooks":      {func() { cmdHooks() }, "Install git pre-commit hook"},
+	"setup-hooks": {func() { cmdHooks() }, "Install git pre-commit hook"},
 	"clean":      {func() { cmdClean() }, "Remove coverage and test cache"},
 }
 
 // Ordered for help display.
 var taskOrder = []string{
 	"check", "fix", "lint", "test", "test-cov",
-	"pre-commit", "ci", "hooks", "clean",
+	"pre-commit", "ci", "setup-hooks", "clean",
 }
 
 func main() {

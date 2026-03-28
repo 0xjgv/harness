@@ -153,7 +153,7 @@ def cmd_hooks() -> None:
     """Install git pre-commit hook."""
     hook = Path(".git/hooks/pre-commit")
     hook.parent.mkdir(parents=True, exist_ok=True)
-    hook.write_text("#!/bin/sh\nuv run pre-commit\n", encoding="utf-8")
+    hook.write_text("#!/bin/sh\nuv run harness pre-commit\n", encoding="utf-8")
     hook.chmod(0o755)
     print("Installed pre-commit hook")
 
@@ -174,57 +174,6 @@ def cmd_clean() -> None:
     run("Ruff clean", ["uv", "run", "ruff", "clean"])
 
 
-# ── Entry points (for [project.scripts]) ─────────────────────────
-
-
-def install_main() -> None:
-    cmd_install()
-
-
-def fix_main() -> None:
-    cmd_fix()
-
-
-def format_main() -> None:
-    cmd_format()
-
-
-def lint_main() -> None:
-    cmd_lint()
-
-
-def typecheck_main() -> None:
-    cmd_typecheck()
-
-
-def check_main() -> None:
-    cmd_check()
-
-
-def pre_commit_main() -> None:
-    cmd_pre_commit()
-
-
-def ci_main() -> None:
-    cmd_ci()
-
-
-def test_main() -> None:
-    cmd_test()
-
-
-def test_cov_main() -> None:
-    cmd_test_cov()
-
-
-def hooks_main() -> None:
-    cmd_hooks()
-
-
-def clean_main() -> None:
-    cmd_clean()
-
-
 # ── CLI dispatch ──────────────────────────────────────────────────
 
 TASKS: dict[str, tuple[Callable[..., None], str]] = {
@@ -238,7 +187,7 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "ci": (cmd_ci, "Lint + format check + typecheck + tests with coverage"),
     "test": (cmd_test, "Run tests with pytest"),
     "test-cov": (cmd_test_cov, "Run tests with coverage"),
-    "hooks": (cmd_hooks, "Install git pre-commit hook"),
+    "setup-hooks": (cmd_hooks, "Install git pre-commit hook"),
     "clean": (cmd_clean, "Remove cache and build artifacts"),
 }
 
@@ -247,7 +196,7 @@ def main() -> None:
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
 
     if not args or args[0] == "help":
-        print("Usage: uv run python harness.py <command> [--verbose]\n")
+        print("Usage: uv run harness <command> [--verbose]\n")
         print("Commands:")
         for name, (_, desc) in TASKS.items():
             print(f"  {name:<14} {desc}")

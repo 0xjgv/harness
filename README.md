@@ -35,7 +35,7 @@ Every template implements exactly 3 scripts:
 
 ```bash
 cp -r python/ my-project && cd my-project
-uv sync && uv run hooks
+uv sync && uv run harness setup-hooks
 # Start coding in src/
 ```
 
@@ -43,7 +43,7 @@ uv sync && uv run hooks
 
 ```bash
 cp -r bun/ my-project && cd my-project
-bun install && bun run hooks
+bun install && bun run setup-hooks
 # Start coding in src/
 ```
 
@@ -55,7 +55,7 @@ brew install golangci-lint  # or: go install github.com/golangci/golangci-lint/c
 
 cp -r go/ my-project && cd my-project
 go mod edit -module my-project
-go run harness.go hooks
+go run harness.go setup-hooks
 # Start coding
 ```
 
@@ -63,7 +63,7 @@ go run harness.go hooks
 
 ```bash
 cp -r rust/ my-project && cd my-project
-cargo build && cargo harness hooks
+cargo build && cargo harness setup-hooks
 # Start coding in src/
 ```
 
