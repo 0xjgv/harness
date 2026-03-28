@@ -21,21 +21,21 @@ bun run pre-commit                 # Staged checks + tests (runs via git hook)
 bun run ci                         # Lint + typecheck + tests with coverage (CI verification)
 ```
 
-All commands minimize output — only errors are shown. Add verbose mode:
+All commands minimize output — only errors are shown. Add `--verbose` for full output:
 
 ```bash
-VERBOSE=1 bun harness.ts
+bun harness.ts check --verbose
 ```
 
 ### Individual commands
 
 ```bash
-bun harness.ts --fix                # Fix lint errors + format code
-bun harness.ts --lint               # Lint + format check (read-only)
-bun harness.ts --typecheck          # Type-check
-bun harness.ts --test               # Run tests
-bun harness.ts --clean              # Remove caches
-bun harness.ts --help               # Show all flags
+bun harness.ts fix                  # Fix lint errors + format code
+bun harness.ts lint                 # Lint + format check (read-only)
+bun harness.ts typecheck            # Type-check
+bun harness.ts test                 # Run tests
+bun harness.ts clean                # Remove caches
+bun harness.ts help                 # Show all commands
 ```
 
 ## Project Structure

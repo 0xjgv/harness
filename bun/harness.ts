@@ -4,11 +4,12 @@
  *
  * Usage:
  *   bun harness.ts                  # full pre-flight (default)
- *   bun harness.ts --pre-commit     # staged checks + tests
- *   bun harness.ts --ci             # CI verification
- *   bun harness.ts --fix            # fix lint errors + format
+ *   bun harness.ts check            # full pre-flight
+ *   bun harness.ts fix              # fix lint errors + format
+ *   bun harness.ts pre-commit       # staged checks + tests
+ *   bun harness.ts ci               # CI verification
  *   bun harness.ts --verbose        # show all output
- *   bun harness.ts --help           # show all flags
+ *   bun harness.ts help             # show all commands
  */
 
 // ── Configuration ───────────────────────────────────────────────────
@@ -25,8 +26,7 @@ const BLUE = '\x1b[34m';
 const DIM = '\x1b[2m';
 const RESET = '\x1b[0m';
 
-const flags = new Set(process.argv.slice(2));
-const VERBOSE = flags.has('--verbose') || process.env.VERBOSE === '1';
+const VERBOSE = process.argv.includes('--verbose') || process.env.VERBOSE === '1';
 
 // ── Runner ──────────────────────────────────────────────────────────
 
@@ -191,7 +191,7 @@ async function cmdHooks(): Promise<void> {
 
   const { mkdirSync, writeFileSync, chmodSync } = await import('node:fs');
   mkdirSync(hookDir, { recursive: true });
-  writeFileSync(hookPath, '#!/bin/sh\nbun harness.ts --pre-commit\n');
+  writeFileSync(hookPath, '#!/bin/sh\nbun harness.ts pre-commit\n');
   chmodSync(hookPath, 0o755);
   console.log('Installed pre-commit hook');
 }
@@ -214,34 +214,40 @@ async function cmdClean(): Promise<void> {
 
 // ── CLI dispatch ────────────────────────────────────────────────────
 
-const MODES: Record<string, [() => Promise<void>, string]> = {
-  '--install': [cmdInstall, 'Install dependencies'],
-  '--fix': [cmdFix, 'Fix lint errors + format code'],
-  '--lint': [cmdLint, 'Lint + format check (read-only)'],
-  '--typecheck': [cmdTypecheck, 'Type-check with tsc'],
-  '--test': [cmdTest, 'Run tests'],
-  '--pre-commit': [cmdPreCommit, 'Staged checks + tests'],
-  '--ci': [cmdCi, 'Lint + typecheck + tests with coverage (CI verification)'],
-  '--setup-hooks': [cmdHooks, 'Install git pre-commit hook'],
-  '--clean': [cmdClean, 'Remove caches and build artifacts'],
+const TASKS: Record<string, [() => Promise<void>, string]> = {
+  install: [cmdInstall, 'Install dependencies'],
+  fix: [cmdFix, 'Fix lint errors + format code'],
+  lint: [cmdLint, 'Lint + format check (read-only)'],
+  typecheck: [cmdTypecheck, 'Type-check with tsc'],
+  test: [cmdTest, 'Run tests'],
+  check: [cmdCheck, 'Full pre-flight: lockfile + fix + typecheck + tests'],
+  'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
+  ci: [cmdCi, 'Lint + typecheck + tests with coverage (CI verification)'],
+  'setup-hooks': [cmdHooks, 'Install git pre-commit hook'],
+  clean: [cmdClean, 'Remove caches and build artifacts'],
 };
 
-if (flags.has('--help')) {
-  console.log('Usage: bun harness.ts [flag] [--verbose]\n');
-  console.log('Flags:');
-  console.log(`  ${'(default)'.padEnd(18)} Full pre-flight: lockfile + fix + typecheck + tests`);
-  for (const [flag, [, desc]] of Object.entries(MODES)) {
-    console.log(`  ${flag.padEnd(18)} ${desc}`);
+const args = process.argv.slice(2).filter((a) => !a.startsWith('-'));
+
+if (args[0] === 'help') {
+  console.log('Usage: bun harness.ts <command> [--verbose]\n');
+  console.log('Commands:');
+  for (const [name, [, desc]] of Object.entries(TASKS)) {
+    console.log(`  ${name.padEnd(16)} ${desc}`);
   }
-  console.log(`  ${'--verbose'.padEnd(18)} Show all command output`);
-  console.log(`  ${'--help'.padEnd(18)} Show this help`);
+  console.log(`  ${'help'.padEnd(16)} Show this help`);
   process.exit(0);
 }
 
-const mode = Object.keys(MODES).find((f) => flags.has(f));
+const taskName = args[0];
 
-if (mode) {
-  await MODES[mode][0]();
+if (taskName && !(taskName in TASKS)) {
+  console.error(`Unknown command: ${taskName}`);
+  process.exit(1);
+}
+
+if (taskName) {
+  await TASKS[taskName][0]();
 } else {
   await cmdCheck();
 }
