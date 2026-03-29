@@ -1,7 +1,10 @@
 """Smoke test — verifies the package is importable."""
 
+import unittest
+
 import src
 
 
-def test_package_importable() -> None:
-    assert src is not None
+class TestSmoke(unittest.TestCase):
+    def test_package_importable(self) -> None:
+        self.assertIsNotNone(src)

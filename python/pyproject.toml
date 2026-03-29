@@ -19,8 +19,7 @@ module-name = "src"
 [dependency-groups]
 dev = [
     "basedpyright>=1.38.1",
-    "pytest>=9.0.2",
-    "pytest-cov>=7.0.0",
+    "coverage>=7.8.0",
     "ruff>=0.15.8",
 ]
 
@@ -49,6 +48,7 @@ select = [
     "ANN",  # type annotations
     "ERA",  # flake8-eradicate (commented-out code)
     "PIE",  # flake8-pie (unnecessary placeholders)
+    "S",    # flake8-bandit (security)
 ]
 ignore = [
     "ANN401",   # dynamically-typed-expressions (Any)
@@ -63,6 +63,11 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"harness.py" = [
+    "S404",     # subprocess module import (intentional — task runner)
+    "S603",     # subprocess call without shell=true check (intentional)
+    "S607",     # partial executable path (intentional — tools on PATH)
+]
 "tests/**/*.py" = [
     "ANN",      # type annotations relaxed in tests
     "ARG",      # unused arguments common in fixtures
@@ -72,6 +77,7 @@ ignore = [
     "PIE810",   # single-starts-ends-with
     "PLR2004",  # magic values fine in tests
     "RUF069",   # float equality comparisons fine in tests
+    "S101",     # assert usage (unittest uses self.assert*, but keep for flexibility)
     "SIM105",   # contextlib.suppress suggestion
     "TCH",      # type-checking imports (fixtures need runtime types)
 ]
@@ -90,12 +96,6 @@ reportUnknownVariableType = false
 reportUnknownMemberType = false
 reportUnknownArgumentType = false
 reportAny = false
-
-# ── Pytest ─────────────────────────────────────────────────────────
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
 
 # ── Coverage ───────────────────────────────────────────────────────
 

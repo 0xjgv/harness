@@ -37,7 +37,7 @@ def run(description: str, cmd: list[str]) -> None:
 
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode == 0:
-        extra = _parse_pytest_summary(result.stdout) if "pytest" in cmd else ""
+        extra = _parse_unittest_summary(result.stderr) if "unittest" in cmd else ""
         print(f"  {GREEN}✓{RESET} {description}{extra}")
     else:
         print(f"  {RED}✗{RESET} {description}")
@@ -49,9 +49,9 @@ def run(description: str, cmd: list[str]) -> None:
         sys.exit(result.returncode)
 
 
-def _parse_pytest_summary(output: str) -> str:
-    """Extract '(N tests, X.Xs)' from pytest output."""
-    m = re.search(r"(\d+) passed.*?in ([\d.]+s)", output)
+def _parse_unittest_summary(output: str) -> str:
+    """Extract '(N tests, X.Xs)' from unittest output."""
+    m = re.search(r"Ran (\d+) tests? in ([\d.]+s)", output)
     return f" ({m.group(1)} tests, {m.group(2)})" if m else ""
 
 
@@ -105,11 +105,22 @@ def cmd_typecheck() -> None:
 
 
 def cmd_test() -> None:
-    run("Run tests", ["uv", "run", "pytest", "-x", "-q"])
+    run("Run tests", ["uv", "run", "python", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"])
 
 
 def cmd_test_cov() -> None:
-    run("Run tests with coverage", ["uv", "run", "pytest", "--cov", "--cov-report=term-missing"])
+    run(
+        "Run tests with coverage",
+        ["uv", "run", "coverage", "run", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"],
+    )
+    run(
+        "Coverage report",
+        ["uv", "run", "coverage", "report", "--show-missing"],
+    )
+
+
+def cmd_audit() -> None:
+    run("Dep audit", ["uv", "run", "--with", "pip-audit", "pip-audit"])
 
 
 # ── Stages ────────────────────────────────────────────────────────
@@ -146,6 +157,7 @@ def cmd_ci() -> None:
     cmd_lint()
     cmd_format_check()
     cmd_typecheck()
+    cmd_audit()
     cmd_test_cov()
 
 
@@ -161,7 +173,7 @@ def cmd_hooks() -> None:
 def cmd_clean() -> None:
     """Remove cache and build artifacts."""
     print("\n=== Cleaning Up ===\n")
-    for name in [".pytest_cache", ".ruff_cache", "build", "dist", "htmlcov"]:
+    for name in [".ruff_cache", "build", "dist", "htmlcov"]:
         p = Path(name)
         if p.is_dir():
             shutil.rmtree(p)
@@ -185,8 +197,9 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "check": (cmd_check, "Fix + format + typecheck + test (full repo)"),
     "pre-commit": (cmd_pre_commit, "Staged checks + tests"),
     "ci": (cmd_ci, "Lint + format check + typecheck + tests with coverage"),
-    "test": (cmd_test, "Run tests with pytest"),
+    "test": (cmd_test, "Run tests with unittest"),
     "test-cov": (cmd_test_cov, "Run tests with coverage"),
+    "audit": (cmd_audit, "Audit dependencies for known vulnerabilities"),
     "setup-hooks": (cmd_hooks, "Install git pre-commit hook"),
     "clean": (cmd_clean, "Remove cache and build artifacts"),
 }
