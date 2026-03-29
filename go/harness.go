@@ -210,6 +210,10 @@ func cmdTestCov() {
 	}, &runOpts{extract: extractCoverageSummary})
 }
 
+func cmdAudit() {
+	run("Dep audit", []string{"go", "run", "golang.org/x/vuln/cmd/govulncheck@v1.1.4", "./..."}, nil)
+}
+
 // ── Stages ──────────────────────────────────────────────────────────
 
 func cmdCheck() {
@@ -260,6 +264,7 @@ func cmdPreCommit() {
 func cmdCi() {
 	fmt.Printf("\n%s[ci]%s\n\n", blue, reset)
 	cmdLint(nil)
+	cmdAudit()
 	cmdTestCov()
 }
 
@@ -304,6 +309,7 @@ var tasks = map[string]task{
 	"lint":       {func() { cmdLint(nil) }, "Lint + format check (read-only)"},
 	"test":       {func() { cmdTest() }, "Run tests"},
 	"test-cov":   {func() { cmdTestCov() }, "Run tests with race detector and coverage"},
+	"audit":      {func() { cmdAudit() }, "Audit dependencies for known vulnerabilities"},
 	"pre-commit": {func() { cmdPreCommit() }, "Staged checks + tests"},
 	"ci":         {func() { cmdCi() }, "Lint + tests with race detector and coverage"},
 	"setup-hooks": {func() { cmdHooks() }, "Install git pre-commit hook"},
@@ -313,7 +319,7 @@ var tasks = map[string]task{
 // Ordered for help display.
 var taskOrder = []string{
 	"check", "fix", "lint", "test", "test-cov",
-	"pre-commit", "ci", "setup-hooks", "clean",
+	"audit", "pre-commit", "ci", "setup-hooks", "clean",
 }
 
 func main() {

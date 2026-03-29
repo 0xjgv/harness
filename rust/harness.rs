@@ -258,6 +258,29 @@ fn cmd_test_cov() {
     );
 }
 
+fn cmd_audit() {
+    cmd_audit_inner(false);
+}
+
+fn cmd_audit_inner(strict: bool) {
+    // cargo-audit requires separate installation
+    let installed = Command::new("cargo")
+        .args(["audit", "--version"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .status()
+        .is_ok_and(|s| s.success());
+
+    if installed {
+        run("Dep audit", &["cargo", "audit"], None);
+    } else if strict {
+        println!("  {RED}\u{2717}{RESET} Dep audit (cargo-audit not installed)");
+        std::process::exit(1);
+    } else {
+        println!("  {DIM}\u{2298} Dep audit skipped (install: cargo install cargo-audit){RESET}");
+    }
+}
+
 // ── Stages ──────────────────────────────────────────────────────────
 
 fn cmd_check() {
@@ -311,6 +334,7 @@ fn cmd_ci() {
     println!("\n{BLUE}[ci]{RESET}\n");
     run("Clippy (strict)", &["cargo", "clippy", "--", "-D", "warnings"], None);
     run("Format check", &["cargo", "fmt", "--check"], None);
+    cmd_audit_inner(true);
     run(
         "Tests",
         &["cargo", "test"],
@@ -368,6 +392,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("lint", "Lint + format check (read-only)"),
     ("test", "Run tests"),
     ("test-cov", "Run tests (install cargo-llvm-cov for coverage)"),
+    ("audit", "Audit dependencies for known vulnerabilities"),
     ("pre-commit", "Staged checks + tests"),
     ("ci", "Clippy strict + format check + tests"),
     ("setup-hooks", "Install git pre-commit hook"),
@@ -381,6 +406,7 @@ fn dispatch(command: &str) {
         "lint" => cmd_lint(),
         "test" => cmd_test(),
         "test-cov" => cmd_test_cov(),
+        "audit" => cmd_audit(),
         "pre-commit" => cmd_pre_commit(),
         "ci" => cmd_ci(),
         "setup-hooks" => cmd_hooks(),

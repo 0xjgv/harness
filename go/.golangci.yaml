@@ -10,6 +10,7 @@ linters:
     - goconst
     - gocritic
     - gocyclo
+    - gosec
     - nakedret
     - revive
     - unconvert

@@ -14,11 +14,11 @@ Every template implements exactly 3 scripts:
 |---|---|---|---|
 | `check` | After edits | Fix, format, typecheck, test | Yes |
 | `pre-commit` | Git hook | Staged files only — fix, format, typecheck, test if source changed | Yes |
-| `ci` | CI pipeline | Read-only lint, typecheck, tests with coverage | No |
+| `ci` | CI pipeline | Read-only lint, typecheck, dep audit, tests with coverage | No |
 
 **`check`** is the one you run constantly. It auto-fixes what it can so you stay in flow.
 **`pre-commit`** runs the same checks scoped to staged files, installed as a git hook.
-**`ci`** is the read-only gate — no fixes, just verification.
+**`ci`** is the read-only gate — no fixes, just verification. Includes dependency auditing.
 
 ## Available Templates
 
@@ -73,6 +73,8 @@ cargo build && cargo harness setup-hooks
 - **Linter + formatter** — ruff (Python) / Biome (Bun) / golangci-lint (Go) / clippy + rustfmt (Rust)
 - **Type checker** — basedpyright (Python) / tsc (Bun) / Go compiler (Go) / Rust compiler (Rust)
 - **Test runner** — pytest (Python) / bun test (Bun) / go test (Go) / cargo test (Rust)
+- **Security scanning** — bandit rules via ruff (Python) / gosec via golangci-lint (Go) / clippy pedantic + `unsafe_code = "forbid"` (Rust)
+- **Dependency auditing** — pip-audit (Python) / bun audit (Bun) / govulncheck (Go) / cargo-audit (Rust) — runs in `ci`
 - **CLAUDE.md** — tells AI agents which commands to run and when
 
 ## Design Principles

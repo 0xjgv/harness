@@ -20,6 +20,8 @@ Every template must follow the same conventions. Use an existing template (e.g. 
 - [ ] Include a **zero-dependency harness runner** (`harness.*`) using only stdlib/runtime APIs
 - [ ] Include a **`CLAUDE.md`** with agent instructions for the template
 - [ ] Include a **`README.md`** with getting-started instructions
+- [ ] Include **security-focused lint rules** enabled in the linter config
+- [ ] Include a **dependency audit** command (`audit`) wired into `ci`
 - [ ] Include at least one **smoke test**
 - [ ] Add the template to the root `README.md` tables (Available Templates, Getting Started)
 

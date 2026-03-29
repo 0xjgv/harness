@@ -126,6 +126,10 @@ async function cmdTest(): Promise<void> {
   await run('Tests', ['bun', 'test'], { extract: extractTestSummary });
 }
 
+async function cmdAudit(): Promise<void> {
+  await run('Dep audit', ['bun', 'audit']);
+}
+
 // ── Stages ──────────────────────────────────────────────────────────
 
 async function cmdCheck(): Promise<void> {
@@ -182,6 +186,7 @@ async function cmdCi(): Promise<void> {
   console.log(`\n${BLUE}[ci]${RESET}\n`);
   await cmdLint();
   await cmdTypecheck();
+  await cmdAudit();
   await run('Tests', ['bun', 'test', '--coverage'], { extract: extractTestSummary });
 }
 
@@ -220,6 +225,7 @@ const TASKS: Record<string, [() => Promise<void>, string]> = {
   lint: [cmdLint, 'Lint + format check (read-only)'],
   typecheck: [cmdTypecheck, 'Type-check with tsc'],
   test: [cmdTest, 'Run tests'],
+  audit: [cmdAudit, 'Audit dependencies for known vulnerabilities'],
   check: [cmdCheck, 'Full pre-flight: lockfile + fix + typecheck + tests'],
   'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
   ci: [cmdCi, 'Lint + typecheck + tests with coverage (CI verification)'],
