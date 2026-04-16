@@ -16,7 +16,7 @@ Every template implements exactly 3 scripts:
 | `pre-commit` | Git hook | Staged files only — fix, format, typecheck, test if source changed | Yes |
 | `ci` | CI pipeline | Read-only lint, typecheck, dep audit, tests with coverage | No |
 
-**`check`** is the one you run constantly. It auto-fixes what it can so you stay in flow.
+**`check`** is the one you run constantly. It auto-fixes what it can so you stay in flow. It also reports suppression comments (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`, etc.) as a report-only signal — visibility, never exit-code change.
 **`pre-commit`** runs the same checks scoped to staged files, installed as a git hook.
 **`ci`** is the read-only gate — no fixes, just verification. Includes dependency auditing.
 

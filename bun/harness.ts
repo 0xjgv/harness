@@ -83,6 +83,101 @@ function extractTestSummary(output: string): string | undefined {
   }
 }
 
+// ── Suppressions ────────────────────────────────────────────────────
+
+export interface SuppressionMatch {
+  kind: string;
+  rules: string[];
+}
+
+const TS_DIRECTIVE_PATTERNS: { kind: string; pattern: RegExp }[] = [
+  { kind: 'ts-ignore', pattern: /\/\/\s*@ts-ignore\b/ },
+  { kind: 'ts-expect-error', pattern: /\/\/\s*@ts-expect-error\b/ },
+  { kind: 'ts-nocheck', pattern: /\/\/\s*@ts-nocheck\b/ },
+];
+const ESLINT_PATTERN =
+  /(?:\/\/|\/\*)\s*eslint-disable(?:-line|-next-line)?(?::\s*([^*\n]+?))?(?:\s*\*\/|\s*$)/;
+const BIOME_PATTERN = /\/\/\s*biome-ignore\s+([a-zA-Z0-9_/-]+)/;
+
+export function parseLineForSuppressions(line: string): SuppressionMatch[] {
+  const out: SuppressionMatch[] = [];
+  for (const d of TS_DIRECTIVE_PATTERNS) {
+    if (d.pattern.test(line)) out.push({ kind: d.kind, rules: [] });
+  }
+  const em = ESLINT_PATTERN.exec(line);
+  if (em) {
+    const rules = em[1]
+      ? em[1]
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : [];
+    out.push({ kind: 'eslint-disable', rules });
+  }
+  const bm = BIOME_PATTERN.exec(line);
+  if (bm) {
+    out.push({ kind: 'biome-ignore', rules: [bm[1]] });
+  }
+  return out;
+}
+
+export async function scanSuppressions(roots?: string[]): Promise<Record<string, string[][]>> {
+  const { readdir, readFile } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const actualRoots = roots ?? [SRC_DIR, TEST_DIR].map((d) => join(ROOT, d));
+  const results: Record<string, string[][]> = {};
+
+  async function walk(dir: string): Promise<void> {
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => null);
+    if (!entries) return;
+    for (const e of entries) {
+      const full = join(dir, e.name);
+      if (e.isDirectory()) {
+        await walk(full);
+      } else if (e.isFile() && e.name.endsWith('.ts')) {
+        const text = await readFile(full, 'utf8').catch(() => null);
+        if (text == null) continue;
+        for (const line of text.split('\n')) {
+          for (const m of parseLineForSuppressions(line)) {
+            const bucket = results[m.kind] ?? [];
+            bucket.push(m.rules);
+            results[m.kind] = bucket;
+          }
+        }
+      }
+    }
+  }
+
+  for (const dir of actualRoots) {
+    await walk(dir);
+  }
+  return results;
+}
+
+async function printSuppressionsReport(): Promise<void> {
+  const results = await scanSuppressions();
+  const total = Object.values(results).reduce((sum, arr) => sum + arr.length, 0);
+  console.log('\n=== Suppressions ===\n');
+  console.log(`Suppressions: ${total} total`);
+  if (total === 0) return;
+  for (const kind of Object.keys(results).sort()) {
+    const entries = results[kind];
+    console.log(`  ${kind}: ${entries.length}`);
+    const ruleCounts: Record<string, number> = {};
+    for (const rules of entries) {
+      for (const r of rules) {
+        ruleCounts[r] = (ruleCounts[r] ?? 0) + 1;
+      }
+    }
+    const sorted = Object.entries(ruleCounts).sort(
+      (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+    );
+    for (const [rule, count] of sorted.slice(0, 10)) {
+      console.log(`    ${rule}: ${count}`);
+    }
+  }
+}
+
 // ── Git helpers ─────────────────────────────────────────────────────
 
 async function stagedTsFiles(): Promise<string[]> {
@@ -96,6 +191,23 @@ async function stagedTsFiles(): Promise<string[]> {
   return stdout
     .trim()
     .split('\n')
+    .filter(
+      (f) => f.endsWith('.ts') && (f.startsWith(`${SRC_DIR}/`) || f.startsWith(`${TEST_DIR}/`)),
+    );
+}
+
+async function dirtySourceFiles(): Promise<string[]> {
+  const proc = Bun.spawn(['git', 'status', '--porcelain'], {
+    cwd: ROOT,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const stdout = await new Response(proc.stdout).text();
+  await proc.exited;
+  return stdout
+    .trim()
+    .split('\n')
+    .map((line) => line.slice(3))
     .filter(
       (f) => f.endsWith('.ts') && (f.startsWith(`${SRC_DIR}/`) || f.startsWith(`${TEST_DIR}/`)),
     );
@@ -130,6 +242,11 @@ async function cmdAudit(): Promise<void> {
   await run('Dep audit', ['bun', 'audit']);
 }
 
+async function cmdPostEdit(): Promise<void> {
+  if ((await dirtySourceFiles()).length === 0) return;
+  await run('Fix & format', ['bunx', 'biome', 'check', '--write', '.'], { noExit: true });
+}
+
 // ── Stages ──────────────────────────────────────────────────────────
 
 async function cmdCheck(): Promise<void> {
@@ -150,6 +267,8 @@ async function cmdCheck(): Promise<void> {
     }),
   );
   results.push(await run('Tests', ['bun', 'test'], { extract: extractTestSummary, noExit: true }));
+
+  await printSuppressionsReport();
 
   const elapsed = ((performance.now() - start) / 1000).toFixed(1);
   const passed = results.filter((r) => r.ok).length;
@@ -230,30 +349,33 @@ const TASKS: Record<string, [() => Promise<void>, string]> = {
   'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
   ci: [cmdCi, 'Lint + typecheck + tests with coverage (CI verification)'],
   'setup-hooks': [cmdHooks, 'Install git pre-commit hook'],
+  'post-edit': [cmdPostEdit, 'Format if source files changed (Claude Code hook)'],
   clean: [cmdClean, 'Remove caches and build artifacts'],
 };
 
-const args = process.argv.slice(2).filter((a) => !a.startsWith('-'));
+if (import.meta.main) {
+  const args = process.argv.slice(2).filter((a) => !a.startsWith('-'));
 
-if (args[0] === 'help') {
-  console.log('Usage: bun harness.ts <command> [--verbose]\n');
-  console.log('Commands:');
-  for (const [name, [, desc]] of Object.entries(TASKS)) {
-    console.log(`  ${name.padEnd(16)} ${desc}`);
+  if (args[0] === 'help') {
+    console.log('Usage: bun harness.ts <command> [--verbose]\n');
+    console.log('Commands:');
+    for (const [name, [, desc]] of Object.entries(TASKS)) {
+      console.log(`  ${name.padEnd(16)} ${desc}`);
+    }
+    console.log(`  ${'help'.padEnd(16)} Show this help`);
+    process.exit(0);
   }
-  console.log(`  ${'help'.padEnd(16)} Show this help`);
-  process.exit(0);
-}
 
-const taskName = args[0];
+  const taskName = args[0];
 
-if (taskName && !(taskName in TASKS)) {
-  console.error(`Unknown command: ${taskName}`);
-  process.exit(1);
-}
+  if (taskName && !(taskName in TASKS)) {
+    console.error(`Unknown command: ${taskName}`);
+    process.exit(1);
+  }
 
-if (taskName) {
-  await TASKS[taskName][0]();
-} else {
-  await cmdCheck();
+  if (taskName) {
+    await TASKS[taskName][0]();
+  } else {
+    await cmdCheck();
+  }
 }

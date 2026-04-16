@@ -14,6 +14,7 @@
 //!   cargo harness help         # show usage
 //!   cargo harness --verbose    # show all command output
 
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -174,6 +175,90 @@ fn extract_after<'a>(s: &'a str, marker: &str) -> Option<&'a str> {
     Some(&s[idx..])
 }
 
+// ── Suppressions ────────────────────────────────────────────────────
+
+const SUPPRESSION_PREFIXES: &[(&str, &str)] =
+    &[("allow", "#[allow("), ("allow_crate", "#![allow(")];
+
+type SuppressionCounts = BTreeMap<String, Vec<Vec<String>>>;
+
+fn parse_line_for_suppressions(line: &str) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    for (kind, prefix) in SUPPRESSION_PREFIXES {
+        let mut rest = line;
+        loop {
+            let Some(idx) = rest.find(prefix) else { break };
+            let after = &rest[idx + prefix.len()..];
+            let Some(end) = after.find(')') else { break };
+            let rules: Vec<String> = after[..end]
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            out.push(((*kind).to_string(), rules));
+            rest = &after[end + 1..];
+        }
+    }
+    out
+}
+
+fn scan_suppressions(roots: &[PathBuf]) -> SuppressionCounts {
+    let mut results: SuppressionCounts = BTreeMap::new();
+    for root_path in roots {
+        let mut stack = vec![root_path.clone()];
+        while let Some(p) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&p) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let Ok(text) = fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    for line in text.lines() {
+                        for (kind, rules) in parse_line_for_suppressions(line) {
+                            results.entry(kind).or_default().push(rules);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    results
+}
+
+fn default_suppression_roots() -> Vec<PathBuf> {
+    vec![root().join("src"), root().join("tests")]
+}
+
+fn print_suppressions_report() {
+    let results = scan_suppressions(&default_suppression_roots());
+    let total: usize = results.values().map(Vec::len).sum();
+    println!("\n=== Suppressions ===\n");
+    println!("Suppressions: {total} total");
+    if total == 0 {
+        return;
+    }
+    for (kind, entries) in &results {
+        println!("  {}: {}", kind, entries.len());
+        let mut rule_counts: HashMap<String, u32> = HashMap::new();
+        for rules in entries {
+            for r in rules {
+                *rule_counts.entry(r.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut sorted: Vec<(String, u32)> = rule_counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (rule, count) in sorted.into_iter().take(10) {
+            println!("    {rule}: {count}");
+        }
+    }
+}
+
 // ── Git helpers ─────────────────────────────────────────────────────
 
 fn staged_rs_files() -> Vec<String> {
@@ -225,6 +310,34 @@ fn has_non_test_files(files: &[String]) -> bool {
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("test") || n.ends_with("_test.rs"))
     })
+}
+
+fn dirty_rs_files() -> Vec<String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(root())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            if line.len() < 4 {
+                return None;
+            }
+            let f = &line[3..];
+            if Path::new(f).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rs")) {
+                Some(f.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 // ── Commands ────────────────────────────────────────────────────────
@@ -281,6 +394,13 @@ fn cmd_audit_inner(strict: bool) {
     }
 }
 
+fn cmd_post_edit() {
+    if dirty_rs_files().is_empty() {
+        return;
+    }
+    run("Format", &["cargo", "fmt"], Some(&RunOpts { no_exit: true, ..RunOpts::default() }));
+}
+
 // ── Stages ──────────────────────────────────────────────────────────
 
 fn cmd_check() {
@@ -300,6 +420,8 @@ fn cmd_check() {
             Some(&RunOpts { extract: Some(extract_test_summary), no_exit: true }),
         ),
     ];
+
+    print_suppressions_report();
 
     let elapsed = start.elapsed().as_secs_f64();
     let passed = results.iter().filter(|r| r.ok).count();
@@ -396,6 +518,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("pre-commit", "Staged checks + tests"),
     ("ci", "Clippy strict + format check + tests"),
     ("setup-hooks", "Install git pre-commit hook"),
+    ("post-edit", "Format if source files changed (Claude Code hook)"),
     ("clean", "Remove target/ and build cache"),
 ];
 
@@ -410,6 +533,7 @@ fn dispatch(command: &str) {
         "pre-commit" => cmd_pre_commit(),
         "ci" => cmd_ci(),
         "setup-hooks" => cmd_hooks(),
+        "post-edit" => cmd_post_edit(),
         "clean" => cmd_clean(),
         _ => {}
     }
@@ -449,4 +573,73 @@ fn main() -> ExitCode {
 
     eprintln!("Unknown command: {command}");
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_code_no_match() {
+        assert!(parse_line_for_suppressions("let x = 1;").is_empty());
+    }
+
+    #[test]
+    fn single_allow_with_one_rule() {
+        let result = parse_line_for_suppressions("#[allow(dead_code)]");
+        assert_eq!(result, vec![("allow".to_string(), vec!["dead_code".to_string()])]);
+    }
+
+    #[test]
+    fn allow_with_multiple_rules_and_namespaces() {
+        let result = parse_line_for_suppressions("#[allow(unused, clippy::bool_to_int_with_if)]");
+        assert_eq!(
+            result,
+            vec![(
+                "allow".to_string(),
+                vec!["unused".to_string(), "clippy::bool_to_int_with_if".to_string()]
+            )],
+        );
+    }
+
+    #[test]
+    fn multiple_allows_on_one_line() {
+        let result = parse_line_for_suppressions("#[allow(a)] fn f() {} #[allow(b)]");
+        assert_eq!(
+            result,
+            vec![
+                ("allow".to_string(), vec!["a".to_string()]),
+                ("allow".to_string(), vec!["b".to_string()]),
+            ],
+        );
+    }
+
+    #[test]
+    fn crate_level_allow() {
+        let result = parse_line_for_suppressions("#![allow(dead_code)]");
+        assert!(
+            result.iter().any(|(k, r)| k == "allow_crate" && r == &vec!["dead_code".to_string()])
+        );
+    }
+
+    #[test]
+    fn scan_fixture_dir() {
+        let tmp = std::env::temp_dir().join(format!("rust-suppr-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("a.rs");
+        let mut f = fs::File::create(&file).unwrap();
+        writeln!(f, "#[allow(dead_code)]").unwrap();
+        writeln!(f, "fn f() {{}}").unwrap();
+        writeln!(f, "#![allow(unused_imports)]").unwrap();
+        drop(f);
+        fs::write(tmp.join("skip.txt"), "#[allow(ignored)]").unwrap();
+
+        let results = scan_suppressions(&[tmp.clone()]);
+
+        assert_eq!(results.get("allow"), Some(&vec![vec!["dead_code".to_string()]]));
+        assert_eq!(results.get("allow_crate"), Some(&vec![vec!["unused_imports".to_string()]]));
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
 }

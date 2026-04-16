@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"harness/suppressions"
 )
 
 // ── Configuration ───────────────────────────────────────────────────
@@ -148,7 +150,7 @@ func stagedGoFiles() []string {
 	}
 
 	var files []string
-	for _, f := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for f := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		if strings.HasSuffix(f, ".go") && f != "" {
 			files = append(files, f)
 		}
@@ -183,6 +185,27 @@ func hasNonTestFiles(files []string) bool {
 	return false
 }
 
+func dirtyGoFiles() []string {
+	c := exec.Command("git", "status", "--porcelain")
+	c.Dir = root
+	out, err := c.Output()
+	if err != nil {
+		return nil
+	}
+
+	var files []string
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		f := line[3:]
+		if strings.HasSuffix(f, ".go") {
+			files = append(files, f)
+		}
+	}
+	return files
+}
+
 // ── Commands ────────────────────────────────────────────────────────
 
 func cmdFix(pkgs []string) {
@@ -214,6 +237,13 @@ func cmdAudit() {
 	run("Dep audit", []string{"go", "run", "golang.org/x/vuln/cmd/govulncheck@v1.1.4", "./..."}, nil)
 }
 
+func cmdPostEdit() {
+	if len(dirtyGoFiles()) == 0 {
+		return
+	}
+	run("Fix & format", []string{"golangci-lint", "run", "--fix", "./..."}, &runOpts{noExit: true})
+}
+
 // ── Stages ──────────────────────────────────────────────────────────
 
 func cmdCheck() {
@@ -224,6 +254,8 @@ func cmdCheck() {
 		run("Fix & format", []string{"golangci-lint", "run", "--fix", "./..."}, &runOpts{noExit: true}),
 		run("Tests", []string{"go", "test", "./..."}, &runOpts{extract: extractTestSummary, noExit: true}),
 	}
+
+	suppressions.PrintReport(suppressions.Scan(root))
 
 	elapsed := time.Since(start).Seconds()
 	passed := 0
@@ -313,13 +345,14 @@ var tasks = map[string]task{
 	"pre-commit": {func() { cmdPreCommit() }, "Staged checks + tests"},
 	"ci":         {func() { cmdCi() }, "Lint + tests with race detector and coverage"},
 	"setup-hooks": {func() { cmdHooks() }, "Install git pre-commit hook"},
+	"post-edit":  {func() { cmdPostEdit() }, "Format if source files changed (Claude Code hook)"},
 	"clean":      {func() { cmdClean() }, "Remove coverage and test cache"},
 }
 
 // Ordered for help display.
 var taskOrder = []string{
 	"check", "fix", "lint", "test", "test-cov",
-	"audit", "pre-commit", "ci", "setup-hooks", "clean",
+	"audit", "pre-commit", "ci", "post-edit", "setup-hooks", "clean",
 }
 
 func main() {
