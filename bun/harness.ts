@@ -196,7 +196,7 @@ async function stagedTsFiles(): Promise<string[]> {
     );
 }
 
-async function dirtySourceFiles(): Promise<string[]> {
+async function changedSourceFiles(): Promise<string[]> {
   const proc = Bun.spawn(['git', 'status', '--porcelain'], {
     cwd: ROOT,
     stdout: 'pipe',
@@ -243,7 +243,7 @@ async function cmdAudit(): Promise<void> {
 }
 
 async function cmdPostEdit(): Promise<void> {
-  if ((await dirtySourceFiles()).length === 0) return;
+  if ((await changedSourceFiles()).length === 0) return;
   await run('Fix & format', ['bunx', 'biome', 'check', '--write', '.'], { noExit: true });
 }
 

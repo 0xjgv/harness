@@ -312,7 +312,7 @@ fn has_non_test_files(files: &[String]) -> bool {
     })
 }
 
-fn dirty_rs_files() -> Vec<String> {
+fn changed_rs_files() -> Vec<String> {
     let output = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(root())
@@ -395,7 +395,7 @@ fn cmd_audit_inner(strict: bool) {
 }
 
 fn cmd_post_edit() {
-    if dirty_rs_files().is_empty() {
+    if changed_rs_files().is_empty() {
         return;
     }
     run("Format", &["cargo", "fmt"], Some(&RunOpts { no_exit: true, ..RunOpts::default() }));

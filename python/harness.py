@@ -138,7 +138,7 @@ def _staged_py_files() -> list[str]:
     ]
 
 
-def _dirty_py_files() -> list[str]:
+def _changed_py_files() -> list[str]:
     """Return .py files with uncommitted changes under src/ and tests/."""
     result = subprocess.run(
         ["git", "status", "--porcelain"],
@@ -207,7 +207,7 @@ def cmd_audit() -> None:
 
 def cmd_post_edit() -> None:
     """Format if source files have uncommitted changes (Claude Code hook)."""
-    if not _dirty_py_files():
+    if not _changed_py_files():
         return
     run("Fix lint errors", ["uv", "run", "ruff", "check", "--fix", "."], no_exit=True)
     run("Format code", ["uv", "run", "ruff", "format", "."], no_exit=True)

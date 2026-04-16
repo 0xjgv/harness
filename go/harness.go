@@ -185,7 +185,7 @@ func hasNonTestFiles(files []string) bool {
 	return false
 }
 
-func dirtyGoFiles() []string {
+func changedGoFiles() []string {
 	c := exec.Command("git", "status", "--porcelain")
 	c.Dir = root
 	out, err := c.Output()
@@ -238,7 +238,7 @@ func cmdAudit() {
 }
 
 func cmdPostEdit() {
-	if len(dirtyGoFiles()) == 0 {
+	if len(changedGoFiles()) == 0 {
 		return
 	}
 	run("Fix & format", []string{"golangci-lint", "run", "--fix", "./..."}, &runOpts{noExit: true})
