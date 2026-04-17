@@ -39,10 +39,10 @@ Each template has its own harness. From inside a template directory, run the `ch
 
 ```bash
 # Python
-cd python && uv run harness.py check
+cd python && uv run harness check
 
 # Bun
-cd bun && bun run harness.ts check
+cd bun && bun harness.ts check
 
 # Go
 cd go && go run harness.go check

@@ -35,7 +35,6 @@ bun harness.ts lint                 # Lint + format check (read-only)
 bun harness.ts typecheck            # Type-check
 bun harness.ts test                 # Run tests
 bun harness.ts clean                # Remove caches
-bun harness.ts help                 # Show all commands
 ```
 
 ## Project Structure

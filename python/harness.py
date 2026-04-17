@@ -158,11 +158,6 @@ def _changed_py_files() -> list[str]:
 # ── Commands ──────────────────────────────────────────────────────
 
 
-def cmd_install() -> None:
-    print("\n=== Installing Dependencies ===\n")
-    run("Sync dependencies", ["uv", "sync"])
-
-
 def cmd_fix(files: list[str] | None = None) -> None:
     target = files or ["."]
     run("Fix lint errors", ["uv", "run", "ruff", "check", "--fix", *target])
@@ -282,7 +277,6 @@ def cmd_clean() -> None:
 # ── CLI dispatch ──────────────────────────────────────────────────
 
 TASKS: dict[str, tuple[Callable[..., None], str]] = {
-    "install": (cmd_install, "Install dependencies with uv"),
     "fix": (cmd_fix, "Fix lint errors with ruff"),
     "format": (cmd_format, "Format code with ruff"),
     "lint": (cmd_lint, "Lint code with ruff (read-only)"),
@@ -291,7 +285,6 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "pre-commit": (cmd_pre_commit, "Staged checks + tests"),
     "ci": (cmd_ci, "Lint + format check + typecheck + tests with coverage"),
     "test": (cmd_test, "Run tests with unittest"),
-    "test-cov": (cmd_test_cov, "Run tests with coverage"),
     "audit": (cmd_audit, "Audit dependencies for known vulnerabilities"),
     "setup-hooks": (cmd_hooks, "Install git pre-commit hook"),
     "post-edit": (cmd_post_edit, "Format if source files changed (Claude Code hook)"),
@@ -302,12 +295,9 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
 def main() -> None:
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
 
-    if not args or args[0] == "help":
-        print("Usage: uv run harness <command> [--verbose]\n")
-        print("Commands:")
-        for name, (_, desc) in TASKS.items():
-            print(f"  {name:<14} {desc}")
-        sys.exit(0)
+    if not args:
+        cmd_check()
+        return
 
     task_name = args[0]
     if task_name not in TASKS:

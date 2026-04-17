@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,10 +40,6 @@ func init() {
 			verbose = true
 		}
 	}
-	if os.Getenv("VERBOSE") == "1" {
-		verbose = true
-	}
-	// go run sets the working directory correctly, but be explicit.
 	_ = os.Chdir(root)
 }
 
@@ -123,9 +120,15 @@ func extractTestSummary(output string) string {
 	if len(matches) == 0 {
 		return ""
 	}
-	pkgs := len(matches)
-	// Sum durations
-	return fmt.Sprintf("%d pkg, %ss", pkgs, matches[len(matches)-1][1])
+	total := 0.0
+	for _, m := range matches {
+		d, err := strconv.ParseFloat(m[1], 64)
+		if err != nil {
+			continue
+		}
+		total += d
+	}
+	return fmt.Sprintf("%d pkg, %.2fs", len(matches), total)
 }
 
 var coverageRe = regexp.MustCompile(`coverage:\s+([\d.]+)%`)
@@ -331,28 +334,22 @@ func cmdClean() {
 // ── CLI dispatch ────────────────────────────────────────────────────
 
 type task struct {
+	name string
 	fn   func()
 	desc string
 }
 
-var tasks = map[string]task{
-	"check":      {func() { cmdCheck() }, "Full pre-flight: fix + format + lint + test"},
-	"fix":        {func() { cmdFix(nil) }, "Fix lint errors + format code"},
-	"lint":       {func() { cmdLint(nil) }, "Lint + format check (read-only)"},
-	"test":       {func() { cmdTest() }, "Run tests"},
-	"test-cov":   {func() { cmdTestCov() }, "Run tests with race detector and coverage"},
-	"audit":      {func() { cmdAudit() }, "Audit dependencies for known vulnerabilities"},
-	"pre-commit": {func() { cmdPreCommit() }, "Staged checks + tests"},
-	"ci":         {func() { cmdCi() }, "Lint + tests with race detector and coverage"},
-	"setup-hooks": {func() { cmdHooks() }, "Install git pre-commit hook"},
-	"post-edit":  {func() { cmdPostEdit() }, "Format if source files changed (Claude Code hook)"},
-	"clean":      {func() { cmdClean() }, "Remove coverage and test cache"},
-}
-
-// Ordered for help display.
-var taskOrder = []string{
-	"check", "fix", "lint", "test", "test-cov",
-	"audit", "pre-commit", "ci", "post-edit", "setup-hooks", "clean",
+var tasks = []task{
+	{"check", cmdCheck, "Full pre-flight: fix + format + lint + test"},
+	{"fix", func() { cmdFix(nil) }, "Fix lint errors + format code"},
+	{"lint", func() { cmdLint(nil) }, "Lint + format check (read-only)"},
+	{"test", cmdTest, "Run tests"},
+	{"audit", cmdAudit, "Audit dependencies for known vulnerabilities"},
+	{"pre-commit", cmdPreCommit, "Staged checks + tests"},
+	{"ci", cmdCi, "Lint + tests with race detector and coverage"},
+	{"setup-hooks", cmdHooks, "Install git pre-commit hook"},
+	{"post-edit", cmdPostEdit, "Format if source files changed (Claude Code hook)"},
+	{"clean", cmdClean, "Remove coverage and test cache"},
 }
 
 func main() {
@@ -363,26 +360,14 @@ func main() {
 		return
 	}
 
-	if args[0] == "help" || args[0] == "--help" {
-		fmt.Println("Usage: go run harness.go <command> [--verbose]")
-		fmt.Println()
-		fmt.Println("Commands:")
-		fmt.Printf("  %-14s %s\n", "(default)", "Full pre-flight: fix + format + lint + test")
-		for _, name := range taskOrder {
-			t := tasks[name]
-			fmt.Printf("  %-14s %s\n", name, t.desc)
+	for _, t := range tasks {
+		if t.name == args[0] {
+			t.fn()
+			return
 		}
-		fmt.Printf("  %-14s %s\n", "--verbose", "Show all command output")
-		fmt.Printf("  %-14s %s\n", "help", "Show this help")
-		os.Exit(0)
 	}
-
-	t, ok := tasks[args[0]]
-	if !ok {
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", args[0])
-		os.Exit(1)
-	}
-	t.fn()
+	fmt.Fprintf(os.Stderr, "Unknown command: %s\n", args[0])
+	os.Exit(1)
 }
 
 func filterFlags(args []string) []string {
