@@ -67,7 +67,7 @@ func Scan(roots ...string) map[string][][]string {
 			if !strings.HasSuffix(path, ".go") {
 				return nil
 			}
-			data, err := os.ReadFile(path)
+			data, err := os.ReadFile(path) //nolint:gosec // path is produced by filepath.WalkDir from caller-supplied roots; never user input
 			if err != nil {
 				return nil
 			}

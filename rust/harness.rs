@@ -12,8 +12,9 @@ use std::time::Instant;
 
 // ── Configuration ───────────────────────────────────────────────────
 
-fn root() -> PathBuf {
-    env::current_dir().expect("cannot determine working directory")
+fn root() -> &'static Path {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| env::current_dir().expect("cannot determine working directory"))
 }
 
 fn is_verbose() -> bool {
@@ -250,7 +251,7 @@ fn print_suppressions_report() {
 fn staged_rs_files() -> Vec<String> {
     let output = Command::new("git")
         .args(["diff", "--cached", "--name-only", "--diff-filter=d"])
-        .current_dir(&root())
+        .current_dir(root())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output();
@@ -276,7 +277,7 @@ fn has_non_test_files(files: &[String]) -> bool {
 fn changed_rs_files() -> Vec<String> {
     let output = Command::new("git")
         .args(["status", "--porcelain"])
-        .current_dir(&root())
+        .current_dir(root())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output();
@@ -446,8 +447,7 @@ fn cmd_clean() {
     println!("\n{BLUE}[clean]{RESET}\n");
     run("Clean build artifacts", &["cargo", "clean"], None);
 
-    // Remove coverage artifacts not under target/
-    for name in ["*.profraw", "*.profdata", "lcov.info", "tarpaulin-report.html"] {
+    for name in ["lcov.info", "tarpaulin-report.html"] {
         let path = root().join(name);
         if path.exists() {
             let _ = fs::remove_file(&path);

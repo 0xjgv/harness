@@ -39,7 +39,6 @@ func init() {
 			verbose = true
 		}
 	}
-	// go run sets the working directory correctly, but be explicit.
 	_ = os.Chdir(root)
 }
 
@@ -121,7 +120,6 @@ func extractTestSummary(output string) string {
 		return ""
 	}
 	pkgs := len(matches)
-	// Sum durations
 	return fmt.Sprintf("%d pkg, %ss", pkgs, matches[len(matches)-1][1])
 }
 
@@ -334,16 +332,16 @@ type task struct {
 }
 
 var tasks = []task{
-	{"check", func() { cmdCheck() }, "Full pre-flight: fix + format + lint + test"},
+	{"check", cmdCheck, "Full pre-flight: fix + format + lint + test"},
 	{"fix", func() { cmdFix(nil) }, "Fix lint errors + format code"},
 	{"lint", func() { cmdLint(nil) }, "Lint + format check (read-only)"},
-	{"test", func() { cmdTest() }, "Run tests"},
-	{"audit", func() { cmdAudit() }, "Audit dependencies for known vulnerabilities"},
-	{"pre-commit", func() { cmdPreCommit() }, "Staged checks + tests"},
-	{"ci", func() { cmdCi() }, "Lint + tests with race detector and coverage"},
-	{"setup-hooks", func() { cmdHooks() }, "Install git pre-commit hook"},
-	{"post-edit", func() { cmdPostEdit() }, "Format if source files changed (Claude Code hook)"},
-	{"clean", func() { cmdClean() }, "Remove coverage and test cache"},
+	{"test", cmdTest, "Run tests"},
+	{"audit", cmdAudit, "Audit dependencies for known vulnerabilities"},
+	{"pre-commit", cmdPreCommit, "Staged checks + tests"},
+	{"ci", cmdCi, "Lint + tests with race detector and coverage"},
+	{"setup-hooks", cmdHooks, "Install git pre-commit hook"},
+	{"post-edit", cmdPostEdit, "Format if source files changed (Claude Code hook)"},
+	{"clean", cmdClean, "Remove coverage and test cache"},
 }
 
 func main() {
