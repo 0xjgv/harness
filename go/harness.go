@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -119,8 +120,15 @@ func extractTestSummary(output string) string {
 	if len(matches) == 0 {
 		return ""
 	}
-	pkgs := len(matches)
-	return fmt.Sprintf("%d pkg, %ss", pkgs, matches[len(matches)-1][1])
+	total := 0.0
+	for _, m := range matches {
+		d, err := strconv.ParseFloat(m[1], 64)
+		if err != nil {
+			continue
+		}
+		total += d
+	}
+	return fmt.Sprintf("%d pkg, %.2fs", len(matches), total)
 }
 
 var coverageRe = regexp.MustCompile(`coverage:\s+([\d.]+)%`)

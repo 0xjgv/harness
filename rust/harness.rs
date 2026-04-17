@@ -270,10 +270,6 @@ fn staged_rs_files() -> Vec<String> {
         .collect()
 }
 
-fn has_non_test_files(files: &[String]) -> bool {
-    files.iter().any(|f| !f.starts_with("tests/"))
-}
-
 fn changed_rs_files() -> Vec<String> {
     let output = Command::new("git")
         .args(["status", "--porcelain"])
@@ -397,10 +393,7 @@ fn cmd_pre_commit() {
     println!("\n{BLUE}[pre-commit]{RESET}\n");
 
     cmd_fix();
-
-    if has_non_test_files(&files) {
-        cmd_test();
-    }
+    cmd_test();
 }
 
 fn cmd_ci() {
