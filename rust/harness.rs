@@ -1,18 +1,6 @@
 //! Project development tasks. Zero dependencies — std only.
 //!
-//! Usage:
-//!   cargo harness              # full pre-flight (default)
-//!   cargo harness check        # full pre-flight
-//!   cargo harness fix          # fix lint + format
-//!   cargo harness lint         # lint + format check (read-only)
-//!   cargo harness test         # run tests
-//!   cargo harness test-cov     # run tests (coverage note)
-//!   cargo harness pre-commit   # staged checks + tests
-//!   cargo harness ci           # CI gate
-//!   cargo harness setup-hooks   # install git pre-commit hook
-//!   cargo harness clean        # remove artifacts
-//!   cargo harness help         # show usage
-//!   cargo harness --verbose    # show all command output
+//! Usage: cargo harness <command> [--verbose]
 
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -30,9 +18,7 @@ fn root() -> PathBuf {
 
 fn is_verbose() -> bool {
     static VERBOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *VERBOSE.get_or_init(|| {
-        env::args().any(|a| a == "--verbose") || env::var("VERBOSE").as_deref() == Ok("1")
-    })
+    *VERBOSE.get_or_init(|| env::args().any(|a| a == "--verbose"))
 }
 
 // ── Output ──────────────────────────────────────────────────────────
@@ -69,7 +55,7 @@ fn run(description: &str, cmd: &[&str], opts: Option<&RunOpts>) -> RunResult {
     let dir = root();
 
     if verbose {
-        let status = Command::new(program).args(args).current_dir(&dir).status();
+        let status = Command::new(program).args(args).current_dir(dir).status();
 
         match status {
             Ok(s) if s.success() => {
@@ -97,7 +83,7 @@ fn run(description: &str, cmd: &[&str], opts: Option<&RunOpts>) -> RunResult {
     // Non-verbose: capture output
     let result = Command::new(program)
         .args(args)
-        .current_dir(&dir)
+        .current_dir(dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output();
@@ -264,7 +250,7 @@ fn print_suppressions_report() {
 fn staged_rs_files() -> Vec<String> {
     let output = Command::new("git")
         .args(["diff", "--cached", "--name-only", "--diff-filter=d"])
-        .current_dir(root())
+        .current_dir(&root())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output();
@@ -283,39 +269,14 @@ fn staged_rs_files() -> Vec<String> {
         .collect()
 }
 
-fn staged_packages(files: &[String]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut pkgs = Vec::new();
-
-    for f in files {
-        let dir = Path::new(f).parent().map_or_else(
-            || ".".to_string(),
-            |p| {
-                let s = p.to_string_lossy();
-                if s.is_empty() { ".".to_string() } else { s.to_string() }
-            },
-        );
-
-        if seen.insert(dir.clone()) {
-            pkgs.push(dir);
-        }
-    }
-    pkgs
-}
-
 fn has_non_test_files(files: &[String]) -> bool {
-    files.iter().any(|f| {
-        !Path::new(f)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("test") || n.ends_with("_test.rs"))
-    })
+    files.iter().any(|f| !f.starts_with("tests/"))
 }
 
 fn changed_rs_files() -> Vec<String> {
     let output = Command::new("git")
         .args(["status", "--porcelain"])
-        .current_dir(root())
+        .current_dir(&root())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output();
@@ -342,7 +303,7 @@ fn changed_rs_files() -> Vec<String> {
 
 // ── Commands ────────────────────────────────────────────────────────
 
-fn cmd_fix(_pkgs: &[String]) {
+fn cmd_fix() {
     // clippy --fix requires --allow-dirty --allow-staged for uncommitted changes
     run("Clippy fix", &["cargo", "clippy", "--fix", "--allow-dirty", "--allow-staged"], None);
     run("Format", &["cargo", "fmt"], None);
@@ -354,16 +315,6 @@ fn cmd_lint() {
 }
 
 fn cmd_test() {
-    run(
-        "Tests",
-        &["cargo", "test"],
-        Some(&RunOpts { extract: Some(extract_test_summary), ..RunOpts::default() }),
-    );
-}
-
-fn cmd_test_cov() {
-    // Rust has no built-in coverage. cargo test is the baseline;
-    // cargo-llvm-cov can be installed separately for full coverage reports.
     run(
         "Tests",
         &["cargo", "test"],
@@ -444,8 +395,7 @@ fn cmd_pre_commit() {
 
     println!("\n{BLUE}[pre-commit]{RESET}\n");
 
-    let pkgs = staged_packages(&files);
-    cmd_fix(&pkgs);
+    cmd_fix();
 
     if has_non_test_files(&files) {
         cmd_test();
@@ -508,48 +458,18 @@ fn cmd_clean() {
 
 // ── CLI dispatch ────────────────────────────────────────────────────
 
-const COMMANDS: &[(&str, &str)] = &[
-    ("check", "Full pre-flight: fix + format + test"),
-    ("fix", "Fix lint errors + format code"),
-    ("lint", "Lint + format check (read-only)"),
-    ("test", "Run tests"),
-    ("test-cov", "Run tests (install cargo-llvm-cov for coverage)"),
-    ("audit", "Audit dependencies for known vulnerabilities"),
-    ("pre-commit", "Staged checks + tests"),
-    ("ci", "Clippy strict + format check + tests"),
-    ("setup-hooks", "Install git pre-commit hook"),
-    ("post-edit", "Format if source files changed (Claude Code hook)"),
-    ("clean", "Remove target/ and build cache"),
+const COMMANDS: &[(&str, fn())] = &[
+    ("check", cmd_check),
+    ("fix", cmd_fix),
+    ("lint", cmd_lint),
+    ("test", cmd_test),
+    ("audit", cmd_audit),
+    ("pre-commit", cmd_pre_commit),
+    ("ci", cmd_ci),
+    ("setup-hooks", cmd_hooks),
+    ("post-edit", cmd_post_edit),
+    ("clean", cmd_clean),
 ];
-
-fn dispatch(command: &str) {
-    match command {
-        "check" => cmd_check(),
-        "fix" => cmd_fix(&[]),
-        "lint" => cmd_lint(),
-        "test" => cmd_test(),
-        "test-cov" => cmd_test_cov(),
-        "audit" => cmd_audit(),
-        "pre-commit" => cmd_pre_commit(),
-        "ci" => cmd_ci(),
-        "setup-hooks" => cmd_hooks(),
-        "post-edit" => cmd_post_edit(),
-        "clean" => cmd_clean(),
-        _ => {}
-    }
-}
-
-fn cmd_help() {
-    println!("Usage: cargo harness <command> [--verbose]");
-    println!();
-    println!("Commands:");
-    println!("  {:<14} Full pre-flight: fix + format + test", "(default)");
-    for (name, desc) in COMMANDS {
-        println!("  {name:<14} {desc}");
-    }
-    println!("  {:<14} Show all command output", "--verbose");
-    println!("  {:<14} Show this help", "help");
-}
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
@@ -560,15 +480,11 @@ fn main() -> ExitCode {
     }
 
     let command = args[0].as_str();
-
-    if command == "help" {
-        cmd_help();
-        return ExitCode::SUCCESS;
-    }
-
-    if COMMANDS.iter().any(|(name, _)| *name == command) {
-        dispatch(command);
-        return ExitCode::SUCCESS;
+    for (name, fun) in COMMANDS {
+        if *name == command {
+            fun();
+            return ExitCode::SUCCESS;
+        }
     }
 
     eprintln!("Unknown command: {command}");

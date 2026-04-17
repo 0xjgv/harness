@@ -6,4 +6,3 @@
 - Audit: `uv run harness audit` — audit dependencies for known vulnerabilities (via pip-audit)
 - Setup: `uv run harness setup-hooks` to install git pre-commit hook
 - Auto-format: runs automatically after Claude edits via Stop hook (post-edit)
-- Help: `uv run harness help` to see all commands

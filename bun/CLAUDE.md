@@ -6,4 +6,3 @@
 - Audit: `bun run audit` — audit dependencies for known vulnerabilities (via bun audit)
 - Setup: `bun run setup-hooks` to install git pre-commit hook
 - Auto-format: runs automatically after Claude edits via Stop hook (post-edit)
-- Help: `bun harness.ts help` to see all commands

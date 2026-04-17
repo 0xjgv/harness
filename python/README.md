@@ -35,10 +35,7 @@ uv run harness format             # Format code
 uv run harness lint               # Lint check (read-only)
 uv run harness typecheck          # Type-check with basedpyright
 uv run harness test               # Run tests
-uv run harness test-cov           # Tests with coverage (80% minimum)
-uv run harness install            # Install dependencies
 uv run harness clean              # Remove caches
-uv run harness help               # List all commands
 ```
 
 ## Project Structure

@@ -9,7 +9,6 @@
  *   bun harness.ts pre-commit       # staged checks + tests
  *   bun harness.ts ci               # CI verification
  *   bun harness.ts --verbose        # show all output
- *   bun harness.ts help             # show all commands
  */
 
 // ── Configuration ───────────────────────────────────────────────────
@@ -26,7 +25,7 @@ const BLUE = '\x1b[34m';
 const DIM = '\x1b[2m';
 const RESET = '\x1b[0m';
 
-const VERBOSE = process.argv.includes('--verbose') || process.env.VERBOSE === '1';
+const VERBOSE = process.argv.includes('--verbose');
 
 // ── Runner ──────────────────────────────────────────────────────────
 
@@ -196,7 +195,7 @@ async function stagedTsFiles(): Promise<string[]> {
     );
 }
 
-async function changedSourceFiles(): Promise<string[]> {
+async function changedTsFiles(): Promise<string[]> {
   const proc = Bun.spawn(['git', 'status', '--porcelain'], {
     cwd: ROOT,
     stdout: 'pipe',
@@ -214,11 +213,6 @@ async function changedSourceFiles(): Promise<string[]> {
 }
 
 // ── Commands ────────────────────────────────────────────────────────
-
-async function cmdInstall(): Promise<void> {
-  console.log(`\n${BLUE}[install]${RESET}\n`);
-  await run('Install dependencies', ['bun', 'install']);
-}
 
 async function cmdFix(files?: string[]): Promise<void> {
   const target = files ?? ['.'];
@@ -243,7 +237,7 @@ async function cmdAudit(): Promise<void> {
 }
 
 async function cmdPostEdit(): Promise<void> {
-  if ((await changedSourceFiles()).length === 0) return;
+  if ((await changedTsFiles()).length === 0) return;
   await run('Fix & format', ['bunx', 'biome', 'check', '--write', '.'], { noExit: true });
 }
 
@@ -339,7 +333,6 @@ async function cmdClean(): Promise<void> {
 // ── CLI dispatch ────────────────────────────────────────────────────
 
 const TASKS: Record<string, [() => Promise<void>, string]> = {
-  install: [cmdInstall, 'Install dependencies'],
   fix: [cmdFix, 'Fix lint errors + format code'],
   lint: [cmdLint, 'Lint + format check (read-only)'],
   typecheck: [cmdTypecheck, 'Type-check with tsc'],
@@ -355,17 +348,6 @@ const TASKS: Record<string, [() => Promise<void>, string]> = {
 
 if (import.meta.main) {
   const args = process.argv.slice(2).filter((a) => !a.startsWith('-'));
-
-  if (args[0] === 'help') {
-    console.log('Usage: bun harness.ts <command> [--verbose]\n');
-    console.log('Commands:');
-    for (const [name, [, desc]] of Object.entries(TASKS)) {
-      console.log(`  ${name.padEnd(16)} ${desc}`);
-    }
-    console.log(`  ${'help'.padEnd(16)} Show this help`);
-    process.exit(0);
-  }
-
   const taskName = args[0];
 
   if (taskName && !(taskName in TASKS)) {

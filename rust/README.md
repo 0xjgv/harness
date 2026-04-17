@@ -33,8 +33,7 @@ cargo harness check --verbose
 cargo harness fix                  # Fix lint errors (clippy --fix) + format
 cargo harness lint                 # Lint + format check (read-only)
 cargo harness test                 # Run tests
-cargo harness test-cov             # Run tests (cargo-llvm-cov for coverage)
-cargo harness setup-hooks           # Install git pre-commit hook
+cargo harness setup-hooks          # Install git pre-commit hook
 cargo harness clean                # Remove build artifacts
 ```
 
