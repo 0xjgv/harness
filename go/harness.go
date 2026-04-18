@@ -145,7 +145,7 @@ func extractCoverageSummary(output string) string {
 // ── Git helpers ─────────────────────────────────────────────────────
 
 func stagedGoFiles() []string {
-	c := exec.Command("git", "diff", "--cached", "--name-only", "--diff-filter=d")
+	c := exec.Command("git", "diff", "--cached", "--name-only", "--diff-filter=d", "--relative")
 	c.Dir = root
 	out, err := c.Output()
 	if err != nil {

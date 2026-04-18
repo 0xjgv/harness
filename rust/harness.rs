@@ -250,7 +250,7 @@ fn print_suppressions_report() {
 
 fn staged_rs_files() -> Vec<String> {
     let output = Command::new("git")
-        .args(["diff", "--cached", "--name-only", "--diff-filter=d"])
+        .args(["diff", "--cached", "--name-only", "--diff-filter=d", "--relative"])
         .current_dir(root())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

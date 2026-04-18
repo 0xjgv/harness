@@ -1,0 +1,7 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Local Claude settings
+.claude/settings.local.json

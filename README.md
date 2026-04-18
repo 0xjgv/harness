@@ -6,19 +6,23 @@ Opinionated project templates with built-in quality guardrails for AI coding age
 
 AI agents write code fast but without feedback loops they drift — formatting breaks, types rot, tests fail silently. These templates give every project a consistent harness that agents (and humans) can run after every edit.
 
-## The 3-Script Contract
+## The 5-Script Contract
 
-Every template implements exactly 3 scripts:
+Every template implements exactly 5 scripts:
 
 | Script | When | What it does | Fixes code? |
 |---|---|---|---|
 | `check` | After edits | Fix, format, typecheck, test | Yes |
 | `pre-commit` | Git hook | Staged files only — fix, format, typecheck, test if source changed | Yes |
 | `ci` | CI pipeline | Read-only lint, typecheck, dep audit, tests with coverage | No |
+| `audit` | CI pipeline | Audit dependencies for known vulnerabilities | No |
+| `post-edit` | Claude Code hook | Format if source files changed | No |
 
 **`check`** is the one you run constantly. It auto-fixes what it can so you stay in flow. It also reports suppression comments (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`, etc.) as a report-only signal — visibility, never exit-code change.
 **`pre-commit`** runs the same checks scoped to staged files, installed as a git hook.
-**`ci`** is the read-only gate — no fixes, just verification. Includes dependency auditing.
+**`ci`** is the read-only gate — no fixes, just verification.
+**`audit`** audits dependencies for known vulnerabilities.
+**`post-edit`** formats source files if changed by Claude Code.
 
 ## Available Templates
 
@@ -28,6 +32,7 @@ Every template implements exactly 3 scripts:
 | [Bun](bun/) | Bun, Biome, TypeScript | [Bun](https://bun.sh/) |
 | [Go](go/) | Go, golangci-lint | [Go](https://go.dev/dl/) 1.24+, [golangci-lint](https://golangci-lint.run/welcome/install/) v2+ |
 | [Rust](rust/) | Rust, clippy, rustfmt | [Rust](https://rustup.rs/) |
+| [Monorepo](monorepo/) | Make dispatcher over any mix of the above | `make`, `bash`, `git` |
 
 ## Getting Started
 
@@ -65,6 +70,21 @@ go run harness.go setup-hooks
 cp -r rust/ my-project && cd my-project
 cargo build && cargo harness setup-hooks
 # Start coding in src/
+```
+
+### Monorepo
+
+```bash
+cp -r monorepo/ my-project && cd my-project
+git init
+
+# Drop in one or more single-language templates as subprojects:
+cp -r ../harness-templates/python/ api
+cp -r ../harness-templates/bun/    web
+
+make bootstrap      # per-language install + root git hook
+make check          # dispatches to every subproject
+make check-api      # scope to one subproject
 ```
 
 ## What Each Template Includes

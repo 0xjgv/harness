@@ -180,11 +180,14 @@ async function printSuppressionsReport(): Promise<void> {
 // ── Git helpers ─────────────────────────────────────────────────────
 
 async function stagedTsFiles(): Promise<string[]> {
-  const proc = Bun.spawn(['git', 'diff', '--cached', '--name-only', '--diff-filter=d'], {
-    cwd: ROOT,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
+  const proc = Bun.spawn(
+    ['git', 'diff', '--cached', '--name-only', '--diff-filter=d', '--relative'],
+    {
+      cwd: ROOT,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  );
   const stdout = await new Response(proc.stdout).text();
   await proc.exited;
   return stdout

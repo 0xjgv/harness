@@ -126,7 +126,7 @@ def _print_suppressions_report() -> None:
 def _staged_py_files() -> list[str]:
     """Return staged .py files under src/ and tests/, excluding deleted files."""
     result = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "--diff-filter=d"],
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=d", "--relative"],
         capture_output=True,
         text=True,
         check=False,
@@ -281,13 +281,13 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "format": (cmd_format, "Format code with ruff"),
     "lint": (cmd_lint, "Lint code with ruff (read-only)"),
     "typecheck": (cmd_typecheck, "Type-check with basedpyright"),
+    "test": (cmd_test, "Run tests with unittest"),
     "check": (cmd_check, "Fix + format + typecheck + test (full repo)"),
     "pre-commit": (cmd_pre_commit, "Staged checks + tests"),
     "ci": (cmd_ci, "Lint + format check + typecheck + tests with coverage"),
-    "test": (cmd_test, "Run tests with unittest"),
     "audit": (cmd_audit, "Audit dependencies for known vulnerabilities"),
-    "setup-hooks": (cmd_hooks, "Install git pre-commit hook"),
     "post-edit": (cmd_post_edit, "Format if source files changed (Claude Code hook)"),
+    "setup-hooks": (cmd_hooks, "Install git pre-commit hook"),
     "clean": (cmd_clean, "Remove cache and build artifacts"),
 }
 
