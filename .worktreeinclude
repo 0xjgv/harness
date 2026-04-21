@@ -1,0 +1,4 @@
+openspec/
+.factory/
+.claude
+.env*
