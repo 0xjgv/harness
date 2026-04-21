@@ -95,6 +95,7 @@ make check-api      # scope to one subproject
 - **Test runner** — pytest (Python) / bun test (Bun) / go test (Go) / cargo test (Rust)
 - **Security scanning** — bandit rules via ruff (Python) / gosec via golangci-lint (Go) / clippy pedantic + `unsafe_code = "forbid"` (Rust)
 - **Dependency auditing** — pip-audit (Python) / bun audit (Bun) / govulncheck (Go) / cargo-audit (Rust) — runs in `ci`
+- **Cyclomatic complexity gate** (CCN 15) — lizard (Python dev dep; Bun via `uvx`) / gocyclo via golangci-lint (Go) — runs in `ci`
 - **CLAUDE.md** — tells AI agents which commands to run and when
 
 ## Design Principles

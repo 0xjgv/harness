@@ -18,8 +18,10 @@ See the [3-script contract](../README.md#the-3-script-contract) for the full rat
 ```bash
 uv run harness check              # Fix + format + typecheck + tests (after editing)
 uv run harness pre-commit         # Staged checks + tests (runs via git hook)
-uv run harness ci                 # Lint + format check + typecheck + tests with coverage
+uv run harness ci                 # Lint + format check + typecheck + complexity gate + tests with coverage
 ```
+
+`ci` runs a cyclomatic-complexity gate via [lizard](https://github.com/terryyin/lizard) (CCN 15), pinned as a dev dependency.
 
 All commands minimize output — only errors are shown. Add `--verbose` for full output:
 

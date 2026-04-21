@@ -18,8 +18,10 @@ See the [3-script contract](../README.md#the-3-script-contract) for the full rat
 ```bash
 bun run check                      # Fix + format + typecheck + tests (after editing)
 bun run pre-commit                 # Staged checks + tests (runs via git hook)
-bun run ci                         # Lint + typecheck + tests with coverage (CI verification)
+bun run ci                         # Lint + typecheck + complexity gate + tests with coverage (CI verification)
 ```
+
+`ci` runs a cyclomatic-complexity gate via [lizard](https://github.com/terryyin/lizard) (CCN 15). Requires `uvx` on PATH — install via [uv](https://docs.astral.sh/uv/).
 
 All commands minimize output — only errors are shown. Add `--verbose` for full output:
 

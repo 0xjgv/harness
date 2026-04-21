@@ -239,6 +239,23 @@ async function cmdAudit(): Promise<void> {
   await run('Dep audit', ['bun', 'audit']);
 }
 
+async function cmdComplexity(): Promise<void> {
+  await run('Complexity (lizard)', [
+    'uvx',
+    'lizard',
+    SRC_DIR,
+    TEST_DIR,
+    '-C',
+    '15',
+    '-a',
+    '7',
+    '-L',
+    '100',
+    '-i',
+    '0',
+  ]);
+}
+
 async function cmdPostEdit(): Promise<void> {
   if ((await changedTsFiles()).length === 0) return;
   await run('Fix & format', ['bunx', 'biome', 'check', '--write', '.'], { noExit: true });
@@ -303,6 +320,7 @@ async function cmdCi(): Promise<void> {
   await cmdLint();
   await cmdTypecheck();
   await cmdAudit();
+  await cmdComplexity();
   await run('Tests', ['bun', 'test', '--coverage'], { extract: extractTestSummary });
 }
 

@@ -200,6 +200,27 @@ def cmd_audit() -> None:
     run("Dep audit", ["uv", "run", "--with", "pip-audit", "pip-audit"])
 
 
+def cmd_complexity() -> None:
+    run(
+        "Complexity (lizard)",
+        [
+            "uv",
+            "run",
+            "lizard",
+            SRC_DIR,
+            TEST_DIR,
+            "-C",
+            "15",
+            "-a",
+            "7",
+            "-L",
+            "100",
+            "-i",
+            "0",
+        ],
+    )
+
+
 def cmd_post_edit() -> None:
     """Format if source files have uncommitted changes (Claude Code hook)."""
     if not _changed_py_files():
@@ -246,6 +267,7 @@ def cmd_ci() -> None:
     cmd_format_check()
     cmd_typecheck()
     cmd_audit()
+    cmd_complexity()
     cmd_test_cov()
 
 
