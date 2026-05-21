@@ -14,6 +14,11 @@ htmlcov/
 # Tools
 .ruff_cache/
 .mypy_cache/
+# mutmut generated working copy
+mutants/
+
+# Claude Code hook runtime state
+.claude/state/
 
 # Environment
 .venv/

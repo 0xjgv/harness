@@ -1,0 +1,11 @@
+[importlinter]
+root_packages =
+    src
+
+[importlinter:contract:no-internal-leak]
+name = Example: src.internal is not imported from other src modules (placeholder)
+type = forbidden
+source_modules =
+    src
+forbidden_modules =
+    src.internal
