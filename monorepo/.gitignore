@@ -5,3 +5,6 @@
 
 # Local Claude settings
 .claude/settings.local.json
+
+# Claude Code hook runtime state
+.claude/state/

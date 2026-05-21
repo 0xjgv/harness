@@ -65,6 +65,17 @@ The Makefile fans out `<cmd>` to each matching subproject, continues past failur
 
 `make pre-commit` is auto-scoped: it reads `git diff --cached --name-only`, maps each staged path to its top-level subproject directory, and runs `pre-commit` only in the affected ones. Staged files outside any subproject are ignored.
 
+## Behavior contract
+
+`CLAUDE.md` encodes an AI behavior contract enforced by hooks at the monorepo root — active whenever Claude Code runs here, across every subproject:
+
+- **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
+- **Human-is-engineer**: `git commit` / `git push` denied unless the user's current prompt explicitly asked (verbs: `commit`, `push`, `ship`, `land`, `merge`).
+- **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
+- **Config write-protection**: edits to any subproject's arch config (`.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, `arch.toml`) denied unless the user names the path in their prompt.
+
+Hook scripts live in `.claude/scripts/` and are wired via `.claude/settings.json`. Each single-language template also ships these hooks for standalone use; at a monorepo root only the root copy runs — Claude Code loads `.claude/` from the project root only, so a subproject's own hooks lie dormant until you open it as its own project.
+
 ## Adding a subproject
 
 ```bash
