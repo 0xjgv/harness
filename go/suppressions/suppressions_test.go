@@ -1,9 +1,11 @@
 package suppressions
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -86,4 +88,50 @@ func TestScan(t *testing.T) {
 	if !reflect.DeepEqual(results["lint_ignore"], wantLintIgnore) {
 		t.Errorf("results[lint_ignore] = %+v, want %+v", results["lint_ignore"], wantLintIgnore)
 	}
+}
+
+// captureStdout runs fn and returns everything it wrote to os.Stdout.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	fn()
+	_ = w.Close()
+	os.Stdout = orig
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+func TestPrintReport(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		out := captureStdout(t, func() { PrintReport(map[string][][]string{}) })
+		if !strings.Contains(out, "Suppressions: 0 total") {
+			t.Errorf("expected zero-total line, got: %q", out)
+		}
+	})
+
+	t.Run("populated", func(t *testing.T) {
+		results := map[string][][]string{
+			"nolint":      {{"errcheck"}, {"errcheck", "gosec"}},
+			"lint_ignore": {{"FOO"}},
+		}
+		out := captureStdout(t, func() { PrintReport(results) })
+		for _, want := range []string{
+			"Suppressions: 3 total",
+			"nolint: 2",
+			"errcheck: 2",
+			"lint_ignore: 1",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("expected %q in report, got: %q", want, out)
+			}
+		}
+	})
 }

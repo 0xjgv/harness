@@ -1,0 +1,38 @@
+# Architecture rules for go-arch-lint.
+# Every Go file must belong to a component, and a component may only import
+# the components listed in its `mayDependOn`. Start with one real rule and
+# extend the graph as the module grows.
+#
+# Protected config: `harness ci` runs this file; the PreToolUse edit-gate
+# denies AI edits unless the user's prompt explicitly names .go-arch-lint.yml.
+# Architectural violations are design decisions — surface them, do not silence.
+version: 3
+workdir: .
+allow:
+  depOnAnyVendor: true
+components:
+  harness:
+    in: .
+  suppressions:
+    in: suppressions
+  acceptance:
+    in: features
+  acceptance-steps:
+    in: features/steps
+deps:
+  # The task runner may use the sample library package.
+  harness:
+    mayDependOn:
+      - suppressions
+  # Starter rule: the sample library is a leaf — it must not import any
+  # other project component (only the standard library / vendored deps).
+  suppressions:
+    anyVendorDeps: true
+  # The acceptance suite wires features to their step definitions.
+  acceptance:
+    mayDependOn:
+      - acceptance-steps
+  # Step definitions exercise the library under test.
+  acceptance-steps:
+    mayDependOn:
+      - suppressions

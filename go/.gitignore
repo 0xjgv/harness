@@ -10,6 +10,13 @@ harness
 # Coverage
 coverage.out
 
+# Mutation testing
+# gremlins copies the module into a temp dir; some versions leave this behind
+.gremlins/
+
+# Claude Code hook runtime state
+.claude/state/
+
 # IDE
 .idea/
 .vscode/
