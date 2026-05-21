@@ -8,6 +8,11 @@
     "lint": "bunx biome check .",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
+    "acceptance": "bun harness.ts acceptance",
+    "coverage": "bun harness.ts coverage",
+    "mutation": "bun harness.ts mutation",
+    "crap": "bun harness.ts crap",
+    "arch": "bun harness.ts arch",
     "pre-commit": "bun harness.ts pre-commit",
     "ci": "bun harness.ts ci",
     "setup-hooks": "bun harness.ts setup-hooks",
@@ -15,6 +20,9 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.8",
+    "@cucumber/cucumber": "^12.9.0",
+    "@stryker-mutator/core": "^9.6.1",
+    "dependency-cruiser": "^17.4.0",
     "typescript": "^5.8.3"
   }
 }

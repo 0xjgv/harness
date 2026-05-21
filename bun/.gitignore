@@ -9,6 +9,16 @@ build/
 # Test / Coverage
 coverage/
 
+# Stryker mutation testing working dir
+.stryker-tmp/
+reports/
+
+# dependency-cruiser cache
+.dependency-cruiser-cache
+
+# Claude Code hook runtime state
+.claude/state/
+
 # Environment
 .env
 .env.*

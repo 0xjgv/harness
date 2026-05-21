@@ -1,0 +1,11 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "StrykerJS has no official Bun test-runner plugin; the universal 'command' runner shells out to `bun test` and grades mutants by exit code. Advisory gate — not wired into ci.",
+  "packageManager": "npm",
+  "testRunner": "command",
+  "commandRunner": { "command": "bun test" },
+  "mutate": ["src/**/*.ts", "!src/**/*.test.ts"],
+  "reporters": ["clear-text", "progress"],
+  "coverageAnalysis": "off",
+  "tempDirName": ".stryker-tmp"
+}

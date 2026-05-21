@@ -8,6 +8,11 @@
  *   bun harness.ts fix              # fix lint errors + format
  *   bun harness.ts pre-commit       # staged checks + tests
  *   bun harness.ts ci               # CI verification
+ *   bun harness.ts acceptance       # cucumber scenarios
+ *   bun harness.ts coverage --min=N # tests with coverage threshold
+ *   bun harness.ts mutation         # Stryker mutation testing (advisory)
+ *   bun harness.ts crap --max=N     # CRAP complexity x coverage (advisory)
+ *   bun harness.ts arch             # dependency-cruiser arch checks
  *   bun harness.ts --verbose        # show all output
  */
 
@@ -239,6 +244,192 @@ async function cmdAudit(): Promise<void> {
   await run('Dep audit', ['bun', 'audit']);
 }
 
+async function cmdCoverage(): Promise<void> {
+  // Bun's test runner has no built-in per-percentage gate; we emit LCOV and
+  // compute the line-coverage percentage ourselves, mirroring python's --min=N.
+  const minArg = process.argv.find((a) => a.startsWith('--min='));
+  const minPct = minArg ? Number(minArg.split('=', 2)[1]) : 0;
+
+  await run('Coverage (run)', [
+    'bun',
+    'test',
+    '--coverage',
+    '--coverage-reporter=lcov',
+    '--coverage-dir=coverage',
+  ]);
+
+  const { readFile } = await import('node:fs/promises');
+  const lcov = await readFile(`${ROOT}/coverage/lcov.info`, 'utf8').catch(() => null);
+  if (lcov == null) {
+    console.log(`  ${RED}✗${RESET} Coverage: coverage/lcov.info not found`);
+    process.exit(1);
+  }
+  let found = 0;
+  let hit = 0;
+  for (const line of lcov.split('\n')) {
+    if (line.startsWith('LF:')) found += Number(line.slice(3));
+    else if (line.startsWith('LH:')) hit += Number(line.slice(3));
+  }
+  const pct = found === 0 ? 100 : (hit / found) * 100;
+  if (pct >= minPct) {
+    console.log(`  ${GREEN}✓${RESET} Coverage >= ${minPct}% ${DIM}(${pct.toFixed(1)}%)${RESET}`);
+  } else {
+    console.log(`  ${RED}✗${RESET} Coverage >= ${minPct}% ${DIM}(got ${pct.toFixed(1)}%)${RESET}`);
+    process.exit(1);
+  }
+}
+
+async function cmdAcceptance(): Promise<void> {
+  // Run cucumber-js scenarios. Empty/absent features dir warns + exits 0.
+  const { existsSync } = await import('node:fs');
+  const featuresDir = `${ROOT}/${TEST_DIR}/features`;
+  let hasFeature = false;
+  if (existsSync(featuresDir)) {
+    const glob = new Bun.Glob('**/*.feature');
+    const matches = await Array.fromAsync(glob.scan({ cwd: featuresDir, onlyFiles: true }));
+    hasFeature = matches.length > 0;
+  }
+  if (!hasFeature) {
+    console.log(
+      `  ${GREEN}⚠${RESET} Acceptance: no .feature files in ${TEST_DIR}/features/ ` +
+        '(add one to enable this gate)',
+    );
+    return;
+  }
+  // cucumber-js runs on Node; invoking its bin through the Bun runtime lets
+  // TypeScript step definitions resolve without a separate loader.
+  await run('Acceptance (cucumber)', ['bun', './node_modules/@cucumber/cucumber/bin/cucumber.js']);
+}
+
+async function cmdArch(): Promise<void> {
+  // Import/dependency-boundary linter via dependency-cruiser.
+  const { existsSync } = await import('node:fs');
+  if (!existsSync(`${ROOT}/.dependency-cruiser.json`)) {
+    console.log(`  ${GREEN}⚠${RESET} Arch: no .dependency-cruiser.json — skipped`);
+    return;
+  }
+  await run('Arch (dependency-cruiser)', [
+    './node_modules/.bin/depcruise',
+    '--config',
+    '.dependency-cruiser.json',
+    '--no-progress',
+    `${SRC_DIR}/**/*.ts`,
+  ]);
+}
+
+async function cmdMutation(): Promise<void> {
+  // StrykerJS mutation testing. Advisory — not wired into ci.
+  // No official Bun runner plugin exists; stryker.conf.json uses the universal
+  // 'command' runner which shells out to `bun test` and grades by exit code.
+  await run('Mutation (Stryker)', ['./node_modules/.bin/stryker', 'run'], { noExit: true });
+}
+
+interface CrapFn {
+  crap: number;
+  ccn: number;
+  cov: number;
+  loc: string;
+}
+
+async function cmdCrap(): Promise<void> {
+  // CRAP = ccn^2 * (1-cov)^3 + ccn per function. Advisory — lizard + LCOV.
+  const maxArg = process.argv.find((a) => a.startsWith('--max='));
+  const maxCrap = maxArg ? Number(maxArg.split('=', 2)[1]) : 30;
+  const changedOnly = process.argv.includes('--changed-only');
+
+  const { readFile } = await import('node:fs/promises');
+  const lcov = await readFile(`${ROOT}/coverage/lcov.info`, 'utf8').catch(() => null);
+  if (lcov == null) {
+    console.log(
+      `  ${RED}✗${RESET} CRAP: coverage/lcov.info not found — run \`harness coverage\` first`,
+    );
+    process.exit(1);
+  }
+
+  // Parse LCOV into { file: { lineNumber: hits } }.
+  const covMap: Record<string, Record<number, number>> = {};
+  let curFile = '';
+  for (const line of lcov.split('\n')) {
+    if (line.startsWith('SF:')) {
+      curFile = line.slice(3).trim();
+      covMap[curFile] = {};
+    } else if (line.startsWith('DA:') && curFile) {
+      const [num, hits] = line.slice(3).split(',');
+      covMap[curFile][Number(num)] = Number(hits);
+    }
+  }
+
+  let changed: Set<string> | null = null;
+  if (changedOnly) {
+    const proc = Bun.spawn(['git', 'diff', '--name-only', 'origin/main...HEAD'], {
+      cwd: ROOT,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const out = await new Response(proc.stdout).text();
+    await proc.exited;
+    changed = new Set(
+      out
+        .split('\n')
+        .map((f) => f.trim())
+        .filter((f) => f.endsWith('.ts')),
+    );
+  }
+
+  // lizard --csv columns: nloc,ccn,token,param,length,location,file,name,sig,start,end
+  const lz = Bun.spawn(['uvx', 'lizard', SRC_DIR, '--csv'], {
+    cwd: ROOT,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const lzOut = await new Response(lz.stdout).text();
+  await lz.exited;
+
+  // lizard --csv: column 1 is CCN; the quoted location field encodes
+  // `name@start-end@path`. Signatures can contain commas, so derive the
+  // location (and thus path/start/end) from that self-contained field.
+  const locRe = /"([^"@]+)@(\d+)-(\d+)@([^"]+)"/;
+  const offenders: CrapFn[] = [];
+  for (const row of lzOut.split('\n')) {
+    const cols = row.split(',');
+    if (cols.length < 11) continue;
+    const ccn = Number(cols[1]);
+    if (!Number.isFinite(ccn)) continue;
+    const lm = locRe.exec(row);
+    if (!lm) continue;
+    const [, name, startS, endS, path] = lm;
+    const start = Number(startS);
+    const end = Number(endS);
+    const location = `${name}@${start}-${end}@${path}`;
+    if (changed !== null && !changed.has(path)) continue;
+
+    const lines = covMap[path] ?? covMap[path.replace(/^\.\//, '')] ?? {};
+    const inRange: number[] = [];
+    for (let n = start; n <= end; n++) {
+      if (n in lines) inRange.push(n);
+    }
+    const cov = inRange.length ? inRange.filter((n) => lines[n] > 0).length / inRange.length : 0;
+    const crap = ccn * ccn * (1 - cov) ** 3 + ccn;
+    if (crap > maxCrap) {
+      offenders.push({ crap, ccn, cov, loc: location });
+    }
+  }
+
+  if (offenders.length === 0) {
+    console.log(`  ${GREEN}✓${RESET} CRAP: all functions below ${maxCrap}`);
+    return;
+  }
+  offenders.sort((a, b) => b.crap - a.crap);
+  console.log(`  ${RED}✗${RESET} CRAP: ${offenders.length} function(s) exceed ${maxCrap}`);
+  for (const o of offenders.slice(0, 20)) {
+    console.log(
+      `    CRAP=${o.crap.toFixed(1).padStart(6)}  CCN=${String(o.ccn).padStart(3)}  ` +
+        `cov=${(o.cov * 100).toFixed(1).padStart(5)}%  ${o.loc}`,
+    );
+  }
+  process.exit(1);
+}
+
 async function cmdComplexity(): Promise<void> {
   await run('Complexity (lizard)', [
     'uvx',
@@ -263,6 +454,21 @@ async function cmdPostEdit(): Promise<void> {
 
 // ── Stages ──────────────────────────────────────────────────────────
 
+async function checkHooksPresent(): Promise<void> {
+  // Warn when required hook scripts are missing (drift detection).
+  const { existsSync } = await import('node:fs');
+  const required = [
+    '.claude/scripts/session-start.sh',
+    '.claude/scripts/ups-classify.sh',
+    '.claude/scripts/pre-bash-gate.sh',
+    '.claude/scripts/pre-edit-gate.sh',
+  ];
+  const missing = required.filter((p) => !existsSync(`${ROOT}/${p}`));
+  if (missing.length > 0) {
+    console.log(`  ${RED}⚠${RESET} Missing hook scripts: ${missing.join(', ')}`);
+  }
+}
+
 async function cmdCheck(): Promise<void> {
   const start = performance.now();
   console.log(`\n${BLUE}[check]${RESET} Running pre-flight checks...\n`);
@@ -282,6 +488,7 @@ async function cmdCheck(): Promise<void> {
   );
   results.push(await run('Tests', ['bun', 'test'], { extract: extractTestSummary, noExit: true }));
 
+  await checkHooksPresent();
   await printSuppressionsReport();
 
   const elapsed = ((performance.now() - start) / 1000).toFixed(1);
@@ -321,7 +528,9 @@ async function cmdCi(): Promise<void> {
   await cmdTypecheck();
   await cmdAudit();
   await cmdComplexity();
-  await run('Tests', ['bun', 'test', '--coverage'], { extract: extractTestSummary });
+  await cmdAcceptance();
+  await cmdCoverage();
+  await cmdArch();
 }
 
 async function cmdHooks(): Promise<void> {
@@ -353,15 +562,20 @@ async function cmdClean(): Promise<void> {
 
 // ── CLI dispatch ────────────────────────────────────────────────────
 
-const TASKS: Record<string, [() => Promise<void>, string]> = {
+const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<void>), string]> = {
   fix: [cmdFix, 'Fix lint errors + format code'],
   lint: [cmdLint, 'Lint + format check (read-only)'],
   typecheck: [cmdTypecheck, 'Type-check with tsc'],
   test: [cmdTest, 'Run tests'],
   audit: [cmdAudit, 'Audit dependencies for known vulnerabilities'],
+  acceptance: [cmdAcceptance, 'Run acceptance scenarios (cucumber)'],
+  coverage: [cmdCoverage, 'Tests with coverage threshold (--min=N)'],
+  mutation: [cmdMutation, 'Mutation testing (Stryker, advisory)'],
+  crap: [cmdCrap, 'CRAP complexity x coverage gate (advisory)'],
+  arch: [cmdArch, 'Architecture checks (dependency-cruiser)'],
   check: [cmdCheck, 'Full pre-flight: lockfile + fix + typecheck + tests'],
   'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
-  ci: [cmdCi, 'Lint + typecheck + tests with coverage (CI verification)'],
+  ci: [cmdCi, 'Lint + typecheck + audit + complexity + acceptance + coverage + arch'],
   'setup-hooks': [cmdHooks, 'Install git pre-commit hook'],
   'post-edit': [cmdPostEdit, 'Format if source files changed (Claude Code hook)'],
   clean: [cmdClean, 'Remove caches and build artifacts'],

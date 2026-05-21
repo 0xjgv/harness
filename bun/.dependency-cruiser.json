@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/sverweij/dependency-cruiser/main/src/schema/configuration.schema.json",
+  "forbidden": [
+    {
+      "name": "no-internal-leak",
+      "comment": "Example starter rule (placeholder): nothing outside src/internal/ may import from src/internal/. Extend as the module graph grows.",
+      "severity": "error",
+      "from": { "pathNot": "^src/internal/" },
+      "to": { "path": "^src/internal/" }
+    },
+    {
+      "name": "no-circular",
+      "comment": "Circular dependencies are forbidden.",
+      "severity": "error",
+      "from": {},
+      "to": { "circular": true }
+    }
+  ],
+  "options": {
+    "doNotFollow": { "path": "node_modules" },
+    "tsPreCompilationDeps": true,
+    "enhancedResolveOptions": {
+      "extensions": [".ts", ".tsx", ".js", ".jsx", ".json"]
+    }
+  }
+}
