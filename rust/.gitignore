@@ -7,6 +7,13 @@
 lcov.info
 tarpaulin-report.html
 
+# cargo-mutants working directory
+/mutants.out/
+/mutants.out.old/
+
+# Claude Code hook runtime state
+.claude/state/
+
 # IDE
 .idea/
 .vscode/

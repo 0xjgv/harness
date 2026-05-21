@@ -42,6 +42,8 @@ struct RunResult {
 struct RunOpts {
     extract: Option<fn(&str) -> Option<String>>,
     no_exit: bool,
+    /// Extra environment variables for the child process.
+    env: Vec<(String, String)>,
 }
 
 fn run(description: &str, cmd: &[&str], opts: Option<&RunOpts>) -> RunResult {
@@ -54,9 +56,19 @@ fn run(description: &str, cmd: &[&str], opts: Option<&RunOpts>) -> RunResult {
     let program = cmd[0];
     let args = &cmd[1..];
     let dir = root();
+    let env = opts.map_or(&[][..], |o| o.env.as_slice());
+
+    let build = || {
+        let mut c = Command::new(program);
+        c.args(args).current_dir(dir);
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        c
+    };
 
     if verbose {
-        let status = Command::new(program).args(args).current_dir(dir).status();
+        let status = build().status();
 
         match status {
             Ok(s) if s.success() => {
@@ -82,12 +94,7 @@ fn run(description: &str, cmd: &[&str], opts: Option<&RunOpts>) -> RunResult {
     }
 
     // Non-verbose: capture output
-    let result = Command::new(program)
-        .args(args)
-        .current_dir(dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+    let result = build().stdout(Stdio::piped()).stderr(Stdio::piped()).output();
 
     match result {
         Ok(output) => {
@@ -173,8 +180,7 @@ fn parse_line_for_suppressions(line: &str) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
     for (kind, prefix) in SUPPRESSION_PREFIXES {
         let mut rest = line;
-        loop {
-            let Some(idx) = rest.find(prefix) else { break };
+        while let Some(idx) = rest.find(prefix) {
             let after = &rest[idx + prefix.len()..];
             let Some(end) = after.find(')') else { break };
             let rules: Vec<String> = after[..end]
@@ -349,7 +355,180 @@ fn cmd_post_edit() {
     run("Format", &["cargo", "fmt"], Some(&RunOpts { no_exit: true, ..RunOpts::default() }));
 }
 
+/// Run Gherkin/BDD acceptance scenarios via cucumber.
+///
+/// The `acceptance` integration test (Cargo.toml `[[test]]`, `harness = false`)
+/// executes every `.feature` file under `tests/features/`. An empty features
+/// directory is not a failure — it warns and exits 0, mirroring python's
+/// `cmd_acceptance`, so adopting the template never blocks on missing scenarios.
+fn cmd_acceptance() {
+    let features_dir = root().join("tests").join("features");
+    let has_features = has_feature_files(&features_dir);
+    if !has_features {
+        println!(
+            "  {GREEN}\u{26a0}{RESET} Acceptance: no .feature files in \
+             tests/features/ (add one to enable this gate)"
+        );
+        return;
+    }
+    run("Acceptance (cucumber)", &["cargo", "test", "--test", "acceptance", "--quiet"], None);
+}
+
+/// True when `dir` contains at least one `.feature` file (recursively).
+fn has_feature_files(dir: &Path) -> bool {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&p) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(path),
+                Ok(_) if path.extension().is_some_and(|e| e == "feature") => return true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Run tests under llvm-cov with a line-coverage threshold (`--min=N`, default 0).
+///
+/// Thresholds start at 0 so adopting the template never fails an existing
+/// project — ratchet up as the suite matures. Requires cargo-llvm-cov:
+/// `cargo install cargo-llvm-cov`. Absent → warn + skip (advisory-friendly),
+/// matching the audit gate's install-aware behavior.
+fn cmd_coverage() {
+    let min_pct = arg_value("--min").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+
+    if !tool_installed("llvm-cov") {
+        println!("  {DIM}\u{2298} Coverage skipped (install: cargo install cargo-llvm-cov){RESET}");
+        return;
+    }
+
+    // cargo-llvm-cov needs llvm-cov/llvm-profdata. rustup ships them via the
+    // `llvm-tools-preview` component; toolchains installed another way (e.g.
+    // Homebrew) may not. When they are absent, fall back to a system LLVM
+    // install via the documented LLVM_COV / LLVM_PROFDATA env vars.
+    let env = llvm_tools_env();
+
+    let threshold = format!("{min_pct}");
+    run(
+        &format!("Coverage >= {min_pct}%"),
+        &["cargo", "llvm-cov", "--summary-only", "--fail-under-lines", &threshold],
+        Some(&RunOpts { env, ..RunOpts::default() }),
+    );
+}
+
+/// Locate a system LLVM for cargo-llvm-cov when the rustup component is absent.
+///
+/// Returns `LLVM_COV` / `LLVM_PROFDATA` pairs to pass to the child process, or
+/// an empty vec when the rustup `llvm-tools` are present (cargo-llvm-cov finds
+/// them itself) or no system LLVM is found.
+fn llvm_tools_env() -> Vec<(String, String)> {
+    // rustup install: the tools sit in the toolchain sysroot.
+    if let Ok(out) = Command::new("rustc").arg("--print").arg("sysroot").output() {
+        let sysroot = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let host = Command::new("rustc")
+            .arg("-vV")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .and_then(|s| s.lines().find_map(|l| l.strip_prefix("host: ").map(str::to_string)));
+        if let Some(host) = host {
+            let bin = Path::new(&sysroot).join("lib/rustlib").join(&host).join("bin");
+            if bin.join("llvm-cov").exists() {
+                return Vec::new(); // rustup component present.
+            }
+        }
+    }
+    // System LLVM fallback (Homebrew, Linux package managers).
+    for prefix in ["/opt/homebrew/opt/llvm/bin", "/usr/local/opt/llvm/bin", "/usr/bin"] {
+        let cov = Path::new(prefix).join("llvm-cov");
+        let profdata = Path::new(prefix).join("llvm-profdata");
+        if cov.exists() && profdata.exists() {
+            return vec![
+                ("LLVM_COV".to_string(), cov.to_string_lossy().into_owned()),
+                ("LLVM_PROFDATA".to_string(), profdata.to_string_lossy().into_owned()),
+            ];
+        }
+    }
+    Vec::new()
+}
+
+/// Run cargo-mutants. Advisory — NOT wired into `ci`.
+///
+/// Mutation testing injects small bugs and checks whether the test suite
+/// catches them. It is slow and noisy by nature, so it stays an explicit
+/// opt-in rather than a blocking gate. Absent → warn + skip.
+fn cmd_mutation() {
+    if !tool_installed("mutants") {
+        println!("  {DIM}\u{2298} Mutation skipped (install: cargo install cargo-mutants){RESET}");
+        return;
+    }
+    run(
+        "Mutation (cargo-mutants)",
+        &["cargo", "mutants", "--no-shuffle"],
+        Some(&RunOpts { no_exit: true, ..RunOpts::default() }),
+    );
+}
+
+/// Run architecture checks via cargo-modules against `arch.toml`.
+///
+/// Rust's compiler enforces visibility and crate layering but NOT freedom
+/// from circular dependencies between modules of one crate, nor the absence
+/// of orphaned (unlinked) source files. Those are the invariants this gate
+/// checks. `arch.toml` is a PROTECTED path — the pre-edit hook denies edits
+/// unless the user's prompt authorizes them. Absent config → skip.
+fn cmd_arch() {
+    if !root().join("arch.toml").exists() {
+        println!("  {GREEN}\u{26a0}{RESET} Arch: no arch.toml \u{2014} skipped");
+        return;
+    }
+    if !tool_installed("modules") {
+        println!("  {DIM}\u{2298} Arch skipped (install: cargo install cargo-modules){RESET}");
+        return;
+    }
+    run(
+        "Arch: no module cycles",
+        &["cargo", "modules", "dependencies", "--lib", "--no-externs", "--acyclic"],
+        None,
+    );
+    run("Arch: no orphan files", &["cargo", "modules", "orphans", "--lib"], None);
+}
+
+/// True when `cargo <subcommand> --version` succeeds (the subcommand is installed).
+fn tool_installed(subcommand: &str) -> bool {
+    Command::new("cargo")
+        .args([subcommand, "--version"])
+        .current_dir(root())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Return the value of a `--name=value` CLI argument, if present.
+fn arg_value(name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    env::args().skip(1).find_map(|a| a.strip_prefix(&prefix).map(String::from))
+}
+
 // ── Stages ──────────────────────────────────────────────────────────
+
+/// Warn when required hook scripts are missing (drift detection).
+fn check_hooks_present() {
+    let required = [
+        ".claude/scripts/session-start.sh",
+        ".claude/scripts/ups-classify.sh",
+        ".claude/scripts/pre-bash-gate.sh",
+        ".claude/scripts/pre-edit-gate.sh",
+    ];
+    let missing: Vec<&str> =
+        required.iter().filter(|p| !root().join(p).exists()).copied().collect();
+    if !missing.is_empty() {
+        println!("  {RED}\u{26a0}{RESET} Missing hook scripts: {}", missing.join(", "));
+    }
+}
 
 fn cmd_check() {
     let start = Instant::now();
@@ -365,10 +544,15 @@ fn cmd_check() {
         run(
             "Tests",
             &["cargo", "test"],
-            Some(&RunOpts { extract: Some(extract_test_summary), no_exit: true }),
+            Some(&RunOpts {
+                extract: Some(extract_test_summary),
+                no_exit: true,
+                ..RunOpts::default()
+            }),
         ),
     ];
 
+    check_hooks_present();
     print_suppressions_report();
 
     let elapsed = start.elapsed().as_secs_f64();
@@ -406,6 +590,9 @@ fn cmd_ci() {
         &["cargo", "test"],
         Some(&RunOpts { extract: Some(extract_test_summary), ..RunOpts::default() }),
     );
+    cmd_acceptance();
+    cmd_coverage();
+    cmd_arch();
 }
 
 fn cmd_hooks() {
@@ -447,6 +634,13 @@ fn cmd_clean() {
             println!("  {GREEN}\u{2713}{RESET} Removed {name}");
         }
     }
+
+    // cargo-mutants writes its build sandbox here.
+    let mutants = root().join("mutants.out");
+    if mutants.is_dir() {
+        let _ = fs::remove_dir_all(&mutants);
+        println!("  {GREEN}\u{2713}{RESET} Removed mutants.out");
+    }
 }
 
 // ── CLI dispatch ────────────────────────────────────────────────────
@@ -457,6 +651,10 @@ const COMMANDS: &[(&str, fn())] = &[
     ("lint", cmd_lint),
     ("test", cmd_test),
     ("audit", cmd_audit),
+    ("acceptance", cmd_acceptance),
+    ("coverage", cmd_coverage),
+    ("mutation", cmd_mutation),
+    ("arch", cmd_arch),
     ("pre-commit", cmd_pre_commit),
     ("ci", cmd_ci),
     ("setup-hooks", cmd_hooks),
@@ -529,6 +727,27 @@ mod tests {
         assert!(
             result.iter().any(|(k, r)| k == "allow_crate" && r == &vec!["dead_code".to_string()])
         );
+    }
+
+    #[test]
+    fn feature_files_detected_recursively() {
+        let tmp = std::env::temp_dir().join(format!("rust-feat-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let nested = tmp.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert!(!has_feature_files(&tmp), "empty dir has no features");
+
+        fs::write(nested.join("smoke.feature"), "Feature: x").unwrap();
+        assert!(has_feature_files(&tmp), "nested .feature file is found");
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn feature_files_missing_dir_is_false() {
+        let missing = std::env::temp_dir().join(format!("rust-nodir-{}", std::process::id()));
+        assert!(!has_feature_files(&missing));
     }
 
     #[test]

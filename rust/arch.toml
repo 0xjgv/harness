@@ -1,0 +1,22 @@
+# Architecture rules — enforced by `cargo harness arch` (via cargo-modules).
+#
+# Rust's compiler already enforces visibility (pub/private) and crate-level
+# layering, but it does NOT forbid circular dependencies between modules
+# inside one crate. A module cycle is a design smell: it means two modules
+# cannot be reasoned about — or extracted — independently.
+#
+# This file declares the architectural invariants the `arch` gate checks.
+# It is a PROTECTED path: the Claude Code pre-edit hook denies edits unless
+# the user's prompt explicitly authorizes them. Architectural violations are
+# design decisions — surface them to the human, do not silence them here.
+
+[arch]
+# Forbid circular dependencies between modules of the library crate.
+# Starter rule — the only one the day-1 template ships. Extend as the
+# module graph grows (e.g. add layering rules once `cargo-modules`
+# constraint support, or a custom check, is wired in).
+forbid_cycles = true
+
+# Forbid orphan source files: .rs files on disk not reachable via `mod`
+# declarations. An orphan is dead weight or a wiring mistake.
+forbid_orphans = true

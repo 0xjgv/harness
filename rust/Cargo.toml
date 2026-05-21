@@ -17,6 +17,21 @@ path = "src/main.rs"
 name = "harness"
 path = "harness.rs"
 
+# ── Acceptance test runner ────────────────────────────────────────
+# Gherkin/BDD scenarios under tests/features/, executed by cucumber.
+# harness = false: cucumber prints its own output instead of libtest's.
+
+[[test]]
+name = "acceptance"
+path = "tests/acceptance.rs"
+harness = false
+
+# ── Dependencies ──────────────────────────────────────────────────
+
+[dev-dependencies]
+cucumber = "0.23"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
 # ── Lints ─────────────────────────────────────────────────────────
 
 [lints.rust]
