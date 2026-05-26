@@ -382,6 +382,56 @@ def _check_hooks_present() -> None:
         print(f"  {RED}⚠{RESET} Missing hook scripts: {', '.join(missing)}")
 
 
+def _first_diff_line(a: str, b: str) -> int:
+    """Return 1-based line number of the first line that differs."""
+    al, bl = a.splitlines(), b.splitlines()
+    for i in range(min(len(al), len(bl))):
+        if al[i] != bl[i]:
+            return i + 1
+    return min(len(al), len(bl)) + 1
+
+
+def _check_agents_md_drift() -> None:
+    """Fail if AGENTS.md differs from CLAUDE.md (byte-compare)."""
+    claude = Path("CLAUDE.md")
+    agents = Path("AGENTS.md")
+    if not claude.exists():
+        print(f"  {RED}✗{RESET} agents-md-drift: CLAUDE.md not found")
+        sys.exit(1)
+    if not agents.exists():
+        print(
+            f"  {RED}✗{RESET} agents-md-drift: AGENTS.md missing — "
+            "run `harness sync-agents-md`"
+        )
+        sys.exit(1)
+    a, b = claude.read_bytes(), agents.read_bytes()
+    if a == b:
+        print(f"  {GREEN}✓{RESET} agents-md-drift")
+        return
+    line = _first_diff_line(a.decode("utf-8", errors="replace"), b.decode("utf-8", errors="replace"))
+    print(
+        f"  {RED}✗{RESET} agents-md-drift: AGENTS.md differs from CLAUDE.md "
+        f"(first diff at line {line}) — run `harness sync-agents-md`"
+    )
+    sys.exit(1)
+
+
+def cmd_sync_agents_md() -> None:
+    """Overwrite AGENTS.md with CLAUDE.md contents."""
+    claude = Path("CLAUDE.md")
+    agents = Path("AGENTS.md")
+    if not claude.exists():
+        print(f"  {RED}✗{RESET} sync-agents-md: CLAUDE.md not found")
+        sys.exit(1)
+    agents.write_bytes(claude.read_bytes())
+    print(f"  {GREEN}✓{RESET} sync-agents-md: AGENTS.md ← CLAUDE.md")
+
+
+def cmd_agents_md_drift() -> None:
+    """Run the AGENTS.md / CLAUDE.md drift check."""
+    _check_agents_md_drift()
+
+
 def cmd_check() -> None:
     """Fix, format, typecheck, and test the full repo."""
     print("\n=== Quality Checks ===\n")
@@ -391,6 +441,7 @@ def cmd_check() -> None:
         cmd_typecheck()
         cmd_test()
         _check_hooks_present()
+        _check_agents_md_drift()
     finally:
         _print_suppressions_report()
 
@@ -406,6 +457,7 @@ def cmd_pre_commit() -> None:
     cmd_fix(files)
     cmd_format(files)
     cmd_typecheck()
+    _check_agents_md_drift()
 
     if any(f.startswith(f"{SRC_DIR}/") for f in files):
         cmd_test()
@@ -469,6 +521,8 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "complexity": (cmd_complexity, "Cyclomatic complexity gate (lizard, CCN 15)"),
     "arch": (cmd_arch, "Architecture checks (import-linter)"),
     "post-edit": (cmd_post_edit, "Format if source files changed (Claude Code hook)"),
+    "agents-md-drift": (cmd_agents_md_drift, "Fail if AGENTS.md differs from CLAUDE.md"),
+    "sync-agents-md": (cmd_sync_agents_md, "Overwrite AGENTS.md from CLAUDE.md"),
     "setup-hooks": (cmd_hooks, "Install git pre-commit hook"),
     "clean": (cmd_clean, "Remove cache and build artifacts"),
 }

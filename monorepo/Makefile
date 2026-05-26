@@ -77,6 +77,7 @@ export SH_FILTER_DIRS
 
 .PHONY: check
 check: ## Run check across all subprojects (auto-fix)
+	@$(MAKE) --no-print-directory _root_agents_drift || exit 1
 	@$(MAKE) --no-print-directory _run CMD=check DIRS="$(SUBPROJECTS)"
 
 .PHONY: check-dirty
@@ -92,6 +93,10 @@ check-dirty: ## Run check only in subprojects with working-tree changes
 pre-commit: ## Staged-only checks across affected subprojects
 	@set -u -o pipefail; eval "$$SH_FILTER_DIRS"; \
 	dirs=$$(staged_dirs); \
+	staged_root=$$(git diff --cached --name-only --diff-filter=d | grep -E '^(CLAUDE|AGENTS)\.md$$' || true); \
+	if [ -n "$$staged_root" ]; then \
+	  $(MAKE) --no-print-directory _root_agents_drift || exit 1; \
+	fi; \
 	if [ -z "$$dirs" ]; then \
 	  printf "$(DIM)No staged files in known subprojects.$(RESET)\n"; exit 0; \
 	fi; \
@@ -112,6 +117,45 @@ crap: ## CRAP gate (advisory) across all subprojects; forward flags via ARGS
 .PHONY: complexity
 complexity: ## Complexity gate across all subprojects; forward flags via ARGS
 	@$(MAKE) --no-print-directory _run CMD=complexity DIRS="$(SUBPROJECTS)" ARGS="$(ARGS)"
+
+.PHONY: agents-md-drift
+agents-md-drift: ## Fail if any AGENTS.md differs from its CLAUDE.md (root + subprojects)
+	@set -u -o pipefail; \
+	if ! $(MAKE) --no-print-directory _root_agents_drift; then exit 1; fi; \
+	$(MAKE) --no-print-directory _run CMD=agents-md-drift DIRS="$(SUBPROJECTS)"
+
+.PHONY: sync-agents-md
+sync-agents-md: ## Overwrite each AGENTS.md from its CLAUDE.md (root + subprojects)
+	@set -u -o pipefail; \
+	$(MAKE) --no-print-directory _root_agents_sync; \
+	$(MAKE) --no-print-directory _run CMD=sync-agents-md DIRS="$(SUBPROJECTS)"
+
+# ── Root-pair drift / sync (monorepo top-level AGENTS.md ↔ CLAUDE.md) ──
+.PHONY: _root_agents_drift _root_agents_sync
+
+_root_agents_drift:
+	@set -u; \
+	if [ ! -f CLAUDE.md ]; then \
+	  printf "  $(RED)✗$(RESET) agents-md-drift (root): CLAUDE.md not found\n"; exit 1; \
+	fi; \
+	if [ ! -f AGENTS.md ]; then \
+	  printf "  $(RED)✗$(RESET) agents-md-drift (root): AGENTS.md missing — run \`make sync-agents-md\`\n"; exit 1; \
+	fi; \
+	if cmp -s CLAUDE.md AGENTS.md; then \
+	  printf "  $(GREEN)✓$(RESET) agents-md-drift (root)\n"; \
+	else \
+	  line=$$(diff CLAUDE.md AGENTS.md | grep -m1 -E '^[0-9]' || echo "?"); \
+	  printf "  $(RED)✗$(RESET) agents-md-drift (root): AGENTS.md differs from CLAUDE.md (diff: %s) — run \`make sync-agents-md\`\n" "$$line"; \
+	  exit 1; \
+	fi
+
+_root_agents_sync:
+	@set -u; \
+	if [ ! -f CLAUDE.md ]; then \
+	  printf "  $(RED)✗$(RESET) sync-agents-md (root): CLAUDE.md not found\n"; exit 1; \
+	fi; \
+	cp CLAUDE.md AGENTS.md; \
+	printf "  $(GREEN)✓$(RESET) sync-agents-md (root): AGENTS.md ← CLAUDE.md\n"
 
 ##@ Setup & misc
 
@@ -198,6 +242,12 @@ crap-%:
 
 complexity-%:
 	@$(MAKE) --no-print-directory _scoped_run CMD=complexity DIR="$*" ARGS="$(ARGS)"
+
+agents-md-drift-%:
+	@$(MAKE) --no-print-directory _scoped_run CMD=agents-md-drift DIR="$*"
+
+sync-agents-md-%:
+	@$(MAKE) --no-print-directory _scoped_run CMD=sync-agents-md DIR="$*"
 
 pre-commit-%:
 	@$(MAKE) --no-print-directory _scoped_run CMD=pre-commit DIR="$*"

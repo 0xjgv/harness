@@ -573,6 +573,70 @@ func checkHooksPresent() {
 	}
 }
 
+// firstDiffLine returns the 1-based line number of the first divergence.
+func firstDiffLine(a, b string) int {
+	al := strings.Split(a, "\n")
+	bl := strings.Split(b, "\n")
+	n := len(al)
+	if len(bl) < n {
+		n = len(bl)
+	}
+	for i := 0; i < n; i++ {
+		if al[i] != bl[i] {
+			return i + 1
+		}
+	}
+	return n + 1
+}
+
+// checkAgentsMdDrift fails if AGENTS.md differs byte-for-byte from CLAUDE.md.
+// Returns ok=true on identity, ok=false otherwise. When noExit is false, exits 1 on mismatch.
+func checkAgentsMdDrift(noExit bool) runResult {
+	claudePath := filepath.Join(root, "CLAUDE.md")
+	agentsPath := filepath.Join(root, "AGENTS.md")
+	fail := func(msg string) runResult {
+		fmt.Printf("  %s✗%s agents-md-drift: %s\n", red, reset, msg)
+		if !noExit {
+			os.Exit(1)
+		}
+		return runResult{ok: false, output: msg}
+	}
+	a, err := os.ReadFile(claudePath)
+	if err != nil {
+		return fail("CLAUDE.md not found")
+	}
+	b, err := os.ReadFile(agentsPath)
+	if err != nil {
+		return fail("AGENTS.md missing — run `harness sync-agents-md`")
+	}
+	if string(a) == string(b) {
+		fmt.Printf("  %s✓%s agents-md-drift\n", green, reset)
+		return runResult{ok: true}
+	}
+	line := firstDiffLine(string(a), string(b))
+	return fail(fmt.Sprintf(
+		"AGENTS.md differs from CLAUDE.md (first diff at line %d) — run `harness sync-agents-md`",
+		line,
+	))
+}
+
+func cmdAgentsMdDrift() { checkAgentsMdDrift(false) }
+
+// cmdSyncAgentsMd overwrites AGENTS.md with CLAUDE.md contents.
+func cmdSyncAgentsMd() {
+	claudePath := filepath.Join(root, "CLAUDE.md")
+	a, err := os.ReadFile(claudePath)
+	if err != nil {
+		fmt.Printf("  %s✗%s sync-agents-md: CLAUDE.md not found\n", red, reset)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), a, 0o644); err != nil {
+		fmt.Printf("  %s✗%s sync-agents-md: %v\n", red, reset, err)
+		os.Exit(1)
+	}
+	fmt.Printf("  %s✓%s sync-agents-md: AGENTS.md ← CLAUDE.md\n", green, reset)
+}
+
 func cmdCheck() {
 	start := time.Now()
 	fmt.Printf("\n%s[check]%s Running pre-flight checks...\n\n", blue, reset)
@@ -583,6 +647,7 @@ func cmdCheck() {
 	}
 
 	checkHooksPresent()
+	results = append(results, checkAgentsMdDrift(true))
 	suppressions.PrintReport(suppressions.Scan(root))
 
 	elapsed := time.Since(start).Seconds()
@@ -615,6 +680,7 @@ func cmdPreCommit() {
 
 	pkgs := stagedPackages(files)
 	cmdFix(pkgs)
+	checkAgentsMdDrift(false)
 
 	if hasNonTestFiles(files) {
 		cmdTest()
@@ -701,6 +767,8 @@ var tasks = []task{
 	{"ci", cmdCi, "Full verification: lint, audit, complexity, acceptance, coverage, arch"},
 	{"setup-hooks", cmdHooks, "Install git pre-commit hook"},
 	{"post-edit", cmdPostEdit, "Format if source files changed (Claude Code hook)"},
+	{"agents-md-drift", cmdAgentsMdDrift, "Fail if AGENTS.md differs from CLAUDE.md"},
+	{"sync-agents-md", cmdSyncAgentsMd, "Overwrite AGENTS.md from CLAUDE.md"},
 	{"clean", cmdClean, "Remove coverage and test cache"},
 }
 

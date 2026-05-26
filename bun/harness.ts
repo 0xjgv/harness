@@ -506,6 +506,57 @@ async function checkHooksPresent(): Promise<void> {
   }
 }
 
+function firstDiffLine(a: string, b: string): number {
+  const al = a.split('\n');
+  const bl = b.split('\n');
+  const len = Math.min(al.length, bl.length);
+  for (let i = 0; i < len; i++) {
+    if (al[i] !== bl[i]) return i + 1;
+  }
+  return len + 1;
+}
+
+async function checkAgentsMdDrift(noExit = false): Promise<RunResult> {
+  const { existsSync, readFileSync } = await import('node:fs');
+  const claudePath = `${ROOT}/CLAUDE.md`;
+  const agentsPath = `${ROOT}/AGENTS.md`;
+  const fail = (msg: string): RunResult => {
+    console.log(`  ${RED}✗${RESET} agents-md-drift: ${msg}`);
+    if (!noExit) process.exit(1);
+    return { ok: false, output: msg };
+  };
+  if (!existsSync(claudePath)) return fail('CLAUDE.md not found');
+  if (!existsSync(agentsPath)) {
+    return fail('AGENTS.md missing — run `harness sync-agents-md`');
+  }
+  const a = readFileSync(claudePath);
+  const b = readFileSync(agentsPath);
+  if (a.equals(b)) {
+    console.log(`  ${GREEN}✓${RESET} agents-md-drift`);
+    return { ok: true, output: '' };
+  }
+  const line = firstDiffLine(a.toString('utf8'), b.toString('utf8'));
+  return fail(
+    `AGENTS.md differs from CLAUDE.md (first diff at line ${line}) — ` +
+      'run `harness sync-agents-md`',
+  );
+}
+
+async function cmdSyncAgentsMd(): Promise<void> {
+  const { existsSync, readFileSync, writeFileSync } = await import('node:fs');
+  const claudePath = `${ROOT}/CLAUDE.md`;
+  if (!existsSync(claudePath)) {
+    console.log(`  ${RED}✗${RESET} sync-agents-md: CLAUDE.md not found`);
+    process.exit(1);
+  }
+  writeFileSync(`${ROOT}/AGENTS.md`, readFileSync(claudePath));
+  console.log(`  ${GREEN}✓${RESET} sync-agents-md: AGENTS.md ← CLAUDE.md`);
+}
+
+async function cmdAgentsMdDrift(): Promise<void> {
+  await checkAgentsMdDrift();
+}
+
 async function cmdCheck(): Promise<void> {
   const start = performance.now();
   console.log(`\n${BLUE}[check]${RESET} Running pre-flight checks...\n`);
@@ -526,6 +577,7 @@ async function cmdCheck(): Promise<void> {
   results.push(await run('Tests', ['bun', 'test'], { extract: extractTestSummary, noExit: true }));
 
   await checkHooksPresent();
+  results.push(await checkAgentsMdDrift(true));
   await printSuppressionsReport();
 
   const elapsed = ((performance.now() - start) / 1000).toFixed(1);
@@ -553,6 +605,7 @@ async function cmdPreCommit(): Promise<void> {
   console.log(`\n${BLUE}[pre-commit]${RESET}\n`);
   await cmdFix(files);
   await cmdTypecheck();
+  await checkAgentsMdDrift();
 
   if (files.some((f) => f.startsWith(`${SRC_DIR}/`))) {
     await cmdTest();
@@ -617,6 +670,8 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   ci: [cmdCi, 'Lint + typecheck + audit + complexity + acceptance + coverage + arch'],
   'setup-hooks': [cmdHooks, 'Install git pre-commit hook'],
   'post-edit': [cmdPostEdit, 'Format if source files changed (Claude Code hook)'],
+  'agents-md-drift': [cmdAgentsMdDrift, 'Fail if AGENTS.md differs from CLAUDE.md'],
+  'sync-agents-md': [cmdSyncAgentsMd, 'Overwrite AGENTS.md from CLAUDE.md'],
   clean: [cmdClean, 'Remove caches and build artifacts'],
 };
 

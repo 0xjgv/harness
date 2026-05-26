@@ -819,6 +819,71 @@ fn check_hooks_present() {
     }
 }
 
+/// 1-based line number of the first divergence between `a` and `b`.
+fn first_diff_line(a: &str, b: &str) -> usize {
+    let mut al = a.lines();
+    let mut bl = b.lines();
+    let mut i = 0usize;
+    loop {
+        match (al.next(), bl.next()) {
+            (Some(x), Some(y)) => {
+                i += 1;
+                if x != y {
+                    return i;
+                }
+            }
+            (None, None) => return i + 1,
+            _ => return i + 1,
+        }
+    }
+}
+
+/// Fail if AGENTS.md differs byte-for-byte from CLAUDE.md.
+/// Returns ok=true on identity. With `no_exit=false`, exits 1 on mismatch.
+fn check_agents_md_drift(no_exit: bool) -> RunResult {
+    let claude_path = root().join("CLAUDE.md");
+    let agents_path = root().join("AGENTS.md");
+    let fail = |msg: String| -> RunResult {
+        println!("  {RED}\u{2717}{RESET} agents-md-drift: {msg}");
+        if !no_exit {
+            std::process::exit(1);
+        }
+        RunResult { ok: false, output: msg }
+    };
+    let Ok(a) = fs::read(&claude_path) else {
+        return fail("CLAUDE.md not found".into());
+    };
+    let Ok(b) = fs::read(&agents_path) else {
+        return fail("AGENTS.md missing \u{2014} run `cargo harness sync-agents-md`".into());
+    };
+    if a == b {
+        println!("  {GREEN}\u{2713}{RESET} agents-md-drift");
+        return RunResult { ok: true, output: String::new() };
+    }
+    let line = first_diff_line(&String::from_utf8_lossy(&a), &String::from_utf8_lossy(&b));
+    fail(format!(
+        "AGENTS.md differs from CLAUDE.md (first diff at line {line}) \u{2014} run `cargo harness sync-agents-md`"
+    ))
+}
+
+fn cmd_agents_md_drift() {
+    check_agents_md_drift(false);
+}
+
+/// Overwrite AGENTS.md with CLAUDE.md contents.
+fn cmd_sync_agents_md() {
+    let claude_path = root().join("CLAUDE.md");
+    let Ok(bytes) = fs::read(&claude_path) else {
+        println!("  {RED}\u{2717}{RESET} sync-agents-md: CLAUDE.md not found");
+        std::process::exit(1);
+    };
+    if let Err(e) = fs::write(root().join("AGENTS.md"), &bytes) {
+        println!("  {RED}\u{2717}{RESET} sync-agents-md: {e}");
+        std::process::exit(1);
+    }
+    println!("  {GREEN}\u{2713}{RESET} sync-agents-md: AGENTS.md \u{2190} CLAUDE.md");
+}
+
 fn cmd_check() {
     let start = Instant::now();
     println!("\n{BLUE}[check]{RESET} Running pre-flight checks...\n");
@@ -839,6 +904,7 @@ fn cmd_check() {
                 ..RunOpts::default()
             }),
         ),
+        check_agents_md_drift(true),
     ];
 
     check_hooks_present();
@@ -866,6 +932,7 @@ fn cmd_pre_commit() {
     println!("\n{BLUE}[pre-commit]{RESET}\n");
 
     cmd_fix();
+    check_agents_md_drift(false);
     cmd_test();
 }
 
@@ -952,6 +1019,8 @@ const COMMANDS: &[(&str, fn())] = &[
     ("ci", cmd_ci),
     ("setup-hooks", cmd_hooks),
     ("post-edit", cmd_post_edit),
+    ("agents-md-drift", cmd_agents_md_drift),
+    ("sync-agents-md", cmd_sync_agents_md),
     ("clean", cmd_clean),
 ];
 
