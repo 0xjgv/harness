@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"harness/crap"
 	"harness/suppressions"
 )
 
@@ -343,40 +343,63 @@ func cmdMutation() {
 	fmt.Printf("  %s✓%s Mutation (gremlins)\n", green, reset)
 }
 
-// funcMetric pairs a function's complexity with its coverage for CRAP scoring.
+// funcMetric pairs a function's location with its cyclomatic complexity.
+// Coverage is computed at join time in cmdCrap from per-line hit counts.
 type funcMetric struct {
 	file string
 	line int
+	end  int
 	name string
 	ccn  int
-	cov  float64
 }
 
-var (
-	gocycloRe = regexp.MustCompile(`^(\d+)\s+\S+\s+(\S+)\s+(\S+):(\d+):\d+`)
-	coverRe   = regexp.MustCompile(`^(\S+):(\d+):\s+(\S+)\s+([\d.]+)%`)
-)
+// lizard --csv location field: "name@start-end@path" (quoted, may contain commas in sig).
+var lizardLocRe = regexp.MustCompile(`"([^"@]*)@(\d+)-(\d+)@([^"]+)"`)
 
 // cmdCrap computes CRAP = CCN² × (1-cov)³ + CCN per function. Advisory.
 //
-// Inputs are Go-native: gocyclo gives per-function complexity, and
-// `go tool cover -func` (over coverage.out) gives per-function coverage.
-// They are joined on (file basename, start line, function name).
+// Inputs: `lizard --csv` gives per-function complexity + line range, and
+// coverage.out (parsed by crap.ParseCoverProfile) gives per-line hits. The
+// per-function coverage is the fraction of in-range tracked lines that ran.
+// Joining on file+line range, not name, sidesteps Go's "(*Foo).Bar" vs "Bar"
+// receiver-name mismatch between cover output and lizard output.
 func cmdCrap() {
 	maxCrap, _ := strconv.ParseFloat(flagValue("max", "30"), 64)
 	changedOnly := hasFlag("changed-only")
+	enforce := hasFlag("enforce")
 
 	covPath := filepath.Join(root, "coverage.out")
-	if _, err := os.Stat(covPath); err != nil {
+	covText, err := os.ReadFile(covPath)
+	if err != nil {
 		fmt.Printf("  %s✗%s CRAP: coverage.out not found — run `harness test-cov` (or `harness ci`) first\n", red, reset)
 		os.Exit(1)
 	}
 
-	covByFunc := coverageByFunc(covPath)
-	metrics := complexityMetrics(covByFunc)
+	// coverprofile paths are module-qualified ("harness/suppressions/foo.go");
+	// lizard reports module-relative paths ("suppressions/foo.go"). Strip the
+	// module prefix once so the two key spaces align.
+	rawCov := crap.ParseCoverProfile(string(covText))
+	modPrefix := goModulePath() + "/"
+	cov := make(map[string]map[int]int, len(rawCov))
+	for k, v := range rawCov {
+		rel := strings.TrimPrefix(k, modPrefix)
+		cov[rel] = v
+	}
+
+	metrics := complexityMetrics()
 	if metrics == nil {
-		fmt.Printf("  %s✗%s CRAP: gocyclo produced no output\n", red, reset)
-		os.Exit(1)
+		// Lizard produced no usable output (uvx missing, lizard crash, format
+		// drift). Reporting "all functions below max" would be a silent false-
+		// pass; surface the failure and degrade to advisory unless --enforce.
+		suffix := ""
+		if !enforce {
+			suffix = " (advisory)"
+		}
+		fmt.Printf("  %s✗%s CRAP: lizard failed to run%s\n", red, reset, suffix)
+		if enforce {
+			os.Exit(1)
+		}
+		return
 	}
 
 	var changed map[string]bool
@@ -384,20 +407,20 @@ func cmdCrap() {
 		changed = changedFilesVsMain()
 	}
 
-	var offenders []struct {
+	type scored struct {
 		crap   float64
+		cov    float64
 		metric funcMetric
 	}
+	var offenders []scored
 	for _, m := range metrics {
 		if changed != nil && !changed[m.file] {
 			continue
 		}
-		crap := float64(m.ccn*m.ccn)*math.Pow(1-m.cov, 3) + float64(m.ccn)
-		if crap > maxCrap {
-			offenders = append(offenders, struct {
-				crap   float64
-				metric funcMetric
-			}{crap, m})
+		c := functionCoverage(cov[m.file], m.line, m.end)
+		score := crap.Score(m.ccn, c)
+		if score > maxCrap {
+			offenders = append(offenders, scored{score, c, m})
 		}
 	}
 
@@ -406,63 +429,107 @@ func cmdCrap() {
 		return
 	}
 	sort.Slice(offenders, func(i, j int) bool { return offenders[i].crap > offenders[j].crap })
-	fmt.Printf("  %s✗%s CRAP: %d function(s) exceed %.0f\n", red, reset, len(offenders), maxCrap)
+	suffix := " (advisory)"
+	if enforce {
+		suffix = ""
+	}
+	fmt.Printf("  %s✗%s CRAP: %d function(s) exceed %.0f%s\n", red, reset, len(offenders), maxCrap, suffix)
 	limit := min(len(offenders), 20)
 	for _, o := range offenders[:limit] {
 		m := o.metric
 		fmt.Printf("    CRAP=%6.1f  CCN=%3d  cov=%5.1f%%  %s@%d %s\n",
-			o.crap, m.ccn, m.cov*100, m.name, m.line, m.file)
+			o.crap, m.ccn, o.cov*100, m.name, m.line, m.file)
 	}
-	os.Exit(1)
+	if enforce {
+		os.Exit(1)
+	}
 }
 
-// coverageByFunc parses `go tool cover -func` into a (file:line:name) keyed map.
-func coverageByFunc(covPath string) map[string]float64 {
-	c := exec.Command("go", "tool", "cover", "-func="+covPath)
+// functionCoverage returns the fraction of tracked lines in [start,end] that
+// ran at least once. Lines absent from fileMap are untracked (not counted).
+// Returns 0 for a function whose lines are all untracked or fileMap is nil.
+func functionCoverage(fileMap map[int]int, start, end int) float64 {
+	if fileMap == nil {
+		return 0
+	}
+	var tracked, covered int
+	for ln := start; ln <= end; ln++ {
+		hits, ok := fileMap[ln]
+		if !ok {
+			continue
+		}
+		tracked++
+		if hits > 0 {
+			covered++
+		}
+	}
+	if tracked == 0 {
+		return 0
+	}
+	return float64(covered) / float64(tracked)
+}
+
+// goModulePath returns the module path declared in go.mod, or "" if absent.
+func goModulePath() string {
+	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	if err != nil {
+		return ""
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(line, "module "); ok {
+			return strings.TrimSpace(rest)
+		}
+	}
+	return ""
+}
+
+// complexityMetrics runs `lizard --csv` over the module and yields per-function
+// (file, line range, name, ccn) tuples for CRAP scoring.
+//
+// `harness.go` carries `//go:build ignore`: it is not part of any testable
+// package, so no coverage data can exist for it. Test files are also skipped
+// because `go test -cover` records coverage only for the SUT.
+//
+// On lizard failure (non-zero exit), returns nil. The caller must NOT trust
+// partial output: if lizard crashed mid-walk, a partial slice would let
+// high-CCN functions slip through the gate silently.
+func complexityMetrics() []funcMetric {
+	c := exec.Command("uvx", "lizard@1.22.2", "-l", "go", ".", "--csv")
 	c.Dir = root
 	out, err := c.Output()
 	if err != nil {
 		return nil
 	}
-	result := map[string]float64{}
-	for line := range strings.SplitSeq(string(out), "\n") {
-		m := coverRe.FindStringSubmatch(strings.TrimSpace(line))
-		if m == nil {
-			continue
-		}
-		pct, _ := strconv.ParseFloat(m[4], 64)
-		key := filepath.Base(m[1]) + ":" + m[2] + ":" + m[3]
-		result[key] = pct / 100
-	}
-	return result
-}
-
-// complexityMetrics runs gocyclo and joins each function with its coverage.
-//
-// `harness.go` carries `//go:build ignore`: it is not part of any testable
-// package, so no coverage data can exist for it. It is skipped here for the
-// same reason python's cmd_crap scans only src/ — CRAP needs both inputs.
-func complexityMetrics(covByFunc map[string]float64) []funcMetric {
-	c := exec.Command("go", "run", "github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0", ".")
-	c.Dir = root
-	out, err := c.Output()
-	if err != nil && len(out) == 0 {
-		return nil
-	}
 	var metrics []funcMetric
-	for line := range strings.SplitSeq(string(out), "\n") {
-		m := gocycloRe.FindStringSubmatch(strings.TrimSpace(line))
+	for row := range strings.SplitSeq(string(out), "\n") {
+		cols := strings.SplitN(row, ",", 11)
+		if len(cols) < 11 {
+			continue
+		}
+		ccn, err := strconv.Atoi(cols[1])
+		if err != nil {
+			continue
+		}
+		m := lizardLocRe.FindStringSubmatch(row)
 		if m == nil {
 			continue
 		}
-		if m[3] == "harness.go" {
+		name := m[1]
+		ln, _ := strconv.Atoi(m[2])
+		end, _ := strconv.Atoi(m[3])
+		path := strings.TrimPrefix(m[4], "./")
+		base := filepath.Base(path)
+		if base == "harness.go" || strings.HasSuffix(base, "_test.go") {
 			continue
 		}
-		ccn, _ := strconv.Atoi(m[1])
-		ln, _ := strconv.Atoi(m[4])
-		key := filepath.Base(m[3]) + ":" + m[4] + ":" + m[2]
+		// Skip anonymous closures: per-function coverage attribution would
+		// roll into the enclosing function and mis-score the closure itself.
+		if name == "" {
+			continue
+		}
 		metrics = append(metrics, funcMetric{
-			file: m[3], line: ln, name: m[2], ccn: ccn, cov: covByFunc[key],
+			file: path, line: ln, end: end, name: name, ccn: ccn,
 		})
 	}
 	return metrics
@@ -561,17 +628,24 @@ func cmdCi() {
 	cmdComplexity()
 	cmdAcceptance()
 	cmdTestCov()
+	cmdCrap()
 	cmdArch()
 }
 
 // cmdComplexity runs the read-only cyclomatic-complexity gate.
 // golangci-lint's gocyclo linter already enforces a per-function ceiling
-// (see .golangci.yaml); this stage surfaces it as its own ci step so the
-// pipeline position mirrors the python template (… → complexity → …).
+// over src (see .golangci.yaml); this stage runs lizard for parity with the
+// bun/python templates (… → complexity → …).
+//
+// Excludes: `_test.go` (test code has different complexity norms — table-
+// driven tests legitimately branch a lot) and `harness.go` (carries
+// `//go:build ignore`, not part of any production package). The cmdCrap join
+// applies the same exclusions so both gates target the same code set.
 func cmdComplexity() {
-	run("Complexity (gocyclo, CCN 15)", []string{
-		"go", "run", "github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0",
-		"-over", "15", "-ignore", "_test\\.go", ".",
+	run("Complexity (lizard)", []string{
+		"uvx", "lizard@1.22.2", "-l", "go", ".",
+		"-C", "15", "-a", "7", "-L", "100", "-i", "0",
+		"-x", "*_test.go", "-x", "./harness.go",
 	}, nil)
 }
 
@@ -618,7 +692,7 @@ var tasks = []task{
 	{"test", cmdTest, "Run tests"},
 	{"test-cov", cmdTestCov, "Run tests with race detector and coverage"},
 	{"audit", cmdAudit, "Audit dependencies for known vulnerabilities"},
-	{"complexity", cmdComplexity, "Cyclomatic complexity gate (gocyclo, CCN 15)"},
+	{"complexity", cmdComplexity, "Cyclomatic complexity gate (lizard, CCN 15)"},
 	{"acceptance", cmdAcceptance, "Run acceptance scenarios (godog)"},
 	{"arch", cmdArch, "Architecture checks (go-arch-lint)"},
 	{"mutation", cmdMutation, "Mutation testing (gremlins, advisory)"},

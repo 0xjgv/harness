@@ -4,12 +4,13 @@
 
 - After edits: `bun run check` — fix, format, typecheck, test, hook-drift + suppression report
 - Pre-commit: `bun run pre-commit` — staged files only (auto via git hook)
-- CI: `bun run ci` — read-only lint, typecheck, dep audit, complexity gate (lizard, CCN 15), acceptance, coverage, arch. Requires `uvx` on PATH.
+- CI: `bun run ci` — read-only pipeline: lint → typecheck → audit → complexity → acceptance → coverage → crap → arch. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
+- Complexity: `bun run harness.ts complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤7, length≤100) over src + tests
 - Audit: `bun run audit` — audit dependencies for known vulnerabilities (via bun audit)
 - Acceptance: `bun run acceptance` — run cucumber against `tests/features/`
 - Coverage: `bun run coverage --min=0` — `bun test` coverage (LCOV) with threshold
 - Mutation (advisory): `bun run mutation` — Stryker mutation score on src/
-- CRAP (advisory): `bun run crap --max=30` — complexity × coverage gate
+- CRAP (advisory): `bun run crap --max=30` — complexity × coverage gate. Add `--enforce` to exit 1 on offenders (default exits 0 with warning).
 - Arch: `bun run arch` — dependency-cruiser against `.dependency-cruiser.json`
 - Setup: `bun run setup-hooks` to install git pre-commit hook
 - Auto-format: runs automatically after Claude edits via `Stop` hook (post-edit)

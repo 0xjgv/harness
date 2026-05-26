@@ -19,7 +19,10 @@ import (
 // TestFeatures executes every *.feature file in this directory.
 func TestFeatures(t *testing.T) {
 	suite := godog.TestSuite{
-		ScenarioInitializer: steps.InitializeScenario,
+		ScenarioInitializer: func(sc *godog.ScenarioContext) {
+			steps.InitializeScenario(sc)
+			steps.InitializeCrapScenario(sc)
+		},
 		Options: &godog.Options{
 			Format:   "pretty",
 			Paths:    []string{"."},

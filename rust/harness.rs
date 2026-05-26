@@ -397,6 +397,10 @@ fn has_feature_files(dir: &Path) -> bool {
 /// project — ratchet up as the suite matures. Requires cargo-llvm-cov:
 /// `cargo install cargo-llvm-cov`. Absent → warn + skip (advisory-friendly),
 /// matching the audit gate's install-aware behavior.
+///
+/// Runs the test suite ONCE under llvm-cov (`--no-report`), then renders two
+/// reports from the cached profdata: an LCOV file (consumed by cmd_crap to
+/// avoid a second test run) and a console summary with the threshold check.
 fn cmd_coverage() {
     let min_pct = arg_value("--min").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
 
@@ -410,11 +414,26 @@ fn cmd_coverage() {
     // Homebrew) may not. When they are absent, fall back to a system LLVM
     // install via the documented LLVM_COV / LLVM_PROFDATA env vars.
     let env = llvm_tools_env();
-
+    let lcov_path = root().join("target").join("llvm-cov").join("lcov.info");
+    if let Some(parent) = lcov_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let lcov_str = lcov_path.to_string_lossy().into_owned();
     let threshold = format!("{min_pct}");
+
+    run(
+        "Coverage (run)",
+        &["cargo", "llvm-cov", "--no-report"],
+        Some(&RunOpts { env: env.clone(), ..RunOpts::default() }),
+    );
+    run(
+        "Coverage: LCOV report",
+        &["cargo", "llvm-cov", "report", "--lcov", "--output-path", &lcov_str],
+        Some(&RunOpts { env: env.clone(), ..RunOpts::default() }),
+    );
     run(
         &format!("Coverage >= {min_pct}%"),
-        &["cargo", "llvm-cov", "--summary-only", "--fail-under-lines", &threshold],
+        &["cargo", "llvm-cov", "report", "--summary-only", "--fail-under-lines", &threshold],
         Some(&RunOpts { env, ..RunOpts::default() }),
     );
 }
@@ -496,6 +515,271 @@ fn cmd_arch() {
     run("Arch: no orphan files", &["cargo", "modules", "orphans", "--lib"], None);
 }
 
+/// Run lizard as a cyclomatic-complexity gate. Mirrors bun/python invocation.
+fn cmd_complexity() {
+    run(
+        "Complexity (lizard)",
+        &[
+            "uvx", "lizard@1.22.2", "-l", "rust", "src", "tests",
+            "-C", "15", "-a", "7", "-L", "100", "-i", "0",
+        ],
+        None,
+    );
+}
+
+/// Compute CRAP = CCN² × (1-cov)³ + CCN per function. Advisory — not in `ci`.
+///
+/// Joins `lizard --csv` (per-function CCN + line range) with the LCOV file
+/// produced by `cargo llvm-cov`. Functions with CRAP above `--max=N`
+/// (default 30) are listed and the gate exits 1 only when `--enforce` is set.
+///
+/// LCOV reuse: when invoked from `cmd_ci`, `cmd_coverage` has already produced
+/// `target/llvm-cov/lcov.info`; this command reuses it. Standalone runs (or
+/// runs where `src/` is newer than the existing LCOV) trigger a full test
+/// re-execution to avoid scoring against stale coverage.
+fn cmd_crap() {
+    let max_crap: f64 = arg_value("--max").and_then(|v| v.parse::<f64>().ok()).unwrap_or(30.0);
+    let enforce = arg_flag("--enforce");
+
+    if !tool_installed("llvm-cov") {
+        println!("  {DIM}\u{2298} CRAP skipped (install: cargo install cargo-llvm-cov){RESET}");
+        return;
+    }
+
+    let lcov_path = root().join("target").join("llvm-cov").join("lcov.info");
+    if !lcov_path.exists() || !lcov_is_fresh(&lcov_path, &["src", "tests"]) {
+        if let Some(parent) = lcov_path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            println!("  {RED}\u{2717}{RESET} CRAP: cannot create {}: {e}", parent.display());
+            std::process::exit(1);
+        }
+        let env = llvm_tools_env();
+        let lcov_str = lcov_path.to_string_lossy().into_owned();
+        let run_result = run(
+            "CRAP: running tests under llvm-cov",
+            &["cargo", "llvm-cov", "--no-report"],
+            Some(&RunOpts { env: env.clone(), no_exit: true, ..RunOpts::default() }),
+        );
+        let report_result = if run_result.ok {
+            run(
+                "CRAP: emit LCOV",
+                &["cargo", "llvm-cov", "report", "--lcov", "--output-path", &lcov_str],
+                Some(&RunOpts { env, no_exit: true, ..RunOpts::default() }),
+            )
+        } else {
+            run_result
+        };
+        if !report_result.ok || !lcov_path.exists() {
+            println!(
+                "  {RED}\u{2717}{RESET} CRAP: could not produce {}",
+                lcov_path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let Some(cov_map) = parse_lcov(&lcov_path) else {
+        println!("  {RED}\u{2717}{RESET} CRAP: failed to read {}", lcov_path.display());
+        std::process::exit(1);
+    };
+
+    let lz_output = Command::new("uvx")
+        .args(["lizard@1.22.2", "-l", "rust", "src", "--csv"])
+        .current_dir(root())
+        .output();
+
+    let lz_stdout = match lz_output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => {
+            // Lizard ran but exited non-zero. Trusting partial output would
+            // print a green ✓ while leaving high-CCN functions unscored;
+            // surface the failure and degrade to advisory unless --enforce.
+            let suffix = if enforce { "" } else { " (advisory)" };
+            println!(
+                "  {RED}\u{2717}{RESET} CRAP: lizard exited {:?}{suffix}",
+                o.status.code()
+            );
+            if !o.stderr.is_empty() {
+                print!("{}", String::from_utf8_lossy(&o.stderr));
+            }
+            if enforce {
+                std::process::exit(o.status.code().unwrap_or(1));
+            }
+            return;
+        }
+        Err(e) => {
+            let suffix = if enforce { "" } else { " (advisory)" };
+            println!("  {RED}\u{2717}{RESET} CRAP: failed to run lizard: {e}{suffix}");
+            if enforce {
+                std::process::exit(1);
+            }
+            return;
+        }
+    };
+
+    // cargo-llvm-cov writes absolute paths in `SF:` lines while lizard emits
+    // paths relative to cwd. Build both key shapes for the join — using only
+    // the relative form would silently score every function as cov=0.
+    let abs_root = root().to_string_lossy().into_owned();
+    let mut offenders: Vec<CrapFn> = Vec::new();
+    for row in lz_stdout.lines() {
+        let Some(parsed) = parse_lizard_csv_row(row) else { continue };
+        let (ccn, name, start, end, path) = parsed;
+        let normalized = path.trim_start_matches("./").to_string();
+        let abs_key = format!("{abs_root}/{normalized}");
+        let lines = cov_map
+            .get(&abs_key)
+            .or_else(|| cov_map.get(&normalized))
+            .or_else(|| cov_map.get(&path));
+        let cov = lines.map_or(0.0, |map| {
+            let in_range: Vec<u32> = (start..=end).filter_map(|n| map.get(&n).copied()).collect();
+            if in_range.is_empty() {
+                0.0
+            } else {
+                in_range.iter().filter(|&&h| h > 0).count() as f64 / in_range.len() as f64
+            }
+        });
+        let crap = crap_score(ccn, cov);
+        if crap > max_crap {
+            offenders.push(CrapFn {
+                crap,
+                ccn,
+                cov,
+                location: format!("{name}@{start}-{end}@{path}"),
+            });
+        }
+    }
+
+    if offenders.is_empty() {
+        println!("  {GREEN}\u{2713}{RESET} CRAP: all functions below {max_crap:.0}");
+        return;
+    }
+    offenders
+        .sort_by(|a, b| b.crap.partial_cmp(&a.crap).unwrap_or(std::cmp::Ordering::Equal));
+    let suffix = if enforce { "" } else { " (advisory)" };
+    println!(
+        "  {RED}\u{2717}{RESET} CRAP: {} function(s) exceed {max_crap:.0}{suffix}",
+        offenders.len()
+    );
+    for o in offenders.iter().take(20) {
+        println!(
+            "    CRAP={:6.1}  CCN={:3}  cov={:5.1}%  {}",
+            o.crap, o.ccn, o.cov * 100.0, o.location
+        );
+    }
+    if enforce {
+        std::process::exit(1);
+    }
+}
+
+/// True when `lcov_path` is at least as new as every `.rs` file under `src_dirs`.
+///
+/// Used by `cmd_crap` to detect "I edited source but did not re-run coverage"
+/// staleness: scoring fresh complexity data against an old LCOV silently
+/// misattributes coverage. Returns false (force regeneration) on any I/O or
+/// metadata error so the safe path is to re-run, not to trust stale data.
+fn lcov_is_fresh(lcov_path: &Path, src_dirs: &[&str]) -> bool {
+    let Ok(lcov_meta) = fs::metadata(lcov_path) else { return false };
+    let Ok(lcov_mtime) = lcov_meta.modified() else { return false };
+    for dir in src_dirs {
+        let dir_path = root().join(dir);
+        let mut stack = vec![dir_path];
+        while let Some(p) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&p) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_some_and(|e| e == "rs")
+                    && let Ok(meta) = path.metadata()
+                    && let Ok(mtime) = meta.modified()
+                    && mtime > lcov_mtime
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// CRAP score = CCN² × (1-cov)³ + CCN. `cov` is in [0,1].
+fn crap_score(ccn: u32, cov: f64) -> f64 {
+    let ccn_f = f64::from(ccn);
+    (ccn_f * ccn_f).mul_add((1.0 - cov).powi(3), ccn_f)
+}
+
+struct CrapFn {
+    crap: f64,
+    ccn: u32,
+    cov: f64,
+    location: String,
+}
+
+/// Parse LCOV into `{file: {lineNumber: hits}}`. Recognizes `SF:`, `DA:`, `end_of_record`.
+fn parse_lcov(path: &Path) -> Option<HashMap<String, HashMap<u32, u32>>> {
+    let text = fs::read_to_string(path).ok()?;
+    Some(parse_lcov_str(&text))
+}
+
+/// In-memory variant of `parse_lcov` — same grammar, but operates on a string.
+/// Exists so tests can exercise the parser without touching the filesystem.
+fn parse_lcov_str(text: &str) -> HashMap<String, HashMap<u32, u32>> {
+    let mut map: HashMap<String, HashMap<u32, u32>> = HashMap::new();
+    let mut cur_file: Option<String> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("SF:") {
+            let file = rest.trim().to_string();
+            map.entry(file.clone()).or_default();
+            cur_file = Some(file);
+        } else if line == "end_of_record" {
+            cur_file = None;
+        } else if let (Some(rest), Some(file)) = (line.strip_prefix("DA:"), cur_file.as_ref()) {
+            let mut parts = rest.split(',');
+            let (Some(n), Some(h)) = (parts.next(), parts.next()) else { continue };
+            let (Ok(ln), Ok(hits)) = (n.parse::<u32>(), h.parse::<u32>()) else { continue };
+            if let Some(file_map) = map.get_mut(file) {
+                file_map.insert(ln, hits);
+            }
+        }
+    }
+    map
+}
+
+/// Parse one `lizard --csv` row into (ccn, name, start, end, path).
+///
+/// Lizard columns: nloc,ccn,token,param,length,location,file,name,sig,start,end.
+/// The location column is the only one whose value is self-contained:
+/// `"name@start-end@path"`. Signatures can contain commas, so we extract
+/// the location field directly rather than splitting the whole row.
+fn parse_lizard_csv_row(row: &str) -> Option<(u32, String, u32, u32, String)> {
+    let mut iter = row.splitn(6, ',');
+    let _nloc = iter.next()?;
+    let ccn: u32 = iter.next()?.parse().ok()?;
+    let _token = iter.next()?;
+    let _param = iter.next()?;
+    let _length = iter.next()?;
+    let rest = iter.next()?;
+    let after_q = rest.strip_prefix('"')?;
+    let end_q = after_q.find('"')?;
+    let location = &after_q[..end_q];
+    // location format: name@start-end@path. name may be empty (anonymous).
+    let at1 = location.find('@')?;
+    let after_at1 = &location[at1 + 1..];
+    let dash = after_at1.find('-')?;
+    let after_dash = &after_at1[dash + 1..];
+    let at2 = after_dash.find('@')?;
+    let name = location[..at1].to_string();
+    let start: u32 = after_at1[..dash].parse().ok()?;
+    let end: u32 = after_dash[..at2].parse().ok()?;
+    let path = after_dash[at2 + 1..].to_string();
+    Some((ccn, name, start, end, path))
+}
+
 /// True when `cargo <subcommand> --version` succeeds (the subcommand is installed).
 fn tool_installed(subcommand: &str) -> bool {
     Command::new("cargo")
@@ -511,6 +795,11 @@ fn tool_installed(subcommand: &str) -> bool {
 fn arg_value(name: &str) -> Option<String> {
     let prefix = format!("{name}=");
     env::args().skip(1).find_map(|a| a.strip_prefix(&prefix).map(String::from))
+}
+
+/// True when a bare `--name` flag appears anywhere in the CLI args.
+fn arg_flag(name: &str) -> bool {
+    env::args().skip(1).any(|a| a == name)
 }
 
 // ── Stages ──────────────────────────────────────────────────────────
@@ -585,6 +874,7 @@ fn cmd_ci() {
     run("Clippy (strict)", &["cargo", "clippy", "--", "-D", "warnings"], None);
     run("Format check", &["cargo", "fmt", "--check"], None);
     cmd_audit_inner(true);
+    cmd_complexity();
     run(
         "Tests",
         &["cargo", "test"],
@@ -592,6 +882,7 @@ fn cmd_ci() {
     );
     cmd_acceptance();
     cmd_coverage();
+    cmd_crap();
     cmd_arch();
 }
 
@@ -655,6 +946,8 @@ const COMMANDS: &[(&str, fn())] = &[
     ("coverage", cmd_coverage),
     ("mutation", cmd_mutation),
     ("arch", cmd_arch),
+    ("complexity", cmd_complexity),
+    ("crap", cmd_crap),
     ("pre-commit", cmd_pre_commit),
     ("ci", cmd_ci),
     ("setup-hooks", cmd_hooks),
@@ -748,6 +1041,46 @@ mod tests {
     fn feature_files_missing_dir_is_false() {
         let missing = std::env::temp_dir().join(format!("rust-nodir-{}", std::process::id()));
         assert!(!has_feature_files(&missing));
+    }
+
+    #[test]
+    fn crap_score_full_coverage_returns_ccn() {
+        // (1-1.0)^3 = 0, so CRAP collapses to CCN.
+        assert!((crap_score(10, 1.0) - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn crap_score_zero_coverage_is_ccn_squared_plus_ccn() {
+        // 10*10*1 + 10 = 110.
+        assert!((crap_score(10, 0.0) - 110.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn crap_score_half_coverage_uses_cubed_gap() {
+        // 100 * 0.125 + 10 = 22.5.
+        assert!((crap_score(10, 0.5) - 22.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn crap_score_ccn_one_zero_coverage() {
+        // 1*1*1 + 1 = 2.
+        assert!((crap_score(1, 0.0) - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_lcov_str_multi_file() {
+        let input = "TN:\n\
+                     SF:src/foo.rs\n\
+                     DA:1,3\n\
+                     DA:2,0\n\
+                     DA:5,1\n\
+                     end_of_record\n\
+                     SF:src/bar.rs\n\
+                     DA:10,7\n\
+                     end_of_record\n";
+        let map = parse_lcov_str(input);
+        assert_eq!(map.get("src/foo.rs"), Some(&HashMap::from([(1, 3), (2, 0), (5, 1)])));
+        assert_eq!(map.get("src/bar.rs"), Some(&HashMap::from([(10, 7)])));
     }
 
     #[test]

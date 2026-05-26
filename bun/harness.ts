@@ -331,11 +331,36 @@ interface CrapFn {
   loc: string;
 }
 
+export function crapScore(ccn: number, cov: number): number {
+  return ccn * ccn * (1 - cov) ** 3 + ccn;
+}
+
+export function parseLcov(text: string): Record<string, Record<number, number>> {
+  const covMap: Record<string, Record<number, number>> = {};
+  let curFile = '';
+  for (const line of text.split('\n')) {
+    if (line.startsWith('SF:')) {
+      curFile = line.slice(3).trim();
+      // Merge into existing entry: LCOV may carry two SF blocks for the same
+      // path (sharded runs, hand-merged reports). Overwriting would drop the
+      // first block's DA entries.
+      covMap[curFile] ??= {};
+    } else if (line.startsWith('DA:') && curFile) {
+      const [num, hits] = line.slice(3).split(',');
+      covMap[curFile][Number(num)] = Number(hits);
+    } else if (line.startsWith('end_of_record')) {
+      curFile = '';
+    }
+  }
+  return covMap;
+}
+
 async function cmdCrap(): Promise<void> {
   // CRAP = ccn^2 * (1-cov)^3 + ccn per function. Advisory — lizard + LCOV.
   const maxArg = process.argv.find((a) => a.startsWith('--max='));
   const maxCrap = maxArg ? Number(maxArg.split('=', 2)[1]) : 30;
   const changedOnly = process.argv.includes('--changed-only');
+  const enforce = process.argv.includes('--enforce');
 
   const { readFile } = await import('node:fs/promises');
   const lcov = await readFile(`${ROOT}/coverage/lcov.info`, 'utf8').catch(() => null);
@@ -347,17 +372,7 @@ async function cmdCrap(): Promise<void> {
   }
 
   // Parse LCOV into { file: { lineNumber: hits } }.
-  const covMap: Record<string, Record<number, number>> = {};
-  let curFile = '';
-  for (const line of lcov.split('\n')) {
-    if (line.startsWith('SF:')) {
-      curFile = line.slice(3).trim();
-      covMap[curFile] = {};
-    } else if (line.startsWith('DA:') && curFile) {
-      const [num, hits] = line.slice(3).split(',');
-      covMap[curFile][Number(num)] = Number(hits);
-    }
-  }
+  const covMap = parseLcov(lcov);
 
   let changed: Set<string> | null = null;
   if (changedOnly) {
@@ -377,18 +392,33 @@ async function cmdCrap(): Promise<void> {
   }
 
   // lizard --csv columns: nloc,ccn,token,param,length,location,file,name,sig,start,end
-  const lz = Bun.spawn(['uvx', 'lizard', SRC_DIR, '--csv'], {
+  const lz = Bun.spawn(['uvx', 'lizard@1.22.2', SRC_DIR, '--csv'], {
     cwd: ROOT,
     stdout: 'pipe',
     stderr: 'pipe',
   });
-  const lzOut = await new Response(lz.stdout).text();
-  await lz.exited;
+  const [lzOut, lzErr, lzCode] = await Promise.all([
+    new Response(lz.stdout).text(),
+    new Response(lz.stderr).text(),
+    lz.exited,
+  ]);
+  if (lzCode !== 0) {
+    // Lizard could not run (uvx missing, network failure, lizard crash).
+    // Reporting "all functions below max" here would be a silent false-pass.
+    console.log(
+      `  ${RED}✗${RESET} CRAP: lizard failed to run (exit ${lzCode})` +
+        `${enforce ? '' : ' (advisory)'}`,
+    );
+    if (lzErr.trim()) console.log(lzErr.trim());
+    if (enforce) process.exit(lzCode);
+    return;
+  }
 
   // lizard --csv: column 1 is CCN; the quoted location field encodes
   // `name@start-end@path`. Signatures can contain commas, so derive the
   // location (and thus path/start/end) from that self-contained field.
-  const locRe = /"([^"@]+)@(\d+)-(\d+)@([^"]+)"/;
+  // Name may be empty for anonymous arrows/IIFEs — match but skip cleanly.
+  const locRe = /"([^"@]*)@(\d+)-(\d+)@([^"]+)"/;
   const offenders: CrapFn[] = [];
   for (const row of lzOut.split('\n')) {
     const cols = row.split(',');
@@ -398,6 +428,10 @@ async function cmdCrap(): Promise<void> {
     const lm = locRe.exec(row);
     if (!lm) continue;
     const [, name, startS, endS, path] = lm;
+    // Anonymous functions: lizard emits an empty name. They share their
+    // parent's coverage attribution in LCOV, so a per-function join cannot
+    // score them fairly — skip rather than silently misattribute.
+    if (!name) continue;
     const start = Number(startS);
     const end = Number(endS);
     const location = `${name}@${start}-${end}@${path}`;
@@ -409,7 +443,7 @@ async function cmdCrap(): Promise<void> {
       if (n in lines) inRange.push(n);
     }
     const cov = inRange.length ? inRange.filter((n) => lines[n] > 0).length / inRange.length : 0;
-    const crap = ccn * ccn * (1 - cov) ** 3 + ccn;
+    const crap = crapScore(ccn, cov);
     if (crap > maxCrap) {
       offenders.push({ crap, ccn, cov, loc: location });
     }
@@ -420,20 +454,23 @@ async function cmdCrap(): Promise<void> {
     return;
   }
   offenders.sort((a, b) => b.crap - a.crap);
-  console.log(`  ${RED}✗${RESET} CRAP: ${offenders.length} function(s) exceed ${maxCrap}`);
+  const suffix = enforce ? '' : ' (advisory)';
+  console.log(
+    `  ${RED}✗${RESET} CRAP: ${offenders.length} function(s) exceed ${maxCrap}${suffix}`,
+  );
   for (const o of offenders.slice(0, 20)) {
     console.log(
       `    CRAP=${o.crap.toFixed(1).padStart(6)}  CCN=${String(o.ccn).padStart(3)}  ` +
         `cov=${(o.cov * 100).toFixed(1).padStart(5)}%  ${o.loc}`,
     );
   }
-  process.exit(1);
+  if (enforce) process.exit(1);
 }
 
 async function cmdComplexity(): Promise<void> {
   await run('Complexity (lizard)', [
     'uvx',
-    'lizard',
+    'lizard@1.22.2',
     SRC_DIR,
     TEST_DIR,
     '-C',
@@ -530,6 +567,7 @@ async function cmdCi(): Promise<void> {
   await cmdComplexity();
   await cmdAcceptance();
   await cmdCoverage();
+  await cmdCrap();
   await cmdArch();
 }
 
@@ -572,6 +610,7 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   coverage: [cmdCoverage, 'Tests with coverage threshold (--min=N)'],
   mutation: [cmdMutation, 'Mutation testing (Stryker, advisory)'],
   crap: [cmdCrap, 'CRAP complexity x coverage gate (advisory)'],
+  complexity: [cmdComplexity, 'Cyclomatic complexity gate (lizard, CCN 15)'],
   arch: [cmdArch, 'Architecture checks (dependency-cruiser)'],
   check: [cmdCheck, 'Full pre-flight: lockfile + fix + typecheck + tests'],
   'pre-commit': [cmdPreCommit, 'Staged checks + tests'],

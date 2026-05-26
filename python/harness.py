@@ -229,12 +229,31 @@ def cmd_arch() -> None:
     run("Arch (import-linter)", ["uv", "run", "lint-imports"])
 
 
+def _crap_score(ccn: int, cov: float) -> float:
+    """CRAP = ccn^2 * (1-cov)^3 + ccn."""
+    return ccn * ccn * (1 - cov) ** 3 + ccn
+
+
+def _parse_coverage_xml(path: Path) -> dict[str, dict[int, int]]:
+    """Parse a Cobertura coverage XML into {filename: {line_no: hits}}."""
+    cov_map: dict[str, dict[int, int]] = {}
+    for cls in ET.parse(path).iter("class"):
+        fn = cls.get("filename", "")
+        cov_map[fn] = {
+            int(ln.get("number", "0")): int(ln.get("hits", "0"))
+            for ln in cls.iter("line")
+            if ln.get("number")
+        }
+    return cov_map
+
+
 def cmd_crap() -> None:
     """CRAP = ccn^2 * (1-cov)^3 + ccn per function. Advisory — lizard + coverage XML."""
     max_crap = float(
         next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--max=")), "30")
     )
     changed_only = "--changed-only" in sys.argv
+    enforce = "--enforce" in sys.argv
 
     # Emit coverage XML quietly; cmd_coverage must have populated .coverage.
     subprocess.run(
@@ -248,14 +267,7 @@ def cmd_crap() -> None:
         print(f"  {RED}✗{RESET} CRAP: coverage XML not found — run `harness coverage` first")
         sys.exit(1)
 
-    cov_map: dict[str, dict[int, int]] = {}
-    for cls in ET.parse(cov_file).iter("class"):
-        fn = cls.get("filename", "")
-        cov_map[fn] = {
-            int(ln.get("number", "0")): int(ln.get("hits", "0"))
-            for ln in cls.iter("line")
-            if ln.get("number")
-        }
+    cov_map = _parse_coverage_xml(cov_file)
 
     changed: set[str] | None = None
     if changed_only:
@@ -268,18 +280,35 @@ def cmd_crap() -> None:
         changed = {f.strip() for f in res.stdout.splitlines() if f.strip().endswith(".py")}
 
     lizard_res = subprocess.run(
-        ["uv", "run", "lizard", SRC_DIR],
+        ["uvx", "lizard@1.22.2", SRC_DIR],
         capture_output=True,
         text=True,
         check=False,
     )
-    line_re = re.compile(r"^\s*(\d+)\s+(\d+)\s+\d+\s+\d+\s+\d+\s+(\S+)@(\d+)-(\d+)@(.+)$")
+    if lizard_res.returncode != 0:
+        # Lizard could not run (uvx missing, network failure, lizard crash).
+        # Reporting "all functions below max" would be a silent false-pass.
+        suffix = "" if enforce else " (advisory)"
+        print(f"  {RED}✗{RESET} CRAP: lizard failed to run (exit {lizard_res.returncode}){suffix}")
+        if lizard_res.stderr.strip():
+            print(lizard_res.stderr.strip())
+        if enforce:
+            sys.exit(lizard_res.returncode or 1)
+        return
+    # Function name capture allows the empty string so we can detect (and skip)
+    # anonymous functions explicitly rather than silently dropping them.
+    line_re = re.compile(r"^\s*(\d+)\s+(\d+)\s+\d+\s+\d+\s+\d+\s+([^@\s]*)@(\d+)-(\d+)@(.+)$")
     offenders: list[tuple[float, int, float, str]] = []
     for out_line in lizard_res.stdout.splitlines():
         m = line_re.match(out_line)
         if not m:
             continue
         _, ccn_s, func, start_s, end_s, path = m.groups()
+        # Anonymous functions: lizard emits an empty name. Coverage in cobertura
+        # is attributed to the enclosing scope, so a per-function join would
+        # mis-score — skip rather than silently misattribute.
+        if not func:
+            continue
         if changed is not None and path not in changed:
             continue
         ccn = int(ccn_s)
@@ -287,7 +316,7 @@ def cmd_crap() -> None:
         lines = cov_map.get(path) or cov_map.get(path.lstrip("./")) or {}
         in_range = [n for n in range(start, end + 1) if n in lines]
         cov = (sum(1 for n in in_range if lines[n] > 0) / len(in_range)) if in_range else 0.0
-        crap = ccn * ccn * (1 - cov) ** 3 + ccn
+        crap = _crap_score(ccn, cov)
         if crap > max_crap:
             offenders.append((crap, ccn, cov, f"{func}@{start}-{end}@{path}"))
 
@@ -295,10 +324,14 @@ def cmd_crap() -> None:
         print(f"  {GREEN}✓{RESET} CRAP: all functions below {max_crap}")
         return
     offenders.sort(reverse=True)
-    print(f"  {RED}✗{RESET} CRAP: {len(offenders)} function(s) exceed {max_crap}")
+    mode_suffix = "" if enforce else " (advisory)"
+    print(
+        f"  {RED}✗{RESET} CRAP: {len(offenders)} function(s) exceed {max_crap}{mode_suffix}"
+    )
     for crap, ccn, cov, loc in offenders[:20]:
         print(f"    CRAP={crap:6.1f}  CCN={ccn:3d}  cov={cov * 100:5.1f}%  {loc}")
-    sys.exit(1)
+    if enforce:
+        sys.exit(1)
 
 
 def cmd_audit() -> None:
@@ -309,9 +342,8 @@ def cmd_complexity() -> None:
     run(
         "Complexity (lizard)",
         [
-            "uv",
-            "run",
-            "lizard",
+            "uvx",
+            "lizard@1.22.2",
             SRC_DIR,
             TEST_DIR,
             "-C",
@@ -380,7 +412,7 @@ def cmd_pre_commit() -> None:
 
 
 def cmd_ci() -> None:
-    """Full verification: lint, format check, typecheck, tests, acceptance, coverage, arch."""
+    """Full verification: lint, format check, typecheck, tests, acceptance, coverage, crap, arch."""
     print("\n=== CI Checks ===\n")
     cmd_lint()
     cmd_format_check()
@@ -389,6 +421,7 @@ def cmd_ci() -> None:
     cmd_complexity()
     cmd_acceptance()
     cmd_coverage()
+    cmd_crap()
     cmd_arch()
 
 
@@ -433,6 +466,7 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "coverage": (cmd_coverage, "Tests with coverage threshold (--min=N)"),
     "mutation": (cmd_mutation, "Mutation testing (mutmut, advisory)"),
     "crap": (cmd_crap, "CRAP complexity x coverage gate (advisory)"),
+    "complexity": (cmd_complexity, "Cyclomatic complexity gate (lizard, CCN 15)"),
     "arch": (cmd_arch, "Architecture checks (import-linter)"),
     "post-edit": (cmd_post_edit, "Format if source files changed (Claude Code hook)"),
     "setup-hooks": (cmd_hooks, "Install git pre-commit hook"),

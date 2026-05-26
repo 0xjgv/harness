@@ -9,15 +9,18 @@ Opinionated Go project template with built-in quality guardrails: linting, forma
 - **Test runner**: `go test`
 - **Acceptance**: [godog](https://github.com/cucumber/godog) (Gherkin, run as a `go test`)
 - **Architecture**: [go-arch-lint](https://github.com/fe3dback/go-arch-lint) (dependency-boundary linter)
-- **Complexity / Mutation**: gocyclo, gremlins (fetched on demand via `go run`)
+- **Complexity**: [lizard](https://github.com/terryyin/lizard) (fetched on demand via `uvx`)
+- **Mutation**: gremlins (fetched on demand via `go run`)
 
 ## Prerequisites
 
 - [Go](https://go.dev/dl/) 1.24+
 - [golangci-lint](https://golangci-lint.run/welcome/install/) v2+
+- [uv](https://docs.astral.sh/uv/) on `PATH` — `uvx` runs `lizard@1.22.2` for the complexity and CRAP gates
 
-Everything else (godog, go-arch-lint, gocyclo, gremlins, govulncheck) is pulled
-on demand by `go run ...@version` — no separate install step.
+Everything else (godog, go-arch-lint, gremlins, govulncheck) is pulled on
+demand by `go run ...@version`; lizard is pulled on demand by `uvx`. No
+separate install step for any of them.
 
 ## Getting Started
 
@@ -38,10 +41,12 @@ go run harness.go setup-hooks
 
 ### `ci` pipeline
 
-`harness ci` runs, in order: lint → dep audit → complexity (gocyclo, CCN 15) →
-acceptance (godog) → coverage (`go test -race -coverprofile`) → arch (go-arch-lint).
+`harness ci` runs, in order: lint → dep audit → complexity (lizard, CCN 15) →
+acceptance (godog) → coverage (`go test -race -coverprofile`) → CRAP (advisory) →
+arch (go-arch-lint).
 
-Mutation testing and CRAP are **advisory**: not wired into `ci`; invoke explicitly.
+CRAP is advisory: it warns by default and exits 0 unless `--enforce` is passed.
+Mutation testing is also advisory and is NOT wired into `ci` — invoke explicitly.
 
 All commands minimize output — only errors are shown. Add `--verbose` for full output:
 
@@ -59,7 +64,7 @@ go run harness.go check --verbose
 | `go run harness.go test` | Run tests |
 | `go run harness.go test-cov` | Run tests with race detector + coverage |
 | `go run harness.go audit` | Audit dependencies for known vulnerabilities |
-| `go run harness.go complexity` | Cyclomatic complexity gate (gocyclo, CCN 15) |
+| `go run harness.go complexity` | Cyclomatic complexity gate (lizard, CCN 15; excludes `_test.go` + `harness.go`) |
 | `go run harness.go acceptance` | Run acceptance scenarios (godog) against `features/` |
 | `go run harness.go arch` | Architecture checks (go-arch-lint) |
 | `go run harness.go mutation` | Mutation testing (gremlins, advisory) |
@@ -98,7 +103,7 @@ Hook scripts live in `.claude/scripts/` and are wired via `.claude/settings.json
 
 Day-1 defaults are deliberately loose so adopting this template does not fail existing projects:
 
-- Complexity is gated at CCN 15 (gocyclo + golangci-lint's `gocyclo`); lower it once the codebase is clean.
+- Complexity is gated at CCN 15 (lizard + golangci-lint's `gocyclo`); lower it once the codebase is clean.
 - Acceptance ships one smoke `.feature`; an empty `features/` dir warns and passes. Add real scenarios.
 - Mutation / CRAP are advisory — enable as blocking gates once baselines are established.
 - `crap --max=30` is the starting ceiling; tighten it as coverage rises. `crap --changed-only` limits the check to files changed vs `origin/main`.

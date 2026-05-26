@@ -13,6 +13,8 @@ allow:
 components:
   harness:
     in: .
+  crap:
+    in: crap
   suppressions:
     in: suppressions
   acceptance:
@@ -20,10 +22,14 @@ components:
   acceptance-steps:
     in: features/steps
 deps:
-  # The task runner may use the sample library package.
+  # The task runner may use the sample library package and the CRAP helper.
   harness:
     mayDependOn:
+      - crap
       - suppressions
+  # The CRAP helper is a leaf — pure stdlib functions over coverage/complexity data.
+  crap:
+    anyVendorDeps: true
   # Starter rule: the sample library is a leaf — it must not import any
   # other project component (only the standard library / vendored deps).
   suppressions:

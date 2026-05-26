@@ -4,12 +4,13 @@
 
 - After edits: `uv run harness check` — fix, format, typecheck, test, suppression report
 - Pre-commit: `uv run harness pre-commit` — staged files only (auto via git hook)
-- CI: `uv run harness ci` — read-only lint, format check, typecheck, dep audit, complexity gate (lizard, CCN 15), tests with coverage, acceptance, arch
+- CI: `uv run harness ci` — read-only pipeline: lint → format check → typecheck → audit → complexity → acceptance → coverage → crap → arch. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
+- Complexity: `uv run harness complexity` — uvx lizard@1.22.2 CC gate (CCN≤15, args≤7, length≤100) over src + tests
 - Audit: `uv run harness audit` — audit dependencies for known vulnerabilities (via pip-audit)
 - Acceptance: `uv run harness acceptance` — run behave against `tests/features/`
 - Coverage: `uv run harness coverage --min=0` — coverage.py with threshold + uncovered listing
 - Mutation (advisory): `uv run harness mutation` — mutmut kill-rate on src/
-- CRAP (advisory): `uv run harness crap --max=30` — complexity × coverage gate
+- CRAP (advisory): `uv run harness crap --max=30` — complexity × coverage gate. Add `--enforce` to exit 1 on offenders (default exits 0 with warning).
 - Arch: `uv run harness arch` — import-linter against `.importlinter`
 - Setup: `uv run harness setup-hooks` to install git pre-commit hook
 - Auto-format: runs automatically after Claude edits via `Stop` hook (post-edit)

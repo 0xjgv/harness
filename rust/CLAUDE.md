@@ -4,7 +4,9 @@
 
 - After edits: `cargo harness check` — fix, format, lint, test, suppression report
 - Pre-commit: `cargo harness pre-commit` — staged files only (auto via git hook)
-- CI: `cargo harness ci` — strict clippy, format check, dep audit, tests, acceptance, coverage, arch
+- CI: `cargo harness ci` — strict pipeline: clippy → format check → audit → complexity → tests → acceptance → coverage → crap → arch. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
+- Complexity: `cargo harness complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤7, length≤100) over src + tests
+- CRAP (advisory): `cargo harness crap --max=30` — complexity × coverage gate (joins lizard --csv with `target/llvm-cov/lcov.info`). Add `--enforce` to exit 1 on offenders (default exits 0 with warning).
 - Audit: `cargo harness audit` — audit dependencies for known vulnerabilities (via cargo-audit)
 - Acceptance: `cargo harness acceptance` — run cucumber against `tests/features/`
 - Coverage: `cargo harness coverage --min=0` — cargo-llvm-cov line coverage with threshold

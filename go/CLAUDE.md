@@ -4,12 +4,13 @@
 
 - After edits: `go run harness.go check` — fix, format, lint, test, suppression report
 - Pre-commit: `go run harness.go pre-commit` — staged files only (auto via git hook)
-- CI: `go run harness.go ci` — read-only lint, dep audit, complexity gate (gocyclo, CCN 15), acceptance, tests with race + coverage, arch
+- CI: `go run harness.go ci` — read-only pipeline: lint → audit → complexity → acceptance → test-cov → crap → arch. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
+- Complexity: `go run harness.go complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤7, length≤100) over the module
 - Audit: `go run harness.go audit` — audit dependencies for known vulnerabilities (via govulncheck)
 - Acceptance: `go run harness.go acceptance` — run godog against `features/`
 - Coverage: `go run harness.go test-cov` — tests with race detector + `coverage.out`
 - Mutation (advisory): `go run harness.go mutation` — gremlins kill-rate on `./suppressions`
-- CRAP (advisory): `go run harness.go crap --max=30` — complexity × coverage gate
+- CRAP (advisory): `go run harness.go crap --max=30` — complexity × coverage gate. Add `--enforce` to exit 1 on offenders (default exits 0 with warning).
 - Arch: `go run harness.go arch` — go-arch-lint against `.go-arch-lint.yml`
 - Setup: `go run harness.go setup-hooks` to install git pre-commit hook
 - Auto-format: runs automatically after Claude edits via the `Stop` hook (post-edit)

@@ -16,11 +16,15 @@ subcommands. Each gate detects whether its tool is installed and warns + skips
 when it is absent, so the template works out of the box and degrades cleanly:
 
 ```bash
-cargo install cargo-llvm-cov         # coverage
+cargo install cargo-llvm-cov         # coverage + CRAP (LCOV producer)
 cargo install cargo-mutants          # mutation (advisory)
 cargo install cargo-modules          # arch
 cargo install cargo-audit            # dep audit
 ```
+
+The complexity and CRAP gates additionally require `uvx` on `PATH` — they shell
+out to `uvx lizard@1.22.2` for the cyclomatic-complexity scan. Install via
+[uv](https://docs.astral.sh/uv/).
 
 `cargo-llvm-cov` needs the LLVM coverage tools. With a rustup-managed toolchain,
 `rustup component add llvm-tools-preview` installs them. The harness also falls
@@ -39,9 +43,15 @@ cargo harness ci                   # Full verification (see below)
 
 ### `ci` pipeline
 
-`harness ci` runs, in order: strict clippy (`-D warnings`) → format check → dep audit → tests → acceptance (cucumber) → coverage (cargo-llvm-cov, `--min=0` by default) → arch (cargo-modules).
+`harness ci` runs, in order: strict clippy (`-D warnings`) → format check → dep audit → complexity (lizard, CCN 15) → tests → acceptance (cucumber) → coverage (cargo-llvm-cov, `--min=0` by default) → CRAP (advisory) → arch (cargo-modules).
 
-Mutation testing is **advisory**: not wired into `ci`; invoke explicitly.
+`cmd_coverage` runs the test suite under llvm-cov once and emits both the
+console summary (with the `--min=N` threshold check) and an LCOV file at
+`target/llvm-cov/lcov.info`. `cmd_crap` reuses that LCOV — no second test run —
+unless the file is missing or older than `src/`.
+
+CRAP is advisory: it warns by default and exits 0 unless `--enforce` is passed.
+Mutation testing is also advisory and NOT wired into `ci`; invoke explicitly.
 
 All commands minimize output — only errors are shown. Add `--verbose` for full output:
 
@@ -53,7 +63,10 @@ cargo harness check --verbose
 
 ```bash
 cargo harness acceptance           # cucumber against tests/features/
+cargo harness complexity           # lizard CCN gate (≤15) over src + tests
 cargo harness coverage --min=80    # tests with coverage, fails below threshold
+cargo harness crap --max=30        # CRAP complexity × coverage gate (advisory)
+cargo harness crap --enforce       # …same, but hard-fail when offenders exist
 cargo harness mutation             # cargo-mutants kill-rate (advisory)
 cargo harness arch                 # cargo-modules checks against arch.toml
 ```
@@ -111,6 +124,8 @@ Rust's module system.
 Day-1 defaults are deliberately loose so adopting this template does not fail existing projects:
 
 - `coverage --min=0` — raise over time as the suite matures.
+- Complexity is gated at CCN 15 via lizard; lower it once the codebase is clean.
+- CRAP is advisory (`crap --max=30` is the starting ceiling). Add `--enforce` to make it blocking once your team has paid down the existing offenders.
 - Mutation is advisory — enable as a blocking gate once a baseline kill-rate is established.
 - `arch.toml` ships with two starter rules (no cycles, no orphans). Extend as the module graph grows.
 - `tests/features/` ships one smoke scenario. An empty features directory warns and passes — add real scenarios before writing user-visible behavior.

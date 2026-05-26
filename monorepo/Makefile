@@ -105,6 +105,14 @@ ci: ## Read-only gate across all subprojects
 test: ## Run tests only, all subprojects
 	@$(MAKE) --no-print-directory _run CMD=test DIRS="$(SUBPROJECTS)"
 
+.PHONY: crap
+crap: ## CRAP gate (advisory) across all subprojects; forward flags via ARGS
+	@$(MAKE) --no-print-directory _run CMD=crap DIRS="$(SUBPROJECTS)" ARGS="$(ARGS)"
+
+.PHONY: complexity
+complexity: ## Complexity gate across all subprojects; forward flags via ARGS
+	@$(MAKE) --no-print-directory _run CMD=complexity DIRS="$(SUBPROJECTS)" ARGS="$(ARGS)"
+
 ##@ Setup & misc
 
 .PHONY: setup
@@ -168,7 +176,8 @@ help: ## Show this message
 	@awk 'BEGIN { FS = ":.*## " } \
 	     /^##@ / { printf "\n\033[1m%s\033[0m\n", substr($$0, 5); next } \
 	     /^[a-zA-Z_%-]+:.*## / { printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
-	@printf "\n$(DIM)Scoped targets:$(RESET) $(BOLD)check-<subproject>$(RESET), $(BOLD)ci-<subproject>$(RESET), $(BOLD)test-<subproject>$(RESET)\n"
+	@printf "\n$(DIM)Scoped targets:$(RESET) $(BOLD)check-<subproject>$(RESET), $(BOLD)ci-<subproject>$(RESET), $(BOLD)test-<subproject>$(RESET), $(BOLD)crap-<subproject>$(RESET), $(BOLD)complexity-<subproject>$(RESET)\n"
+	@printf "$(DIM)Forward flags:$(RESET)  $(BOLD)ARGS=\"--enforce --max=50\" make crap$(RESET)\n"
 	@printf "$(DIM)Verbose:$(RESET)        $(BOLD)VERBOSE=1 make check$(RESET)\n"
 	@printf "$(DIM)Parallel:$(RESET)       $(BOLD)PARALLEL=1 make check$(RESET) $(DIM)(buffers per-subproject output)$(RESET)\n"
 
@@ -183,6 +192,12 @@ ci-%:
 
 test-%:
 	@$(MAKE) --no-print-directory _scoped_run CMD=test DIR="$*"
+
+crap-%:
+	@$(MAKE) --no-print-directory _scoped_run CMD=crap DIR="$*" ARGS="$(ARGS)"
+
+complexity-%:
+	@$(MAKE) --no-print-directory _scoped_run CMD=complexity DIR="$*" ARGS="$(ARGS)"
 
 pre-commit-%:
 	@$(MAKE) --no-print-directory _scoped_run CMD=pre-commit DIR="$*"
@@ -210,32 +225,32 @@ _scoped_run:
 	     printf "$(DIM)Available:$(RESET) %s\n" "$(SUBPROJECTS)"; \
 	     exit 1 ;; \
 	esac; \
-	$(MAKE) --no-print-directory _run CMD="$(CMD)" DIRS="$(DIR)"
+	$(MAKE) --no-print-directory _run CMD="$(CMD)" DIRS="$(DIR)" ARGS="$(ARGS)"
 
 _run:
 	@set -u -o pipefail; \
-	dirs="$(DIRS)"; cmd="$(CMD)"; vf="$(if $(VERBOSE),--verbose)"; quiet="$(QUIET)"; \
+	dirs="$(DIRS)"; cmd="$(CMD)"; vf="$(if $(VERBOSE),--verbose)"; quiet="$(QUIET)"; args="$(ARGS)"; \
 	if [ -z "$$dirs" ]; then \
 	  printf "$(DIM)No subprojects to run '%s'.$(RESET)\n" "$$cmd"; \
 	  exit 0; \
 	fi; \
 	eval "$$SH_LANG_HELPERS"; \
 	run_one() { \
-	  local dir="$$1" cmd="$$2" vf="$$3" quiet="$$4" runner; \
+	  local dir="$$1" cmd="$$2" vf="$$3" quiet="$$4" args="$$5" runner; \
 	  if ! runner=$$(runner_of "$$dir"); then \
 	    printf "$(RED)✗ %s$(RESET) $(DIM)(no recognized harness — skipped)$(RESET)\n" "$$dir"; \
 	    return 1; \
 	  fi; \
 	  [ -z "$$quiet" ] && printf "\n$(BOLD)▶ %s$(RESET) $(DIM)($(CYAN)%s$(RESET)$(DIM) · %s)$(RESET)\n" "$$dir" "$$(lang_of "$$dir")" "$$cmd"; \
-	  ( cd "$$dir" && $$runner $$cmd $$vf ); \
+	  ( cd "$$dir" && $$runner $$cmd $$vf $$args ); \
 	}; \
 	passed=0; failed=0; failed_dirs=""; t_start=$$(date +%s); \
 	if [ -n "$(PARALLEL)" ]; then \
 	  tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT INT TERM; \
 	  export -f run_one lang_of runner_of; \
 	  printf '%s\n' $$dirs | xargs -n1 -P$(JOBS) -I{} bash -c ' \
-	    run_one "$$1" "$$2" "$$3" "$$4" >"$$5/$$1.out" 2>&1; \
-	    echo $$? >"$$5/$$1.rc"' _ {} "$$cmd" "$$vf" "$$quiet" "$$tmp"; \
+	    run_one "$$1" "$$2" "$$3" "$$4" "$$5" >"$$6/$$1.out" 2>&1; \
+	    echo $$? >"$$6/$$1.rc"' _ {} "$$cmd" "$$vf" "$$quiet" "$$args" "$$tmp"; \
 	  for dir in $$dirs; do \
 	    [ -z "$$quiet" ] && cat "$$tmp/$$dir.out"; \
 	    rc=$$(cat "$$tmp/$$dir.rc" 2>/dev/null || echo 1); \
@@ -244,7 +259,7 @@ _run:
 	  done; \
 	else \
 	  for dir in $$dirs; do \
-	    if run_one "$$dir" "$$cmd" "$$vf" "$$quiet"; then \
+	    if run_one "$$dir" "$$cmd" "$$vf" "$$quiet" "$$args"; then \
 	      passed=$$((passed+1)); \
 	    else \
 	      failed=$$((failed+1)); failed_dirs="$$failed_dirs $$dir"; \
