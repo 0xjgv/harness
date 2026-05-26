@@ -104,6 +104,14 @@ make check-api      # scope to one subproject
 - **Quiet by default** — only errors shown, `--verbose` for everything
 - **Fix what you can** — `check` and `pre-commit` auto-fix; `ci` is read-only
 
+## Harness skill
+
+The skill that bootstraps repos to match these templates lives in
+`skills/harness/`. Edit there; run `make sync-skills` to deploy to
+`~/.claude/skills/harness/` and `~/.agents/skills/harness/`. `make
+skills-drift` (run by `make check`) fails if the deployed copies have
+diverged.
+
 ## License
 
 [MIT](LICENSE)
