@@ -19,7 +19,7 @@ paraphrase (it drifts). Two sections:
   → tests → acceptance → coverage → crap → arch`; `crap` is advisory
   (warns by default, `--enforce` to hard-fail; joins lizard `--csv` with
   `target/llvm-cov/lcov.info`). Requires `uvx` on PATH for `complexity`/
-  `crap` (lizard pinned to `1.22.2`).
+  `crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8, length≤100).
 - `## Behavior contract` — Layer 2; see
   [reference-behavior-contract.md](reference-behavior-contract.md).
 
@@ -41,7 +41,9 @@ This brings `.claude/` (Layer 2) intact — keep it.
 
 `.claude/settings.json` wires all 5 hooks. Full shape:
 [reference-settings-json.md](reference-settings-json.md).
-Stop command: `cd $CLAUDE_PROJECT_DIR && cargo harness post-edit`.
+Stop commands:
+`cd $CLAUDE_PROJECT_DIR && cargo harness post-edit`;
+`cd $CLAUDE_PROJECT_DIR && cargo harness stop-hook`.
 
 ## Canonical anchors
 
@@ -50,5 +52,6 @@ Stop command: `cd $CLAUDE_PROJECT_DIR && cargo harness post-edit`.
 - Tooling: rustfmt, clippy (pedantic + `unsafe_code = "forbid"`),
   `cargo test`, cargo-audit, lizard (complexity, via `uvx`),
   cargo-llvm-cov (coverage), cucumber (acceptance), cargo-mutants
-  (mutation), cargo-modules (arch)
+  (mutation), proptest (property-based tests, see `mod property_tests`
+  in `harness.rs`), cargo-modules (arch)
 - Protected arch config: `arch.toml`

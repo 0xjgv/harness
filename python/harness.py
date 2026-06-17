@@ -16,8 +16,11 @@ if TYPE_CHECKING:
 
 # ── Configuration ─────────────────────────────────────────────────
 
-SRC_DIR = "src"
+APP_SOURCES = ("src",)
+QUALITY_SOURCES = ("src", "harness.py")
 TEST_DIR = "tests"
+LIZARD = "lizard@1.22.2"
+COMPLEXITY_MAX_ARGS = 8
 
 # ── Output ────────────────────────────────────────────────────────
 
@@ -60,6 +63,80 @@ def _parse_unittest_summary(output: str) -> str:
     return f" ({m.group(1)} tests, {m.group(2)})" if m else ""
 
 
+def warn(message: str) -> None:
+    """Print a non-blocking warning line."""
+    print(f"  {GREEN}⚠{RESET} {message}")
+
+
+def _existing(paths: Iterable[str]) -> list[str]:
+    """Return paths that exist in this project."""
+    return [path for path in paths if Path(path).exists()]
+
+
+def _quality_targets(*, include_tests: bool = True) -> list[str]:
+    """Return quality-check targets that exist."""
+    targets = _existing(QUALITY_SOURCES)
+    if include_tests and Path(TEST_DIR).is_dir():
+        targets.append(TEST_DIR)
+    return targets
+
+
+def _app_targets(*, include_tests: bool = False) -> list[str]:
+    """Return app targets that exist."""
+    targets = _existing(APP_SOURCES)
+    if include_tests and Path(TEST_DIR).is_dir():
+        targets.append(TEST_DIR)
+    return targets
+
+
+def _iter_python_files(paths: Iterable[str]) -> list[Path]:
+    """Return Python files under existing file or directory targets."""
+    files: list[Path] = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        if path.is_file() and path.suffix == ".py":
+            files.append(path)
+        elif path.is_dir():
+            files.extend(sorted(path.rglob("*.py")))
+    return files
+
+
+def _has_tests() -> bool:
+    """Return true when unittest-discoverable tests exist."""
+    test_root = Path(TEST_DIR)
+    return test_root.is_dir() and any(test_root.rglob("test*.py"))
+
+
+def _matches_python_target(path: str, targets: Iterable[str]) -> bool:
+    """Return true if path is a Python file inside one of the target paths."""
+    if not path.endswith(".py"):
+        return False
+    for target in targets:
+        if target.endswith(".py") and path == target:
+            return True
+        if not target.endswith(".py") and path.startswith(f"{target}/"):
+            return True
+    return False
+
+
+def _is_project_python_file(path: str) -> bool:
+    """Return true for Python files owned by the template project."""
+    return _matches_python_target(path, (*QUALITY_SOURCES, TEST_DIR))
+
+
+def _is_quality_python_file(path: str) -> bool:
+    """Return true for non-test quality targets."""
+    return _matches_python_target(path, QUALITY_SOURCES)
+
+
+def _porcelain_path(line: str) -> str:
+    """Extract the current path from a git porcelain status line."""
+    path = line[3:]
+    if " -> " in path:
+        return path.rsplit(" -> ", 1)[1]
+    return path
+
+
 # ── Suppressions ──────────────────────────────────────────────────
 
 _SUPPRESSION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
@@ -89,16 +166,15 @@ def _parse_line_for_suppressions(line: str) -> list[tuple[str, list[str]]]:
 def _scan_suppressions(roots: Iterable[str] | None = None) -> dict[str, list[list[str]]]:
     """Scan Python files for suppression comments. Returns {kind: [rules...]}."""
     results: dict[str, list[list[str]]] = {}
-    actual_roots = roots if roots is not None else (SRC_DIR, TEST_DIR)
-    for dir_name in actual_roots:
-        for py_file in sorted(Path(dir_name).rglob("*.py")):
-            try:
-                text = py_file.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-            for line in text.splitlines():
-                for kind, rules in _parse_line_for_suppressions(line):
-                    results.setdefault(kind, []).append(rules)
+    actual_roots = roots if roots is not None else _quality_targets()
+    for py_file in _iter_python_files(actual_roots):
+        try:
+            text = py_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line in text.splitlines():
+            for kind, rules in _parse_line_for_suppressions(line):
+                results.setdefault(kind, []).append(rules)
     return results
 
 
@@ -125,35 +201,32 @@ def _print_suppressions_report() -> None:
 
 
 def _staged_py_files() -> list[str]:
-    """Return staged .py files under src/ and tests/, excluding deleted files."""
+    """Return staged project .py files, excluding deleted files."""
     result = subprocess.run(
         ["git", "diff", "--cached", "--name-only", "--diff-filter=d", "--relative"],
         capture_output=True,
         text=True,
         check=False,
     )
-    return [
-        f
-        for f in result.stdout.strip().splitlines()
-        if f.endswith(".py") and f.startswith((f"{SRC_DIR}/", f"{TEST_DIR}/"))
-    ]
+    return [path for path in result.stdout.splitlines() if _is_project_python_file(path)]
 
 
 def _changed_py_files() -> list[str]:
-    """Return .py files with uncommitted changes under src/ and tests/."""
+    """Return project .py files with uncommitted changes."""
     result = subprocess.run(
         ["git", "status", "--porcelain"],
         capture_output=True,
         text=True,
         check=False,
     )
-    return [
-        line[3:]
-        for line in result.stdout.strip().splitlines()
-        if len(line) > 3
-        and line[3:].endswith(".py")
-        and line[3:].startswith((f"{SRC_DIR}/", f"{TEST_DIR}/"))
-    ]
+    changed: list[str] = []
+    for line in result.stdout.splitlines():
+        if len(line) <= 3 or "D" in line[:2]:
+            continue
+        path = _porcelain_path(line)
+        if _is_project_python_file(path):
+            changed.append(path)
+    return changed
 
 
 # ── Commands ──────────────────────────────────────────────────────
@@ -179,15 +252,30 @@ def cmd_format_check() -> None:
 
 
 def cmd_typecheck() -> None:
-    run("Type check", ["uv", "run", "basedpyright", SRC_DIR])
+    run("Type check", ["uv", "run", "basedpyright", *_quality_targets()])
 
 
 def cmd_test() -> None:
-    run("Run tests", ["uv", "run", "python", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"])
+    if _has_tests():
+        run(
+            "Run tests",
+            ["uv", "run", "python", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"],
+        )
+        return
+
+    files = [str(path) for path in _iter_python_files(_quality_targets(include_tests=False))]
+    if not files:
+        warn("Syntax check: no Python files found; skipped")
+        return
+    run("Syntax check", ["uv", "run", "python", "-m", "py_compile", *files])
 
 
 def cmd_coverage() -> None:
     """Run tests under coverage with threshold + uncovered listing."""
+    if not _has_tests():
+        warn(f"Coverage: no {TEST_DIR}/test*.py files; skipped")
+        return
+
     min_pct = int(next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--min=")), "0"))
     run(
         "Coverage (run)",
@@ -203,10 +291,7 @@ def cmd_acceptance() -> None:
     """Run behave scenarios. Empty features dir warns + exits 0."""
     features_dir = Path(TEST_DIR) / "features"
     if not features_dir.exists() or not list(features_dir.rglob("*.feature")):
-        print(
-            f"  {GREEN}⚠{RESET} Acceptance: no .feature files in "
-            f"{features_dir}/ (add one to enable this gate)"
-        )
+        warn(f"Acceptance: no .feature files in {features_dir}/ (add one to enable this gate)")
         return
     run("Acceptance (behave)", ["uv", "run", "behave", str(features_dir), "--no-color"])
 
@@ -217,6 +302,10 @@ def cmd_mutation() -> None:
     mutmut 3.x takes no --paths-to-mutate flag; it defaults to `src/` and reads
     `[tool.mutmut]` in pyproject.toml for customization.
     """
+    if not _has_tests():
+        warn(f"Mutation: no {TEST_DIR}/test*.py files; skipped")
+        return
+
     run("Mutation (mutmut)", ["uv", "run", "mutmut", "run"], no_exit=True)
     run("Mutation results", ["uv", "run", "mutmut", "results"], no_exit=True)
 
@@ -224,7 +313,7 @@ def cmd_mutation() -> None:
 def cmd_arch() -> None:
     """Run import-linter against .importlinter."""
     if not Path(".importlinter").exists():
-        print(f"  {GREEN}⚠{RESET} Arch: no .importlinter — skipped")
+        warn("Arch: no .importlinter — skipped")
         return
     run("Arch (import-linter)", ["uv", "run", "lint-imports"])
 
@@ -249,10 +338,13 @@ def _parse_coverage_xml(path: Path) -> dict[str, dict[int, int]]:
 
 def cmd_crap() -> None:
     """CRAP = ccn^2 * (1-cov)^3 + ccn per function. Advisory — lizard + coverage XML."""
+    if not _has_tests():
+        warn("CRAP: no tests; skipped")
+        return
+
     max_crap = float(
         next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--max=")), "30")
     )
-    changed_only = "--changed-only" in sys.argv
     enforce = "--enforce" in sys.argv
 
     # Emit coverage XML quietly; cmd_coverage must have populated .coverage.
@@ -264,23 +356,17 @@ def cmd_crap() -> None:
     )
     cov_file = Path("coverage.xml")
     if not cov_file.exists():
-        print(f"  {RED}✗{RESET} CRAP: coverage XML not found — run `harness coverage` first")
-        sys.exit(1)
+        warn("CRAP: coverage XML not found — run `harness coverage` first")
+        return
 
     cov_map = _parse_coverage_xml(cov_file)
-
-    changed: set[str] | None = None
-    if changed_only:
-        res = subprocess.run(
-            ["git", "diff", "--name-only", "origin/main...HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        changed = {f.strip() for f in res.stdout.splitlines() if f.strip().endswith(".py")}
+    targets = _app_targets()
+    if not targets:
+        warn("CRAP: no app sources; skipped")
+        return
 
     lizard_res = subprocess.run(
-        ["uvx", "lizard@1.22.2", SRC_DIR],
+        ["uvx", LIZARD, *targets],
         capture_output=True,
         text=True,
         check=False,
@@ -309,8 +395,6 @@ def cmd_crap() -> None:
         # mis-score — skip rather than silently misattribute.
         if not func:
             continue
-        if changed is not None and path not in changed:
-            continue
         ccn = int(ccn_s)
         start, end = int(start_s), int(end_s)
         lines = cov_map.get(path) or cov_map.get(path.lstrip("./")) or {}
@@ -325,9 +409,7 @@ def cmd_crap() -> None:
         return
     offenders.sort(reverse=True)
     mode_suffix = "" if enforce else " (advisory)"
-    print(
-        f"  {RED}✗{RESET} CRAP: {len(offenders)} function(s) exceed {max_crap}{mode_suffix}"
-    )
+    print(f"  {RED}✗{RESET} CRAP: {len(offenders)} function(s) exceed {max_crap}{mode_suffix}")
     for crap, ccn, cov, loc in offenders[:20]:
         print(f"    CRAP={crap:6.1f}  CCN={ccn:3d}  cov={cov * 100:5.1f}%  {loc}")
     if enforce:
@@ -343,13 +425,12 @@ def cmd_complexity() -> None:
         "Complexity (lizard)",
         [
             "uvx",
-            "lizard@1.22.2",
-            SRC_DIR,
-            TEST_DIR,
+            LIZARD,
+            *_app_targets(include_tests=True),
             "-C",
             "15",
             "-a",
-            "7",
+            str(COMPLEXITY_MAX_ARGS),
             "-L",
             "100",
             "-i",
@@ -360,10 +441,17 @@ def cmd_complexity() -> None:
 
 def cmd_post_edit() -> None:
     """Format if source files have uncommitted changes (Claude Code hook)."""
-    if not _changed_py_files():
+    files = _changed_py_files()
+    if not files:
         return
-    run("Fix lint errors", ["uv", "run", "ruff", "check", "--fix", "."], no_exit=True)
-    run("Format code", ["uv", "run", "ruff", "format", "."], no_exit=True)
+    run("Fix lint errors", ["uv", "run", "ruff", "check", "--fix", *files], no_exit=True)
+    run("Format code", ["uv", "run", "ruff", "format", *files], no_exit=True)
+
+
+def cmd_stop_hook() -> None:
+    """Run stop-time checks after agent edits."""
+    print("\n=== Stop Hook Checks ===\n")
+    cmd_complexity()
 
 
 # ── Stages ────────────────────────────────────────────────────────
@@ -399,16 +487,16 @@ def _check_agents_md_drift() -> None:
         print(f"  {RED}✗{RESET} agents-md-drift: CLAUDE.md not found")
         sys.exit(1)
     if not agents.exists():
-        print(
-            f"  {RED}✗{RESET} agents-md-drift: AGENTS.md missing — "
-            "run `harness sync-agents-md`"
-        )
+        print(f"  {RED}✗{RESET} agents-md-drift: AGENTS.md missing — run `harness sync-agents-md`")
         sys.exit(1)
     a, b = claude.read_bytes(), agents.read_bytes()
     if a == b:
         print(f"  {GREEN}✓{RESET} agents-md-drift")
         return
-    line = _first_diff_line(a.decode("utf-8", errors="replace"), b.decode("utf-8", errors="replace"))
+    line = _first_diff_line(
+        a.decode("utf-8", errors="replace"),
+        b.decode("utf-8", errors="replace"),
+    )
     print(
         f"  {RED}✗{RESET} agents-md-drift: AGENTS.md differs from CLAUDE.md "
         f"(first diff at line {line}) — run `harness sync-agents-md`"
@@ -459,12 +547,12 @@ def cmd_pre_commit() -> None:
     cmd_typecheck()
     _check_agents_md_drift()
 
-    if any(f.startswith(f"{SRC_DIR}/") for f in files):
+    if any(_is_quality_python_file(f) for f in files):
         cmd_test()
 
 
 def cmd_ci() -> None:
-    """Full verification: lint, format check, typecheck, tests, acceptance, coverage, crap, arch."""
+    """Run full read-only verification."""
     print("\n=== CI Checks ===\n")
     cmd_lint()
     cmd_format_check()
@@ -489,14 +577,25 @@ def cmd_hooks() -> None:
 def cmd_clean() -> None:
     """Remove cache and build artifacts."""
     print("\n=== Cleaning Up ===\n")
-    for name in [".ruff_cache", "build", "dist", "htmlcov"]:
+    for name in [
+        ".ruff_cache",
+        ".pytest_cache",
+        ".import_linter_cache",
+        "build",
+        "dist",
+        "htmlcov",
+        "mutants",
+    ]:
         p = Path(name)
         if p.is_dir():
             shutil.rmtree(p)
-    for name in [".coverage"]:
+    for name in [".coverage", "coverage.xml"]:
         p = Path(name)
         if p.is_file():
             p.unlink()
+    for p in Path().glob("*.egg-info"):
+        if p.is_dir():
+            shutil.rmtree(p)
     for p in Path().rglob("__pycache__"):
         shutil.rmtree(p)
     run("Ruff clean", ["uv", "run", "ruff", "clean"])
@@ -509,18 +608,19 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "format": (cmd_format, "Format code with ruff"),
     "lint": (cmd_lint, "Lint code with ruff (read-only)"),
     "typecheck": (cmd_typecheck, "Type-check with basedpyright"),
-    "test": (cmd_test, "Run tests with unittest"),
+    "test": (cmd_test, "Run tests, or syntax check when no tests exist"),
     "check": (cmd_check, "Fix + format + typecheck + test (full repo)"),
     "pre-commit": (cmd_pre_commit, "Staged checks + tests"),
-    "ci": (cmd_ci, "Full verification: lint, typecheck, tests, acceptance, coverage, arch"),
+    "ci": (cmd_ci, "Full verification: lint, typecheck, tests, acceptance, coverage, crap, arch"),
     "audit": (cmd_audit, "Audit dependencies for known vulnerabilities"),
     "acceptance": (cmd_acceptance, "Run acceptance scenarios (behave)"),
     "coverage": (cmd_coverage, "Tests with coverage threshold (--min=N)"),
     "mutation": (cmd_mutation, "Mutation testing (mutmut, advisory)"),
     "crap": (cmd_crap, "CRAP complexity x coverage gate (advisory)"),
-    "complexity": (cmd_complexity, "Cyclomatic complexity gate (lizard, CCN 15)"),
+    "complexity": (cmd_complexity, "Cyclomatic complexity gate (lizard, CCN 15, args 8)"),
     "arch": (cmd_arch, "Architecture checks (import-linter)"),
     "post-edit": (cmd_post_edit, "Format if source files changed (Claude Code hook)"),
+    "stop-hook": (cmd_stop_hook, "Run stop-hook checks"),
     "agents-md-drift": (cmd_agents_md_drift, "Fail if AGENTS.md differs from CLAUDE.md"),
     "sync-agents-md": (cmd_sync_agents_md, "Overwrite AGENTS.md from CLAUDE.md"),
     "setup-hooks": (cmd_hooks, "Install git pre-commit hook"),

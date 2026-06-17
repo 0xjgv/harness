@@ -9,7 +9,8 @@ applies as instruction to any agent reading the file.
 
 Two cases:
 
-- **Layer 1 only** — just the `Stop` hook (post-edit auto-format).
+- **Layer 1 only** — just the `Stop` hook (post-edit auto-format, then
+  stop-hook complexity).
 - **Layer 1 + Layer 2** — all five hooks (the behavior contract; see
   [reference-behavior-contract.md](reference-behavior-contract.md)).
 
@@ -18,7 +19,7 @@ entries you need and preserve every other key.
 
 ## Full shape (Layer 1 + Layer 2)
 
-Every template now ships this. Only the `Stop` command differs per
+Every template now ships this. Only the `Stop` commands differ per
 language — every other hook is byte-identical.
 
 ```json
@@ -57,7 +58,8 @@ language — every other hook is byte-identical.
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "<STOP COMMAND — see table below>" }
+          { "type": "command", "command": "<POST-EDIT COMMAND — see table below>" },
+          { "type": "command", "command": "<STOP-HOOK COMMAND — see table below>" }
         ]
       }
     ]
@@ -65,15 +67,15 @@ language — every other hook is byte-identical.
 }
 ```
 
-## Stop command per language
+## Stop commands per language
 
-| Template | Stop command |
-|---|---|
-| Python | `cd $CLAUDE_PROJECT_DIR && uv run harness post-edit` |
-| Bun | `cd $CLAUDE_PROJECT_DIR && bun harness.ts post-edit` |
-| Go | `cd $CLAUDE_PROJECT_DIR && go run harness.go post-edit` |
-| Rust | `cd $CLAUDE_PROJECT_DIR && cargo harness post-edit` |
-| Monorepo | `cd $CLAUDE_PROJECT_DIR && make post-edit` |
+| Template | Post-edit command | Stop-hook command |
+|---|---|---|
+| Python | `cd $CLAUDE_PROJECT_DIR && uv run harness post-edit` | `cd $CLAUDE_PROJECT_DIR && uv run harness stop-hook` |
+| Bun | `cd $CLAUDE_PROJECT_DIR && bun harness.ts post-edit` | `cd $CLAUDE_PROJECT_DIR && bun harness.ts stop-hook` |
+| Go | `cd $CLAUDE_PROJECT_DIR && go run harness.go post-edit` | `cd $CLAUDE_PROJECT_DIR && go run harness.go stop-hook` |
+| Rust | `cd $CLAUDE_PROJECT_DIR && cargo harness post-edit` | `cd $CLAUDE_PROJECT_DIR && cargo harness stop-hook` |
+| Monorepo | `cd $CLAUDE_PROJECT_DIR && make post-edit` | `cd $CLAUDE_PROJECT_DIR && make stop-hook` |
 
 ## Layer 1 only (no behavior contract)
 
@@ -84,5 +86,5 @@ and do not copy `.claude/scripts/`.
 ## Adapting to a different runner
 
 If the repo uses `just`, `make`, or npm scripts instead of the template
-runner, only the trailing `Stop` command changes. Keep the
+runner, only the trailing `Stop` commands change. Keep the
 `cd $CLAUDE_PROJECT_DIR &&` prefix and every hook array shape.

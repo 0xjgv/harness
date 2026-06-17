@@ -9,6 +9,8 @@ import (
 	"testing"
 )
 
+const ruleErrcheck = "errcheck"
+
 func TestParseLine(t *testing.T) {
 	tests := []struct {
 		name string
@@ -23,29 +25,29 @@ func TestParseLine(t *testing.T) {
 		{
 			name: "bare nolint",
 			line: "x := 1 // nolint",
-			want: []Match{{Kind: "nolint", Rules: nil}},
+			want: []Match{{Kind: kindNolint, Rules: nil}},
 		},
 		{
 			name: "nolint with rules",
 			line: "x := 1 // nolint: errcheck, gosec",
-			want: []Match{{Kind: "nolint", Rules: []string{"errcheck", "gosec"}}},
+			want: []Match{{Kind: kindNolint, Rules: []string{ruleErrcheck, "gosec"}}},
 		},
 		{
 			name: "lint ignore with rule",
 			line: "const Foo = 1 // lint:ignore CONST_ASSIGN",
-			want: []Match{{Kind: "lint_ignore", Rules: []string{"CONST_ASSIGN"}}},
+			want: []Match{{Kind: kindLintIgnore, Rules: []string{"CONST_ASSIGN"}}},
 		},
 		{
 			name: "nolint with whitespace in rules",
 			line: "x := 1 // nolint: foo  ,  bar  ",
-			want: []Match{{Kind: "nolint", Rules: []string{"foo", "bar"}}},
+			want: []Match{{Kind: kindNolint, Rules: []string{"foo", "bar"}}},
 		},
 		{
 			name: "both kinds on one line",
 			line: "x := 1 // nolint: errcheck // lint:ignore FOO",
 			want: []Match{
-				{Kind: "nolint", Rules: []string{"errcheck"}},
-				{Kind: "lint_ignore", Rules: []string{"FOO"}},
+				{Kind: kindNolint, Rules: []string{ruleErrcheck}},
+				{Kind: kindLintIgnore, Rules: []string{"FOO"}},
 			},
 		},
 	}
@@ -79,14 +81,14 @@ func TestScan(t *testing.T) {
 
 	results := Scan(tmp)
 
-	wantNolint := [][]string{{"errcheck"}}
-	if !reflect.DeepEqual(results["nolint"], wantNolint) {
-		t.Errorf("results[nolint] = %+v, want %+v", results["nolint"], wantNolint)
+	wantNolint := [][]string{{ruleErrcheck}}
+	if !reflect.DeepEqual(results[kindNolint], wantNolint) {
+		t.Errorf("results[nolint] = %+v, want %+v", results[kindNolint], wantNolint)
 	}
 
 	wantLintIgnore := [][]string{{"CONST_ASSIGN"}}
-	if !reflect.DeepEqual(results["lint_ignore"], wantLintIgnore) {
-		t.Errorf("results[lint_ignore] = %+v, want %+v", results["lint_ignore"], wantLintIgnore)
+	if !reflect.DeepEqual(results[kindLintIgnore], wantLintIgnore) {
+		t.Errorf("results[lint_ignore] = %+v, want %+v", results[kindLintIgnore], wantLintIgnore)
 	}
 }
 
@@ -119,8 +121,8 @@ func TestPrintReport(t *testing.T) {
 
 	t.Run("populated", func(t *testing.T) {
 		results := map[string][][]string{
-			"nolint":      {{"errcheck"}, {"errcheck", "gosec"}},
-			"lint_ignore": {{"FOO"}},
+			kindNolint:     {{ruleErrcheck}, {ruleErrcheck, "gosec"}},
+			kindLintIgnore: {{"FOO"}},
 		}
 		out := captureStdout(t, func() { PrintReport(results) })
 		for _, want := range []string{

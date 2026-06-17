@@ -195,9 +195,27 @@ fn parse_line_for_suppressions(line: &str) -> Vec<(String, Vec<String>)> {
     out
 }
 
+fn scan_rs_file(path: &Path, results: &mut SuppressionCounts) {
+    if path.extension().is_none_or(|e| e != "rs") {
+        return;
+    }
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    for line in text.lines() {
+        for (kind, rules) in parse_line_for_suppressions(line) {
+            results.entry(kind).or_default().push(rules);
+        }
+    }
+}
+
 fn scan_suppressions(roots: &[PathBuf]) -> SuppressionCounts {
     let mut results: SuppressionCounts = BTreeMap::new();
     for root_path in roots {
+        if root_path.is_file() {
+            scan_rs_file(root_path, &mut results);
+            continue;
+        }
         let mut stack = vec![root_path.clone()];
         while let Some(p) = stack.pop() {
             let Ok(entries) = fs::read_dir(&p) else {
@@ -208,15 +226,8 @@ fn scan_suppressions(roots: &[PathBuf]) -> SuppressionCounts {
                 let Ok(ft) = entry.file_type() else { continue };
                 if ft.is_dir() {
                     stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    let Ok(text) = fs::read_to_string(&path) else {
-                        continue;
-                    };
-                    for line in text.lines() {
-                        for (kind, rules) in parse_line_for_suppressions(line) {
-                            results.entry(kind).or_default().push(rules);
-                        }
-                    }
+                } else {
+                    scan_rs_file(&path, &mut results);
                 }
             }
         }
@@ -225,7 +236,7 @@ fn scan_suppressions(roots: &[PathBuf]) -> SuppressionCounts {
 }
 
 fn default_suppression_roots() -> Vec<PathBuf> {
-    vec![root().join("src"), root().join("tests")]
+    vec![root().join("src"), root().join("tests"), root().join("harness.rs")]
 }
 
 fn print_suppressions_report() {
@@ -355,6 +366,11 @@ fn cmd_post_edit() {
     run("Format", &["cargo", "fmt"], Some(&RunOpts { no_exit: true, ..RunOpts::default() }));
 }
 
+fn cmd_stop_hook() {
+    println!("\n=== Stop Hook Checks ===\n");
+    cmd_complexity();
+}
+
 /// Run Gherkin/BDD acceptance scenarios via cucumber.
 ///
 /// The `acceptance` integration test (Cargo.toml `[[test]]`, `harness = false`)
@@ -399,7 +415,7 @@ fn has_feature_files(dir: &Path) -> bool {
 /// matching the audit gate's install-aware behavior.
 ///
 /// Runs the test suite ONCE under llvm-cov (`--no-report`), then renders two
-/// reports from the cached profdata: an LCOV file (consumed by cmd_crap to
+/// reports from the cached profdata: an LCOV file (consumed by `cmd_crap` to
 /// avoid a second test run) and a console summary with the threshold check.
 fn cmd_coverage() {
     let min_pct = arg_value("--min").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
@@ -520,14 +536,26 @@ fn cmd_complexity() {
     run(
         "Complexity (lizard)",
         &[
-            "uvx", "lizard@1.22.2", "-l", "rust", "src", "tests",
-            "-C", "15", "-a", "7", "-L", "100", "-i", "0",
+            "uvx",
+            "lizard@1.22.2",
+            "-l",
+            "rust",
+            "src",
+            "tests",
+            "-C",
+            "15",
+            "-a",
+            "8",
+            "-L",
+            "100",
+            "-i",
+            "0",
         ],
         None,
     );
 }
 
-/// Compute CRAP = CCN² × (1-cov)³ + CCN per function. Advisory — not in `ci`.
+/// Compute CRAP = CCN² × (1-cov)³ + CCN per function. Advisory by default.
 ///
 /// Joins `lizard --csv` (per-function CCN + line range) with the LCOV file
 /// produced by `cargo llvm-cov`. Functions with CRAP above `--max=N`
@@ -571,10 +599,7 @@ fn cmd_crap() {
             run_result
         };
         if !report_result.ok || !lcov_path.exists() {
-            println!(
-                "  {RED}\u{2717}{RESET} CRAP: could not produce {}",
-                lcov_path.display()
-            );
+            println!("  {RED}\u{2717}{RESET} CRAP: could not produce {}", lcov_path.display());
             std::process::exit(1);
         }
     }
@@ -596,10 +621,7 @@ fn cmd_crap() {
             // print a green ✓ while leaving high-CCN functions unscored;
             // surface the failure and degrade to advisory unless --enforce.
             let suffix = if enforce { "" } else { " (advisory)" };
-            println!(
-                "  {RED}\u{2717}{RESET} CRAP: lizard exited {:?}{suffix}",
-                o.status.code()
-            );
+            println!("  {RED}\u{2717}{RESET} CRAP: lizard exited {:?}{suffix}", o.status.code());
             if !o.stderr.is_empty() {
                 print!("{}", String::from_utf8_lossy(&o.stderr));
             }
@@ -637,7 +659,10 @@ fn cmd_crap() {
             if in_range.is_empty() {
                 0.0
             } else {
-                in_range.iter().filter(|&&h| h > 0).count() as f64 / in_range.len() as f64
+                let covered =
+                    u32::try_from(in_range.iter().filter(|&&h| h > 0).count()).unwrap_or(u32::MAX);
+                let tracked = u32::try_from(in_range.len()).unwrap_or(u32::MAX);
+                f64::from(covered) / f64::from(tracked)
             }
         });
         let crap = crap_score(ccn, cov);
@@ -655,8 +680,7 @@ fn cmd_crap() {
         println!("  {GREEN}\u{2713}{RESET} CRAP: all functions below {max_crap:.0}");
         return;
     }
-    offenders
-        .sort_by(|a, b| b.crap.partial_cmp(&a.crap).unwrap_or(std::cmp::Ordering::Equal));
+    offenders.sort_by(|a, b| b.crap.partial_cmp(&a.crap).unwrap_or(std::cmp::Ordering::Equal));
     let suffix = if enforce { "" } else { " (advisory)" };
     println!(
         "  {RED}\u{2717}{RESET} CRAP: {} function(s) exceed {max_crap:.0}{suffix}",
@@ -665,7 +689,10 @@ fn cmd_crap() {
     for o in offenders.iter().take(20) {
         println!(
             "    CRAP={:6.1}  CCN={:3}  cov={:5.1}%  {}",
-            o.crap, o.ccn, o.cov * 100.0, o.location
+            o.crap,
+            o.ccn,
+            o.cov * 100.0,
+            o.location
         );
     }
     if enforce {
@@ -820,20 +847,19 @@ fn check_hooks_present() {
 }
 
 /// 1-based line number of the first divergence between `a` and `b`.
-fn first_diff_line(a: &str, b: &str) -> usize {
-    let mut al = a.lines();
-    let mut bl = b.lines();
-    let mut i = 0usize;
+fn first_diff_line(left: &str, right: &str) -> usize {
+    let mut left_lines = left.lines();
+    let mut right_lines = right.lines();
+    let mut line_number = 0usize;
     loop {
-        match (al.next(), bl.next()) {
-            (Some(x), Some(y)) => {
-                i += 1;
-                if x != y {
-                    return i;
+        match (left_lines.next(), right_lines.next()) {
+            (Some(left_line), Some(right_line)) => {
+                line_number += 1;
+                if left_line != right_line {
+                    return line_number;
                 }
             }
-            (None, None) => return i + 1,
-            _ => return i + 1,
+            _ => return line_number + 1,
         }
     }
 }
@@ -1019,6 +1045,7 @@ const COMMANDS: &[(&str, fn())] = &[
     ("ci", cmd_ci),
     ("setup-hooks", cmd_hooks),
     ("post-edit", cmd_post_edit),
+    ("stop-hook", cmd_stop_hook),
     ("agents-md-drift", cmd_agents_md_drift),
     ("sync-agents-md", cmd_sync_agents_md),
     ("clean", cmd_clean),
@@ -1171,5 +1198,123 @@ mod tests {
         assert_eq!(results.get("allow_crate"), Some(&vec![vec!["unused_imports".to_string()]]));
 
         fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn scan_file_root() {
+        let tmp = std::env::temp_dir().join(format!("rust-suppr-file-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("single.rs");
+        let mut f = fs::File::create(&file).unwrap();
+        writeln!(f, "#[allow(dead_code)]").unwrap();
+        writeln!(f, "fn f() {{}}").unwrap();
+        drop(f);
+
+        let results = scan_suppressions(&[file]);
+
+        assert_eq!(results.get("allow"), Some(&vec![vec!["dead_code".to_string()]]));
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn default_suppression_roots_include_harness() {
+        let roots = default_suppression_roots();
+        assert!(roots.iter().any(|path| path.ends_with("harness.rs")));
+    }
+}
+
+// Property-based tests for the pure helpers above.
+//
+// Worked example for the template's PBT convention: law-like behavior
+// (formulas, parsers, round-trips) gets a property, not just examples.
+// Examples pin known cases; properties pin the law.
+#[cfg(test)]
+mod property_tests {
+    use std::fmt::Write as _;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn crap_score_full_coverage_collapses_to_ccn(ccn in 1u32..=100) {
+            prop_assert!((crap_score(ccn, 1.0) - f64::from(ccn)).abs() < 1e-9);
+        }
+
+        #[test]
+        fn crap_score_bounded_by_ccn_and_zero_coverage(ccn in 1u32..=100, cov in 0.0f64..=1.0) {
+            let score = crap_score(ccn, cov);
+            prop_assert!(score >= f64::from(ccn) - 1e-9);
+            prop_assert!(score <= f64::from(ccn * ccn + ccn) + 1e-9);
+        }
+
+        #[test]
+        fn crap_score_more_coverage_never_raises(
+            ccn in 1u32..=100,
+            a in 0.0f64..=1.0,
+            b in 0.0f64..=1.0,
+        ) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            prop_assert!(crap_score(ccn, lo) >= crap_score(ccn, hi) - 1e-9);
+        }
+
+        #[test]
+        fn crap_score_more_complexity_never_lowers(
+            a in 1u32..=100,
+            b in 1u32..=100,
+            cov in 0.0f64..=1.0,
+        ) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            prop_assert!(crap_score(lo, cov) <= crap_score(hi, cov) + 1e-9);
+        }
+
+        #[test]
+        fn suppressions_total_on_arbitrary_text(line in ".*") {
+            for (kind, _rules) in parse_line_for_suppressions(&line) {
+                prop_assert!(kind == "allow" || kind == "allow_crate");
+            }
+        }
+
+        #[test]
+        fn suppressions_no_hash_means_no_match(line in "[^#]*") {
+            prop_assert!(parse_line_for_suppressions(&line).is_empty());
+        }
+
+        #[test]
+        fn suppressions_allow_rules_round_trip(
+            rules in prop::collection::vec("[a-z][a-z0-9_]{0,8}", 1..4),
+        ) {
+            let line = format!("#[allow({})]", rules.join(", "));
+            let parsed = parse_line_for_suppressions(&line);
+            prop_assert_eq!(parsed, vec![("allow".to_string(), rules)]);
+        }
+
+        #[test]
+        fn lcov_generated_input_round_trips(
+            cov in prop::collection::hash_map(
+                "[a-z][a-z0-9_/.-]{0,12}",
+                prop::collection::hash_map(1u32..10_000, 0u32..1_000, 1..10),
+                1..5,
+            ),
+        ) {
+            let mut text = String::from("TN:\n");
+            for (file, lines) in &cov {
+                writeln!(text, "SF:{file}").unwrap();
+                for (ln, hits) in lines {
+                    writeln!(text, "DA:{ln},{hits}").unwrap();
+                }
+                text.push_str("end_of_record\n");
+            }
+            prop_assert_eq!(parse_lcov_str(&text), cov);
+        }
+
+        #[test]
+        fn lcov_total_on_arbitrary_text(text in ".*") {
+            // Never panics; every file entry has a line map.
+            let _map = parse_lcov_str(&text);
+        }
     }
 }

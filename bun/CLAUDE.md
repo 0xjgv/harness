@@ -2,20 +2,20 @@
 
 ## Commands
 
-- After edits: `bun run check` — fix, format, typecheck, test, hook-drift + suppression report
+- After edits: `bun run check` — fix, format, typecheck, test (warns/skips when no tests exist), hook-drift + suppression report
 - Pre-commit: `bun run pre-commit` — staged files only (auto via git hook)
 - CI: `bun run ci` — read-only pipeline: lint → typecheck → audit → complexity → acceptance → coverage → crap → arch. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
-- Complexity: `bun run harness.ts complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤7, length≤100) over src + tests
+- Complexity: `bun run harness.ts complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over src + tests
 - Audit: `bun run audit` — audit dependencies for known vulnerabilities (via bun audit)
 - Acceptance: `bun run acceptance` — run cucumber against `tests/features/`
-- Coverage: `bun run coverage --min=0` — `bun test` coverage (LCOV) with threshold
-- Mutation (advisory): `bun run mutation` — Stryker mutation score on src/
-- CRAP (advisory): `bun run crap --max=30` — complexity × coverage gate. Add `--enforce` to exit 1 on offenders (default exits 0 with warning).
+- Coverage: `bun run coverage --min=0` — `bun test` coverage (LCOV) with threshold; warns and skips when no tests exist
+- Mutation (advisory): `bun run mutation` — Stryker mutation score on src/; warns and skips when no tests exist
+- CRAP (advisory): `bun run crap --max=30` — complexity × coverage gate. Add `--enforce` to exit 1 on offenders (default exits 0 with warning). Warns and skips when no tests or coverage artifact exist.
 - Arch: `bun run arch` — dependency-cruiser against `.dependency-cruiser.json`
 - Agents drift: `bun run harness.ts agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `bun run harness.ts sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
 - Setup: `bun run setup-hooks` to install git pre-commit hook
-- Auto-format: runs automatically after Claude edits via `Stop` hook (post-edit)
+- Stop hook: auto-formats changed files, then runs complexity (`post-edit`, `stop-hook`)
 
 ## Behavior contract
 
@@ -35,6 +35,7 @@
 
 <important if="the task changes user-visible behavior">
 - Workflow: write or extend a `.feature` scenario → get human approval → write step definitions → write implementation.
+- If the behavior is law-like (formula, parser, codec, round-trip, invariant), also write a fast-check property test, not just examples — see `tests/properties.test.ts` for the pattern.
 - Refactors, typo fixes, dependency bumps, and internal cleanup are NOT user-visible behavior changes. You MAY proceed without a new `.feature`, but you MUST state in your first response that the change is non-behavioral and why.
 - If it is unclear whether a task changes user-visible behavior, ASK before editing source.
 </important>

@@ -82,8 +82,8 @@ type crapWorld struct {
 // `//go:build ignore`, so `go test` does not build it transitively — we
 // shell out to `go build` ourselves and reuse the artifact across scenarios.
 var (
-	harnessBin    string
-	harnessBinErr error
+	harnessBin     string
+	errHarnessBin  error
 	harnessBinOnce sync.Once
 )
 
@@ -91,27 +91,28 @@ func buildHarness() (string, error) {
 	harnessBinOnce.Do(func() {
 		_, file, _, ok := runtime.Caller(0)
 		if !ok {
-			harnessBinErr = fmt.Errorf("cannot locate harness source")
+			errHarnessBin = fmt.Errorf("cannot locate harness source")
 			return
 		}
 		// features/steps/crap_steps.go → go template root is two levels up.
 		goRoot := filepath.Dir(filepath.Dir(filepath.Dir(file)))
 		bin, err := os.CreateTemp("", "harness-bin-*")
 		if err != nil {
-			harnessBinErr = err
+			errHarnessBin = err
 			return
 		}
 		_ = bin.Close()
 		_ = os.Remove(bin.Name())
+		//nolint:gosec // test fixture builds the local harness with fixed argv.
 		cmd := exec.Command("go", "build", "-o", bin.Name(), "harness.go")
 		cmd.Dir = goRoot
 		if out, err := cmd.CombinedOutput(); err != nil {
-			harnessBinErr = fmt.Errorf("go build: %w\n%s", err, out)
+			errHarnessBin = fmt.Errorf("go build: %w\n%s", err, out)
 			return
 		}
 		harnessBin = bin.Name()
 	})
-	return harnessBin, harnessBinErr
+	return harnessBin, errHarnessBin
 }
 
 func (w *crapWorld) makeTmp() error {
@@ -120,17 +121,17 @@ func (w *crapWorld) makeTmp() error {
 		return err
 	}
 	w.tmp = d
-	if err := os.WriteFile(filepath.Join(d, "go.mod"), []byte(stubGoMod), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(d, "go.mod"), []byte(stubGoMod), 0o600); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(d, "stub.go"), []byte(stubGo), 0o644)
+	return os.WriteFile(filepath.Join(d, "stub.go"), []byte(stubGo), 0o600)
 }
 
 func (w *crapWorld) artifactPresent() error {
 	if err := w.makeTmp(); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(w.tmp, "coverage.out"), []byte(stubCoverOut), 0o644)
+	return os.WriteFile(filepath.Join(w.tmp, "coverage.out"), []byte(stubCoverOut), 0o600)
 }
 
 func (w *crapWorld) artifactMissing() error {
@@ -147,6 +148,7 @@ func (w *crapWorld) iRun(cmd string) error {
 	if len(parts) > 0 && parts[0] == "harness" {
 		parts = parts[1:]
 	}
+	//nolint:gosec // test fixture invokes the local harness binary with scenario arguments.
 	c := exec.Command(bin, parts...)
 	c.Dir = w.tmp
 	out, _ := c.CombinedOutput()

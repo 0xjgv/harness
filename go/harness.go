@@ -24,6 +24,11 @@ var root = func() string {
 	return wd
 }()
 
+const (
+	lizard            = "lizard@1.22.2"
+	complexityMaxArgs = "8"
+)
+
 // ── Output ──────────────────────────────────────────────────────────
 
 const (
@@ -249,6 +254,11 @@ func cmdPostEdit() {
 	run("Fix & format", []string{"golangci-lint", "run", "--fix", "./..."}, &runOpts{noExit: true})
 }
 
+func cmdStopHook() {
+	fmt.Println("\n=== Stop Hook Checks ===\n")
+	cmdComplexity()
+}
+
 // ── Quality gates ───────────────────────────────────────────────────
 
 const archConfig = ".go-arch-lint.yml"
@@ -365,7 +375,6 @@ var lizardLocRe = regexp.MustCompile(`"([^"@]*)@(\d+)-(\d+)@([^"]+)"`)
 // receiver-name mismatch between cover output and lizard output.
 func cmdCrap() {
 	maxCrap, _ := strconv.ParseFloat(flagValue("max", "30"), 64)
-	changedOnly := hasFlag("changed-only")
 	enforce := hasFlag("enforce")
 
 	covPath := filepath.Join(root, "coverage.out")
@@ -402,11 +411,6 @@ func cmdCrap() {
 		return
 	}
 
-	var changed map[string]bool
-	if changedOnly {
-		changed = changedFilesVsMain()
-	}
-
 	type scored struct {
 		crap   float64
 		cov    float64
@@ -414,9 +418,6 @@ func cmdCrap() {
 	}
 	var offenders []scored
 	for _, m := range metrics {
-		if changed != nil && !changed[m.file] {
-			continue
-		}
 		c := functionCoverage(cov[m.file], m.line, m.end)
 		score := crap.Score(m.ccn, c)
 		if score > maxCrap {
@@ -495,7 +496,7 @@ func goModulePath() string {
 // partial output: if lizard crashed mid-walk, a partial slice would let
 // high-CCN functions slip through the gate silently.
 func complexityMetrics() []funcMetric {
-	c := exec.Command("uvx", "lizard@1.22.2", "-l", "go", ".", "--csv")
+	c := exec.Command("uvx", lizard, "-l", "go", ".", "--csv")
 	c.Dir = root
 	out, err := c.Output()
 	if err != nil {
@@ -533,23 +534,6 @@ func complexityMetrics() []funcMetric {
 		})
 	}
 	return metrics
-}
-
-// changedFilesVsMain returns the set of .go files changed vs origin/main.
-func changedFilesVsMain() map[string]bool {
-	c := exec.Command("git", "diff", "--name-only", "origin/main...HEAD")
-	c.Dir = root
-	out, err := c.Output()
-	if err != nil {
-		return map[string]bool{}
-	}
-	changed := map[string]bool{}
-	for f := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		if strings.HasSuffix(f, ".go") {
-			changed[f] = true
-		}
-	}
-	return changed
 }
 
 // ── Stages ──────────────────────────────────────────────────────────
@@ -709,8 +693,8 @@ func cmdCi() {
 // applies the same exclusions so both gates target the same code set.
 func cmdComplexity() {
 	run("Complexity (lizard)", []string{
-		"uvx", "lizard@1.22.2", "-l", "go", ".",
-		"-C", "15", "-a", "7", "-L", "100", "-i", "0",
+		"uvx", lizard, "-l", "go", ".",
+		"-C", "15", "-a", complexityMaxArgs, "-L", "100", "-i", "0",
 		"-x", "*_test.go", "-x", "./harness.go",
 	}, nil)
 }
@@ -758,15 +742,16 @@ var tasks = []task{
 	{"test", cmdTest, "Run tests"},
 	{"test-cov", cmdTestCov, "Run tests with race detector and coverage"},
 	{"audit", cmdAudit, "Audit dependencies for known vulnerabilities"},
-	{"complexity", cmdComplexity, "Cyclomatic complexity gate (lizard, CCN 15)"},
+	{"complexity", cmdComplexity, "Cyclomatic complexity gate (lizard, CCN 15, args 8)"},
 	{"acceptance", cmdAcceptance, "Run acceptance scenarios (godog)"},
 	{"arch", cmdArch, "Architecture checks (go-arch-lint)"},
 	{"mutation", cmdMutation, "Mutation testing (gremlins, advisory)"},
 	{"crap", cmdCrap, "CRAP complexity x coverage gate (advisory)"},
 	{"pre-commit", cmdPreCommit, "Staged checks + tests"},
-	{"ci", cmdCi, "Full verification: lint, audit, complexity, acceptance, coverage, arch"},
+	{"ci", cmdCi, "Full verification: lint, audit, complexity, acceptance, coverage, crap, arch"},
 	{"setup-hooks", cmdHooks, "Install git pre-commit hook"},
 	{"post-edit", cmdPostEdit, "Format if source files changed (Claude Code hook)"},
+	{"stop-hook", cmdStopHook, "Run stop-hook checks"},
 	{"agents-md-drift", cmdAgentsMdDrift, "Fail if AGENTS.md differs from CLAUDE.md"},
 	{"sync-agents-md", cmdSyncAgentsMd, "Overwrite AGENTS.md from CLAUDE.md"},
 	{"clean", cmdClean, "Remove coverage and test cache"},

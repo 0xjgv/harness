@@ -13,19 +13,19 @@ uv run harness setup-hooks           # Install git pre-commit hook
 
 ## Development
 
-See the [3-script contract](../README.md#the-3-script-contract) for the full rationale.
+See the [5-script contract](../README.md#the-5-script-contract) for the full rationale.
 
 ```bash
-uv run harness check                 # Fix + format + typecheck + tests (after editing)
+uv run harness check                 # Fix + format + typecheck + tests/syntax check (after editing)
 uv run harness pre-commit            # Staged checks + tests (runs via git hook)
 uv run harness ci                    # Full verification (see below)
 ```
 
 ### `ci` pipeline
 
-`harness ci` runs, in order: lint → format check → typecheck → dep audit → complexity (lizard, CCN 15) → acceptance (behave) → coverage (coverage.py, `--min=0` by default) → arch (import-linter).
+`harness ci` runs, in order: lint → format check → typecheck → dep audit → complexity (lizard, CCN 15, args 8) → acceptance (behave) → coverage (coverage.py, `--min=0` by default) → crap (advisory) → arch (import-linter).
 
-Mutation testing and CRAP are **advisory**: not wired into `ci`; invoke explicitly.
+CRAP is **advisory** but still runs in `ci`. Mutation testing is advisory and invoked explicitly.
 
 All commands minimize output — only errors are shown. Add `--verbose` for full output:
 
@@ -40,7 +40,6 @@ uv run harness acceptance            # behave against tests/features/
 uv run harness coverage --min=80     # tests with coverage, fails below threshold
 uv run harness mutation              # mutmut kill-rate on src/ (advisory; see note below)
 uv run harness crap --max=30         # CRAP = CCN² × (1-cov)³ + CCN per function (advisory)
-uv run harness crap --changed-only   # limit CRAP to files changed vs origin/main
 uv run harness arch                  # import-linter against .importlinter
 ```
 
@@ -51,7 +50,7 @@ uv run harness fix                   # Fix lint errors
 uv run harness format                # Format code
 uv run harness lint                  # Lint check (read-only)
 uv run harness typecheck             # Type-check with basedpyright
-uv run harness test                  # Run tests
+uv run harness test                  # Run unittest tests, or py_compile when no tests/test*.py exist
 uv run harness clean                 # Remove caches
 ```
 
@@ -69,7 +68,7 @@ harness.py           Development task runner (zero dependencies)
 
 ## Behavior contract
 
-`CLAUDE.md` encodes an AI behavior contract enforced by hooks:
+`AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract. Claude Code hooks enforce it for Claude; agents that read `AGENTS.md` receive the same instructions.
 
 - **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
 - **Human-is-engineer**: `git commit` / `git push` denied unless the user's current prompt explicitly asked (verbs: `commit`, `push`, `ship`, `land`, `merge`).
@@ -83,8 +82,11 @@ Hook scripts live in `.claude/scripts/` and are wired via `.claude/settings.json
 Day-1 defaults are deliberately loose so adopting this template does not fail existing projects:
 
 - `coverage --min=0` — raise over time.
-- Mutation / CRAP are advisory — enable as blocking gates once baselines are established.
-- `mutmut 3.x` isolates `src/` into a `mutants/` subdir and runs pytest from there. If your tests import top-level modules (e.g., `from harness import ...`), add `[tool.mutmut]` config or a `conftest.py` path shim so the isolated test run can resolve them.
+- `harness test` uses `unittest`; when no `tests/test*.py` files exist, it runs `py_compile` over `src/` and `harness.py`.
+- Coverage, mutation, and CRAP warn and skip when no unit tests exist.
+- CRAP is advisory in `ci`; pass `--enforce` when you are ready to block on it.
+- Mutation is advisory — enable as a blocking gate once a baseline is established.
+- `mutmut 3.x` isolates `src/` into a `mutants/` subdir. If your tests import top-level modules (e.g., `from harness import ...`), add `[tool.mutmut]` config or a `conftest.py` path shim so the isolated test run can resolve them.
 - `.importlinter` ships with one starter rule (`tests` cannot import `src.internal`). Extend as the module graph grows.
 
 ## Starting from This Template

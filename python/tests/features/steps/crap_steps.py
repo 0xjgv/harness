@@ -58,6 +58,13 @@ def _make_tmp_with_src(context):
     context.tmp = Path(tempfile.mkdtemp(prefix="crap-"))
     (context.tmp / "src").mkdir()
     (context.tmp / "src" / "stub.py").write_text(STUB_PY)
+    (context.tmp / "tests").mkdir()
+    (context.tmp / "tests" / "test_stub.py").write_text(
+        "import unittest\n\n"
+        "class TestStub(unittest.TestCase):\n"
+        "    def test_smoke(self):\n"
+        "        self.assertTrue(True)\n"
+    )
 
 
 @given("a coverage artifact for a high-CCN, zero-coverage function")
@@ -82,9 +89,7 @@ def step_run(context, cmd):
     # convert from, leaving us with an empty file. Drop both so uv errors out
     # before opening anything.
     env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
-    env["PATH"] = ":".join(
-        p for p in env.get("PATH", "").split(":") if "/.venv/" not in p
-    )
+    env["PATH"] = ":".join(p for p in env.get("PATH", "").split(":") if "/.venv/" not in p)
     result = subprocess.run(
         [sys.executable, str(HARNESS), *argv],
         cwd=str(context.tmp),
@@ -106,16 +111,12 @@ def step_exit_code(context, code):
 
 @then('the output contains "{text}"')
 def step_output_contains(context, text):
-    assert text in context.output, (
-        f"expected {text!r} in output:\n{context.output}"
-    )
+    assert text in context.output, f"expected {text!r} in output:\n{context.output}"
 
 
 @then('the output does not contain "{text}"')
 def step_output_not_contains(context, text):
-    assert text not in context.output, (
-        f"unexpected {text!r} in output:\n{context.output}"
-    )
+    assert text not in context.output, f"unexpected {text!r} in output:\n{context.output}"
 
 
 @then("the output mentions running the coverage command first")

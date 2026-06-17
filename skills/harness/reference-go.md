@@ -18,7 +18,8 @@ paraphrase (it drifts). Two sections:
   on drift). `ci` pipeline is `lint → audit → complexity → acceptance →
   test-cov → crap → arch`; `crap` is advisory (warns by default,
   `--enforce` to hard-fail). Requires `uvx` on PATH for `complexity`/
-  `crap` (lizard pinned to `1.22.2` — replaces the old gocyclo gate).
+  `crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8, length≤100 —
+  replaces the old gocyclo gate).
 - `## Behavior contract` — Layer 2; see
   [reference-behavior-contract.md](reference-behavior-contract.md).
 
@@ -42,7 +43,9 @@ Requires Go 1.24+. This brings `.claude/` (Layer 2) intact — keep it.
 
 `.claude/settings.json` wires all 5 hooks. Full shape:
 [reference-settings-json.md](reference-settings-json.md).
-Stop command: `cd $CLAUDE_PROJECT_DIR && go run harness.go post-edit`.
+Stop commands:
+`cd $CLAUDE_PROJECT_DIR && go run harness.go post-edit`;
+`cd $CLAUDE_PROJECT_DIR && go run harness.go stop-hook`.
 
 ## Canonical anchors
 
@@ -50,5 +53,6 @@ Stop command: `cd $CLAUDE_PROJECT_DIR && go run harness.go post-edit`.
 - Lint config: `~/Code/harness-templates/go/.golangci.yaml` (gosec)
 - Tooling: Go compiler typecheck, gofmt, golangci-lint v2, `go test -race`,
   govulncheck, lizard (complexity, via `uvx`), godog (acceptance),
-  gremlins (mutation), go-arch-lint (arch)
+  gremlins (mutation), rapid (property-based tests, see
+  `crap/properties_test.go`), go-arch-lint (arch)
 - Protected arch config: `.go-arch-lint.yml`

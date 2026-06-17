@@ -48,6 +48,10 @@
           {
             "type": "command",
             "command": "cd $CLAUDE_PROJECT_DIR && make post-edit"
+          },
+          {
+            "type": "command",
+            "command": "cd $CLAUDE_PROJECT_DIR && make stop-hook"
           }
         ]
       }

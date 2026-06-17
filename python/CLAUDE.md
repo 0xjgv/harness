@@ -2,20 +2,20 @@
 
 ## Commands
 
-- After edits: `uv run harness check` — fix, format, typecheck, test, suppression report
+- After edits: `uv run harness check` — fix, format, typecheck, test (or syntax check when no tests exist), suppression report
 - Pre-commit: `uv run harness pre-commit` — staged files only (auto via git hook)
 - CI: `uv run harness ci` — read-only pipeline: lint → format check → typecheck → audit → complexity → acceptance → coverage → crap → arch. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
-- Complexity: `uv run harness complexity` — uvx lizard@1.22.2 CC gate (CCN≤15, args≤7, length≤100) over src + tests
+- Complexity: `uv run harness complexity` — uvx lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over src + tests
 - Audit: `uv run harness audit` — audit dependencies for known vulnerabilities (via pip-audit)
 - Acceptance: `uv run harness acceptance` — run behave against `tests/features/`
-- Coverage: `uv run harness coverage --min=0` — coverage.py with threshold + uncovered listing
-- Mutation (advisory): `uv run harness mutation` — mutmut kill-rate on src/
-- CRAP (advisory): `uv run harness crap --max=30` — complexity × coverage gate. Add `--enforce` to exit 1 on offenders (default exits 0 with warning).
+- Coverage: `uv run harness coverage --min=0` — coverage.py with threshold + uncovered listing; warns and skips when no `tests/test*.py` files exist
+- Mutation (advisory): `uv run harness mutation` — mutmut kill-rate on src/; warns and skips when no tests exist
+- CRAP (advisory): `uv run harness crap --max=30` — complexity × coverage gate. Add `--enforce` to exit 1 on offenders (default exits 0 with warning). Warns and skips when no tests exist.
 - Arch: `uv run harness arch` — import-linter against `.importlinter`
 - Agents drift: `uv run harness agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `uv run harness sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
 - Setup: `uv run harness setup-hooks` to install git pre-commit hook
-- Auto-format: runs automatically after Claude edits via `Stop` hook (post-edit)
+- Stop hook: auto-formats changed files, then runs complexity (`post-edit`, `stop-hook`)
 
 ## Behavior contract
 
@@ -35,6 +35,7 @@
 
 <important if="the task changes user-visible behavior">
 - Workflow: write or extend a `.feature` scenario → get human approval → write step definitions → write implementation.
+- If the behavior is law-like (formula, parser, codec, round-trip, invariant), also write a Hypothesis property test, not just examples — see `tests/test_properties.py` for the pattern.
 - Refactors, typo fixes, dependency bumps, and internal cleanup are NOT user-visible behavior changes. You MAY proceed without a new `.feature`, but you MUST state in your first response that the change is non-behavioral and why.
 - If it is unclear whether a task changes user-visible behavior, ASK before editing source.
 </important>

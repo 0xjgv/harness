@@ -13,21 +13,21 @@ bun run setup-hooks                 # Install git pre-commit hook
 
 ## Development
 
-See the [3-script contract](../README.md#the-3-script-contract) for the full rationale.
+See the [5-script contract](../README.md#the-5-script-contract) for the full rationale.
 
 ```bash
-bun run check                      # Fix + format + typecheck + tests (after editing)
+bun run check                      # Fix + format + typecheck + tests/no-test warning (after editing)
 bun run pre-commit                 # Staged checks + tests (runs via git hook)
 bun run ci                         # Full verification (see below)
 ```
 
 ### `ci` pipeline
 
-`harness ci` runs, in order: lint + format check (biome) → typecheck (tsc) → dep audit (bun audit) → complexity (lizard, CCN 15) → acceptance (cucumber) → coverage (`bun test --coverage`, `--min=0` by default) → arch (dependency-cruiser).
+`harness ci` runs, in order: lint + format check (biome) → typecheck (tsc) → dep audit (bun audit) → complexity (lizard, CCN 15, args 8) → acceptance (cucumber) → coverage (`bun test --coverage`, `--min=0` by default) → crap (advisory) → arch (dependency-cruiser).
 
 The complexity gate requires `uvx` on PATH — install via [uv](https://docs.astral.sh/uv/).
 
-Mutation testing and CRAP are **advisory**: not wired into `ci`; invoke explicitly.
+CRAP is **advisory** but still runs in `ci`. Mutation testing is advisory and invoked explicitly.
 
 All commands minimize output — only errors are shown. Add `--verbose` for full output:
 
@@ -42,7 +42,6 @@ bun run acceptance                 # cucumber against tests/features/
 bun run coverage --min=80          # tests with coverage, fails below threshold
 bun run mutation                   # Stryker mutation score on src/ (advisory)
 bun run crap --max=30              # CRAP = CCN² × (1-cov)³ + CCN per function (advisory)
-bun harness.ts crap --changed-only # limit CRAP to files changed vs origin/main
 bun run arch                       # dependency-cruiser against .dependency-cruiser.json
 ```
 
@@ -72,7 +71,7 @@ cucumber.json              Acceptance runner config (cucumber)
 
 ## Behavior contract
 
-`CLAUDE.md` encodes an AI behavior contract enforced by hooks:
+`AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract. Claude Code hooks enforce it for Claude; agents that read `AGENTS.md` receive the same instructions.
 
 - **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
 - **Human-is-engineer**: `git commit` / `git push` denied unless the user's current prompt explicitly asked (verbs: `commit`, `push`, `ship`, `land`, `merge`).
@@ -86,7 +85,9 @@ Hook scripts live in `.claude/scripts/` and are wired via `.claude/settings.json
 Day-1 defaults are deliberately loose so adopting this template does not fail existing projects:
 
 - `coverage --min=0` — raise over time.
-- Mutation / CRAP are advisory — enable as blocking gates once baselines are established.
+- `harness test`, coverage, mutation, and CRAP warn and skip when no test files exist.
+- CRAP is advisory in `ci`; pass `--enforce` when you are ready to block on it.
+- Mutation is advisory — enable as a blocking gate once a baseline is established.
 - StrykerJS has no official Bun test-runner plugin; `stryker.conf.json` uses the universal `command` runner, which shells out to `bun test` and grades each mutant by exit code. It works everywhere but cannot do per-test coverage optimizations — expect a full test run per mutant.
 - `.dependency-cruiser.json` ships with one starter rule (`src/internal/` is not importable from outside it) plus a `no-circular` rule. Extend as the module graph grows.
 

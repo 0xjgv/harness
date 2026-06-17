@@ -263,6 +263,14 @@ post-edit:
 	[ -z "$$dirs" ] && exit 0; \
 	$(MAKE) --no-print-directory _run CMD=post-edit DIRS="$$dirs" QUIET=1 PARALLEL=
 
+.PHONY: stop-hook
+stop-hook:
+	@set -u -o pipefail; eval "$$SH_FILTER_DIRS"; \
+	dirs=$$(dirty_dirs); \
+	[ -z "$$dirs" ] && exit 0; \
+	printf "\n=== Stop Hook Checks ===\n"; \
+	$(MAKE) --no-print-directory _run CMD=complexity DIRS="$$dirs" PARALLEL=
+
 # ── Internal dispatch ─────────────────────────────────────────────
 
 .PHONY: _run _scoped_run

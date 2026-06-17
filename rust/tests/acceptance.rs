@@ -99,11 +99,8 @@ fn name_not_empty(world: &mut CrateWorld) {
 fn artifact_present(world: &mut CrateWorld) {
     let dir = world.make_tmp();
     fs::create_dir_all(dir.join("target").join("llvm-cov")).expect("create llvm-cov dir");
-    fs::write(
-        dir.join("target").join("llvm-cov").join("lcov.info"),
-        ZERO_COVERAGE_LCOV,
-    )
-    .expect("write lcov.info");
+    fs::write(dir.join("target").join("llvm-cov").join("lcov.info"), ZERO_COVERAGE_LCOV)
+        .expect("write lcov.info");
 }
 
 #[given("no coverage artifact")]
@@ -148,20 +145,12 @@ fn exit_code_is(world: &mut CrateWorld, code: i32) {
 
 #[then(expr = "the output contains {string}")]
 fn output_contains(world: &mut CrateWorld, text: String) {
-    assert!(
-        world.output.contains(&text),
-        "expected {text:?} in output:\n{}",
-        world.output,
-    );
+    assert!(world.output.contains(&text), "expected {text:?} in output:\n{}", world.output,);
 }
 
 #[then(expr = "the output does not contain {string}")]
 fn output_does_not_contain(world: &mut CrateWorld, text: String) {
-    assert!(
-        !world.output.contains(&text),
-        "unexpected {text:?} in output:\n{}",
-        world.output,
-    );
+    assert!(!world.output.contains(&text), "unexpected {text:?} in output:\n{}", world.output,);
 }
 
 #[tokio::main]

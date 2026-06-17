@@ -5,7 +5,7 @@ Thanks for your interest in harness-templates! Contributions are welcome — whe
 ## Ways to contribute
 
 - **Report bugs** — open an issue describing what's broken and how to reproduce it
-- **Improve existing templates** — better defaults, clearer CLAUDE.md instructions, additional checks
+- **Improve existing templates** — better defaults, clearer AGENTS.md / CLAUDE.md instructions, additional checks
 - **Add a new language template** — see the checklist below
 - **Improve documentation** — fix typos, clarify instructions, add examples
 
@@ -16,14 +16,15 @@ Every template must follow the same conventions. Use an existing template (e.g. 
 ### Checklist
 
 - [ ] Create a directory named after the language/runtime (e.g. `ruby/`)
-- [ ] Implement the **3-script contract** — `check`, `pre-commit`, and `ci` commands
+- [ ] Implement the **5-script contract** — `check`, `pre-commit`, `ci`, `audit`, and `post-edit` commands
 - [ ] Include a **zero-dependency harness runner** (`harness.*`) using only stdlib/runtime APIs
-- [ ] Include a **`CLAUDE.md`** with agent instructions for the template
+- [ ] Include byte-identical **`AGENTS.md`** and **`CLAUDE.md`** agent instructions for the template
 - [ ] Include a **`README.md`** with getting-started instructions
 - [ ] Include **security-focused lint rules** enabled in the linter config
 - [ ] Include a **dependency audit** command (`audit`) wired into `ci`
 - [ ] Include a **post-edit** command that formats changed source files (non-blocking)
-- [ ] Include a **`.claude/settings.json`** with a Stop hook for post-edit
+- [ ] Include a **stop-hook** command that runs the complexity gate
+- [ ] Include a **`.claude/settings.json`** with a Stop hook for post-edit and stop-hook
 - [ ] Include at least one **smoke test**
 - [ ] Add the template to the root `README.md` tables (Available Templates, Getting Started)
 

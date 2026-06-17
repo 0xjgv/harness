@@ -67,7 +67,7 @@ The Makefile fans out `<cmd>` to each matching subproject, continues past failur
 
 ## Behavior contract
 
-`CLAUDE.md` encodes an AI behavior contract enforced by hooks at the monorepo root — active whenever Claude Code runs here, across every subproject:
+`AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract at the monorepo root. Claude Code hooks enforce it for Claude; agents that read `AGENTS.md` receive the same instructions across every subproject:
 
 - **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
 - **Human-is-engineer**: `git commit` / `git push` denied unless the user's current prompt explicitly asked (verbs: `commit`, `push`, `ship`, `land`, `merge`).

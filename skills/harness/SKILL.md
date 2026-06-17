@@ -64,6 +64,8 @@ Never edit anything under `~/Code/harness-templates/`.
 | `Makefile` + multiple subprojects | `monorepo/` → [reference-monorepo.md](reference-monorepo.md) |
 
 Hook + Stop-hook shape: [reference-settings-json.md](reference-settings-json.md).
+The Stop hook runs `post-edit` first, then `stop-hook`; `stop-hook` runs
+the read-only complexity gate.
 Behavior contract: [reference-behavior-contract.md](reference-behavior-contract.md).
 
 ## Layer 1 — the 5-script contract
@@ -74,16 +76,25 @@ Behavior contract: [reference-behavior-contract.md](reference-behavior-contract.
 | `pre-commit` | Git hook | same, staged files only | yes |
 | `ci` | CI pipeline | read-only lint + typecheck + dep audit + complexity + acceptance + tests/coverage + crap (advisory) + arch | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
-| `post-edit` | Stop hook | format if source files changed | no |
+| `post-edit` | Stop hook step | format if source files changed | no |
 
 Quality subcommands also callable standalone: `complexity`, `crap`,
-`acceptance`, `coverage` (Go: `test-cov`), `mutation`, `arch`. `complexity`
-runs `uvx lizard@1.22.2` (CCN≤15, args≤7, length≤100) — all 4 templates,
-so `uvx` must be on PATH. `crap` is **advisory by default** (warns; pass
-`--enforce` to hard-fail) and is the last `ci` step.
+`acceptance`, `coverage` (Go: `test-cov`), `mutation`, `arch`. Python
+`test` runs `unittest`, or `py_compile` over quality targets when no
+`tests/test*.py` files exist. Bun `test`, `coverage`, `mutation`, and
+`crap` warn and skip when no Bun test files exist. `complexity` runs
+`uvx lizard@1.22.2` (CCN≤15, args≤8, length≤100) — all 4 templates, so
+`uvx` must be on PATH. `crap` is **advisory by default** (warns; pass
+`--enforce` to hard-fail) and runs in `ci`.
 
 Suppression report (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`) is
 **report-only** — never affects exit code.
+
+Property-based tests run inside the normal `test` step — no extra script.
+Each template carries the language's PBT dev-dep (hypothesis / fast-check /
+rapid / proptest) and seeds a property suite over its own CRAP and parser
+helpers as the worked example. The behavior contract's law-like rule
+points agents at that suite.
 
 ## Layer 2 — the behavior contract
 
@@ -126,6 +137,10 @@ not broken.
   repos that already have a runner.
 - Layer 2 is opt-in: never wire the behavior-contract hooks into a repo
   that did not ask for them.
+- The contract's law-like rule (property tests) needs the language's PBT
+  dev-dep: hypothesis (python), fast-check (bun), rapid (go), proptest
+  (rust). Wire it when porting the contract — or on the first law-like
+  change — and model the suite on the template's seeded example.
 
 ## Runner output contract
 
@@ -145,7 +160,7 @@ Layer 1:
 2. `ci` does not mutate tracked files (`git status` clean after).
 3. Pre-commit hook fires on a staged change (`.git/hooks/pre-commit` exists).
 4. `audit` passes.
-5. `post-edit` runs via Stop hook (settings.json wired per
+5. `post-edit` and `stop-hook` run via Stop hook (settings.json wired per
    [reference-settings-json.md](reference-settings-json.md)).
 6. Suppression report exits 0 regardless of count.
 7. Runner imports nothing outside stdlib/runtime.

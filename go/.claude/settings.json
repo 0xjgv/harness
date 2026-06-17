@@ -48,6 +48,10 @@
           {
             "type": "command",
             "command": "cd $CLAUDE_PROJECT_DIR && go run harness.go post-edit"
+          },
+          {
+            "type": "command",
+            "command": "cd $CLAUDE_PROJECT_DIR && go run harness.go stop-hook"
           }
         ]
       }

@@ -22,9 +22,14 @@ var patterns = []struct {
 	kind    string
 	pattern *regexp.Regexp
 }{
-	{"nolint", regexp.MustCompile(`//\s*nolint(?::([\w,\s]+))?`)},
-	{"lint_ignore", regexp.MustCompile(`//\s*lint:ignore\s+(\S+)`)},
+	{kindNolint, regexp.MustCompile(`//\s*nolint(?::([\w,\s]+))?`)},
+	{kindLintIgnore, regexp.MustCompile(`//\s*lint:ignore\s+(\S+)`)},
 }
+
+const (
+	kindNolint     = "nolint"
+	kindLintIgnore = "lint_ignore"
+)
 
 // ParseLine returns all suppression matches found on a single line.
 func ParseLine(line string) []Match {

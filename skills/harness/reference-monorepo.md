@@ -17,7 +17,8 @@ Code reads `CLAUDE.md`; Codex (and other AGENTS.md-consuming tools) read
 (it drifts). Two sections:
 
 - `## Commands` — `make check` / `pre-commit` / `ci` dispatch to every
-  subproject; `make crap` fans out the advisory CRAP gate (per-subproject
+  subproject; each subproject `ci` includes its advisory CRAP gate.
+  `make crap` fans out the advisory CRAP gate directly (per-subproject
   `harness crap`, pass `--enforce` for hard-fail); `make agents-md-drift`
   / `make sync-agents-md` fan out the root + per-subproject AGENTS.md ↔
   CLAUDE.md drift pair; `make check-<subproject>` / `ci-<subproject>` /
@@ -57,7 +58,9 @@ The monorepo root `.claude/` (Layer 2) comes in with the copy — keep it.
 
 `.claude/settings.json` wires all 5 hooks. Full shape:
 [reference-settings-json.md](reference-settings-json.md).
-Stop command: `cd $CLAUDE_PROJECT_DIR && make post-edit`.
+Stop commands:
+`cd $CLAUDE_PROJECT_DIR && make post-edit`;
+`cd $CLAUDE_PROJECT_DIR && make stop-hook`.
 
 The monorepo's `pre-edit-gate.sh` and `ups-classify.sh` protect **all
 four** arch configs by basename (`.importlinter`,

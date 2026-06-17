@@ -33,7 +33,7 @@ rustup component is unavailable.
 
 ## Development
 
-See the [3-script contract](../README.md#the-3-script-contract) for the full rationale.
+See the [5-script contract](../README.md#the-5-script-contract) for the full rationale.
 
 ```bash
 cargo harness check                # Fix + format + lint + tests (after editing)
@@ -43,7 +43,7 @@ cargo harness ci                   # Full verification (see below)
 
 ### `ci` pipeline
 
-`harness ci` runs, in order: strict clippy (`-D warnings`) → format check → dep audit → complexity (lizard, CCN 15) → tests → acceptance (cucumber) → coverage (cargo-llvm-cov, `--min=0` by default) → CRAP (advisory) → arch (cargo-modules).
+`harness ci` runs, in order: strict clippy (`-D warnings`) → format check → dep audit → complexity (lizard, CCN 15, args 8) → tests → acceptance (cucumber) → coverage (cargo-llvm-cov, `--min=0` by default) → CRAP (advisory) → arch (cargo-modules).
 
 `cmd_coverage` runs the test suite under llvm-cov once and emits both the
 console summary (with the `--min=N` threshold check) and an LCOV file at
@@ -63,7 +63,7 @@ cargo harness check --verbose
 
 ```bash
 cargo harness acceptance           # cucumber against tests/features/
-cargo harness complexity           # lizard CCN gate (≤15) over src + tests
+cargo harness complexity           # lizard CCN gate (≤15, args≤8) over src + tests
 cargo harness coverage --min=80    # tests with coverage, fails below threshold
 cargo harness crap --max=30        # CRAP complexity × coverage gate (advisory)
 cargo harness crap --enforce       # …same, but hard-fail when offenders exist
@@ -95,7 +95,7 @@ arch.toml             Architecture rules (cargo-modules)
 
 ## Behavior contract
 
-`CLAUDE.md` encodes an AI behavior contract enforced by hooks:
+`AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract. Claude Code hooks enforce it for Claude; agents that read `AGENTS.md` receive the same instructions.
 
 - **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
 - **Human-is-engineer**: `git commit` / `git push` denied unless the user's current prompt explicitly asked (verbs: `commit`, `push`, `ship`, `land`, `merge`).
@@ -124,7 +124,7 @@ Rust's module system.
 Day-1 defaults are deliberately loose so adopting this template does not fail existing projects:
 
 - `coverage --min=0` — raise over time as the suite matures.
-- Complexity is gated at CCN 15 via lizard; lower it once the codebase is clean.
+- Complexity is gated at CCN 15 and args 8 via lizard; lower it once the codebase is clean.
 - CRAP is advisory (`crap --max=30` is the starting ceiling). Add `--enforce` to make it blocking once your team has paid down the existing offenders.
 - Mutation is advisory — enable as a blocking gate once a baseline kill-rate is established.
 - `arch.toml` ships with two starter rules (no cycles, no orphans). Extend as the module graph grows.

@@ -8,7 +8,6 @@
 package crap
 
 import (
-	"math"
 	"strconv"
 	"strings"
 )
@@ -22,7 +21,7 @@ import (
 // cubically with the uncovered fraction, so an untested complex function
 // dominates the report.
 func Score(ccn int, cov float64) float64 {
-	return float64(ccn*ccn)*math.Pow(1-cov, 3) + float64(ccn)
+	return float64(ccn*ccn)*(1-cov)*(1-cov)*(1-cov) + float64(ccn)
 }
 
 // ParseCoverProfile parses Go's coverprofile text format into a nested map

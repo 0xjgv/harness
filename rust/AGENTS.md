@@ -5,7 +5,7 @@
 - After edits: `cargo harness check` — fix, format, lint, test, suppression report
 - Pre-commit: `cargo harness pre-commit` — staged files only (auto via git hook)
 - CI: `cargo harness ci` — strict pipeline: clippy → format check → audit → complexity → tests → acceptance → coverage → crap → arch. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
-- Complexity: `cargo harness complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤7, length≤100) over src + tests
+- Complexity: `cargo harness complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over src + tests
 - CRAP (advisory): `cargo harness crap --max=30` — complexity × coverage gate (joins lizard --csv with `target/llvm-cov/lcov.info`). Add `--enforce` to exit 1 on offenders (default exits 0 with warning).
 - Audit: `cargo harness audit` — audit dependencies for known vulnerabilities (via cargo-audit)
 - Acceptance: `cargo harness acceptance` — run cucumber against `tests/features/`
@@ -15,7 +15,7 @@
 - Agents drift: `cargo harness agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `cargo harness sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
 - Setup: `cargo harness setup-hooks` to install git hook
-- Auto-format: runs automatically after Claude edits via `Stop` hook (post-edit)
+- Stop hook: auto-formats changed files, then runs complexity (`post-edit`, `stop-hook`)
 
 ## Behavior contract
 
@@ -36,6 +36,7 @@
 <important if="the task changes user-visible behavior">
 - Workflow: write or extend a `.feature` scenario → get human approval → write step definitions → write implementation.
 - Step definitions are Rust functions in `tests/acceptance.rs`; the `.feature` files live under `tests/features/`.
+- If the behavior is law-like (formula, parser, codec, round-trip, invariant), also write a proptest property test, not just examples — see `mod property_tests` in `harness.rs` for the pattern.
 - Refactors, typo fixes, dependency bumps, and internal cleanup are NOT user-visible behavior changes. You MAY proceed without a new `.feature`, but you MUST state in your first response that the change is non-behavioral and why.
 - If it is unclear whether a task changes user-visible behavior, ASK before editing source.
 </important>

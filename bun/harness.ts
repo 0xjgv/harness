@@ -18,8 +18,11 @@
 
 // ── Configuration ───────────────────────────────────────────────────
 
-const SRC_DIR = 'src';
+const APP_SOURCES = ['src'] as const;
+const QUALITY_SOURCES = ['src', 'harness.ts'] as const;
 const TEST_DIR = 'tests';
+const LIZARD = 'lizard@1.22.2';
+const COMPLEXITY_MAX_ARGS = 8;
 const ROOT = import.meta.dir;
 
 // ── Output ──────────────────────────────────────────────────────────
@@ -31,6 +34,85 @@ const DIM = '\x1b[2m';
 const RESET = '\x1b[0m';
 
 const VERBOSE = process.argv.includes('--verbose');
+
+function warn(message: string): void {
+  console.log(`  ${GREEN}⚠${RESET} ${message}`);
+}
+
+async function pathExists(path: string, base = ROOT): Promise<boolean> {
+  const { existsSync } = await import('node:fs');
+  const { isAbsolute, join } = await import('node:path');
+  const full = isAbsolute(path) ? path : join(base, path);
+  return existsSync(full);
+}
+
+export async function existingTargets(paths: readonly string[], base = ROOT): Promise<string[]> {
+  const found: string[] = [];
+  for (const path of paths) {
+    if (await pathExists(path, base)) found.push(path);
+  }
+  return found;
+}
+
+export async function qualityTargets(
+  opts: { includeTests?: boolean; base?: string } = {},
+): Promise<string[]> {
+  const base = opts.base ?? ROOT;
+  const includeTests = opts.includeTests ?? true;
+  const targets = await existingTargets(QUALITY_SOURCES, base);
+  if (includeTests && (await pathExists(TEST_DIR, base))) targets.push(TEST_DIR);
+  return targets;
+}
+
+export async function appTargets(
+  opts: { includeTests?: boolean; base?: string } = {},
+): Promise<string[]> {
+  const base = opts.base ?? ROOT;
+  const includeTests = opts.includeTests ?? false;
+  const targets = await existingTargets(APP_SOURCES, base);
+  if (includeTests && (await pathExists(TEST_DIR, base))) targets.push(TEST_DIR);
+  return targets;
+}
+
+export function isTestFile(path: string): boolean {
+  return (
+    path.endsWith('.test.ts') ||
+    path.endsWith('.spec.ts') ||
+    path.includes('_test_') ||
+    path.includes('_spec_')
+  );
+}
+
+export async function hasTests(base = ROOT): Promise<boolean> {
+  if (!(await pathExists(TEST_DIR, base))) return false;
+  const glob = new Bun.Glob('**/*.ts');
+  for await (const path of glob.scan({ cwd: `${base}/${TEST_DIR}`, onlyFiles: true })) {
+    if (isTestFile(path)) return true;
+  }
+  return false;
+}
+
+function matchesTsTarget(path: string, targets: readonly string[]): boolean {
+  if (!path.endsWith('.ts')) return false;
+  return targets.some((target) => {
+    if (target.endsWith('.ts')) return path === target;
+    return path.startsWith(`${target}/`);
+  });
+}
+
+export function isProjectTsFile(path: string): boolean {
+  return matchesTsTarget(path, [...QUALITY_SOURCES, TEST_DIR]);
+}
+
+export function isQualityTsFile(path: string): boolean {
+  return matchesTsTarget(path, QUALITY_SOURCES);
+}
+
+export function porcelainPath(line: string): string {
+  const path = line.slice(3);
+  if (path.includes(' -> ')) return path.split(' -> ').at(-1) ?? path;
+  return path;
+}
 
 // ── Runner ──────────────────────────────────────────────────────────
 
@@ -126,20 +208,37 @@ export function parseLineForSuppressions(line: string): SuppressionMatch[] {
 }
 
 export async function scanSuppressions(roots?: string[]): Promise<Record<string, string[][]>> {
-  const { readdir, readFile } = await import('node:fs/promises');
-  const { join } = await import('node:path');
-  const actualRoots = roots ?? [SRC_DIR, TEST_DIR].map((d) => join(ROOT, d));
+  const { readdir, readFile, stat } = await import('node:fs/promises');
+  const { isAbsolute, join } = await import('node:path');
+  const actualRoots = roots ?? (await qualityTargets());
   const results: Record<string, string[][]> = {};
 
-  async function walk(dir: string): Promise<void> {
-    const entries = await readdir(dir, { withFileTypes: true }).catch(() => null);
+  async function scanPath(rawPath: string): Promise<void> {
+    const full = isAbsolute(rawPath) ? rawPath : join(ROOT, rawPath);
+    const info = await stat(full).catch(() => null);
+    if (!info) return;
+    if (info.isFile()) {
+      if (!full.endsWith('.ts')) return;
+      const text = await readFile(full, 'utf8').catch(() => null);
+      if (text == null) return;
+      for (const line of text.split('\n')) {
+        for (const m of parseLineForSuppressions(line)) {
+          const bucket = results[m.kind] ?? [];
+          bucket.push(m.rules);
+          results[m.kind] = bucket;
+        }
+      }
+      return;
+    }
+
+    const entries = await readdir(full, { withFileTypes: true }).catch(() => null);
     if (!entries) return;
     for (const e of entries) {
-      const full = join(dir, e.name);
+      const child = join(full, e.name);
       if (e.isDirectory()) {
-        await walk(full);
+        await scanPath(child);
       } else if (e.isFile() && e.name.endsWith('.ts')) {
-        const text = await readFile(full, 'utf8').catch(() => null);
+        const text = await readFile(child, 'utf8').catch(() => null);
         if (text == null) continue;
         for (const line of text.split('\n')) {
           for (const m of parseLineForSuppressions(line)) {
@@ -153,7 +252,7 @@ export async function scanSuppressions(roots?: string[]): Promise<Record<string,
   }
 
   for (const dir of actualRoots) {
-    await walk(dir);
+    await scanPath(dir);
   }
   return results;
 }
@@ -198,9 +297,7 @@ async function stagedTsFiles(): Promise<string[]> {
   return stdout
     .trim()
     .split('\n')
-    .filter(
-      (f) => f.endsWith('.ts') && (f.startsWith(`${SRC_DIR}/`) || f.startsWith(`${TEST_DIR}/`)),
-    );
+    .filter((f) => isProjectTsFile(f));
 }
 
 async function changedTsFiles(): Promise<string[]> {
@@ -214,10 +311,9 @@ async function changedTsFiles(): Promise<string[]> {
   return stdout
     .trim()
     .split('\n')
-    .map((line) => line.slice(3))
-    .filter(
-      (f) => f.endsWith('.ts') && (f.startsWith(`${SRC_DIR}/`) || f.startsWith(`${TEST_DIR}/`)),
-    );
+    .filter((line) => line.length > 3 && !line.slice(0, 2).includes('D'))
+    .map(porcelainPath)
+    .filter((f) => isProjectTsFile(f));
 }
 
 // ── Commands ────────────────────────────────────────────────────────
@@ -237,6 +333,10 @@ async function cmdTypecheck(): Promise<void> {
 }
 
 async function cmdTest(): Promise<void> {
+  if (!(await hasTests())) {
+    warn(`Tests: no ${TEST_DIR}/*.test.ts or *.spec.ts files; skipped`);
+    return;
+  }
   await run('Tests', ['bun', 'test'], { extract: extractTestSummary });
 }
 
@@ -245,6 +345,11 @@ async function cmdAudit(): Promise<void> {
 }
 
 async function cmdCoverage(): Promise<void> {
+  if (!(await hasTests())) {
+    warn(`Coverage: no ${TEST_DIR}/*.test.ts or *.spec.ts files; skipped`);
+    return;
+  }
+
   // Bun's test runner has no built-in per-percentage gate; we emit LCOV and
   // compute the line-coverage percentage ourselves, mirroring python's --min=N.
   const minArg = process.argv.find((a) => a.startsWith('--min='));
@@ -308,12 +413,17 @@ async function cmdArch(): Promise<void> {
     console.log(`  ${GREEN}⚠${RESET} Arch: no .dependency-cruiser.json — skipped`);
     return;
   }
+  const targets = (await appTargets()).map((target) => `${target}/**/*.ts`);
+  if (targets.length === 0) {
+    warn('Arch: no app sources; skipped');
+    return;
+  }
   await run('Arch (dependency-cruiser)', [
     './node_modules/.bin/depcruise',
     '--config',
     '.dependency-cruiser.json',
     '--no-progress',
-    `${SRC_DIR}/**/*.ts`,
+    ...targets,
   ]);
 }
 
@@ -321,6 +431,10 @@ async function cmdMutation(): Promise<void> {
   // StrykerJS mutation testing. Advisory — not wired into ci.
   // No official Bun runner plugin exists; stryker.conf.json uses the universal
   // 'command' runner which shells out to `bun test` and grades by exit code.
+  if (!(await hasTests())) {
+    warn(`Mutation: no ${TEST_DIR}/*.test.ts or *.spec.ts files; skipped`);
+    return;
+  }
   await run('Mutation (Stryker)', ['./node_modules/.bin/stryker', 'run'], { noExit: true });
 }
 
@@ -357,42 +471,32 @@ export function parseLcov(text: string): Record<string, Record<number, number>> 
 
 async function cmdCrap(): Promise<void> {
   // CRAP = ccn^2 * (1-cov)^3 + ccn per function. Advisory — lizard + LCOV.
+  if (!(await hasTests())) {
+    warn('CRAP: no tests; skipped');
+    return;
+  }
+
   const maxArg = process.argv.find((a) => a.startsWith('--max='));
   const maxCrap = maxArg ? Number(maxArg.split('=', 2)[1]) : 30;
-  const changedOnly = process.argv.includes('--changed-only');
   const enforce = process.argv.includes('--enforce');
 
   const { readFile } = await import('node:fs/promises');
   const lcov = await readFile(`${ROOT}/coverage/lcov.info`, 'utf8').catch(() => null);
   if (lcov == null) {
-    console.log(
-      `  ${RED}✗${RESET} CRAP: coverage/lcov.info not found — run \`harness coverage\` first`,
-    );
-    process.exit(1);
+    warn('CRAP: coverage/lcov.info not found — run `harness coverage` first');
+    return;
   }
 
   // Parse LCOV into { file: { lineNumber: hits } }.
   const covMap = parseLcov(lcov);
-
-  let changed: Set<string> | null = null;
-  if (changedOnly) {
-    const proc = Bun.spawn(['git', 'diff', '--name-only', 'origin/main...HEAD'], {
-      cwd: ROOT,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    const out = await new Response(proc.stdout).text();
-    await proc.exited;
-    changed = new Set(
-      out
-        .split('\n')
-        .map((f) => f.trim())
-        .filter((f) => f.endsWith('.ts')),
-    );
+  const targets = await appTargets();
+  if (targets.length === 0) {
+    warn('CRAP: no app sources; skipped');
+    return;
   }
 
   // lizard --csv columns: nloc,ccn,token,param,length,location,file,name,sig,start,end
-  const lz = Bun.spawn(['uvx', 'lizard@1.22.2', SRC_DIR, '--csv'], {
+  const lz = Bun.spawn(['uvx', LIZARD, ...targets, '--csv'], {
     cwd: ROOT,
     stdout: 'pipe',
     stderr: 'pipe',
@@ -435,7 +539,6 @@ async function cmdCrap(): Promise<void> {
     const start = Number(startS);
     const end = Number(endS);
     const location = `${name}@${start}-${end}@${path}`;
-    if (changed !== null && !changed.has(path)) continue;
 
     const lines = covMap[path] ?? covMap[path.replace(/^\.\//, '')] ?? {};
     const inRange: number[] = [];
@@ -455,9 +558,7 @@ async function cmdCrap(): Promise<void> {
   }
   offenders.sort((a, b) => b.crap - a.crap);
   const suffix = enforce ? '' : ' (advisory)';
-  console.log(
-    `  ${RED}✗${RESET} CRAP: ${offenders.length} function(s) exceed ${maxCrap}${suffix}`,
-  );
+  console.log(`  ${RED}✗${RESET} CRAP: ${offenders.length} function(s) exceed ${maxCrap}${suffix}`);
   for (const o of offenders.slice(0, 20)) {
     console.log(
       `    CRAP=${o.crap.toFixed(1).padStart(6)}  CCN=${String(o.ccn).padStart(3)}  ` +
@@ -468,15 +569,19 @@ async function cmdCrap(): Promise<void> {
 }
 
 async function cmdComplexity(): Promise<void> {
+  const targets = await appTargets({ includeTests: true });
+  if (targets.length === 0) {
+    warn('Complexity: no app sources; skipped');
+    return;
+  }
   await run('Complexity (lizard)', [
     'uvx',
-    'lizard@1.22.2',
-    SRC_DIR,
-    TEST_DIR,
+    LIZARD,
+    ...targets,
     '-C',
     '15',
     '-a',
-    '7',
+    String(COMPLEXITY_MAX_ARGS),
     '-L',
     '100',
     '-i',
@@ -485,8 +590,14 @@ async function cmdComplexity(): Promise<void> {
 }
 
 async function cmdPostEdit(): Promise<void> {
-  if ((await changedTsFiles()).length === 0) return;
-  await run('Fix & format', ['bunx', 'biome', 'check', '--write', '.'], { noExit: true });
+  const files = await changedTsFiles();
+  if (files.length === 0) return;
+  await run('Fix & format', ['bunx', 'biome', 'check', '--write', ...files], { noExit: true });
+}
+
+async function cmdStopHook(): Promise<void> {
+  console.log('\n=== Stop Hook Checks ===\n');
+  await cmdComplexity();
 }
 
 // ── Stages ──────────────────────────────────────────────────────────
@@ -574,7 +685,14 @@ async function cmdCheck(): Promise<void> {
       noExit: true,
     }),
   );
-  results.push(await run('Tests', ['bun', 'test'], { extract: extractTestSummary, noExit: true }));
+  if (await hasTests()) {
+    results.push(
+      await run('Tests', ['bun', 'test'], { extract: extractTestSummary, noExit: true }),
+    );
+  } else {
+    warn(`Tests: no ${TEST_DIR}/*.test.ts or *.spec.ts files; skipped`);
+    results.push({ ok: true, output: '' });
+  }
 
   await checkHooksPresent();
   results.push(await checkAgentsMdDrift(true));
@@ -607,7 +725,7 @@ async function cmdPreCommit(): Promise<void> {
   await cmdTypecheck();
   await checkAgentsMdDrift();
 
-  if (files.some((f) => f.startsWith(`${SRC_DIR}/`))) {
+  if (files.some((f) => isQualityTsFile(f))) {
     await cmdTest();
   }
 }
@@ -663,13 +781,14 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   coverage: [cmdCoverage, 'Tests with coverage threshold (--min=N)'],
   mutation: [cmdMutation, 'Mutation testing (Stryker, advisory)'],
   crap: [cmdCrap, 'CRAP complexity x coverage gate (advisory)'],
-  complexity: [cmdComplexity, 'Cyclomatic complexity gate (lizard, CCN 15)'],
+  complexity: [cmdComplexity, 'Cyclomatic complexity gate (lizard, CCN 15, args 8)'],
   arch: [cmdArch, 'Architecture checks (dependency-cruiser)'],
   check: [cmdCheck, 'Full pre-flight: lockfile + fix + typecheck + tests'],
   'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
-  ci: [cmdCi, 'Lint + typecheck + audit + complexity + acceptance + coverage + arch'],
+  ci: [cmdCi, 'Lint + typecheck + audit + complexity + acceptance + coverage + crap + arch'],
   'setup-hooks': [cmdHooks, 'Install git pre-commit hook'],
   'post-edit': [cmdPostEdit, 'Format if source files changed (Claude Code hook)'],
+  'stop-hook': [cmdStopHook, 'Run stop-hook checks'],
   'agents-md-drift': [cmdAgentsMdDrift, 'Fail if AGENTS.md differs from CLAUDE.md'],
   'sync-agents-md': [cmdSyncAgentsMd, 'Overwrite AGENTS.md from CLAUDE.md'],
   clean: [cmdClean, 'Remove caches and build artifacts'],

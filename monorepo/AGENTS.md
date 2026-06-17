@@ -4,7 +4,7 @@
 
 - After edits: `make check` — dispatches `check` to every subproject (fix, format, typecheck, test, suppression report)
 - Pre-commit: `make pre-commit` — runs only in subprojects with staged files (auto via git hook)
-- CI: `make ci` — read-only gate across every subproject; each runs its own `harness ci` (lint, typecheck, dep audit, complexity, acceptance, coverage, arch)
+- CI: `make ci` — read-only gate across every subproject; each runs its own `harness ci` (lint, typecheck, dep audit, complexity, acceptance, coverage, crap, arch)
 - CRAP (advisory): `make crap` — fan out the CRAP gate to every subproject (each runs its own `harness crap`). Forward flags via `ARGS`, e.g. `make crap ARGS="--enforce --max=50"`.
 - Complexity: `make complexity` — fan out the complexity gate to every subproject (lizard CCN). Same `ARGS=...` forwarding.
 - Scope to one subproject: `make check-<subproject>` (e.g. `make check-api`, `make ci-web`, `make crap-api`, `make complexity-api`)
@@ -14,7 +14,7 @@
 - Agents drift: `make agents-md-drift` — fail if any subproject's AGENTS.md differs from its CLAUDE.md (root pair included). Scope: `make agents-md-drift-<sub>`
 - Sync: `make sync-agents-md` — overwrite each subproject's AGENTS.md from its CLAUDE.md. Scope: `make sync-agents-md-<sub>`
 - Setup: `make bootstrap` — per-language install + install the root git hook
-- Auto-format: runs automatically after Claude edits via `Stop` hook (`make post-edit`)
+- Stop hook: auto-formats changed files, then runs complexity (`make post-edit`, `make stop-hook`)
 
 Each subproject keeps its own zero-dep harness (`harness.ts` / `harness.py` / `harness.go` / `cargo harness`). The Makefile only dispatches — never reimplements lint, format, or test logic. Running a subproject's harness directly from its own directory still works:
 
@@ -40,6 +40,7 @@ cd api && uv run harness check
 
 <important if="the task changes user-visible behavior">
 - Workflow: write or extend a `.feature` scenario in the affected subproject → get human approval → write step definitions → write implementation.
+- If the behavior is law-like (formula, parser, codec, round-trip, invariant), also write a property test with the subproject's PBT tool (hypothesis / fast-check / rapid / proptest), not just examples.
 - Refactors, typo fixes, dependency bumps, and internal cleanup are NOT user-visible behavior changes. You MAY proceed without a new `.feature`, but you MUST state in your first response that the change is non-behavioral and why.
 - If it is unclear whether a task changes user-visible behavior, ASK before editing source.
 </important>

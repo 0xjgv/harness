@@ -5,7 +5,7 @@
 - After edits: `go run harness.go check` — fix, format, lint, test, suppression report
 - Pre-commit: `go run harness.go pre-commit` — staged files only (auto via git hook)
 - CI: `go run harness.go ci` — read-only pipeline: lint → audit → complexity → acceptance → test-cov → crap → arch. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
-- Complexity: `go run harness.go complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤7, length≤100) over the module
+- Complexity: `go run harness.go complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over the module
 - Audit: `go run harness.go audit` — audit dependencies for known vulnerabilities (via govulncheck)
 - Acceptance: `go run harness.go acceptance` — run godog against `features/`
 - Coverage: `go run harness.go test-cov` — tests with race detector + `coverage.out`
@@ -15,7 +15,7 @@
 - Agents drift: `go run harness.go agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `go run harness.go sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
 - Setup: `go run harness.go setup-hooks` to install git pre-commit hook
-- Auto-format: runs automatically after Claude edits via the `Stop` hook (post-edit)
+- Stop hook: auto-formats changed files, then runs complexity (`post-edit`, `stop-hook`)
 
 ## Behavior contract
 
@@ -35,6 +35,7 @@
 
 <important if="the task changes user-visible behavior">
 - Workflow: write or extend a `.feature` scenario under `features/` → get human approval → write step definitions under `features/steps/` → write implementation.
+- If the behavior is law-like (formula, parser, codec, round-trip, invariant), also write a rapid property test, not just examples — see `crap/properties_test.go` for the pattern.
 - Refactors, typo fixes, dependency bumps, and internal cleanup are NOT user-visible behavior changes. You MAY proceed without a new `.feature`, but you MUST state in your first response that the change is non-behavioral and why.
 - If it is unclear whether a task changes user-visible behavior, ASK before editing source.
 </important>

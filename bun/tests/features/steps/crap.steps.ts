@@ -47,7 +47,12 @@ end_of_record
 async function makeTmp(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'crap-'));
   await mkdir(join(dir, 'src'));
+  await mkdir(join(dir, 'tests'));
   await writeFile(join(dir, 'src', 'stub.ts'), STUB_TS);
+  await writeFile(
+    join(dir, 'tests', 'stub.test.ts'),
+    "import { test } from 'bun:test';\ntest('stub', () => {});\n",
+  );
   await copyFile(HARNESS_TS, join(dir, 'harness.ts'));
   return dir;
 }

@@ -31,17 +31,20 @@ go run harness.go setup-hooks
 # Start coding
 ```
 
-## The 3-Script Contract
+## The 5-Script Contract
 
 | Script | When | What it does | Fixes code? |
 |---|---|---|---|
 | `go run harness.go check` | After edits | Fix, format, lint, test | Yes |
 | `go run harness.go pre-commit` | Git hook | Staged files only | Yes |
 | `go run harness.go ci` | CI pipeline | Read-only verification (see below) | No |
+| `go run harness.go audit` | CI pipeline | Dependency vulnerability audit | No |
+| `go run harness.go post-edit` | Stop hook step | Format if source files changed | No |
+| `go run harness.go stop-hook` | Stop hook step | Run complexity gate | No |
 
 ### `ci` pipeline
 
-`harness ci` runs, in order: lint → dep audit → complexity (lizard, CCN 15) →
+`harness ci` runs, in order: lint → dep audit → complexity (lizard, CCN 15, args 8) →
 acceptance (godog) → coverage (`go test -race -coverprofile`) → CRAP (advisory) →
 arch (go-arch-lint).
 
@@ -64,7 +67,7 @@ go run harness.go check --verbose
 | `go run harness.go test` | Run tests |
 | `go run harness.go test-cov` | Run tests with race detector + coverage |
 | `go run harness.go audit` | Audit dependencies for known vulnerabilities |
-| `go run harness.go complexity` | Cyclomatic complexity gate (lizard, CCN 15; excludes `_test.go` + `harness.go`) |
+| `go run harness.go complexity` | Cyclomatic complexity gate (lizard, CCN 15, args 8; excludes `_test.go` + `harness.go`) |
 | `go run harness.go acceptance` | Run acceptance scenarios (godog) against `features/` |
 | `go run harness.go arch` | Architecture checks (go-arch-lint) |
 | `go run harness.go mutation` | Mutation testing (gremlins, advisory) |
@@ -90,7 +93,7 @@ harness.go           Development task runner (zero dependencies; //go:build igno
 
 ## Behavior contract
 
-`CLAUDE.md` encodes an AI behavior contract enforced by hooks:
+`AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract. Claude Code hooks enforce it for Claude; agents that read `AGENTS.md` receive the same instructions.
 
 - **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
 - **Human-is-engineer**: `git commit` / `git push` denied unless the user's current prompt explicitly asked (verbs: `commit`, `push`, `ship`, `land`, `merge`).
@@ -103,10 +106,10 @@ Hook scripts live in `.claude/scripts/` and are wired via `.claude/settings.json
 
 Day-1 defaults are deliberately loose so adopting this template does not fail existing projects:
 
-- Complexity is gated at CCN 15 (lizard + golangci-lint's `gocyclo`); lower it once the codebase is clean.
+- Complexity is gated at CCN 15 and args 8 (lizard + golangci-lint's `gocyclo`); lower it once the codebase is clean.
 - Acceptance ships one smoke `.feature`; an empty `features/` dir warns and passes. Add real scenarios.
 - Mutation / CRAP are advisory — enable as blocking gates once baselines are established.
-- `crap --max=30` is the starting ceiling; tighten it as coverage rises. `crap --changed-only` limits the check to files changed vs `origin/main`.
+- `crap --max=30` is the starting ceiling; tighten it as coverage rises.
 - `.go-arch-lint.yml` ships with one starter rule (the sample `suppressions` package is a leaf — it may not import other project components). Extend the component graph as the module grows.
 
 ### Mutation testing notes

@@ -17,9 +17,12 @@ paraphrase (it drifts). Two sections:
   `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit` fail
   on drift). `ci` pipeline is `lint → typecheck → audit → complexity →
   acceptance → coverage → crap → arch`; `crap` is advisory (warns by
-  default, `--enforce` to hard-fail). `check` also runs a `hook-drift`
-  check that flags `.claude/` hook config drift. Requires `uvx` on PATH
-  for `complexity`/`crap` (lizard pinned to `1.22.2`).
+  default, `--enforce` to hard-fail) but still runs in `ci`. `test`,
+  `coverage`, `mutation`, and `crap` warn and skip when no Bun test
+  files exist. `check` also runs a `hook-drift` check that flags
+  `.claude/` hook config drift. Requires `uvx` on PATH for
+  `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
+  length≤100).
 - `## Behavior contract` — Layer 2; see
   [reference-behavior-contract.md](reference-behavior-contract.md).
 
@@ -41,12 +44,15 @@ This brings `.claude/` (Layer 2) intact — keep it.
 
 `.claude/settings.json` wires all 5 hooks. Full shape:
 [reference-settings-json.md](reference-settings-json.md).
-Stop command: `cd $CLAUDE_PROJECT_DIR && bun harness.ts post-edit`.
+Stop commands:
+`cd $CLAUDE_PROJECT_DIR && bun harness.ts post-edit`;
+`cd $CLAUDE_PROJECT_DIR && bun harness.ts stop-hook`.
 
 ## Canonical anchors
 
 - Runner: `~/Code/harness-templates/bun/harness.ts`
-- Tooling: Bun runtime, Biome (lint + format), tsc, `bun test`,
+- Tooling: Bun runtime, Biome (lint + format), tsc (src + harness + tests), `bun test`,
   `bun audit`, lizard (complexity, via `uvx`), cucumber (acceptance),
-  Stryker (mutation), dependency-cruiser (arch)
+  Stryker (mutation), fast-check (property-based tests, see
+  `tests/properties.test.ts`), dependency-cruiser (arch)
 - Protected arch config: `.dependency-cruiser.json`

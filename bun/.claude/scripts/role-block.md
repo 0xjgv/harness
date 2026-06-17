@@ -12,6 +12,7 @@
 
 <important if="the task changes user-visible behavior">
 - Write or extend a `.feature` scenario first; get human approval; then write step defs; then write implementation.
+- If the behavior is law-like (formula, parser, round-trip, invariant), also write a fast-check property test — see `tests/properties.test.ts`.
 - Refactors, typo fixes, dep bumps, and internal cleanup are NOT user-visible. You MAY proceed without a new `.feature`, but state explicitly that the change is non-behavioral and why.
 - If unclear, ASK before editing source.
 </important>

@@ -15,10 +15,13 @@ not paraphrase (it drifts). Two sections:
   subcommands `complexity`, `acceptance`, `coverage`, `mutation`, `crap`,
   `arch`, and the drift pair `agents-md-drift` / `sync-agents-md` (keeps
   `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit` fail
-  on drift). `ci` runs the pipeline `lint → format check → typecheck →
-  audit → complexity → acceptance → coverage → crap → arch`; `crap` is
-  advisory (warns by default, `--enforce` to hard-fail). Requires `uvx`
-  on PATH for `complexity`/`crap` (lizard pinned to `1.22.2`).
+  on drift). `test` runs `unittest`, or `py_compile` over `src/` and
+  `harness.py` when no `tests/test*.py` files exist. `ci` runs the
+  pipeline `lint → format check → typecheck → audit → complexity →
+  acceptance → coverage → crap → arch`; `crap` is advisory (warns by
+  default, `--enforce` to hard-fail) but still runs in `ci`. Requires
+  `uvx` on PATH for `complexity`/`crap` (lizard pinned to `1.22.2`,
+  CCN≤15, args≤8, length≤100).
 - `## Behavior contract` — Layer 2; see
   [reference-behavior-contract.md](reference-behavior-contract.md).
 
@@ -40,13 +43,16 @@ This brings `.claude/` (Layer 2) intact — keep it.
 
 `.claude/settings.json` wires all 5 hooks. Full shape:
 [reference-settings-json.md](reference-settings-json.md).
-Stop command: `cd $CLAUDE_PROJECT_DIR && uv run harness post-edit`.
+Stop commands:
+`cd $CLAUDE_PROJECT_DIR && uv run harness post-edit`;
+`cd $CLAUDE_PROJECT_DIR && uv run harness stop-hook`.
 
 ## Canonical anchors
 
 - Runner: `~/Code/harness-templates/python/harness.py`
 - Quiet-output `run()` pattern: `~/Code/harness-templates/python/harness.py`
 - Tooling: uv, ruff (lint + format + bandit-style security), basedpyright,
-  coverage, pip-audit, lizard (complexity, via `uvx`), behave (acceptance),
-  mutmut (mutation), import-linter (arch)
+  unittest, coverage, pip-audit, lizard (complexity, via `uvx`), behave
+  (acceptance), mutmut (mutation), hypothesis (property-based tests, see
+  `tests/test_properties.py`), import-linter (arch)
 - Protected arch config: `.importlinter`

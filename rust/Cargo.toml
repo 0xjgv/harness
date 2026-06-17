@@ -30,6 +30,7 @@ harness = false
 
 [dev-dependencies]
 cucumber = "0.23"
+proptest = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 # ── Lints ─────────────────────────────────────────────────────────
