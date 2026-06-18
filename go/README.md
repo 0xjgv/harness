@@ -39,8 +39,8 @@ go run harness.go setup-hooks
 | `go run harness.go pre-commit` | Git hook | Staged files only | Yes |
 | `go run harness.go ci` | CI pipeline | Read-only verification (see below) | No |
 | `go run harness.go audit` | CI pipeline | Dependency vulnerability audit | No |
-| `go run harness.go post-edit` | Stop hook step | Format if source files changed | No |
-| `go run harness.go stop-hook` | Stop hook step | Run complexity gate | No |
+| `go run harness.go post-edit` | Stop hook helper | Format if source files changed | No |
+| `go run harness.go stop-hook` | Stop hook entrypoint | Format/fix changed files, then run complexity and advisory CRAP | Yes |
 
 ### `ci` pipeline
 
@@ -74,7 +74,7 @@ go run harness.go check --verbose
 | `go run harness.go crap` | CRAP complexity × coverage gate (advisory) |
 | `go run harness.go pre-commit` | Staged checks + tests |
 | `go run harness.go ci` | Full verification pipeline |
-| `go run harness.go setup-hooks` | Install git pre-commit hook |
+| `go run harness.go setup-hooks` | Install git pre-commit and verify Claude/Codex Stop hook wiring |
 | `go run harness.go clean` | Remove coverage and test cache |
 
 Add `--verbose` to any command to see all output.
@@ -100,7 +100,8 @@ harness.go           Development task runner (zero dependencies; //go:build igno
 - **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
 - **Config write-protection**: edits to `.go-arch-lint.yml` denied unless the user names the path in their prompt. Note `.golangci.yaml` is deliberately *not* protected — it is the general lint config, and protecting it would block all lint-config edits.
 
-Hook scripts live in `.claude/scripts/` and are wired via `.claude/settings.json`.
+Hook scripts live in `.claude/scripts/`. Stop hooks are wired via
+`.claude/settings.json` for Claude and `.codex/hooks.json` for Codex.
 
 ## Thresholds: start at 0, ratchet up
 

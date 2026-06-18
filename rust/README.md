@@ -8,7 +8,7 @@ Rust project template with built-in harness: linting, formatting, testing, accep
 
 ```bash
 cargo build                          # Build the project
-cargo harness setup-hooks            # Install git hooks
+cargo harness setup-hooks            # Install git pre-commit and verify Claude/Codex Stop hook wiring
 ```
 
 The acceptance, coverage, mutation, and arch gates depend on external cargo
@@ -77,7 +77,7 @@ cargo harness arch                 # cargo-modules checks against arch.toml
 cargo harness fix                  # Fix lint errors (clippy --fix) + format
 cargo harness lint                 # Lint + format check (read-only)
 cargo harness test                 # Run tests
-cargo harness setup-hooks          # Install git pre-commit hook
+cargo harness setup-hooks          # Install git pre-commit and verify Claude/Codex Stop hook wiring
 cargo harness clean                # Remove build artifacts
 ```
 
@@ -102,7 +102,8 @@ arch.toml             Architecture rules (cargo-modules)
 - **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
 - **Config write-protection**: edits to `arch.toml` denied unless the user names the path in their prompt.
 
-Hook scripts live in `.claude/scripts/` and are wired via `.claude/settings.json`.
+Hook scripts live in `.claude/scripts/`. Stop hooks are wired via
+`.claude/settings.json` for Claude and `.codex/hooks.json` for Codex.
 
 ## Architecture gate
 

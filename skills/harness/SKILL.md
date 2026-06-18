@@ -35,7 +35,8 @@ Always read first. Do not restate the contract from memory.
   `AGENTS.md`. Both files carry the full content; the harness
   `agents-md-drift` check enforces no drift, and `sync-agents-md` writes
   `AGENTS.md ← CLAUDE.md` after edits. Copy verbatim; do not paraphrase.
-- `~/Code/harness-templates/<lang>/.claude/settings.json` — all 5 hooks
+- `~/Code/harness-templates/<lang>/.claude/settings.json` — Claude hooks
+- `~/Code/harness-templates/<lang>/.codex/hooks.json` — Codex Stop hook
 - `~/Code/harness-templates/<lang>/.claude/scripts/` — hook scripts and
   `role-block.md` (the contract text)
 - `~/Code/harness-templates/python/harness.py` `run()` — canonical quiet output
@@ -63,9 +64,9 @@ Never edit anything under `~/Code/harness-templates/`.
 | `go.mod` | `go/` → [reference-go.md](reference-go.md) |
 | `Makefile` + multiple subprojects | `monorepo/` → [reference-monorepo.md](reference-monorepo.md) |
 
-Hook + Stop-hook shape: [reference-settings-json.md](reference-settings-json.md).
-The Stop hook runs `post-edit` first, then `stop-hook`; `stop-hook` runs
-the read-only complexity gate.
+Claude/Codex hook + Stop-hook shape: [reference-settings-json.md](reference-settings-json.md).
+The Stop hook runs `stop-hook`; `stop-hook` runs `post-edit`, then the
+complexity gate and advisory CRAP.
 Behavior contract: [reference-behavior-contract.md](reference-behavior-contract.md).
 
 ## Layer 1 — the 5-script contract
@@ -76,7 +77,8 @@ Behavior contract: [reference-behavior-contract.md](reference-behavior-contract.
 | `pre-commit` | Git hook | same, staged files only | yes |
 | `ci` | CI pipeline | read-only lint + typecheck + dep audit + complexity + acceptance + tests/coverage + crap (advisory) + arch | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
-| `post-edit` | Stop hook step | format if source files changed | no |
+| `post-edit` | Stop hook helper | format if source files changed | yes |
+| `stop-hook` | Agent Stop hook | post-edit + complexity + crap (advisory) | yes |
 
 Quality subcommands also callable standalone: `complexity`, `crap`,
 `acceptance`, `coverage` (Go: `test-cov`), `mutation`, `arch`. Python
@@ -85,7 +87,7 @@ Quality subcommands also callable standalone: `complexity`, `crap`,
 `crap` warn and skip when no Bun test files exist. `complexity` runs
 `uvx lizard@1.22.2` (CCN≤15, args≤8, length≤100) — all 4 templates, so
 `uvx` must be on PATH. `crap` is **advisory by default** (warns; pass
-`--enforce` to hard-fail) and runs in `ci`.
+`--enforce` to hard-fail) and runs in `ci` and `stop-hook`.
 
 Suppression report (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`) is
 **report-only** — never affects exit code.
@@ -102,8 +104,8 @@ Greenfield copies inherit it via `.claude/`. For an existing repo, wire it
 **only when the user opts in**. Full porting + onboarding steps:
 [reference-behavior-contract.md](reference-behavior-contract.md). In short:
 
-- `.claude/scripts/` + `.claude/settings.json` add four hooks beyond
-  `post-edit`: reinject a role block each session, capture commit/edit
+- `.claude/scripts/` + `.claude/settings.json` add four hooks around
+  `stop-hook`: reinject a role block each session, capture commit/edit
   intent from the user's prompt, deny unauthorized `git commit`/`push`,
   deny unauthorized arch-config edits.
 - `AGENTS.md` and `CLAUDE.md` both carry the `## Behavior contract`
@@ -160,7 +162,7 @@ Layer 1:
 2. `ci` does not mutate tracked files (`git status` clean after).
 3. Pre-commit hook fires on a staged change (`.git/hooks/pre-commit` exists).
 4. `audit` passes.
-5. `post-edit` and `stop-hook` run via Stop hook (settings.json wired per
+5. `stop-hook` runs via Stop hook and includes post-edit formatting (Claude/Codex hooks wired per
    [reference-settings-json.md](reference-settings-json.md)).
 6. Suppression report exits 0 regardless of count.
 7. Runner imports nothing outside stdlib/runtime.

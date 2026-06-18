@@ -256,7 +256,9 @@ func cmdPostEdit() {
 
 func cmdStopHook() {
 	fmt.Println("\n=== Stop Hook Checks ===\n")
+	cmdPostEdit()
 	cmdComplexity()
+	cmdCrap()
 }
 
 // ── Quality gates ───────────────────────────────────────────────────
@@ -378,9 +380,12 @@ func cmdCrap() {
 	enforce := hasFlag("enforce")
 
 	covPath := filepath.Join(root, "coverage.out")
+	if !coverageFresh(covPath) {
+		cmdTestCov()
+	}
 	covText, err := os.ReadFile(covPath)
 	if err != nil {
-		fmt.Printf("  %s✗%s CRAP: coverage.out not found — run `harness test-cov` (or `harness ci`) first\n", red, reset)
+		fmt.Printf("  %s✗%s CRAP: coverage.out not found after test-cov\n", red, reset)
 		os.Exit(1)
 	}
 
@@ -444,6 +449,41 @@ func cmdCrap() {
 	if enforce {
 		os.Exit(1)
 	}
+}
+
+func coverageFresh(covPath string) bool {
+	covInfo, err := os.Stat(covPath)
+	if err != nil {
+		return false
+	}
+	covTime := covInfo.ModTime()
+	fresh := true
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			fresh = false
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", ".idea", ".vscode":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			fresh = false
+			return err
+		}
+		if info.ModTime().After(covTime) {
+			fresh = false
+		}
+		return nil
+	})
+	return err == nil && fresh
 }
 
 // functionCoverage returns the fraction of tracked lines in [start,end] that
@@ -712,6 +752,19 @@ func cmdHooks() {
 		os.Exit(1)
 	}
 	fmt.Println("Installed pre-commit hook")
+	checkStopHookPresent()
+}
+
+func checkStopHookPresent() {
+	for _, rel := range []string{".claude/settings.json", ".codex/hooks.json"} {
+		content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+		contentText := string(content)
+		if err != nil || !strings.Contains(contentText, "Stop") || !strings.Contains(contentText, "stop-hook") {
+			fmt.Printf("  %s⚠%s Missing Stop hook wiring: %s\n", red, reset, rel)
+			continue
+		}
+		fmt.Printf("  %s✓%s Stop hook wiring (%s)\n", green, reset, rel)
+	}
 }
 
 func cmdClean() {
@@ -749,9 +802,9 @@ var tasks = []task{
 	{"crap", cmdCrap, "CRAP complexity x coverage gate (advisory)"},
 	{"pre-commit", cmdPreCommit, "Staged checks + tests"},
 	{"ci", cmdCi, "Full verification: lint, audit, complexity, acceptance, coverage, crap, arch"},
-	{"setup-hooks", cmdHooks, "Install git pre-commit hook"},
-	{"post-edit", cmdPostEdit, "Format if source files changed (Claude Code hook)"},
-	{"stop-hook", cmdStopHook, "Run stop-hook checks"},
+	{"setup-hooks", cmdHooks, "Install git pre-commit hook and verify stop-hook wiring"},
+	{"post-edit", cmdPostEdit, "Format if source files changed"},
+	{"stop-hook", cmdStopHook, "Format changed files, then run stop-hook checks"},
 	{"agents-md-drift", cmdAgentsMdDrift, "Fail if AGENTS.md differs from CLAUDE.md"},
 	{"sync-agents-md", cmdSyncAgentsMd, "Overwrite AGENTS.md from CLAUDE.md"},
 	{"clean", cmdClean, "Remove coverage and test cache"},

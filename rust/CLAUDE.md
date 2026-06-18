@@ -14,8 +14,8 @@
 - Arch: `cargo harness arch` — cargo-modules checks against `arch.toml`
 - Agents drift: `cargo harness agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `cargo harness sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
-- Setup: `cargo harness setup-hooks` to install git hook
-- Stop hook: auto-formats changed files, then runs complexity (`post-edit`, `stop-hook`)
+- Setup: `cargo harness setup-hooks` to install git pre-commit and verify Claude/Codex Stop hook wiring
+- Stop hook: auto-formats/fixes changed files, then runs complexity and CRAP (`stop-hook`)
 
 ## Behavior contract
 

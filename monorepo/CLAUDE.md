@@ -14,7 +14,7 @@
 - Agents drift: `make agents-md-drift` — fail if any subproject's AGENTS.md differs from its CLAUDE.md (root pair included). Scope: `make agents-md-drift-<sub>`
 - Sync: `make sync-agents-md` — overwrite each subproject's AGENTS.md from its CLAUDE.md. Scope: `make sync-agents-md-<sub>`
 - Setup: `make bootstrap` — per-language install + install the root git hook
-- Stop hook: auto-formats changed files, then runs complexity (`make post-edit`, `make stop-hook`)
+- Stop hook: auto-formats/fixes changed files, then runs each dirty subproject's complexity and CRAP gate (`make stop-hook`)
 
 Each subproject keeps its own zero-dep harness (`harness.ts` / `harness.py` / `harness.go` / `cargo harness`). The Makefile only dispatches — never reimplements lint, format, or test logic. Running a subproject's harness directly from its own directory still works:
 

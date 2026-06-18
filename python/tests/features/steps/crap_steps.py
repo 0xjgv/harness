@@ -1,4 +1,3 @@
-import os
 import shlex
 import subprocess
 import sys
@@ -82,21 +81,12 @@ def step_artifact_missing(context):
 def step_run(context, cmd):
     # cmd looks like 'harness crap --max=0 [--enforce]'; drop the leading "harness".
     argv = shlex.split(cmd)[1:]
-    # Sanitize env: behave runs under `uv run`, which leaks VIRTUAL_ENV and a
-    # PATH that fronts the project's `.venv/bin`. If the harness's inner
-    # `uv run coverage xml` finds `coverage`, it opens (and truncates) our
-    # pre-populated coverage.xml before noticing it has no `.coverage` to
-    # convert from, leaving us with an empty file. Drop both so uv errors out
-    # before opening anything.
-    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
-    env["PATH"] = ":".join(p for p in env.get("PATH", "").split(":") if "/.venv/" not in p)
     result = subprocess.run(
         [sys.executable, str(HARNESS), *argv],
         cwd=str(context.tmp),
         capture_output=True,
         text=True,
         check=False,
-        env=env,
     )
     context.result = result
     context.output = result.stdout + result.stderr
@@ -117,11 +107,3 @@ def step_output_contains(context, text):
 @then('the output does not contain "{text}"')
 def step_output_not_contains(context, text):
     assert text not in context.output, f"unexpected {text!r} in output:\n{context.output}"
-
-
-@then("the output mentions running the coverage command first")
-def step_output_coverage_hint(context):
-    out = context.output.lower()
-    assert "coverage" in out and "first" in out, (
-        f"expected coverage-hint in output:\n{context.output}"
-    )

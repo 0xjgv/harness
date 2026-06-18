@@ -47,10 +47,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd $CLAUDE_PROJECT_DIR && bun harness.ts post-edit"
-          },
-          {
-            "type": "command",
             "command": "cd $CLAUDE_PROJECT_DIR && bun harness.ts stop-hook"
           }
         ]

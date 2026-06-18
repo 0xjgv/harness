@@ -368,7 +368,9 @@ fn cmd_post_edit() {
 
 fn cmd_stop_hook() {
     println!("\n=== Stop Hook Checks ===\n");
+    cmd_post_edit();
     cmd_complexity();
+    cmd_crap();
 }
 
 /// Run Gherkin/BDD acceptance scenarios via cucumber.
@@ -1005,6 +1007,19 @@ fn cmd_hooks() {
     }
 
     println!("Installed pre-commit hook");
+    check_stop_hook_present();
+}
+
+fn check_stop_hook_present() {
+    let root = root();
+    for rel in [".claude/settings.json", ".codex/hooks.json"] {
+        let content = fs::read_to_string(root.join(rel)).unwrap_or_default();
+        if content.contains("Stop") && content.contains("stop-hook") {
+            println!("  {GREEN}\u{2713}{RESET} Stop hook wiring ({rel})");
+        } else {
+            println!("  {RED}\u{26a0}{RESET} Missing Stop hook wiring: {rel}");
+        }
+    }
 }
 
 fn cmd_clean() {

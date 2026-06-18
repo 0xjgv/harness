@@ -39,7 +39,7 @@ make check-api      # scope to one subproject
 | `make test` | Run tests only, all subprojects |
 | `make list` | Show detected subprojects |
 | `make setup` | Per-language deps: `bun install`, `uv sync`, `go mod download`, `cargo build` |
-| `make setup-hooks` | Install `.git/hooks/pre-commit` → `make pre-commit`. Re-run with `FORCE=1` to overwrite an existing hook |
+| `make setup-hooks` | Install `.git/hooks/pre-commit` → `make pre-commit` and verify Claude/Codex Stop hook wiring. Re-run with `FORCE=1` to overwrite an existing hook |
 | `make bootstrap` | `setup` + `setup-hooks` |
 | `make clean` | Delegate `clean` to each subproject |
 
@@ -74,7 +74,11 @@ The Makefile fans out `<cmd>` to each matching subproject, continues past failur
 - **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
 - **Config write-protection**: edits to any subproject's arch config (`.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, `arch.toml`) denied unless the user names the path in their prompt.
 
-Hook scripts live in `.claude/scripts/` and are wired via `.claude/settings.json`. Each single-language template also ships these hooks for standalone use; at a monorepo root only the root copy runs — Claude Code loads `.claude/` from the project root only, so a subproject's own hooks lie dormant until you open it as its own project.
+Hook scripts live in `.claude/scripts/`. Stop hooks are wired via
+`.claude/settings.json` for Claude and `.codex/hooks.json` for Codex. Each
+single-language template also ships these hooks for standalone use; at a
+monorepo root only the root copy runs, so a subproject's own hooks lie dormant
+until you open it as its own project.
 
 ## Adding a subproject
 

@@ -336,6 +336,19 @@ def _parse_coverage_xml(path: Path) -> dict[str, dict[int, int]]:
     return cov_map
 
 
+def _artifact_is_fresh(path: Path, roots: Iterable[str]) -> bool:
+    """Return true when artifact is newer than every Python file under roots."""
+    try:
+        artifact_mtime = path.stat().st_mtime
+    except OSError:
+        return False
+
+    try:
+        return all(p.stat().st_mtime <= artifact_mtime for p in _iter_python_files(roots))
+    except OSError:
+        return False
+
+
 def cmd_crap() -> None:
     """CRAP = ccn^2 * (1-cov)^3 + ccn per function. Advisory — lizard + coverage XML."""
     if not _has_tests():
@@ -347,6 +360,10 @@ def cmd_crap() -> None:
     )
     enforce = "--enforce" in sys.argv
 
+    cov_data = Path(".coverage")
+    if not _artifact_is_fresh(cov_data, _quality_targets()):
+        cmd_coverage()
+
     # Emit coverage XML quietly; cmd_coverage must have populated .coverage.
     subprocess.run(
         ["uv", "run", "coverage", "xml", "-o", "coverage.xml", "-q"],
@@ -356,7 +373,7 @@ def cmd_crap() -> None:
     )
     cov_file = Path("coverage.xml")
     if not cov_file.exists():
-        warn("CRAP: coverage XML not found — run `harness coverage` first")
+        warn("CRAP: coverage XML not found after coverage run")
         return
 
     cov_map = _parse_coverage_xml(cov_file)
@@ -440,7 +457,7 @@ def cmd_complexity() -> None:
 
 
 def cmd_post_edit() -> None:
-    """Format if source files have uncommitted changes (Claude Code hook)."""
+    """Format if source files have uncommitted changes."""
     files = _changed_py_files()
     if not files:
         return
@@ -451,7 +468,9 @@ def cmd_post_edit() -> None:
 def cmd_stop_hook() -> None:
     """Run stop-time checks after agent edits."""
     print("\n=== Stop Hook Checks ===\n")
+    cmd_post_edit()
     cmd_complexity()
+    cmd_crap()
 
 
 # ── Stages ────────────────────────────────────────────────────────
@@ -468,6 +487,16 @@ def _check_hooks_present() -> None:
     missing = [p for p in required if not Path(p).exists()]
     if missing:
         print(f"  {RED}⚠{RESET} Missing hook scripts: {', '.join(missing)}")
+
+
+def _check_stop_hook_present() -> None:
+    """Warn when the project Stop hook wiring is missing."""
+    for hook_file in [Path(".claude/settings.json"), Path(".codex/hooks.json")]:
+        content = hook_file.read_text(encoding="utf-8") if hook_file.exists() else ""
+        if "Stop" not in content or "stop-hook" not in content:
+            print(f"  {RED}⚠{RESET} Missing Stop hook wiring: {hook_file}")
+            continue
+        print(f"  {GREEN}✓{RESET} Stop hook wiring ({hook_file})")
 
 
 def _first_diff_line(a: str, b: str) -> int:
@@ -566,12 +595,13 @@ def cmd_ci() -> None:
 
 
 def cmd_hooks() -> None:
-    """Install git pre-commit hook."""
+    """Install local hooks."""
     hook = Path(".git/hooks/pre-commit")
     hook.parent.mkdir(parents=True, exist_ok=True)
     hook.write_text("#!/bin/sh\nuv run harness pre-commit\n", encoding="utf-8")
     hook.chmod(0o755)
     print("Installed pre-commit hook")
+    _check_stop_hook_present()
 
 
 def cmd_clean() -> None:
@@ -619,11 +649,11 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "crap": (cmd_crap, "CRAP complexity x coverage gate (advisory)"),
     "complexity": (cmd_complexity, "Cyclomatic complexity gate (lizard, CCN 15, args 8)"),
     "arch": (cmd_arch, "Architecture checks (import-linter)"),
-    "post-edit": (cmd_post_edit, "Format if source files changed (Claude Code hook)"),
-    "stop-hook": (cmd_stop_hook, "Run stop-hook checks"),
+    "post-edit": (cmd_post_edit, "Format if source files changed"),
+    "stop-hook": (cmd_stop_hook, "Format changed files, then run stop-hook checks"),
     "agents-md-drift": (cmd_agents_md_drift, "Fail if AGENTS.md differs from CLAUDE.md"),
     "sync-agents-md": (cmd_sync_agents_md, "Overwrite AGENTS.md from CLAUDE.md"),
-    "setup-hooks": (cmd_hooks, "Install git pre-commit hook"),
+    "setup-hooks": (cmd_hooks, "Install git pre-commit hook and verify stop-hook wiring"),
     "clean": (cmd_clean, "Remove cache and build artifacts"),
 }
 

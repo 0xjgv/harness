@@ -47,10 +47,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd $CLAUDE_PROJECT_DIR && uv run harness post-edit"
-          },
-          {
-            "type": "command",
             "command": "cd $CLAUDE_PROJECT_DIR && uv run harness stop-hook"
           }
         ]

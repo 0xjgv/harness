@@ -450,7 +450,7 @@ export function crapScore(ccn: number, cov: number): number {
 }
 
 export function parseLcov(text: string): Record<string, Record<number, number>> {
-  const covMap: Record<string, Record<number, number>> = {};
+  const covMap = new Map<string, Map<number, number>>();
   let curFile = '';
   for (const line of text.split('\n')) {
     if (line.startsWith('SF:')) {
@@ -458,15 +458,42 @@ export function parseLcov(text: string): Record<string, Record<number, number>> 
       // Merge into existing entry: LCOV may carry two SF blocks for the same
       // path (sharded runs, hand-merged reports). Overwriting would drop the
       // first block's DA entries.
-      covMap[curFile] ??= {};
+      if (!covMap.has(curFile)) covMap.set(curFile, new Map());
     } else if (line.startsWith('DA:') && curFile) {
       const [num, hits] = line.slice(3).split(',');
-      covMap[curFile][Number(num)] = Number(hits);
+      covMap.get(curFile)?.set(Number(num), Number(hits));
     } else if (line.startsWith('end_of_record')) {
       curFile = '';
     }
   }
-  return covMap;
+  return Object.fromEntries(
+    Array.from(covMap, ([file, lines]) => [file, Object.fromEntries(lines)]),
+  ) as Record<string, Record<number, number>>;
+}
+
+async function artifactIsFresh(path: string, roots: string[]): Promise<boolean> {
+  const { stat } = await import('node:fs/promises');
+  const { existsSync } = await import('node:fs');
+  const artifact = await stat(`${ROOT}/${path}`).catch(() => null);
+  if (artifact == null) return false;
+
+  for (const root of roots) {
+    const full = `${ROOT}/${root}`;
+    if (!existsSync(full)) continue;
+    const rootStat = await stat(full).catch(() => null);
+    if (rootStat == null) return false;
+    if (rootStat.isFile()) {
+      if (rootStat.mtimeMs > artifact.mtimeMs) return false;
+      continue;
+    }
+
+    const glob = new Bun.Glob('**/*.ts');
+    for await (const rel of glob.scan({ cwd: full, onlyFiles: true })) {
+      const file = await stat(`${full}/${rel}`).catch(() => null);
+      if (file == null || file.mtimeMs > artifact.mtimeMs) return false;
+    }
+  }
+  return true;
 }
 
 async function cmdCrap(): Promise<void> {
@@ -480,10 +507,14 @@ async function cmdCrap(): Promise<void> {
   const maxCrap = maxArg ? Number(maxArg.split('=', 2)[1]) : 30;
   const enforce = process.argv.includes('--enforce');
 
+  if (!(await artifactIsFresh('coverage/lcov.info', await qualityTargets()))) {
+    await cmdCoverage();
+  }
+
   const { readFile } = await import('node:fs/promises');
   const lcov = await readFile(`${ROOT}/coverage/lcov.info`, 'utf8').catch(() => null);
   if (lcov == null) {
-    warn('CRAP: coverage/lcov.info not found — run `harness coverage` first');
+    warn('CRAP: coverage/lcov.info not found after coverage run');
     return;
   }
 
@@ -597,7 +628,9 @@ async function cmdPostEdit(): Promise<void> {
 
 async function cmdStopHook(): Promise<void> {
   console.log('\n=== Stop Hook Checks ===\n');
+  await cmdPostEdit();
   await cmdComplexity();
+  await cmdCrap();
 }
 
 // ── Stages ──────────────────────────────────────────────────────────
@@ -614,6 +647,19 @@ async function checkHooksPresent(): Promise<void> {
   const missing = required.filter((p) => !existsSync(`${ROOT}/${p}`));
   if (missing.length > 0) {
     console.log(`  ${RED}⚠${RESET} Missing hook scripts: ${missing.join(', ')}`);
+  }
+}
+
+async function checkStopHookPresent(): Promise<void> {
+  const { existsSync, readFileSync } = await import('node:fs');
+  for (const rel of ['.claude/settings.json', '.codex/hooks.json']) {
+    const path = `${ROOT}/${rel}`;
+    const content = existsSync(path) ? readFileSync(path, 'utf8') : '';
+    if (!content.includes('Stop') || !content.includes('stop-hook')) {
+      console.log(`  ${RED}⚠${RESET} Missing Stop hook wiring: ${rel}`);
+      continue;
+    }
+    console.log(`  ${GREEN}✓${RESET} Stop hook wiring (${rel})`);
   }
 }
 
@@ -751,6 +797,7 @@ async function cmdHooks(): Promise<void> {
   writeFileSync(hookPath, '#!/bin/sh\nbun harness.ts pre-commit\n');
   chmodSync(hookPath, 0o755);
   console.log('Installed pre-commit hook');
+  await checkStopHookPresent();
 }
 
 async function cmdClean(): Promise<void> {
@@ -786,9 +833,9 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   check: [cmdCheck, 'Full pre-flight: lockfile + fix + typecheck + tests'],
   'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
   ci: [cmdCi, 'Lint + typecheck + audit + complexity + acceptance + coverage + crap + arch'],
-  'setup-hooks': [cmdHooks, 'Install git pre-commit hook'],
-  'post-edit': [cmdPostEdit, 'Format if source files changed (Claude Code hook)'],
-  'stop-hook': [cmdStopHook, 'Run stop-hook checks'],
+  'setup-hooks': [cmdHooks, 'Install git pre-commit hook and verify stop-hook wiring'],
+  'post-edit': [cmdPostEdit, 'Format if source files changed'],
+  'stop-hook': [cmdStopHook, 'Format changed files, then run stop-hook checks'],
   'agents-md-drift': [cmdAgentsMdDrift, 'Fail if AGENTS.md differs from CLAUDE.md'],
   'sync-agents-md': [cmdSyncAgentsMd, 'Overwrite AGENTS.md from CLAUDE.md'],
   clean: [cmdClean, 'Remove caches and build artifacts'],

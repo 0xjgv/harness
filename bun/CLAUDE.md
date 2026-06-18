@@ -14,8 +14,8 @@
 - Arch: `bun run arch` — dependency-cruiser against `.dependency-cruiser.json`
 - Agents drift: `bun run harness.ts agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `bun run harness.ts sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
-- Setup: `bun run setup-hooks` to install git pre-commit hook
-- Stop hook: auto-formats changed files, then runs complexity (`post-edit`, `stop-hook`)
+- Setup: `bun run setup-hooks` to install git pre-commit and verify Claude/Codex Stop hook wiring
+- Stop hook: auto-formats/fixes changed files, then runs complexity and CRAP (`stop-hook`)
 
 ## Behavior contract
 

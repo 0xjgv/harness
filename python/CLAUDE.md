@@ -14,8 +14,8 @@
 - Arch: `uv run harness arch` — import-linter against `.importlinter`
 - Agents drift: `uv run harness agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `uv run harness sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
-- Setup: `uv run harness setup-hooks` to install git pre-commit hook
-- Stop hook: auto-formats changed files, then runs complexity (`post-edit`, `stop-hook`)
+- Setup: `uv run harness setup-hooks` to install git pre-commit and verify Claude/Codex Stop hook wiring
+- Stop hook: auto-formats/fixes changed files, then runs complexity and CRAP (`stop-hook`)
 
 ## Behavior contract
 

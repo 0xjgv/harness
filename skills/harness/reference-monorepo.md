@@ -52,14 +52,15 @@ make check       # dispatches to every subproject
 make check-api   # scope to one subproject
 ```
 
-The monorepo root `.claude/` (Layer 2) comes in with the copy — keep it.
+The monorepo root `.claude/` (Layer 2) and `.codex/hooks.json` come in with
+the copy — keep both.
 
 ## Hooks
 
-`.claude/settings.json` wires all 5 hooks. Full shape:
+`.claude/settings.json` wires Claude hooks; `.codex/hooks.json` wires the
+Codex Stop hook. Full shape:
 [reference-settings-json.md](reference-settings-json.md).
-Stop commands:
-`cd $CLAUDE_PROJECT_DIR && make post-edit`;
+Stop command:
 `cd $CLAUDE_PROJECT_DIR && make stop-hook`.
 
 The monorepo's `pre-edit-gate.sh` and `ups-classify.sh` protect **all

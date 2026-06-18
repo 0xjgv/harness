@@ -8,7 +8,7 @@ Python project template with built-in harness: linting, formatting, type-checkin
 
 ```bash
 uv sync                              # Install dependencies
-uv run harness setup-hooks           # Install git pre-commit hook
+uv run harness setup-hooks           # Install git pre-commit and verify Claude/Codex Stop hook wiring
 ```
 
 ## Development
@@ -75,7 +75,8 @@ harness.py           Development task runner (zero dependencies)
 - **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
 - **Config write-protection**: edits to `.importlinter` denied unless the user names the path in their prompt.
 
-Hook scripts live in `.claude/scripts/` and are wired via `.claude/settings.json`.
+Hook scripts live in `.claude/scripts/`. Stop hooks are wired via
+`.claude/settings.json` for Claude and `.codex/hooks.json` for Codex.
 
 ## Thresholds: start at 0, ratchet up
 

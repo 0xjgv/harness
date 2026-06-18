@@ -38,14 +38,14 @@ bun install && bun run setup-hooks
 # Start coding in src/
 ```
 
-This brings `.claude/` (Layer 2) intact — keep it.
+This brings `.claude/` (Layer 2) and `.codex/hooks.json` intact — keep both.
 
 ## Hooks
 
-`.claude/settings.json` wires all 5 hooks. Full shape:
+`.claude/settings.json` wires Claude hooks; `.codex/hooks.json` wires the
+Codex Stop hook. Full shape:
 [reference-settings-json.md](reference-settings-json.md).
-Stop commands:
-`cd $CLAUDE_PROJECT_DIR && bun harness.ts post-edit`;
+Stop command:
 `cd $CLAUDE_PROJECT_DIR && bun harness.ts stop-hook`.
 
 ## Canonical anchors

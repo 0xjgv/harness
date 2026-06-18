@@ -8,7 +8,7 @@ Bun project template with built-in harness: linting, formatting, type-checking, 
 
 ```bash
 bun install                         # Install dependencies
-bun run setup-hooks                 # Install git pre-commit hook
+bun run setup-hooks                 # Install git pre-commit and verify Claude/Codex Stop hook wiring
 ```
 
 ## Development
@@ -78,7 +78,8 @@ cucumber.json              Acceptance runner config (cucumber)
 - **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
 - **Config write-protection**: edits to `.dependency-cruiser.json` denied unless the user names the path in their prompt.
 
-Hook scripts live in `.claude/scripts/` and are wired via `.claude/settings.json`.
+Hook scripts live in `.claude/scripts/`. Stop hooks are wired via
+`.claude/settings.json` for Claude and `.codex/hooks.json` for Codex.
 
 ## Thresholds: start at 0, ratchet up
 

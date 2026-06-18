@@ -17,14 +17,15 @@ used by the Stop hook:
 | `pre-commit` | Git hook | Staged files only — fix, format, typecheck, test if source changed | Yes |
 | `ci` | CI pipeline | Read-only lint, typecheck, dep audit, complexity, acceptance, coverage, advisory CRAP, arch | No |
 | `audit` | CI pipeline | Audit dependencies for known vulnerabilities | No |
-| `post-edit` | Claude Code hook | Format if source files changed | No |
+| `post-edit` | Stop hook helper | Format if source files changed | Yes |
+| `stop-hook` | Agent Stop hook | Run `post-edit`, complexity, advisory CRAP | Yes |
 
 **`check`** is the one you run constantly. It auto-fixes what it can so you stay in flow. It also reports suppression comments (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`, etc.) as a report-only signal — visibility, never exit-code change.
 **`pre-commit`** runs the same checks scoped to staged files, installed as a git hook.
 **`ci`** is the read-only gate — no fixes, just verification.
 **`audit`** audits dependencies for known vulnerabilities.
-**`post-edit`** formats source files if changed by Claude Code.
-**`stop-hook`** runs the stop-time complexity gate after `post-edit`.
+**`post-edit`** formats source files if changed by an agent.
+**`stop-hook`** is the Stop hook entrypoint: it runs `post-edit`, then complexity and advisory CRAP.
 
 ## Available Templates
 
@@ -99,6 +100,7 @@ make check-api      # scope to one subproject
 - **Dependency auditing** — pip-audit (Python) / bun audit (Bun) / govulncheck (Go) / cargo-audit (Rust) — runs in `ci`
 - **Cyclomatic complexity gate** (CCN 15, args 8) — lizard via `uvx` (Python/Bun/Go/Rust) / gocyclo via golangci-lint (Go) — runs in `ci`
 - **CRAP advisory** — complexity × coverage signal, advisory by default and still run in `ci`
+- **Agent Stop hooks** — `.claude/settings.json` and `.codex/hooks.json` run `stop-hook`
 - **Property-based testing** — hypothesis (Python) / fast-check (Bun) / rapid (Go) / proptest (Rust), seeded with a property suite over each template's own CRAP and parser helpers as the worked example; runs under the normal `test` step
 - **AGENTS.md + CLAUDE.md** — tell AI agents which commands to run and when
 

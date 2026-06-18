@@ -154,5 +154,23 @@ class TestNoTestBehavior(unittest.TestCase):
                 subprocess_run.assert_not_called()
 
 
+class TestStopHook(unittest.TestCase):
+    def test_stop_hook_runs_post_edit_then_complexity_then_crap(self):
+        calls: list[str] = []
+
+        with (
+            mock.patch.object(
+                harness, "cmd_post_edit", side_effect=lambda: calls.append("post-edit")
+            ),
+            mock.patch.object(
+                harness, "cmd_complexity", side_effect=lambda: calls.append("complexity")
+            ),
+            mock.patch.object(harness, "cmd_crap", side_effect=lambda: calls.append("crap")),
+        ):
+            harness.cmd_stop_hook()
+
+        self.assertEqual(calls, ["post-edit", "complexity", "crap"])
+
+
 if __name__ == "__main__":
     unittest.main()

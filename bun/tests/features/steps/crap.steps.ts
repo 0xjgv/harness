@@ -51,7 +51,7 @@ async function makeTmp(): Promise<string> {
   await writeFile(join(dir, 'src', 'stub.ts'), STUB_TS);
   await writeFile(
     join(dir, 'tests', 'stub.test.ts'),
-    "import { test } from 'bun:test';\ntest('stub', () => {});\n",
+    "import { test, expect } from 'bun:test';\nimport { stub } from '../src/stub';\ntest('stub', () => expect(stub(0)).toBe(0));\n",
   );
   await copyFile(HARNESS_TS, join(dir, 'harness.ts'));
   return dir;
@@ -104,14 +104,6 @@ Then('the output does not contain {string}', function (this: CrapWorld, text: st
   assert.ok(
     !this.result?.output.includes(text),
     `unexpected ${JSON.stringify(text)} in output:\n${this.result?.output}`,
-  );
-});
-
-Then('the output mentions running the coverage command first', function (this: CrapWorld) {
-  const out = (this.result?.output ?? '').toLowerCase();
-  assert.ok(
-    out.includes('coverage') && out.includes('first'),
-    `expected coverage-hint in output:\n${this.result?.output}`,
   );
 });
 

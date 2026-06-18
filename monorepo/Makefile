@@ -170,7 +170,7 @@ setup: ## Install per-language deps (one-time)
 	@set -eu; for d in $(RUST_DIRS); do printf "$(BOLD)▶ %s$(RESET) $(DIM)(cargo build)$(RESET)\n"    "$$d"; (cd "$$d" && cargo build); done
 
 .PHONY: setup-hooks
-setup-hooks: ## Install root pre-commit git hook
+setup-hooks: ## Install root pre-commit git hook and verify Claude/Codex Stop hook wiring
 	@if [ ! -d .git ]; then \
 	  printf "$(RED)Not a git repo.$(RESET) Run 'git init' first.\n"; exit 1; \
 	fi
@@ -181,6 +181,16 @@ setup-hooks: ## Install root pre-commit git hook
 	@printf '#!/bin/sh\nexec make pre-commit\n' > .git/hooks/pre-commit
 	@chmod +x .git/hooks/pre-commit
 	@printf "$(GREEN)✓$(RESET) Installed .git/hooks/pre-commit → make pre-commit\n"
+	@if [ -f .claude/settings.json ] && grep -q 'Stop' .claude/settings.json && grep -q 'stop-hook' .claude/settings.json; then \
+	  printf "$(GREEN)✓$(RESET) Stop hook wiring (.claude/settings.json)\n"; \
+	else \
+	  printf "$(RED)⚠$(RESET) Missing Stop hook wiring: .claude/settings.json\n"; \
+	fi
+	@if [ -f .codex/hooks.json ] && grep -q 'Stop' .codex/hooks.json && grep -q 'stop-hook' .codex/hooks.json; then \
+	  printf "$(GREEN)✓$(RESET) Stop hook wiring (.codex/hooks.json)\n"; \
+	else \
+	  printf "$(RED)⚠$(RESET) Missing Stop hook wiring: .codex/hooks.json\n"; \
+	fi
 
 .PHONY: bootstrap
 bootstrap: setup setup-hooks ## Full first-time setup (setup + install hook)
@@ -269,7 +279,7 @@ stop-hook:
 	dirs=$$(dirty_dirs); \
 	[ -z "$$dirs" ] && exit 0; \
 	printf "\n=== Stop Hook Checks ===\n"; \
-	$(MAKE) --no-print-directory _run CMD=complexity DIRS="$$dirs" PARALLEL=
+	$(MAKE) --no-print-directory _run CMD=stop-hook DIRS="$$dirs" PARALLEL=
 
 # ── Internal dispatch ─────────────────────────────────────────────
 
