@@ -37,6 +37,8 @@ Always read first. Do not restate the contract from memory.
   `AGENTS.md ← CLAUDE.md` after edits. Copy verbatim; do not paraphrase.
 - `~/Code/harness-templates/<lang>/.claude/settings.json` — Claude hooks
 - `~/Code/harness-templates/<lang>/.codex/hooks.json` — Codex Stop hook
+- `~/Code/harness-templates/<lang>/.codex/hooks/codex-stop-hook.sh` —
+  Codex stdout-to-JSON wrapper for Stop hooks
 - `~/Code/harness-templates/<lang>/.claude/scripts/` — hook scripts and
   `role-block.md` (the contract text)
 - `~/Code/harness-templates/python/harness.py` `run()` — canonical quiet output

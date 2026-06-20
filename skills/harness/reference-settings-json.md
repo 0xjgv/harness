@@ -5,6 +5,7 @@ Source files live at:
 
 - `~/Code/harness-templates/<lang>/.claude/settings.json`
 - `~/Code/harness-templates/<lang>/.codex/hooks.json`
+- `~/Code/harness-templates/<lang>/.codex/hooks/codex-stop-hook.sh`
 
 Copy the pair matching the target language. Claude hooks run inside Claude
 Code's hook runtime. Codex hooks run inside Codex's hook runtime and are
@@ -85,7 +86,16 @@ language — every other hook is byte-identical.
 ## Codex Stop hook
 
 Codex project hooks live at `.codex/hooks.json`. Use the repository root from
-Git because Codex hook commands run from the session working directory.
+Git because Codex hook commands run from the session working directory. Codex
+parses Stop hook stdout as JSON, so the bundled
+`.codex/hooks/codex-stop-hook.sh` wrapper redirects the runner's stdout/stderr
+to stderr and prints exactly one JSON object to stdout:
+
+- `{"continue":true}` when checks pass.
+- `{"decision":"block","reason":"..."}` when checks fail.
+
+Do not point Codex directly at `make stop-hook` or a language runner that prints
+human status lines to stdout.
 
 ```json
 {
@@ -108,11 +118,11 @@ Git because Codex hook commands run from the session working directory.
 
 | Template | Codex Stop-hook command |
 |---|---|
-| Python | `cd "$(git rev-parse --show-toplevel)" && uv run harness stop-hook` |
-| Bun | `cd "$(git rev-parse --show-toplevel)" && bun harness.ts stop-hook` |
-| Go | `cd "$(git rev-parse --show-toplevel)" && go run harness.go stop-hook` |
-| Rust | `cd "$(git rev-parse --show-toplevel)" && cargo harness stop-hook` |
-| Monorepo | `cd "$(git rev-parse --show-toplevel)" && make stop-hook` |
+| Python | `cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh uv run harness stop-hook` |
+| Bun | `cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh bun harness.ts stop-hook` |
+| Go | `cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh go run harness.go stop-hook` |
+| Rust | `cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh cargo harness stop-hook` |
+| Monorepo | `cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh make stop-hook` |
 
 ## Layer 1 only (no behavior contract)
 

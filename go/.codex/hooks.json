@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$(git rev-parse --show-toplevel)\" && go run harness.go stop-hook",
+            "command": "cd \"$(git rev-parse --show-toplevel)\" && .codex/hooks/codex-stop-hook.sh go run harness.go stop-hook",
             "timeout": 300,
             "statusMessage": "Running stop-hook checks"
           }

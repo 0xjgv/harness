@@ -100,7 +100,7 @@ make check-api      # scope to one subproject
 - **Dependency auditing** — pip-audit (Python) / bun audit (Bun) / govulncheck (Go) / cargo-audit (Rust) — runs in `ci`
 - **Cyclomatic complexity gate** (CCN 15, args 8) — lizard via `uvx` (Python/Bun/Go/Rust) / gocyclo via golangci-lint (Go) — runs in `ci`
 - **CRAP advisory** — complexity × coverage signal, advisory by default and still run in `ci`
-- **Agent Stop hooks** — `.claude/settings.json` and `.codex/hooks.json` run `stop-hook`
+- **Agent Stop hooks** — `.claude/settings.json` runs `stop-hook`; `.codex/hooks.json` runs the Codex JSON wrapper around `stop-hook`
 - **Property-based testing** — hypothesis (Python) / fast-check (Bun) / rapid (Go) / proptest (Rust), seeded with a property suite over each template's own CRAP and parser helpers as the worked example; runs under the normal `test` step
 - **AGENTS.md + CLAUDE.md** — tell AI agents which commands to run and when
 

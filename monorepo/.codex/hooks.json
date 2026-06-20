@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$(git rev-parse --show-toplevel)\" && make stop-hook",
+            "command": "cd \"$(git rev-parse --show-toplevel)\" && .codex/hooks/codex-stop-hook.sh make stop-hook",
             "timeout": 300,
             "statusMessage": "Running stop-hook checks"
           }

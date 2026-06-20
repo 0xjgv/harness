@@ -37,16 +37,18 @@ go mod edit -module my-project
 go run harness.go setup-hooks
 ```
 
-Requires Go 1.24+. This brings `.claude/` (Layer 2) and
-`.codex/hooks.json` intact — keep both.
+Requires Go 1.24+. This brings `.claude/` (Layer 2), `.codex/hooks.json`,
+and `.codex/hooks/codex-stop-hook.sh` intact — keep them.
 
 ## Hooks
 
 `.claude/settings.json` wires Claude hooks; `.codex/hooks.json` wires the
 Codex Stop hook. Full shape:
 [reference-settings-json.md](reference-settings-json.md).
-Stop command:
+Claude Stop command:
 `cd $CLAUDE_PROJECT_DIR && go run harness.go stop-hook`.
+Codex Stop command:
+`cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh go run harness.go stop-hook`.
 
 ## Canonical anchors
 
