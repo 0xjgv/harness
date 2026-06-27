@@ -131,6 +131,7 @@ class TestNoTestBehavior(unittest.TestCase):
         run_mock.assert_called_once_with(
             "Run tests",
             ["uv", "run", "python", "-m", "unittest", "discover", "-s", "tests", "-q"],
+            stream=True,
         )
 
     def test_warning_only_gates_skip_when_no_tests_exist(self):
@@ -155,21 +156,50 @@ class TestNoTestBehavior(unittest.TestCase):
 
 
 class TestStopHook(unittest.TestCase):
-    def test_stop_hook_runs_post_edit_then_complexity_then_crap(self):
+    def test_stop_hook_runs_post_edit_then_parallel_batch_then_crap(self):
         calls: list[str] = []
+
+        def record_batch(gates: list[harness.Gate]) -> bool:
+            calls.append("batch:" + ",".join(gate.description for gate in gates))
+            return True
 
         with (
             mock.patch.object(
                 harness, "cmd_post_edit", side_effect=lambda: calls.append("post-edit")
             ),
-            mock.patch.object(
-                harness, "cmd_complexity", side_effect=lambda: calls.append("complexity")
-            ),
+            mock.patch.object(harness, "run_gates_parallel", side_effect=record_batch),
             mock.patch.object(harness, "cmd_crap", side_effect=lambda: calls.append("crap")),
         ):
             harness.cmd_stop_hook()
 
-        self.assertEqual(calls, ["post-edit", "complexity", "crap"])
+        # Mutating fix/format runs first and alone; the read-only complexity gate
+        # runs through the parallel batch; CRAP streams last.
+        self.assertEqual(calls, ["post-edit", "batch:Complexity (lizard)", "crap"])
+
+
+class TestParallelGates(unittest.TestCase):
+    def test_all_gates_run_to_completion_on_seeded_failure(self):
+        # A seeded failure in the middle must not short-circuit the batch: every
+        # gate still reports, results print in submission order, and the overall
+        # result is False.
+        gates = [
+            harness.Gate("first ok", ["true"]),
+            harness.Gate("seeded fail", ["false"]),
+            harness.Gate("last ok", ["true"]),
+        ]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            all_ok = harness.run_gates_parallel(gates)
+        text = output.getvalue()
+
+        self.assertFalse(all_ok)
+        self.assertIn("first ok", text)
+        self.assertIn("seeded fail", text)
+        self.assertIn("last ok", text)
+        self.assertLess(text.index("first ok"), text.index("last ok"))
+
+    def test_empty_batch_passes(self):
+        self.assertTrue(harness.run_gates_parallel([]))
 
 
 if __name__ == "__main__":

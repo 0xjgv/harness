@@ -18,5 +18,5 @@ Feature: CRAP gate is advisory by default, enforceable on demand
     Given no coverage artifact
     When I run "harness crap"
     Then the exit code is 0
-    And the output contains "Coverage (run)"
+    And the output contains "coverage run"
     And the output contains "(advisory)"

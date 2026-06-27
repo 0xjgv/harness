@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import dataclasses
+import os
 import re
 import shutil
 import subprocess
@@ -30,31 +33,103 @@ RESET = "\033[0m"
 VERBOSE = "--verbose" in sys.argv
 
 
-def run(description: str, cmd: list[str], *, no_exit: bool = False) -> None:
-    """Run command silently; show output only on failure."""
-    if VERBOSE:
+@dataclasses.dataclass(frozen=True)
+class GateResult:
+    """The captured outcome of one gate command; safe to build off the main thread."""
+
+    description: str
+    cmd: list[str]
+    returncode: int
+    stdout: str
+    stderr: str
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
+
+
+@dataclasses.dataclass(frozen=True)
+class Gate:
+    """A read-only gate's label and command, shared by standalone cmd_* and the batch."""
+
+    description: str
+    cmd: list[str]
+
+
+def run_capture(description: str, cmd: list[str]) -> GateResult:
+    """Run a command with output captured; the thread-safe unit for the parallel batch."""
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    return GateResult(description, cmd, result.returncode, result.stdout, result.stderr)
+
+
+def print_gate_result(result: GateResult, *, no_exit: bool = False) -> None:
+    """Print a gate's pass/fail line (with the failure body); exit on failure unless no_exit."""
+    if result.ok:
+        extra = _parse_unittest_summary(result.stderr) if "unittest" in result.cmd else ""
+        print(f"  {GREEN}✓{RESET} {result.description}{extra}")
+        return
+
+    print(f"  {RED}✗{RESET} {result.description}")
+    print(f"{RED}Command failed: {' '.join(result.cmd)}{RESET}")
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="")
+    if not no_exit:
+        sys.exit(result.returncode)
+
+
+def run(description: str, cmd: list[str], *, no_exit: bool = False, stream: bool = False) -> None:
+    """Run command silently; show output only on failure.
+
+    Pass stream=True for long-running commands (tests, coverage) so their live
+    output is shown instead of being captured — captured silence looks like a hang.
+    """
+    if VERBOSE or stream:
         print(f"  -> {' '.join(cmd)}")
         result = subprocess.run(cmd, check=False)
-        if result.returncode != 0:
-            if no_exit:
-                return
+        if result.returncode != 0 and not no_exit:
             sys.exit(result.returncode)
         return
 
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode == 0:
-        extra = _parse_unittest_summary(result.stderr) if "unittest" in cmd else ""
-        print(f"  {GREEN}✓{RESET} {description}{extra}")
-    else:
-        print(f"  {RED}✗{RESET} {description}")
-        print(f"{RED}Command failed: {' '.join(cmd)}{RESET}")
-        if result.stdout:
-            print(result.stdout, end="")
-        if result.stderr:
-            print(result.stderr, end="")
-        if no_exit:
-            return
-        sys.exit(result.returncode)
+    print_gate_result(run_capture(description, cmd), no_exit=no_exit)
+
+
+def run_gates_parallel(gates: list[Gate]) -> bool:
+    """Run read-only gates concurrently, then print each result in submission order.
+
+    Returns True when every gate passed. Unlike the fail-fast standalone gates, this
+    runs all gates to completion so one pass surfaces every failure; the caller exits
+    non-zero afterward. Output is captured and printed in submission order (not as
+    they finish) so a parallel run reads the same every time — matching the monorepo
+    Makefile's buffered, deterministic dump. VERBOSE falls back to a sequential run
+    so the live `-> cmd` echoes stay ordered.
+    """
+    if not gates:
+        return True
+
+    if VERBOSE:
+        all_ok = True
+        for gate in gates:
+            print(f"  -> {' '.join(gate.cmd)}")
+            result = subprocess.run(gate.cmd, check=False)
+            all_ok = all_ok and result.returncode == 0
+        return all_ok
+
+    max_workers = min(len(gates), os.cpu_count() or 4)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(executor.map(lambda gate: run_capture(gate.description, gate.cmd), gates))
+
+    all_ok = True
+    for result in results:
+        print_gate_result(result, no_exit=True)
+        all_ok = all_ok and result.ok
+    return all_ok
+
+
+def _exit_if_failed(all_ok: bool) -> None:
+    if not all_ok:
+        sys.exit(1)
 
 
 def _parse_unittest_summary(output: str) -> str:
@@ -242,17 +317,27 @@ def cmd_format(files: list[str] | None = None) -> None:
     run("Format code", ["uv", "run", "ruff", "format", *target])
 
 
-def cmd_lint(files: list[str] | None = None) -> None:
+def _lint_gate(files: list[str] | None = None) -> Gate:
     target = files or ["."]
-    run("Lint check", ["uv", "run", "ruff", "check", *target])
+    return Gate("Lint check", ["uv", "run", "ruff", "check", *target])
 
 
-def cmd_format_check() -> None:
-    run("Format check", ["uv", "run", "ruff", "format", "--check", "."])
+def cmd_lint(files: list[str] | None = None) -> None:
+    gate = _lint_gate(files)
+    run(gate.description, gate.cmd)
+
+
+def _format_check_gate() -> Gate:
+    return Gate("Format check", ["uv", "run", "ruff", "format", "--check", "."])
+
+
+def _typecheck_gate() -> Gate:
+    return Gate("Type check", ["uv", "run", "basedpyright", *_quality_targets()])
 
 
 def cmd_typecheck() -> None:
-    run("Type check", ["uv", "run", "basedpyright", *_quality_targets()])
+    gate = _typecheck_gate()
+    run(gate.description, gate.cmd)
 
 
 def cmd_test() -> None:
@@ -260,6 +345,7 @@ def cmd_test() -> None:
         run(
             "Run tests",
             ["uv", "run", "python", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"],
+            stream=True,
         )
         return
 
@@ -280,6 +366,7 @@ def cmd_coverage() -> None:
     run(
         "Coverage (run)",
         ["uv", "run", "coverage", "run", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"],
+        stream=True,
     )
     run(
         f"Coverage >= {min_pct}%",
@@ -287,13 +374,19 @@ def cmd_coverage() -> None:
     )
 
 
-def cmd_acceptance() -> None:
-    """Run behave scenarios. Empty features dir warns + exits 0."""
+def _acceptance_gates_or_warn() -> list[Gate]:
+    """Build the acceptance gate, or warn + return [] when there are no scenarios."""
     features_dir = Path(TEST_DIR) / "features"
     if not features_dir.exists() or not list(features_dir.rglob("*.feature")):
         warn(f"Acceptance: no .feature files in {features_dir}/ (add one to enable this gate)")
-        return
-    run("Acceptance (behave)", ["uv", "run", "behave", str(features_dir), "--no-color"])
+        return []
+    return [Gate("Acceptance (behave)", ["uv", "run", "behave", str(features_dir), "--no-color"])]
+
+
+def cmd_acceptance() -> None:
+    """Run behave scenarios. Empty features dir warns + exits 0."""
+    for gate in _acceptance_gates_or_warn():
+        run(gate.description, gate.cmd)
 
 
 def cmd_mutation() -> None:
@@ -310,12 +403,18 @@ def cmd_mutation() -> None:
     run("Mutation results", ["uv", "run", "mutmut", "results"], no_exit=True)
 
 
-def cmd_arch() -> None:
-    """Run import-linter against .importlinter."""
+def _arch_gates_or_warn() -> list[Gate]:
+    """Build the import-linter gate, or warn + return [] when no .importlinter exists."""
     if not Path(".importlinter").exists():
         warn("Arch: no .importlinter — skipped")
-        return
-    run("Arch (import-linter)", ["uv", "run", "lint-imports"])
+        return []
+    return [Gate("Arch (import-linter)", ["uv", "run", "lint-imports"])]
+
+
+def cmd_arch() -> None:
+    """Run import-linter against .importlinter."""
+    for gate in _arch_gates_or_warn():
+        run(gate.description, gate.cmd)
 
 
 def _crap_score(ccn: int, cov: float) -> float:
@@ -433,12 +532,17 @@ def cmd_crap() -> None:
         sys.exit(1)
 
 
+def _audit_gate() -> Gate:
+    return Gate("Dep audit", ["uv", "run", "--with", "pip-audit", "pip-audit"])
+
+
 def cmd_audit() -> None:
-    run("Dep audit", ["uv", "run", "--with", "pip-audit", "pip-audit"])
+    gate = _audit_gate()
+    run(gate.description, gate.cmd)
 
 
-def cmd_complexity() -> None:
-    run(
+def _complexity_gate() -> Gate:
+    return Gate(
         "Complexity (lizard)",
         [
             "uvx",
@@ -456,6 +560,11 @@ def cmd_complexity() -> None:
     )
 
 
+def cmd_complexity() -> None:
+    gate = _complexity_gate()
+    run(gate.description, gate.cmd)
+
+
 def cmd_post_edit() -> None:
     """Format if source files have uncommitted changes."""
     files = _changed_py_files()
@@ -468,9 +577,10 @@ def cmd_post_edit() -> None:
 def cmd_stop_hook() -> None:
     """Run stop-time checks after agent edits."""
     print("\n=== Stop Hook Checks ===\n")
-    cmd_post_edit()
-    cmd_complexity()
-    cmd_crap()
+    cmd_post_edit()  # mutating — sequential, first
+    all_ok = run_gates_parallel([_complexity_gate()])  # read-only batch
+    cmd_crap()  # streaming advisory — after the batch
+    _exit_if_failed(all_ok)
 
 
 # ── Stages ────────────────────────────────────────────────────────
@@ -581,17 +691,27 @@ def cmd_pre_commit() -> None:
 
 
 def cmd_ci() -> None:
-    """Run full read-only verification."""
+    """Run full read-only verification.
+
+    Read-only gates run as a parallel batch (lint, format check, typecheck, audit,
+    complexity, acceptance, arch) — captured and printed in submission order, run to
+    completion so one pass surfaces every failure. Coverage and CRAP run after the
+    batch: coverage streams (a long command), CRAP is advisory unless --enforce.
+    """
     print("\n=== CI Checks ===\n")
-    cmd_lint()
-    cmd_format_check()
-    cmd_typecheck()
-    cmd_audit()
-    cmd_complexity()
-    cmd_acceptance()
-    cmd_coverage()
-    cmd_crap()
-    cmd_arch()
+    gates = [
+        _lint_gate(),
+        _format_check_gate(),
+        _typecheck_gate(),
+        _audit_gate(),
+        _complexity_gate(),
+        *_acceptance_gates_or_warn(),
+        *_arch_gates_or_warn(),
+    ]
+    all_ok = run_gates_parallel(gates)
+    cmd_coverage()  # streams; self-skips; sequential, after the batch
+    cmd_crap()  # reads .coverage/coverage.xml; advisory unless --enforce
+    _exit_if_failed(all_ok)
 
 
 def cmd_hooks() -> None:

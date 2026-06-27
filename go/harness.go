@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"harness/crap"
@@ -60,17 +61,79 @@ type runResult struct {
 type runOpts struct {
 	extract func(output string) string
 	noExit  bool
+	// stream inherits stdio for long commands (tests, coverage) so their live
+	// output shows instead of being captured — captured silence looks like a hang.
+	stream bool
+}
+
+// gate is a read-only gate's label + command, shared by the standalone cmd* and the batch.
+type gate struct {
+	description string
+	cmd         []string
+	extract     func(output string) string
+}
+
+type gateResult struct {
+	description string
+	cmd         []string
+	ok          bool
+	exitCode    int
+	output      string
+	detail      string
+}
+
+// runCapture runs a gate's command with output captured (no printing, no exit):
+// the goroutine-safe unit the parallel batch runs.
+func runCapture(g gate) gateResult {
+	c := exec.Command(g.cmd[0], g.cmd[1:]...)
+	c.Dir = root
+	out, err := c.CombinedOutput()
+	output := string(out)
+	ok := err == nil
+	detail := ""
+	code := 0
+	if ok {
+		if g.extract != nil {
+			detail = g.extract(output)
+		}
+	} else {
+		code = exitCode(err)
+	}
+	return gateResult{g.description, g.cmd, ok, code, output, detail}
+}
+
+// printGateResult prints a gate's ✓/✗ line (with the failure body); exits on
+// failure unless noExit. Returns ok.
+func printGateResult(r gateResult, noExit bool) bool {
+	if verbose {
+		fmt.Printf("  %s→ %s%s\n", dim, strings.Join(r.cmd, " "), reset)
+		if r.output != "" {
+			fmt.Print(r.output)
+		}
+	}
+	if r.ok {
+		suffix := ""
+		if r.detail != "" {
+			suffix = fmt.Sprintf(" %s(%s)%s", dim, r.detail, reset)
+		}
+		fmt.Printf("  %s✓%s %s%s\n", green, reset, r.description, suffix)
+		return true
+	}
+	fmt.Printf("  %s✗%s %s\n", red, reset, r.description)
+	if !verbose && r.output != "" {
+		fmt.Print(r.output)
+	}
+	if !noExit {
+		os.Exit(r.exitCode)
+	}
+	return false
 }
 
 func run(description string, cmd []string, opts *runOpts) runResult {
-	if verbose {
+	if verbose || (opts != nil && opts.stream) {
 		fmt.Printf("  %s→ %s%s\n", dim, strings.Join(cmd, " "), reset)
-	}
-
-	c := exec.Command(cmd[0], cmd[1:]...)
-	c.Dir = root
-
-	if verbose {
+		c := exec.Command(cmd[0], cmd[1:]...)
+		c.Dir = root
 		c.Stdout = os.Stdout
 		c.Stderr = os.Stderr
 		err := c.Run()
@@ -85,30 +148,43 @@ func run(description string, cmd []string, opts *runOpts) runResult {
 		return runResult{ok: true}
 	}
 
-	out, err := c.CombinedOutput()
-	output := string(out)
+	g := gate{description: description, cmd: cmd}
+	if opts != nil {
+		g.extract = opts.extract
+	}
+	r := runCapture(g)
+	ok := printGateResult(r, opts != nil && opts.noExit)
+	return runResult{ok: ok, output: r.output}
+}
 
-	if err == nil {
-		detail := ""
-		if opts != nil && opts.extract != nil {
-			detail = opts.extract(output)
-		}
-		suffix := ""
-		if detail != "" {
-			suffix = fmt.Sprintf(" %s(%s)%s", dim, detail, reset)
-		}
-		fmt.Printf("  %s✓%s %s%s\n", green, reset, description, suffix)
-		return runResult{ok: true, output: output}
+// runGatesParallel runs read-only gates concurrently, then prints each result in
+// submission order. Returns true when every gate passed. Unlike the fail-fast
+// standalone gates, this runs all gates to completion so one pass surfaces every
+// failure; the caller exits non-zero afterward. Results are collected into an
+// index-stable slice and printed in submission order (not as they finish) so a
+// parallel run reads the same every time — matching the monorepo Makefile's dump.
+func runGatesParallel(gates []gate) bool {
+	if len(gates) == 0 {
+		return true
 	}
+	results := make([]gateResult, len(gates))
+	var wg sync.WaitGroup
+	for i, g := range gates {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = runCapture(g)
+		}()
+	}
+	wg.Wait()
 
-	fmt.Printf("  %s✗%s %s\n", red, reset, description)
-	if output != "" {
-		fmt.Print(output)
+	allOk := true
+	for _, r := range results {
+		if !printGateResult(r, true) {
+			allOk = false
+		}
 	}
-	if opts == nil || !opts.noExit {
-		os.Exit(exitCode(err))
-	}
-	return runResult{ok: false, output: output}
+	return allOk
 }
 
 func exitCode(err error) int {
@@ -136,17 +212,6 @@ func extractTestSummary(output string) string {
 		total += d
 	}
 	return fmt.Sprintf("%d pkg, %.2fs", len(matches), total)
-}
-
-var coverageRe = regexp.MustCompile(`coverage:\s+([\d.]+)%`)
-
-func extractCoverageSummary(output string) string {
-	matches := coverageRe.FindAllStringSubmatch(output, -1)
-	if len(matches) == 0 {
-		return ""
-	}
-	last := matches[len(matches)-1][1]
-	return fmt.Sprintf("%s%% coverage", last)
 }
 
 // ── Git helpers ─────────────────────────────────────────────────────
@@ -225,26 +290,37 @@ func cmdFix(pkgs []string) {
 	run("Fix & format", append([]string{"golangci-lint", "run", "--fix"}, pkgs...), nil)
 }
 
-func cmdLint(pkgs []string) {
+func lintGate(pkgs []string) gate {
 	if len(pkgs) == 0 {
 		pkgs = []string{"./..."}
 	}
-	run("Lint & format check", append([]string{"golangci-lint", "run"}, pkgs...), nil)
+	return gate{description: "Lint & format check", cmd: append([]string{"golangci-lint", "run"}, pkgs...)}
+}
+
+func cmdLint(pkgs []string) {
+	g := lintGate(pkgs)
+	run(g.description, g.cmd, nil)
 }
 
 func cmdTest() {
-	run("Tests", []string{"go", "test", "./..."}, &runOpts{extract: extractTestSummary})
+	// Stream: `go test ./...` is a long command, so live output beats captured silence.
+	run("Tests", []string{"go", "test", "./..."}, &runOpts{stream: true})
 }
 
 func cmdTestCov() {
 	run("Tests with coverage", []string{
 		"go", "test", "-race", "-count=1",
 		"-coverprofile=coverage.out", "./...",
-	}, &runOpts{extract: extractCoverageSummary})
+	}, &runOpts{stream: true})
+}
+
+func auditGate() gate {
+	return gate{description: "Dep audit", cmd: []string{"go", "run", "golang.org/x/vuln/cmd/govulncheck@v1.1.4", "./..."}}
 }
 
 func cmdAudit() {
-	run("Dep audit", []string{"go", "run", "golang.org/x/vuln/cmd/govulncheck@v1.1.4", "./..."}, nil)
+	g := auditGate()
+	run(g.description, g.cmd, nil)
 }
 
 func cmdPostEdit() {
@@ -256,9 +332,12 @@ func cmdPostEdit() {
 
 func cmdStopHook() {
 	fmt.Println("\n=== Stop Hook Checks ===\n")
-	cmdPostEdit()
-	cmdComplexity()
-	cmdCrap()
+	cmdPostEdit()                                       // mutating — sequential, first
+	allOk := runGatesParallel([]gate{complexityGate()}) // read-only batch
+	cmdCrap()                                           // streaming advisory — after the batch
+	if !allOk {
+		os.Exit(1)
+	}
 }
 
 // ── Quality gates ───────────────────────────────────────────────────
@@ -287,9 +366,9 @@ func hasFlag(name string) bool {
 	return false
 }
 
-// cmdAcceptance runs Gherkin scenarios via godog (as a `go test`).
-// An empty features dir warns and exits 0 — mirrors python's cmd_acceptance.
-func cmdAcceptance() {
+// acceptanceGatesOrWarn builds the godog Gherkin gate (run as a `go test`), or
+// warns + returns nil when there are no scenarios — mirrors python's cmd_acceptance.
+func acceptanceGatesOrWarn() []gate {
 	featuresDir := filepath.Join(root, "features")
 	var featureFiles []string
 	_ = filepath.WalkDir(featuresDir, func(path string, d os.DirEntry, err error) error {
@@ -300,20 +379,33 @@ func cmdAcceptance() {
 	})
 	if len(featureFiles) == 0 {
 		fmt.Printf("  %s⚠%s Acceptance: no .feature files in features/ (add one to enable this gate)\n", green, reset)
-		return
+		return nil
 	}
-	run("Acceptance (godog)", []string{"go", "test", "./features/..."}, nil)
+	return []gate{{description: "Acceptance (godog)", cmd: []string{"go", "test", "./features/..."}}}
 }
 
-// cmdArch runs the import/dependency-boundary linter against .go-arch-lint.yml.
-func cmdArch() {
+func cmdAcceptance() {
+	for _, g := range acceptanceGatesOrWarn() {
+		run(g.description, g.cmd, nil)
+	}
+}
+
+// archGatesOrWarn builds the import/dependency-boundary gate, or warns + returns
+// nil when .go-arch-lint.yml is absent.
+func archGatesOrWarn() []gate {
 	if _, err := os.Stat(filepath.Join(root, archConfig)); err != nil {
 		fmt.Printf("  %s⚠%s Arch: no %s — skipped\n", green, reset, archConfig)
-		return
+		return nil
 	}
-	run("Arch (go-arch-lint)", []string{
+	return []gate{{description: "Arch (go-arch-lint)", cmd: []string{
 		"go", "run", "github.com/fe3dback/go-arch-lint@v1.15.0", "check",
-	}, nil)
+	}}}
+}
+
+func cmdArch() {
+	for _, g := range archGatesOrWarn() {
+		run(g.description, g.cmd, nil)
+	}
 }
 
 // mutationTarget is the package gremlins mutates. The template ships
@@ -713,13 +805,17 @@ func cmdPreCommit() {
 
 func cmdCi() {
 	fmt.Printf("\n%s[ci]%s\n\n", blue, reset)
-	cmdLint(nil)
-	cmdAudit()
-	cmdComplexity()
-	cmdAcceptance()
-	cmdTestCov()
-	cmdCrap()
-	cmdArch()
+	// Read-only gates run as a parallel batch (captured, printed in submission
+	// order, run to completion). Coverage streams and CRAP is advisory — after.
+	gates := []gate{lintGate(nil), auditGate(), complexityGate()}
+	gates = append(gates, acceptanceGatesOrWarn()...)
+	gates = append(gates, archGatesOrWarn()...)
+	allOk := runGatesParallel(gates)
+	cmdTestCov() // streams; after the batch
+	cmdCrap()    // advisory unless --enforce
+	if !allOk {
+		os.Exit(1)
+	}
 }
 
 // cmdComplexity runs the read-only cyclomatic-complexity gate.
@@ -731,12 +827,17 @@ func cmdCi() {
 // driven tests legitimately branch a lot) and `harness.go` (carries
 // `//go:build ignore`, not part of any production package). The cmdCrap join
 // applies the same exclusions so both gates target the same code set.
-func cmdComplexity() {
-	run("Complexity (lizard)", []string{
+func complexityGate() gate {
+	return gate{description: "Complexity (lizard)", cmd: []string{
 		"uvx", lizard, "-l", "go", ".",
 		"-C", "15", "-a", complexityMaxArgs, "-L", "100", "-i", "0",
 		"-x", "*_test.go", "-x", "./harness.go",
-	}, nil)
+	}}
+}
+
+func cmdComplexity() {
+	g := complexityGate()
+	run(g.description, g.cmd, nil)
 }
 
 func cmdHooks() {

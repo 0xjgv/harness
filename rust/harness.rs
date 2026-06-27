@@ -44,12 +44,16 @@ struct RunOpts {
     no_exit: bool,
     /// Extra environment variables for the child process.
     env: Vec<(String, String)>,
+    /// Stream inherits stdio for long commands (tests, coverage) so their live
+    /// output shows instead of being captured — captured silence looks like a hang.
+    stream: bool,
 }
 
 fn run(description: &str, cmd: &[&str], opts: Option<&RunOpts>) -> RunResult {
     let verbose = is_verbose();
+    let stream = opts.is_some_and(|o| o.stream);
 
-    if verbose {
+    if verbose || stream {
         println!("  {DIM}\u{2192} {}{RESET}", cmd.join(" "));
     }
 
@@ -67,7 +71,7 @@ fn run(description: &str, cmd: &[&str], opts: Option<&RunOpts>) -> RunResult {
         c
     };
 
-    if verbose {
+    if verbose || stream {
         let status = build().status();
 
         match status {
@@ -129,6 +133,123 @@ fn run(description: &str, cmd: &[&str], opts: Option<&RunOpts>) -> RunResult {
             RunResult { ok: false, output: String::new() }
         }
     }
+}
+
+// ── Parallel gate batch ─────────────────────────────────────────────
+
+/// A read-only gate's label + command, shared by the standalone cmd_* and the batch.
+struct Gate {
+    description: &'static str,
+    cmd: Vec<String>,
+    extract: Option<fn(&str) -> Option<String>>,
+}
+
+impl Gate {
+    fn new(description: &'static str, cmd: &[&str]) -> Self {
+        Self { description, cmd: cmd.iter().map(|&s| s.to_string()).collect(), extract: None }
+    }
+}
+
+struct GateResult {
+    description: &'static str,
+    cmd: Vec<String>,
+    ok: bool,
+    exit_code: i32,
+    output: String,
+    detail: Option<String>,
+}
+
+/// Run a gate's command with output captured (no printing, no exit): the
+/// thread-safe unit the parallel batch spawns. Batch gates never need env vars.
+fn run_capture(gate: &Gate) -> GateResult {
+    let program = &gate.cmd[0];
+    let args: Vec<&str> = gate.cmd[1..].iter().map(String::as_str).collect();
+    let result = Command::new(program)
+        .args(&args)
+        .current_dir(root())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    match result {
+        Ok(output) => {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let ok = output.status.success();
+            let detail = if ok { gate.extract.and_then(|f| f(&combined)) } else { None };
+            GateResult {
+                description: gate.description,
+                cmd: gate.cmd.clone(),
+                ok,
+                exit_code: output.status.code().unwrap_or(1),
+                output: combined,
+                detail,
+            }
+        }
+        Err(e) => GateResult {
+            description: gate.description,
+            cmd: gate.cmd.clone(),
+            ok: false,
+            exit_code: 1,
+            output: format!("Failed to execute {program}: {e}"),
+            detail: None,
+        },
+    }
+}
+
+/// Print a gate's ✓/✗ line (with the failure body); exit on failure unless `no_exit`.
+fn print_gate_result(result: &GateResult, no_exit: bool) -> bool {
+    if is_verbose() {
+        println!("  {DIM}\u{2192} {}{RESET}", result.cmd.join(" "));
+        if !result.output.is_empty() {
+            print!("{}", result.output);
+        }
+    }
+    if result.ok {
+        let suffix =
+            result.detail.as_ref().map_or_else(String::new, |d| format!(" {DIM}({d}){RESET}"));
+        println!("  {GREEN}\u{2713}{RESET} {}{suffix}", result.description);
+        return true;
+    }
+    println!("  {RED}\u{2717}{RESET} {}", result.description);
+    if !is_verbose() && !result.output.is_empty() {
+        print!("{}", result.output);
+    }
+    if !no_exit {
+        std::process::exit(result.exit_code);
+    }
+    false
+}
+
+/// Run read-only gates concurrently, then print each result in submission order.
+///
+/// Returns true when every gate passed. Unlike the fail-fast standalone gates, this
+/// runs all gates to completion so one pass surfaces every failure; the caller exits
+/// non-zero afterward. Each gate captures on its own scoped thread; results collect
+/// into a Vec by submission order (not as they finish) so a parallel run reads the
+/// same every time — matching the monorepo Makefile's buffered, deterministic dump.
+fn run_gates_parallel(gates: &[Gate]) -> bool {
+    if gates.is_empty() {
+        return true;
+    }
+    let results: Vec<GateResult> = std::thread::scope(|scope| {
+        // Spawn every gate first (collect handles), then join — so the gates run
+        // concurrently rather than spawn-then-immediately-join one at a time.
+        let mut handles = Vec::with_capacity(gates.len());
+        for gate in gates {
+            handles.push(scope.spawn(move || run_capture(gate)));
+        }
+        handles.into_iter().map(|handle| handle.join().expect("gate thread panicked")).collect()
+    });
+    let mut all_ok = true;
+    for result in &results {
+        if !print_gate_result(result, true) {
+            all_ok = false;
+        }
+    }
+    all_ok
 }
 
 // ── Extractors ──────────────────────────────────────────────────────
@@ -328,20 +449,30 @@ fn cmd_lint() {
     run("Format check", &["cargo", "fmt", "--check"], None);
 }
 
+/// The strict clippy gate used by ci/pre-push: warnings are errors. (The dev-facing
+/// `cmd_lint` stays lenient so a warning does not block an in-progress edit loop.)
+fn lint_gate() -> Gate {
+    Gate::new("Clippy (strict)", &["cargo", "clippy", "--", "-D", "warnings"])
+}
+
+fn format_check_gate() -> Gate {
+    Gate::new("Format check", &["cargo", "fmt", "--check"])
+}
+
 fn cmd_test() {
-    run(
-        "Tests",
-        &["cargo", "test"],
-        Some(&RunOpts { extract: Some(extract_test_summary), ..RunOpts::default() }),
-    );
+    // Stream: `cargo test` is a long command, so live output beats captured silence.
+    run("Tests", &["cargo", "test"], Some(&RunOpts { stream: true, ..RunOpts::default() }));
 }
 
 fn cmd_audit() {
     cmd_audit_inner(false);
 }
 
-fn cmd_audit_inner(strict: bool) {
-    // cargo-audit requires separate installation
+/// Run cargo-audit; returns whether the audit passed. cargo-audit requires separate
+/// installation: in strict mode (ci) a missing tool is a failure, otherwise it is a
+/// non-blocking skip. Strict callers run with `no_exit` so a vuln folds into the batch
+/// result instead of short-circuiting the rest of ci.
+fn cmd_audit_inner(strict: bool) -> bool {
     let installed = Command::new("cargo")
         .args(["audit", "--version"])
         .stdout(Stdio::piped())
@@ -350,13 +481,19 @@ fn cmd_audit_inner(strict: bool) {
         .is_ok_and(|s| s.success());
 
     if installed {
-        run("Dep audit", &["cargo", "audit"], None);
-    } else if strict {
-        println!("  {RED}\u{2717}{RESET} Dep audit (cargo-audit not installed)");
-        std::process::exit(1);
-    } else {
-        println!("  {DIM}\u{2298} Dep audit skipped (install: cargo install cargo-audit){RESET}");
+        return run(
+            "Dep audit",
+            &["cargo", "audit"],
+            Some(&RunOpts { no_exit: strict, ..RunOpts::default() }),
+        )
+        .ok;
     }
+    if strict {
+        println!("  {RED}\u{2717}{RESET} Dep audit (cargo-audit not installed)");
+        return false;
+    }
+    println!("  {DIM}\u{2298} Dep audit skipped (install: cargo install cargo-audit){RESET}");
+    true
 }
 
 fn cmd_post_edit() {
@@ -368,9 +505,12 @@ fn cmd_post_edit() {
 
 fn cmd_stop_hook() {
     println!("\n=== Stop Hook Checks ===\n");
-    cmd_post_edit();
-    cmd_complexity();
-    cmd_crap();
+    cmd_post_edit(); // mutating — sequential, first
+    let all_ok = run_gates_parallel(&[complexity_gate()]); // read-only batch
+    cmd_crap(); // streaming advisory — after the batch
+    if !all_ok {
+        std::process::exit(1);
+    }
 }
 
 /// Run Gherkin/BDD acceptance scenarios via cucumber.
@@ -379,17 +519,22 @@ fn cmd_stop_hook() {
 /// executes every `.feature` file under `tests/features/`. An empty features
 /// directory is not a failure — it warns and exits 0, mirroring python's
 /// `cmd_acceptance`, so adopting the template never blocks on missing scenarios.
-fn cmd_acceptance() {
+fn acceptance_gates_or_warn() -> Vec<Gate> {
     let features_dir = root().join("tests").join("features");
-    let has_features = has_feature_files(&features_dir);
-    if !has_features {
+    if !has_feature_files(&features_dir) {
         println!(
             "  {GREEN}\u{26a0}{RESET} Acceptance: no .feature files in \
              tests/features/ (add one to enable this gate)"
         );
-        return;
+        return Vec::new();
     }
-    run("Acceptance (cucumber)", &["cargo", "test", "--test", "acceptance", "--quiet"], None);
+    vec![Gate::new("Acceptance (cucumber)", &["cargo", "test", "--test", "acceptance", "--quiet"])]
+}
+
+fn cmd_acceptance() {
+    for gate in acceptance_gates_or_warn() {
+        print_gate_result(&run_capture(&gate), false);
+    }
 }
 
 /// True when `dir` contains at least one `.feature` file (recursively).
@@ -442,7 +587,7 @@ fn cmd_coverage() {
     run(
         "Coverage (run)",
         &["cargo", "llvm-cov", "--no-report"],
-        Some(&RunOpts { env: env.clone(), ..RunOpts::default() }),
+        Some(&RunOpts { env: env.clone(), stream: true, ..RunOpts::default() }),
     );
     run(
         "Coverage: LCOV report",
@@ -516,26 +661,33 @@ fn cmd_mutation() {
 /// of orphaned (unlinked) source files. Those are the invariants this gate
 /// checks. `arch.toml` is a PROTECTED path — the pre-edit hook denies edits
 /// unless the user's prompt authorizes them. Absent config → skip.
-fn cmd_arch() {
+fn arch_gates_or_warn() -> Vec<Gate> {
     if !root().join("arch.toml").exists() {
         println!("  {GREEN}\u{26a0}{RESET} Arch: no arch.toml \u{2014} skipped");
-        return;
+        return Vec::new();
     }
     if !tool_installed("modules") {
         println!("  {DIM}\u{2298} Arch skipped (install: cargo install cargo-modules){RESET}");
-        return;
+        return Vec::new();
     }
-    run(
-        "Arch: no module cycles",
-        &["cargo", "modules", "dependencies", "--lib", "--no-externs", "--acyclic"],
-        None,
-    );
-    run("Arch: no orphan files", &["cargo", "modules", "orphans", "--lib"], None);
+    vec![
+        Gate::new(
+            "Arch: no module cycles",
+            &["cargo", "modules", "dependencies", "--lib", "--no-externs", "--acyclic"],
+        ),
+        Gate::new("Arch: no orphan files", &["cargo", "modules", "orphans", "--lib"]),
+    ]
+}
+
+fn cmd_arch() {
+    for gate in arch_gates_or_warn() {
+        print_gate_result(&run_capture(&gate), false);
+    }
 }
 
 /// Run lizard as a cyclomatic-complexity gate. Mirrors bun/python invocation.
-fn cmd_complexity() {
-    run(
+fn complexity_gate() -> Gate {
+    Gate::new(
         "Complexity (lizard)",
         &[
             "uvx",
@@ -553,8 +705,11 @@ fn cmd_complexity() {
             "-i",
             "0",
         ],
-        None,
-    );
+    )
+}
+
+fn cmd_complexity() {
+    print_gate_result(&run_capture(&complexity_gate()), false);
 }
 
 /// Compute CRAP = CCN² × (1-cov)³ + CCN per function. Advisory by default.
@@ -589,7 +744,7 @@ fn cmd_crap() {
         let run_result = run(
             "CRAP: running tests under llvm-cov",
             &["cargo", "llvm-cov", "--no-report"],
-            Some(&RunOpts { env: env.clone(), no_exit: true, ..RunOpts::default() }),
+            Some(&RunOpts { env: env.clone(), no_exit: true, stream: true, ..RunOpts::default() }),
         );
         let report_result = if run_result.ok {
             run(
@@ -966,19 +1121,26 @@ fn cmd_pre_commit() {
 
 fn cmd_ci() {
     println!("\n{BLUE}[ci]{RESET}\n");
-    run("Clippy (strict)", &["cargo", "clippy", "--", "-D", "warnings"], None);
-    run("Format check", &["cargo", "fmt", "--check"], None);
-    cmd_audit_inner(true);
-    cmd_complexity();
-    run(
+    // Read-only gates run as a parallel batch (captured, printed in submission
+    // order, run to completion). Tests + coverage stream; CRAP is advisory — after.
+    let mut gates = vec![lint_gate(), format_check_gate(), complexity_gate()];
+    gates.extend(acceptance_gates_or_warn());
+    gates.extend(arch_gates_or_warn());
+    // Bind each result before combining: every step must run (no &&-short-circuit)
+    // so one pass surfaces every failure. Audit is install-aware and strict in ci.
+    let batch_ok = run_gates_parallel(&gates);
+    let audit_ok = cmd_audit_inner(true);
+    let tests_ok = run(
         "Tests",
         &["cargo", "test"],
-        Some(&RunOpts { extract: Some(extract_test_summary), ..RunOpts::default() }),
-    );
-    cmd_acceptance();
+        Some(&RunOpts { no_exit: true, stream: true, ..RunOpts::default() }),
+    )
+    .ok;
     cmd_coverage();
     cmd_crap();
-    cmd_arch();
+    if !batch_ok || !audit_ok || !tests_ok {
+        std::process::exit(1);
+    }
 }
 
 fn cmd_hooks() {
@@ -1237,6 +1399,38 @@ mod tests {
     fn default_suppression_roots_include_harness() {
         let roots = default_suppression_roots();
         assert!(roots.iter().any(|path| path.ends_with("harness.rs")));
+    }
+
+    #[test]
+    fn parallel_gates_run_all_on_seeded_failure() {
+        // Each gate touches the filesystem so we can prove every gate ran even
+        // though one fails: a short-circuit would leave a marker missing. The
+        // overall result must be false.
+        let dir = std::env::temp_dir().join(format!("rust-gates-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first");
+        let last = dir.join("last");
+        let first_s = first.to_string_lossy().into_owned();
+        let last_s = last.to_string_lossy().into_owned();
+        let gates = vec![
+            Gate::new("first", &["touch", first_s.as_str()]),
+            Gate::new("seeded fail", &["false"]),
+            Gate::new("last", &["touch", last_s.as_str()]),
+        ];
+
+        let all_ok = run_gates_parallel(&gates);
+
+        assert!(!all_ok, "a seeded failure makes the whole batch fail");
+        assert!(first.exists(), "the gate before the failure ran");
+        assert!(last.exists(), "the gate after the failure still ran (no short-circuit)");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parallel_gates_empty_batch_passes() {
+        assert!(run_gates_parallel(&[]));
     }
 }
 

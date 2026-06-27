@@ -121,34 +121,100 @@ interface RunResult {
   output: string;
 }
 
-async function run(
-  description: string,
-  cmd: string[],
-  opts?: { extract?: (output: string) => string | undefined; noExit?: boolean },
-): Promise<RunResult> {
-  if (VERBOSE) console.log(`${DIM}  → ${cmd.join(' ')}${RESET}`);
+/** A read-only gate's label + command, shared by the standalone cmd* and the batch. */
+export interface Gate {
+  description: string;
+  cmd: string[];
+  extract?: (output: string) => string | undefined;
+}
 
-  const proc = Bun.spawn(cmd, { cwd: ROOT, stdout: 'pipe', stderr: 'pipe' });
+interface GateResult {
+  description: string;
+  cmd: string[];
+  ok: boolean;
+  exitCode: number;
+  output: string;
+  detail?: string;
+}
+
+/** Run a command with output captured (no printing, no exit): the unit the batch runs. */
+async function runCapture(gate: Gate): Promise<GateResult> {
+  const proc = Bun.spawn(gate.cmd, { cwd: ROOT, stdout: 'pipe', stderr: 'pipe' });
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
   ]);
   const exitCode = await proc.exited;
   const output = stdout + stderr;
+  const ok = exitCode === 0;
+  return {
+    description: gate.description,
+    cmd: gate.cmd,
+    ok,
+    exitCode,
+    output,
+    detail: ok ? gate.extract?.(output) : undefined,
+  };
+}
 
-  if (VERBOSE && output.trim()) console.log(output);
+/** Print a gate's ✓/✗ line (with the failure body); exit on failure unless noExit. */
+function printGateResult(result: GateResult, opts?: { noExit?: boolean }): boolean {
+  if (VERBOSE) console.log(`${DIM}  → ${result.cmd.join(' ')}${RESET}`);
+  if (VERBOSE && result.output.trim()) console.log(result.output);
 
-  if (exitCode === 0) {
-    const detail = opts?.extract?.(output);
-    const suffix = detail ? ` ${DIM}(${detail})${RESET}` : '';
-    console.log(`  ${GREEN}✓${RESET} ${description}${suffix}`);
-    return { ok: true, output };
+  if (result.ok) {
+    const suffix = result.detail ? ` ${DIM}(${result.detail})${RESET}` : '';
+    console.log(`  ${GREEN}✓${RESET} ${result.description}${suffix}`);
+    return true;
+  }
+  console.log(`  ${RED}✗${RESET} ${result.description}`);
+  if (!VERBOSE && result.output.trim()) console.log(result.output);
+  if (!opts?.noExit) process.exit(result.exitCode);
+  return false;
+}
+
+async function run(
+  description: string,
+  cmd: string[],
+  opts?: { extract?: (output: string) => string | undefined; noExit?: boolean; stream?: boolean },
+): Promise<RunResult> {
+  // stream=true inherits stdio for long commands (tests, coverage) so their live
+  // output shows instead of being captured — captured silence looks like a hang.
+  if (opts?.stream) {
+    if (VERBOSE) console.log(`${DIM}  → ${cmd.join(' ')}${RESET}`);
+    const proc = Bun.spawn(cmd, { cwd: ROOT, stdout: 'inherit', stderr: 'inherit' });
+    const exitCode = await proc.exited;
+    if (exitCode === 0) {
+      console.log(`  ${GREEN}✓${RESET} ${description}`);
+      return { ok: true, output: '' };
+    }
+    console.log(`  ${RED}✗${RESET} ${description}`);
+    if (!opts?.noExit) process.exit(exitCode);
+    return { ok: false, output: '' };
   }
 
-  console.log(`  ${RED}✗${RESET} ${description}`);
-  if (!VERBOSE && output.trim()) console.log(output);
-  if (!opts?.noExit) process.exit(exitCode);
-  return { ok: false, output };
+  const result = await runCapture({ description, cmd, extract: opts?.extract });
+  const ok = printGateResult(result, { noExit: opts?.noExit });
+  return { ok, output: result.output };
+}
+
+/**
+ * Run read-only gates concurrently, then print each result in submission order.
+ *
+ * Returns true when every gate passed. Unlike the fail-fast standalone gates, this
+ * runs all gates to completion so one pass surfaces every failure; the caller exits
+ * non-zero afterward. Results print in submission order (not as they settle) so a
+ * parallel run reads the same every time — matching the monorepo Makefile's
+ * buffered, deterministic dump.
+ */
+export async function runGatesParallel(gates: Gate[]): Promise<boolean> {
+  if (gates.length === 0) return true;
+  const results = await Promise.all(gates.map((gate) => runCapture(gate)));
+  let allOk = true;
+  for (const result of results) {
+    if (!printGateResult(result, { noExit: true })) allOk = false;
+  }
+  return allOk;
 }
 
 // ── Extractors ──────────────────────────────────────────────────────
@@ -323,13 +389,23 @@ async function cmdFix(files?: string[]): Promise<void> {
   await run('Fix & format', ['bunx', 'biome', 'check', '--write', ...target]);
 }
 
-async function cmdLint(files?: string[]): Promise<void> {
+function lintGate(files?: string[]): Gate {
   const target = files ?? ['.'];
-  await run('Lint & format check', ['bunx', 'biome', 'check', ...target]);
+  return { description: 'Lint & format check', cmd: ['bunx', 'biome', 'check', ...target] };
+}
+
+async function cmdLint(files?: string[]): Promise<void> {
+  const gate = lintGate(files);
+  await run(gate.description, gate.cmd);
+}
+
+function typecheckGate(): Gate {
+  return { description: 'Typecheck', cmd: ['bunx', 'tsc', '--noEmit'], extract: extractTscSummary };
 }
 
 async function cmdTypecheck(): Promise<void> {
-  await run('Typecheck', ['bunx', 'tsc', '--noEmit'], { extract: extractTscSummary });
+  const gate = typecheckGate();
+  await run(gate.description, gate.cmd, { extract: gate.extract });
 }
 
 async function cmdTest(): Promise<void> {
@@ -337,11 +413,17 @@ async function cmdTest(): Promise<void> {
     warn(`Tests: no ${TEST_DIR}/*.test.ts or *.spec.ts files; skipped`);
     return;
   }
-  await run('Tests', ['bun', 'test'], { extract: extractTestSummary });
+  // Stream: `bun test` is a long command, so live output beats captured silence.
+  await run('Tests', ['bun', 'test'], { stream: true });
+}
+
+function auditGate(): Gate {
+  return { description: 'Dep audit', cmd: ['bun', 'audit'] };
 }
 
 async function cmdAudit(): Promise<void> {
-  await run('Dep audit', ['bun', 'audit']);
+  const gate = auditGate();
+  await run(gate.description, gate.cmd);
 }
 
 async function cmdCoverage(): Promise<void> {
@@ -355,13 +437,11 @@ async function cmdCoverage(): Promise<void> {
   const minArg = process.argv.find((a) => a.startsWith('--min='));
   const minPct = minArg ? Number(minArg.split('=', 2)[1]) : 0;
 
-  await run('Coverage (run)', [
-    'bun',
-    'test',
-    '--coverage',
-    '--coverage-reporter=lcov',
-    '--coverage-dir=coverage',
-  ]);
+  await run(
+    'Coverage (run)',
+    ['bun', 'test', '--coverage', '--coverage-reporter=lcov', '--coverage-dir=coverage'],
+    { stream: true },
+  );
 
   const { readFile } = await import('node:fs/promises');
   const lcov = await readFile(`${ROOT}/coverage/lcov.info`, 'utf8').catch(() => null);
@@ -384,8 +464,8 @@ async function cmdCoverage(): Promise<void> {
   }
 }
 
-async function cmdAcceptance(): Promise<void> {
-  // Run cucumber-js scenarios. Empty/absent features dir warns + exits 0.
+async function acceptanceGatesOrWarn(): Promise<Gate[]> {
+  // Build the cucumber-js gate, or warn + return [] when there are no scenarios.
   const { existsSync } = await import('node:fs');
   const featuresDir = `${ROOT}/${TEST_DIR}/features`;
   let hasFeature = false;
@@ -399,32 +479,50 @@ async function cmdAcceptance(): Promise<void> {
       `  ${GREEN}⚠${RESET} Acceptance: no .feature files in ${TEST_DIR}/features/ ` +
         '(add one to enable this gate)',
     );
-    return;
+    return [];
   }
   // cucumber-js runs on Node; invoking its bin through the Bun runtime lets
   // TypeScript step definitions resolve without a separate loader.
-  await run('Acceptance (cucumber)', ['bun', './node_modules/@cucumber/cucumber/bin/cucumber.js']);
+  return [
+    {
+      description: 'Acceptance (cucumber)',
+      cmd: ['bun', './node_modules/@cucumber/cucumber/bin/cucumber.js'],
+    },
+  ];
 }
 
-async function cmdArch(): Promise<void> {
-  // Import/dependency-boundary linter via dependency-cruiser.
+async function cmdAcceptance(): Promise<void> {
+  for (const gate of await acceptanceGatesOrWarn()) await run(gate.description, gate.cmd);
+}
+
+async function archGatesOrWarn(): Promise<Gate[]> {
+  // Build the dependency-cruiser gate, or warn + return [] when it cannot run.
   const { existsSync } = await import('node:fs');
   if (!existsSync(`${ROOT}/.dependency-cruiser.json`)) {
     console.log(`  ${GREEN}⚠${RESET} Arch: no .dependency-cruiser.json — skipped`);
-    return;
+    return [];
   }
   const targets = (await appTargets()).map((target) => `${target}/**/*.ts`);
   if (targets.length === 0) {
     warn('Arch: no app sources; skipped');
-    return;
+    return [];
   }
-  await run('Arch (dependency-cruiser)', [
-    './node_modules/.bin/depcruise',
-    '--config',
-    '.dependency-cruiser.json',
-    '--no-progress',
-    ...targets,
-  ]);
+  return [
+    {
+      description: 'Arch (dependency-cruiser)',
+      cmd: [
+        './node_modules/.bin/depcruise',
+        '--config',
+        '.dependency-cruiser.json',
+        '--no-progress',
+        ...targets,
+      ],
+    },
+  ];
+}
+
+async function cmdArch(): Promise<void> {
+  for (const gate of await archGatesOrWarn()) await run(gate.description, gate.cmd);
 }
 
 async function cmdMutation(): Promise<void> {
@@ -599,25 +697,34 @@ async function cmdCrap(): Promise<void> {
   if (enforce) process.exit(1);
 }
 
-async function cmdComplexity(): Promise<void> {
+async function complexityGatesOrWarn(): Promise<Gate[]> {
   const targets = await appTargets({ includeTests: true });
   if (targets.length === 0) {
     warn('Complexity: no app sources; skipped');
-    return;
+    return [];
   }
-  await run('Complexity (lizard)', [
-    'uvx',
-    LIZARD,
-    ...targets,
-    '-C',
-    '15',
-    '-a',
-    String(COMPLEXITY_MAX_ARGS),
-    '-L',
-    '100',
-    '-i',
-    '0',
-  ]);
+  return [
+    {
+      description: 'Complexity (lizard)',
+      cmd: [
+        'uvx',
+        LIZARD,
+        ...targets,
+        '-C',
+        '15',
+        '-a',
+        String(COMPLEXITY_MAX_ARGS),
+        '-L',
+        '100',
+        '-i',
+        '0',
+      ],
+    },
+  ];
+}
+
+async function cmdComplexity(): Promise<void> {
+  for (const gate of await complexityGatesOrWarn()) await run(gate.description, gate.cmd);
 }
 
 async function cmdPostEdit(): Promise<void> {
@@ -628,9 +735,10 @@ async function cmdPostEdit(): Promise<void> {
 
 async function cmdStopHook(): Promise<void> {
   console.log('\n=== Stop Hook Checks ===\n');
-  await cmdPostEdit();
-  await cmdComplexity();
-  await cmdCrap();
+  await cmdPostEdit(); // mutating — sequential, first
+  const allOk = await runGatesParallel(await complexityGatesOrWarn()); // read-only batch
+  await cmdCrap(); // streaming advisory — after the batch
+  if (!allOk) process.exit(1);
 }
 
 // ── Stages ──────────────────────────────────────────────────────────
@@ -778,14 +886,20 @@ async function cmdPreCommit(): Promise<void> {
 
 async function cmdCi(): Promise<void> {
   console.log(`\n${BLUE}[ci]${RESET}\n`);
-  await cmdLint();
-  await cmdTypecheck();
-  await cmdAudit();
-  await cmdComplexity();
-  await cmdAcceptance();
-  await cmdCoverage();
-  await cmdCrap();
-  await cmdArch();
+  // Read-only gates run as a parallel batch (captured, printed in submission order,
+  // run to completion). Coverage streams and CRAP is advisory — both after the batch.
+  const gates: Gate[] = [
+    lintGate(),
+    typecheckGate(),
+    auditGate(),
+    ...(await complexityGatesOrWarn()),
+    ...(await acceptanceGatesOrWarn()),
+    ...(await archGatesOrWarn()),
+  ];
+  const allOk = await runGatesParallel(gates);
+  await cmdCoverage(); // streams; self-skips; after the batch
+  await cmdCrap(); // advisory unless --enforce
+  if (!allOk) process.exit(1);
 }
 
 async function cmdHooks(): Promise<void> {

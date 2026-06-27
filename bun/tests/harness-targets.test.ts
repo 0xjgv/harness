@@ -5,12 +5,14 @@ import { join } from 'node:path';
 import {
   appTargets,
   existingTargets,
+  type Gate,
   hasTests,
   isProjectTsFile,
   isQualityTsFile,
   isTestFile,
   porcelainPath,
   qualityTargets,
+  runGatesParallel,
 } from '../harness';
 
 function tempProject(withTests = false): string {
@@ -81,5 +83,44 @@ describe('target helpers', () => {
   test('porcelain path keeps rename target', () => {
     expect(porcelainPath(' M src/index.ts')).toBe('src/index.ts');
     expect(porcelainPath('R  old.ts -> harness.ts')).toBe('harness.ts');
+  });
+});
+
+describe('parallel gate runner', () => {
+  function captureLog(): { lines: string[]; restore: () => void } {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (...args: unknown[]) => {
+      lines.push(args.map(String).join(' '));
+    };
+    return { lines, restore: () => (console.log = original) };
+  }
+
+  test('all gates run to completion on a seeded failure', async () => {
+    // A seeded failure in the middle must not short-circuit: every gate still
+    // reports, results print in submission order, and the overall result is false.
+    const gates: Gate[] = [
+      { description: 'first ok', cmd: ['true'] },
+      { description: 'seeded fail', cmd: ['false'] },
+      { description: 'last ok', cmd: ['true'] },
+    ];
+    const { lines, restore } = captureLog();
+    let allOk: boolean;
+    try {
+      allOk = await runGatesParallel(gates);
+    } finally {
+      restore();
+    }
+    const text = lines.join('\n');
+
+    expect(allOk).toBe(false);
+    expect(text).toContain('first ok');
+    expect(text).toContain('seeded fail');
+    expect(text).toContain('last ok');
+    expect(text.indexOf('first ok')).toBeLessThan(text.indexOf('last ok'));
+  });
+
+  test('empty batch passes', async () => {
+    expect(await runGatesParallel([])).toBe(true);
   });
 });
