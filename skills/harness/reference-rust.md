@@ -11,13 +11,18 @@ files carry the full contract — Claude Code reads `CLAUDE.md`; Codex
 a link. Copy `~/Code/harness-templates/rust/CLAUDE.md` verbatim; do not
 paraphrase (it drifts). Two sections:
 
-- `## Commands` — `check`, `pre-commit`, `ci`, `audit`, plus quality
-  subcommands `complexity`, `acceptance`, `coverage`, `mutation`, `crap`,
-  `arch`, and the drift pair `agents-md-drift` / `sync-agents-md` (keeps
-  `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit` fail
-  on drift). `ci` pipeline is `clippy → format check → audit → complexity
-  → tests → acceptance → coverage → crap → arch`; `crap` is advisory
-  (warns by default, `--enforce` to hard-fail; joins lizard `--csv` with
+- `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
+  quality subcommands `complexity`, `acceptance`, `coverage`, `mutation`,
+  `crap`, `arch`, and the drift pair `agents-md-drift` / `sync-agents-md`
+  (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
+  fail on drift). `ci` runs the read-only gates (`clippy`, `format check`,
+  `complexity`, `acceptance`, `arch`) **in parallel** — captured and
+  printed in submission order, run to completion so one pass surfaces every
+  failure — then runs `audit`, streams `tests` + `coverage`, and the
+  advisory `crap`. `pre-push` is the offline push gate: `clippy`, `format
+  check`, `acceptance`, `arch` over the whole pushed tree (the deterministic
+  checks pre-commit and stop-hook skip). `crap` is advisory (warns by
+  default, `--enforce` to hard-fail; joins lizard `--csv` with
   `target/llvm-cov/lcov.info`). Requires `uvx` on PATH for `complexity`/
   `crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8, length≤100).
 - `## Behavior contract` — Layer 2; see

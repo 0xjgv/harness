@@ -4,7 +4,8 @@
 
 - After edits: `go run harness.go check` — fix, format, lint, test, suppression report
 - Pre-commit: `go run harness.go pre-commit` — staged files only (auto via git hook)
-- CI: `go run harness.go ci` — read-only pipeline: lint → audit → complexity → acceptance → test-cov → crap → arch. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
+- Pre-push: `go run harness.go pre-push` — read-only push gate over the whole tree: lint (golangci-lint covers format), acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
+- CI: `go run harness.go ci` — read-only gates (lint, audit, complexity, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then test-cov (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
 - Complexity: `go run harness.go complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over the module
 - Audit: `go run harness.go audit` — audit dependencies for known vulnerabilities (via govulncheck)
 - Acceptance: `go run harness.go acceptance` — run godog against `features/`

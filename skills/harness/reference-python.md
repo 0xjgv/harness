@@ -11,17 +11,21 @@ files carry the full contract — Claude Code reads `CLAUDE.md`; Codex
 a link. Copy `~/Code/harness-templates/python/CLAUDE.md` verbatim; do
 not paraphrase (it drifts). Two sections:
 
-- `## Commands` — `check`, `pre-commit`, `ci`, `audit`, plus quality
-  subcommands `complexity`, `acceptance`, `coverage`, `mutation`, `crap`,
-  `arch`, and the drift pair `agents-md-drift` / `sync-agents-md` (keeps
-  `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit` fail
-  on drift). `test` runs `unittest`, or `py_compile` over `src/` and
+- `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
+  quality subcommands `complexity`, `acceptance`, `coverage`, `mutation`,
+  `crap`, `arch`, and the drift pair `agents-md-drift` / `sync-agents-md`
+  (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
+  fail on drift). `test` runs `unittest`, or `py_compile` over `src/` and
   `harness.py` when no `tests/test*.py` files exist. `ci` runs the
-  pipeline `lint → format check → typecheck → audit → complexity →
-  acceptance → coverage → crap → arch`; `crap` is advisory (warns by
-  default, `--enforce` to hard-fail) but still runs in `ci`. Requires
-  `uvx` on PATH for `complexity`/`crap` (lizard pinned to `1.22.2`,
-  CCN≤15, args≤8, length≤100).
+  read-only gates (`lint`, `format check`, `typecheck`, `audit`,
+  `complexity`, `acceptance`, `arch`) **in parallel** — captured and
+  printed in submission order, run to completion so one pass surfaces every
+  failure — then streams `coverage` and the advisory `crap`. `pre-push` is
+  the offline push gate: `lint`, `format check`, `acceptance`, `arch` over
+  the whole pushed tree (the deterministic checks pre-commit and stop-hook
+  skip). `crap` is advisory (warns by default, `--enforce` to hard-fail)
+  but still runs in `ci`. Requires `uvx` on PATH for `complexity`/`crap`
+  (lizard pinned to `1.22.2`, CCN≤15, args≤8, length≤100).
 - `## Behavior contract` — Layer 2; see
   [reference-behavior-contract.md](reference-behavior-contract.md).
 

@@ -4,10 +4,11 @@
 
 - After edits: `make check` — dispatches `check` to every subproject (fix, format, typecheck, test, suppression report)
 - Pre-commit: `make pre-commit` — runs only in subprojects with staged files (auto via git hook)
-- CI: `make ci` — read-only gate across every subproject; each runs its own `harness ci` (lint, typecheck, dep audit, complexity, acceptance, coverage, crap, arch)
+- Pre-push: `make pre-push` — read-only push gate across every subproject; each runs its own `harness pre-push` (lint, format check, acceptance, arch over the whole tree). Auto via git pre-push hook.
+- CI: `make ci` — read-only gate across every subproject; each runs its own `harness ci` — read-only gates (lint, typecheck, dep audit, complexity, acceptance, arch) in parallel, then coverage + crap
 - CRAP (advisory): `make crap` — fan out the CRAP gate to every subproject (each runs its own `harness crap`). Forward flags via `ARGS`, e.g. `make crap ARGS="--enforce --max=50"`.
 - Complexity: `make complexity` — fan out the complexity gate to every subproject (lizard CCN). Same `ARGS=...` forwarding.
-- Scope to one subproject: `make check-<subproject>` (e.g. `make check-api`, `make ci-web`, `make crap-api`, `make complexity-api`)
+- Scope to one subproject: `make check-<subproject>` (e.g. `make check-api`, `make ci-web`, `make pre-push-api`, `make crap-api`, `make complexity-api`)
 - Scope to dirty subprojects: `make check-dirty` (working-tree + untracked changes)
 - Parallel fan-out: `PARALLEL=1 make check` — opt-in, buffered per-subproject output. Keep off for CI and agent-visible runs.
 - List subprojects: `make list`

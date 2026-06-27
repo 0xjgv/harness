@@ -76,8 +76,9 @@ Behavior contract: [reference-behavior-contract.md](reference-behavior-contract.
 | Script | When | What | Fixes? |
 |---|---|---|---|
 | `check` | After edits | fix + format + typecheck + test + suppression report | yes |
-| `pre-commit` | Git hook | same, staged files only | yes |
-| `ci` | CI pipeline | read-only lint + typecheck + dep audit + complexity + acceptance + tests/coverage + crap (advisory) + arch | no |
+| `pre-commit` | Git pre-commit hook | same, staged files only | yes |
+| `pre-push` | Before push | read-only push gate: lint + format check + acceptance + arch over the whole tree, in parallel | no |
+| `ci` | CI pipeline | read-only gates (lint + typecheck + dep audit + complexity + acceptance + arch) **run in parallel**, captured and printed in submission order; then tests/coverage + crap (advisory) | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
 | `post-edit` | Stop hook helper | format if source files changed | yes |
 | `stop-hook` | Agent Stop hook | post-edit + complexity + crap (advisory) | yes |

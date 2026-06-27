@@ -11,15 +11,19 @@ files carry the full contract — Claude Code reads `CLAUDE.md`; Codex
 a link. Copy `~/Code/harness-templates/go/CLAUDE.md` verbatim; do not
 paraphrase (it drifts). Two sections:
 
-- `## Commands` — `check`, `pre-commit`, `ci`, `audit`, plus quality
-  subcommands `complexity`, `acceptance`, `test-cov`, `mutation`, `crap`,
-  `arch`, and the drift pair `agents-md-drift` / `sync-agents-md` (keeps
-  `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit` fail
-  on drift). `ci` pipeline is `lint → audit → complexity → acceptance →
-  test-cov → crap → arch`; `crap` is advisory (warns by default,
-  `--enforce` to hard-fail). Requires `uvx` on PATH for `complexity`/
-  `crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8, length≤100 —
-  replaces the old gocyclo gate).
+- `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
+  quality subcommands `complexity`, `acceptance`, `test-cov`, `mutation`,
+  `crap`, `arch`, and the drift pair `agents-md-drift` / `sync-agents-md`
+  (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
+  fail on drift). `ci` runs the read-only gates (`lint`, `audit`,
+  `complexity`, `acceptance`, `arch`) **in parallel** — captured and
+  printed in submission order, run to completion so one pass surfaces every
+  failure — then streams `test-cov` and the advisory `crap`. `pre-push` is
+  the offline push gate: `lint` (golangci-lint covers format), `acceptance`,
+  `arch` over the whole pushed tree (the deterministic checks pre-commit and
+  stop-hook skip). `crap` is advisory (warns by default, `--enforce` to
+  hard-fail). Requires `uvx` on PATH for `complexity`/`crap` (lizard pinned
+  to `1.22.2`, CCN≤15, args≤8, length≤100 — replaces the old gocyclo gate).
 - `## Behavior contract` — Layer 2; see
   [reference-behavior-contract.md](reference-behavior-contract.md).
 

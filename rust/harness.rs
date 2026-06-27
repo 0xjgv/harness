@@ -1143,6 +1143,22 @@ fn cmd_ci() {
     }
 }
 
+/// Read-only push gate: the offline checks pre-commit and stop-hook do not run.
+/// pre-commit covers fix/format/test on staged files; stop-hook adds complexity.
+/// This fills the gap with the deterministic, offline gates none of them run —
+/// clippy (strict), format check, acceptance, arch — validating the whole pushed
+/// tree (after merges/rebases/--no-verify) before it leaves the machine. Network
+/// (audit) and advisory (coverage/CRAP) gates stay in ci.
+fn cmd_pre_push() {
+    println!("\n{BLUE}[pre-push]{RESET}\n");
+    let mut gates = vec![lint_gate(), format_check_gate()];
+    gates.extend(acceptance_gates_or_warn());
+    gates.extend(arch_gates_or_warn());
+    if !run_gates_parallel(&gates) {
+        std::process::exit(1);
+    }
+}
+
 fn cmd_hooks() {
     let hook_dir = root().join(".git").join("hooks");
     let hook_path = hook_dir.join("pre-commit");
@@ -1219,6 +1235,7 @@ const COMMANDS: &[(&str, fn())] = &[
     ("complexity", cmd_complexity),
     ("crap", cmd_crap),
     ("pre-commit", cmd_pre_commit),
+    ("pre-push", cmd_pre_push),
     ("ci", cmd_ci),
     ("setup-hooks", cmd_hooks),
     ("post-edit", cmd_post_edit),

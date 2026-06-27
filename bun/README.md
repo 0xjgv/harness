@@ -18,12 +18,15 @@ See the [5-script contract](../README.md#the-5-script-contract) for the full rat
 ```bash
 bun run check                      # Fix + format + typecheck + tests/no-test warning (after editing)
 bun run pre-commit                 # Staged checks + tests (runs via git hook)
+bun run pre-push                   # Read-only push gate: lint, acceptance, arch (runs via git hook)
 bun run ci                         # Full verification (see below)
 ```
 
 ### `ci` pipeline
 
-`harness ci` runs, in order: lint + format check (biome) → typecheck (tsc) → dep audit (bun audit) → complexity (lizard, CCN 15, args 8) → acceptance (cucumber) → coverage (`bun test --coverage`, `--min=0` by default) → crap (advisory) → arch (dependency-cruiser).
+`harness ci` runs the read-only gates — lint + format check (biome), typecheck (tsc), dep audit (bun audit), complexity (lizard, CCN 15, args 8), acceptance (cucumber), arch (dependency-cruiser) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then streams coverage (`bun test --coverage`, `--min=0` by default) and the advisory crap.
+
+`pre-push` is the offline push gate — lint (biome covers format), acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
 
 The complexity gate requires `uvx` on PATH — install via [uv](https://docs.astral.sh/uv/).
 

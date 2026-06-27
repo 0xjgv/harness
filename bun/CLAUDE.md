@@ -4,7 +4,8 @@
 
 - After edits: `bun run check` — fix, format, typecheck, test (warns/skips when no tests exist), hook-drift + suppression report
 - Pre-commit: `bun run pre-commit` — staged files only (auto via git hook)
-- CI: `bun run ci` — read-only pipeline: lint → typecheck → audit → complexity → acceptance → coverage → crap → arch. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
+- Pre-push: `bun run pre-push` — read-only push gate over the whole tree: lint (biome covers format), acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
+- CI: `bun run ci` — read-only gates (lint, typecheck, audit, complexity, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then coverage (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
 - Complexity: `bun run harness.ts complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over src + tests
 - Audit: `bun run audit` — audit dependencies for known vulnerabilities (via bun audit)
 - Acceptance: `bun run acceptance` — run cucumber against `tests/features/`

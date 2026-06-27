@@ -18,14 +18,15 @@ See the [5-script contract](../README.md#the-5-script-contract) for the full rat
 ```bash
 uv run harness check                 # Fix + format + typecheck + tests/syntax check (after editing)
 uv run harness pre-commit            # Staged checks + tests (runs via git hook)
+uv run harness pre-push              # Read-only push gate: lint, format check, acceptance, arch (runs via git hook)
 uv run harness ci                    # Full verification (see below)
 ```
 
 ### `ci` pipeline
 
-`harness ci` runs, in order: lint → format check → typecheck → dep audit → complexity (lizard, CCN 15, args 8) → acceptance (behave) → coverage (coverage.py, `--min=0` by default) → crap (advisory) → arch (import-linter).
+`harness ci` runs the read-only gates — lint, format check, typecheck, dep audit, complexity (lizard, CCN 15, args 8), acceptance (behave), arch (import-linter) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then streams coverage (coverage.py, `--min=0` by default) and the advisory crap.
 
-CRAP is **advisory** but still runs in `ci`. Mutation testing is advisory and invoked explicitly.
+`pre-push` is the offline push gate — lint, format check, acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip). CRAP is **advisory** but still runs in `ci`. Mutation testing is advisory and invoked explicitly.
 
 All commands minimize output — only errors are shown. Add `--verbose` for full output:
 

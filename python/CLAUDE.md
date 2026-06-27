@@ -4,7 +4,8 @@
 
 - After edits: `uv run harness check` — fix, format, typecheck, test (or syntax check when no tests exist), suppression report
 - Pre-commit: `uv run harness pre-commit` — staged files only (auto via git hook)
-- CI: `uv run harness ci` — read-only pipeline: lint → format check → typecheck → audit → complexity → acceptance → coverage → crap → arch. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
+- Pre-push: `uv run harness pre-push` — read-only push gate over the whole tree: lint, format check, acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
+- CI: `uv run harness ci` — read-only gates (lint, format check, typecheck, audit, complexity, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then coverage (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
 - Complexity: `uv run harness complexity` — uvx lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over src + tests
 - Audit: `uv run harness audit` — audit dependencies for known vulnerabilities (via pip-audit)
 - Acceptance: `uv run harness acceptance` — run behave against `tests/features/`

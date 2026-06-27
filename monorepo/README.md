@@ -1,6 +1,6 @@
 # monorepo template
 
-A Makefile that dispatches `check` / `pre-commit` / `ci` into N subprojects — each subproject keeps its own zero-dep harness (`bun`, `python`, `go`, or `rust`).
+A Makefile that dispatches `check` / `pre-commit` / `pre-push` / `ci` into N subprojects — each subproject keeps its own zero-dep harness (`bun`, `python`, `go`, or `rust`).
 
 ## When to use
 
@@ -35,7 +35,8 @@ make check-api      # scope to one subproject
 | `make check-<name>` | Run `check` in one subproject (tab-complete via help) |
 | `make check-dirty` | Run `check` only in subprojects with working-tree changes |
 | `make pre-commit` | Run `pre-commit` only in subprojects with staged files |
-| `make ci` | Read-only gate across all subprojects (no fixes) |
+| `make pre-push` | Read-only push gate across all subprojects (lint, format check, acceptance, arch) |
+| `make ci` | Read-only gate across all subprojects (no fixes); each subproject runs its read-only gates in parallel |
 | `make test` | Run tests only, all subprojects |
 | `make list` | Show detected subprojects |
 | `make setup` | Per-language deps: `bun install`, `uv sync`, `go mod download`, `cargo build` |
@@ -43,7 +44,7 @@ make check-api      # scope to one subproject
 | `make bootstrap` | `setup` + `setup-hooks` |
 | `make clean` | Delegate `clean` to each subproject |
 
-Scoped variants exist for `ci-<name>`, `test-<name>`, `pre-commit-<name>`.
+Scoped variants exist for `ci-<name>`, `pre-push-<name>`, `test-<name>`, `pre-commit-<name>`.
 
 Flags:
 

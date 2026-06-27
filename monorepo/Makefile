@@ -106,6 +106,10 @@ pre-commit: ## Staged-only checks across affected subprojects
 ci: ## Read-only gate across all subprojects
 	@$(MAKE) --no-print-directory _run CMD=ci DIRS="$(SUBPROJECTS)"
 
+.PHONY: pre-push
+pre-push: ## Read-only push gate across all subprojects (lint, format check, acceptance, arch)
+	@$(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)"
+
 .PHONY: test
 test: ## Run tests only, all subprojects
 	@$(MAKE) --no-print-directory _run CMD=test DIRS="$(SUBPROJECTS)"
@@ -230,7 +234,7 @@ help: ## Show this message
 	@awk 'BEGIN { FS = ":.*## " } \
 	     /^##@ / { printf "\n\033[1m%s\033[0m\n", substr($$0, 5); next } \
 	     /^[a-zA-Z_%-]+:.*## / { printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
-	@printf "\n$(DIM)Scoped targets:$(RESET) $(BOLD)check-<subproject>$(RESET), $(BOLD)ci-<subproject>$(RESET), $(BOLD)test-<subproject>$(RESET), $(BOLD)crap-<subproject>$(RESET), $(BOLD)complexity-<subproject>$(RESET)\n"
+	@printf "\n$(DIM)Scoped targets:$(RESET) $(BOLD)check-<subproject>$(RESET), $(BOLD)ci-<subproject>$(RESET), $(BOLD)pre-push-<subproject>$(RESET), $(BOLD)test-<subproject>$(RESET), $(BOLD)crap-<subproject>$(RESET), $(BOLD)complexity-<subproject>$(RESET)\n"
 	@printf "$(DIM)Forward flags:$(RESET)  $(BOLD)ARGS=\"--enforce --max=50\" make crap$(RESET)\n"
 	@printf "$(DIM)Verbose:$(RESET)        $(BOLD)VERBOSE=1 make check$(RESET)\n"
 	@printf "$(DIM)Parallel:$(RESET)       $(BOLD)PARALLEL=1 make check$(RESET) $(DIM)(buffers per-subproject output)$(RESET)\n"
@@ -243,6 +247,9 @@ check-%:
 
 ci-%:
 	@$(MAKE) --no-print-directory _scoped_run CMD=ci DIR="$*"
+
+pre-push-%:
+	@$(MAKE) --no-print-directory _scoped_run CMD=pre-push DIR="$*"
 
 test-%:
 	@$(MAKE) --no-print-directory _scoped_run CMD=test DIR="$*"
@@ -340,7 +347,7 @@ _run:
 	if [ $$failed -gt 0 ]; then \
 	  printf "$(RED)FAIL$(RESET) %d passed, %d failed $(DIM)(%ds)$(RESET)\n" "$$passed" "$$failed" "$$t_elapsed"; \
 	  case "$$cmd" in \
-	    check|ci|test|pre-commit) \
+	    check|ci|test|pre-commit|pre-push) \
 	      for d in $$failed_dirs; do \
 	        printf "  Retry just this one:  $(BOLD)make %s-%s$(RESET)\n" "$$cmd" "$$d"; \
 	      done ;; \

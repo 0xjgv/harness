@@ -714,6 +714,25 @@ def cmd_ci() -> None:
     _exit_if_failed(all_ok)
 
 
+def cmd_pre_push() -> None:
+    """Read-only push gate: the offline checks pre-commit and stop-hook do not run.
+
+    pre-commit covers fix/format/typecheck/test on staged files; stop-hook adds
+    complexity. This fills the gap with the deterministic, offline gates none of them
+    run — lint, format check, acceptance, arch — validating the whole pushed tree
+    (after merges/rebases/--no-verify, which pre-commit may never have seen) before it
+    leaves the machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
+    """
+    print("\n=== Pre-push Checks ===\n")
+    gates = [
+        _lint_gate(),
+        _format_check_gate(),
+        *_acceptance_gates_or_warn(),
+        *_arch_gates_or_warn(),
+    ]
+    _exit_if_failed(run_gates_parallel(gates))
+
+
 def cmd_hooks() -> None:
     """Install local hooks."""
     hook = Path(".git/hooks/pre-commit")
@@ -761,6 +780,7 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "test": (cmd_test, "Run tests, or syntax check when no tests exist"),
     "check": (cmd_check, "Fix + format + typecheck + test (full repo)"),
     "pre-commit": (cmd_pre_commit, "Staged checks + tests"),
+    "pre-push": (cmd_pre_push, "Read-only push gate: lint, format check, acceptance, arch"),
     "ci": (cmd_ci, "Full verification: lint, typecheck, tests, acceptance, coverage, crap, arch"),
     "audit": (cmd_audit, "Audit dependencies for known vulnerabilities"),
     "acceptance": (cmd_acceptance, "Run acceptance scenarios (behave)"),

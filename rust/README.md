@@ -38,12 +38,15 @@ See the [5-script contract](../README.md#the-5-script-contract) for the full rat
 ```bash
 cargo harness check                # Fix + format + lint + tests (after editing)
 cargo harness pre-commit           # Staged checks + tests (runs via git hook)
+cargo harness pre-push             # Read-only push gate: clippy, format check, acceptance, arch (runs via git hook)
 cargo harness ci                   # Full verification (see below)
 ```
 
 ### `ci` pipeline
 
-`harness ci` runs, in order: strict clippy (`-D warnings`) → format check → dep audit → complexity (lizard, CCN 15, args 8) → tests → acceptance (cucumber) → coverage (cargo-llvm-cov, `--min=0` by default) → CRAP (advisory) → arch (cargo-modules).
+`harness ci` runs the read-only gates — strict clippy (`-D warnings`), format check, complexity (lizard, CCN 15, args 8), acceptance (cucumber), arch (cargo-modules) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then runs dep audit, streams tests + coverage (cargo-llvm-cov, `--min=0` by default), and the advisory CRAP.
+
+`pre-push` is the offline push gate — clippy, format check, acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
 
 `cmd_coverage` runs the test suite under llvm-cov once and emits both the
 console summary (with the `--min=N` threshold check) and an LCOV file at
@@ -77,6 +80,7 @@ cargo harness arch                 # cargo-modules checks against arch.toml
 cargo harness fix                  # Fix lint errors (clippy --fix) + format
 cargo harness lint                 # Lint + format check (read-only)
 cargo harness test                 # Run tests
+cargo harness pre-push             # Read-only push gate: clippy, format check, acceptance, arch
 cargo harness setup-hooks          # Install git pre-commit and verify Claude/Codex Stop hook wiring
 cargo harness clean                # Remove build artifacts
 ```

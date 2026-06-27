@@ -37,6 +37,7 @@ go run harness.go setup-hooks
 |---|---|---|---|
 | `go run harness.go check` | After edits | Fix, format, lint, test | Yes |
 | `go run harness.go pre-commit` | Git hook | Staged files only | Yes |
+| `go run harness.go pre-push` | Git pre-push hook | Read-only push gate: lint, acceptance, arch over the whole tree | No |
 | `go run harness.go ci` | CI pipeline | Read-only verification (see below) | No |
 | `go run harness.go audit` | CI pipeline | Dependency vulnerability audit | No |
 | `go run harness.go post-edit` | Stop hook helper | Format if source files changed | No |
@@ -44,9 +45,14 @@ go run harness.go setup-hooks
 
 ### `ci` pipeline
 
-`harness ci` runs, in order: lint → dep audit → complexity (lizard, CCN 15, args 8) →
-acceptance (godog) → coverage (`go test -race -coverprofile`) → CRAP (advisory) →
-arch (go-arch-lint).
+`harness ci` runs the read-only gates — lint, dep audit, complexity (lizard, CCN 15,
+args 8), acceptance (godog), arch (go-arch-lint) — **in parallel**: each is captured
+and printed in submission order, and the batch runs to completion so one pass surfaces
+every failure. It then streams coverage (`go test -race -coverprofile`) and the
+advisory CRAP.
+
+`pre-push` is the offline push gate — lint (golangci-lint covers format), acceptance,
+arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
 
 CRAP is advisory: it warns by default and exits 0 unless `--enforce` is passed.
 Mutation testing is also advisory and is NOT wired into `ci` — invoke explicitly.
@@ -73,6 +79,7 @@ go run harness.go check --verbose
 | `go run harness.go mutation` | Mutation testing (gremlins, advisory) |
 | `go run harness.go crap` | CRAP complexity × coverage gate (advisory) |
 | `go run harness.go pre-commit` | Staged checks + tests |
+| `go run harness.go pre-push` | Read-only push gate: lint, acceptance, arch |
 | `go run harness.go ci` | Full verification pipeline |
 | `go run harness.go setup-hooks` | Install git pre-commit and verify Claude/Codex Stop hook wiring |
 | `go run harness.go clean` | Remove coverage and test cache |

@@ -818,6 +818,22 @@ func cmdCi() {
 	}
 }
 
+// cmdPrePush is the read-only push gate: the offline checks pre-commit and
+// stop-hook do not run. pre-commit covers fix/format/test on staged files;
+// stop-hook adds complexity. This fills the gap with the deterministic, offline
+// gates none of them run — lint (golangci-lint covers format), acceptance, arch —
+// validating the whole pushed tree (after merges/rebases/--no-verify) before it
+// leaves the machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
+func cmdPrePush() {
+	fmt.Printf("\n%s[pre-push]%s\n\n", blue, reset)
+	gates := []gate{lintGate(nil)}
+	gates = append(gates, acceptanceGatesOrWarn()...)
+	gates = append(gates, archGatesOrWarn()...)
+	if !runGatesParallel(gates) {
+		os.Exit(1)
+	}
+}
+
 // cmdComplexity runs the read-only cyclomatic-complexity gate.
 // golangci-lint's gocyclo linter already enforces a per-function ceiling
 // over src (see .golangci.yaml); this stage runs lizard for parity with the
@@ -902,6 +918,7 @@ var tasks = []task{
 	{"mutation", cmdMutation, "Mutation testing (gremlins, advisory)"},
 	{"crap", cmdCrap, "CRAP complexity x coverage gate (advisory)"},
 	{"pre-commit", cmdPreCommit, "Staged checks + tests"},
+	{"pre-push", cmdPrePush, "Read-only push gate: lint, acceptance, arch"},
 	{"ci", cmdCi, "Full verification: lint, audit, complexity, acceptance, coverage, crap, arch"},
 	{"setup-hooks", cmdHooks, "Install git pre-commit hook and verify stop-hook wiring"},
 	{"post-edit", cmdPostEdit, "Format if source files changed"},

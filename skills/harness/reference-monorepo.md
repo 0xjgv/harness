@@ -16,16 +16,19 @@ Code reads `CLAUDE.md`; Codex (and other AGENTS.md-consuming tools) read
 `~/Code/harness-templates/monorepo/CLAUDE.md` verbatim; do not paraphrase
 (it drifts). Two sections:
 
-- `## Commands` — `make check` / `pre-commit` / `ci` dispatch to every
-  subproject; each subproject `ci` includes its advisory CRAP gate.
-  `make crap` fans out the advisory CRAP gate directly (per-subproject
-  `harness crap`, pass `--enforce` for hard-fail); `make agents-md-drift`
-  / `make sync-agents-md` fan out the root + per-subproject AGENTS.md ↔
-  CLAUDE.md drift pair; `make check-<subproject>` / `ci-<subproject>` /
-  `crap-<subproject>` / `agents-md-drift-<subproject>` /
-  `sync-agents-md-<subproject>` scope to one; `make check-dirty` scopes
-  to changed ones; `PARALLEL=1` opts into buffered fan-out; `make list`
-  lists subprojects; `make bootstrap` installs everything.
+- `## Commands` — `make check` / `pre-commit` / `pre-push` / `ci` dispatch
+  to every subproject; each subproject `ci` runs its read-only gates in
+  parallel and includes its advisory CRAP gate, and `pre-push` is the
+  offline push gate (lint, format check, acceptance, arch over the whole
+  pushed tree). `make crap` fans out the advisory CRAP gate directly
+  (per-subproject `harness crap`, pass `--enforce` for hard-fail);
+  `make agents-md-drift` / `make sync-agents-md` fan out the root +
+  per-subproject AGENTS.md ↔ CLAUDE.md drift pair; `make check-<subproject>`
+  / `ci-<subproject>` / `pre-push-<subproject>` / `crap-<subproject>` /
+  `agents-md-drift-<subproject>` / `sync-agents-md-<subproject>` scope to
+  one; `make check-dirty` scopes to changed ones; `PARALLEL=1` opts into
+  buffered fan-out; `make list` lists subprojects; `make bootstrap`
+  installs everything.
 - `## Behavior contract` — Layer 2; see
   [reference-behavior-contract.md](reference-behavior-contract.md).
 
