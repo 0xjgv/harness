@@ -61,6 +61,13 @@ analyzes programs with a `main` package, not this library template.)
 CRAP is advisory: it warns by default and exits 0 unless `--enforce` is passed.
 Mutation testing is also advisory and is NOT wired into `ci` — invoke explicitly.
 
+### Continuous integration
+
+`.github/workflows/ci.yml` runs `go run harness.go ci` on every push to `main`
+and every pull request — the same gate you run locally, so local gate == remote
+gate. It installs golangci-lint and `uv` (for the lizard gates). Copying the
+template into a repo brings CI along.
+
 All commands minimize output — only errors are shown. Add `--verbose` for full output:
 
 ```bash

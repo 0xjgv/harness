@@ -51,6 +51,10 @@ Flags:
 - `VERBOSE=1 make check` — forward `--verbose` to each subproject's harness.
 - `PARALLEL=1 make check` — fan out subprojects with `xargs -P$(JOBS)`. Per-subproject output is buffered and dumped in-order on completion; exit status matches the sequential run. Off by default — CI logs, the Stop hook, and agent-visible runs stay sequential.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs `make ci` on every push to `main` and every pull request — the same gate you run locally, so local gate == remote gate. It ships with every toolchain wired (uv, Bun, Go, Rust + golangci-lint and the cargo tools) so any mix of subprojects works out of the box; trim the setup steps to the languages you actually use.
+
 ## How it works
 
 Subproject discovery is filename-based. A top-level directory is a subproject when it contains one of:

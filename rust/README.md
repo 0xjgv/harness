@@ -58,6 +58,13 @@ unless the file is missing or older than `src/`.
 CRAP is advisory: it warns by default and exits 0 unless `--enforce` is passed.
 Mutation testing is also advisory and NOT wired into `ci`; invoke explicitly.
 
+### Continuous integration
+
+`.github/workflows/ci.yml` runs `cargo harness ci` on every push to `main` and
+every pull request — the same gate you run locally, so local gate == remote gate.
+It installs `uv` (for the lizard gates) and cargo-audit / cargo-llvm-cov /
+cargo-modules. Copying the template into a repo brings CI along.
+
 All commands minimize output — only errors are shown. Add `--verbose` for full output:
 
 ```bash

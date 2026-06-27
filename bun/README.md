@@ -32,6 +32,10 @@ The complexity gate requires `uvx` on PATH — install via [uv](https://docs.ast
 
 CRAP is **advisory** but still runs in `ci`. Mutation testing is advisory and invoked explicitly.
 
+### Continuous integration
+
+`.github/workflows/ci.yml` runs `bun harness.ts ci` on every push to `main` and every pull request — the same gate you run locally, so local gate == remote gate. It installs `uv` alongside Bun so the lizard-based gates work. Copying the template into a repo brings CI along.
+
 All commands minimize output — only errors are shown. Add `--verbose` for full output:
 
 ```bash
