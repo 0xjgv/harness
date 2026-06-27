@@ -68,7 +68,8 @@ Never edit anything under `~/Code/harness-templates/`.
 
 Claude/Codex hook + Stop-hook shape: [reference-settings-json.md](reference-settings-json.md).
 The Stop hook runs `stop-hook`; `stop-hook` runs `post-edit`, then the
-complexity gate and advisory CRAP.
+read-only complexity gate (plus the dead-code gate where the language ships
+one) in parallel, then advisory CRAP.
 Behavior contract: [reference-behavior-contract.md](reference-behavior-contract.md).
 
 ## Layer 1 — the 5-script contract
@@ -81,12 +82,18 @@ Behavior contract: [reference-behavior-contract.md](reference-behavior-contract.
 | `ci` | CI pipeline | read-only gates (lint + typecheck + dep audit + complexity + acceptance + arch) **run in parallel**, captured and printed in submission order; then tests/coverage + crap (advisory) | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
 | `post-edit` | Stop hook helper | format if source files changed | yes |
-| `stop-hook` | Agent Stop hook | post-edit + complexity + crap (advisory) | yes |
+| `stop-hook` | Agent Stop hook | post-edit + complexity + deadcode (python/bun) + crap (advisory) | yes |
 
 Quality subcommands also callable standalone: `complexity`, `crap`,
-`acceptance`, `coverage` (Go: `test-cov`), `mutation`, `arch`. Python
-`test` runs `unittest`, or `py_compile` over quality targets when no
-`tests/test*.py` files exist. Bun `test`, `coverage`, `mutation`, and
+`acceptance`, `coverage` (Go: `test-cov`), `mutation`, `arch`, and
+`deadcode` (python/bun). `deadcode` flags unused code and runs in `ci` +
+`stop-hook`: python via vulture (app sources only, `--min-confidence 60`,
+allowlist false positives in `vulture_allowlist.py`), bun via knip (unused
+files/exports/deps, configured by `knip.json`, fetched on demand via
+`bunx`). Go and rust have **no** `deadcode` target — their linters already
+flag dead code (golangci-lint `unused`, clippy `dead_code` under
+`-D warnings`). Python `test` runs `unittest`, or `py_compile` over quality
+targets when no `tests/test*.py` files exist. Bun `test`, `coverage`, `mutation`, and
 `crap` warn and skip when no Bun test files exist. `complexity` runs
 `uvx lizard@1.22.2` (CCN≤15, args≤8, length≤100) — all 4 templates, so
 `uvx` must be on PATH. `crap` is **advisory by default** (warns; pass

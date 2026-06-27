@@ -7,6 +7,7 @@
 - Pre-push: `cargo harness pre-push` — read-only push gate over the whole tree: clippy, format check, acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
 - CI: `cargo harness ci` — read-only gates (clippy, format check, complexity, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then audit, tests + coverage (stream), crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
 - Complexity: `cargo harness complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over src + tests
+- Deadcode: no separate target — rust's `dead_code` lint is on by default and `ci`'s strict clippy (`-D warnings`) denies unused functions, fields, and variants.
 - CRAP (advisory): `cargo harness crap --max=30` — complexity × coverage gate (joins lizard --csv with `target/llvm-cov/lcov.info`). Add `--enforce` to exit 1 on offenders (default exits 0 with warning).
 - Audit: `cargo harness audit` — audit dependencies for known vulnerabilities (via cargo-audit)
 - Acceptance: `cargo harness acceptance` — run cucumber against `tests/features/`

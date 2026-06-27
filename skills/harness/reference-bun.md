@@ -12,21 +12,25 @@ a link. Copy `~/Code/harness-templates/bun/CLAUDE.md` verbatim; do not
 paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
-  quality subcommands `complexity`, `acceptance`, `coverage`, `mutation`,
-  `crap`, `arch`, and the drift pair `agents-md-drift` / `sync-agents-md`
-  (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
-  fail on drift). `ci` runs the read-only gates (`lint`, `typecheck`,
-  `audit`, `complexity`, `acceptance`, `arch`) **in parallel** — captured
-  and printed in submission order, run to completion so one pass surfaces
-  every failure — then streams `coverage` and the advisory `crap`.
-  `pre-push` is the offline push gate: `lint` (biome covers format),
-  `acceptance`, `arch` over the whole pushed tree (the deterministic checks
-  pre-commit and stop-hook skip). `crap` is advisory (warns by default,
-  `--enforce` to hard-fail) but still runs in `ci`. `test`, `coverage`,
-  `mutation`, and `crap` warn and skip when no Bun test files exist.
-  `check` also runs a `hook-drift` check that flags `.claude/` hook config
-  drift. Requires `uvx` on PATH for `complexity`/`crap` (lizard pinned to
-  `1.22.2`, CCN≤15, args≤8, length≤100).
+  quality subcommands `complexity`, `deadcode`, `acceptance`, `coverage`,
+  `mutation`, `crap`, `arch`, and the drift pair `agents-md-drift` /
+  `sync-agents-md` (keeps `AGENTS.md` byte-identical to `CLAUDE.md`;
+  `check` + `pre-commit` fail on drift). `ci` runs the read-only gates
+  (`lint`, `typecheck`, `audit`, `complexity`, `deadcode`, `acceptance`,
+  `arch`) **in parallel** — captured and printed in submission order, run to
+  completion so one pass surfaces every failure — then streams `coverage` and
+  the advisory `crap`. `pre-push` is the offline push gate: `lint` (biome
+  covers format), `acceptance`, `arch` over the whole pushed tree (the
+  deterministic checks pre-commit and stop-hook skip). `deadcode` runs knip
+  (pinned, fetched on demand via `bunx` — no devDep) to flag unused files,
+  exports, and dependencies; `knip.json` declares the cucumber step files as
+  entries and ignores the tool devDeps invoked as binaries. It runs in `ci`
+  and `stop-hook`. `crap` is advisory (warns by default, `--enforce` to
+  hard-fail) but still runs in `ci`. `test`, `coverage`, `mutation`, and
+  `crap` warn and skip when no Bun test files exist. `check` also runs a
+  `hook-drift` check that flags `.claude/` hook config drift. Requires `uvx`
+  on PATH for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
+  length≤100).
 - `## Behavior contract` — Layer 2; see
   [reference-behavior-contract.md](reference-behavior-contract.md).
 
@@ -59,7 +63,8 @@ Codex Stop command:
 
 - Runner: `~/Code/harness-templates/bun/harness.ts`
 - Tooling: Bun runtime, Biome (lint + format), tsc (src + harness + tests), `bun test`,
-  `bun audit`, lizard (complexity, via `uvx`), cucumber (acceptance),
-  Stryker (mutation), fast-check (property-based tests, see
-  `tests/properties.test.ts`), dependency-cruiser (arch)
+  `bun audit`, lizard (complexity, via `uvx`), knip (dead code, via `bunx`),
+  cucumber (acceptance), Stryker (mutation), fast-check (property-based tests,
+  see `tests/properties.test.ts`), dependency-cruiser (arch)
 - Protected arch config: `.dependency-cruiser.json`
+- Dead-code config: `knip.json`

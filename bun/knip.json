@@ -1,0 +1,10 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": ["src/index.ts", "tests/**/*.test.ts", "tests/features/steps/**/*.ts"],
+  "project": ["src/**/*.ts", "harness.ts"],
+  "ignoreDependencies": [
+    "@stryker-mutator/core",
+    "@stryker-mutator/command-runner",
+    "dependency-cruiser"
+  ]
+}

@@ -7,6 +7,7 @@
 - Pre-push: `go run harness.go pre-push` — read-only push gate over the whole tree: lint (golangci-lint covers format), acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
 - CI: `go run harness.go ci` — read-only gates (lint, audit, complexity, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then test-cov (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
 - Complexity: `go run harness.go complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over the module
+- Deadcode: no separate target — golangci-lint's `unused` linter (run by `lint`/`ci`) already flags unreachable functions, vars, and types. (`x/tools/cmd/deadcode` needs a `main` package; this template is a library.)
 - Audit: `go run harness.go audit` — audit dependencies for known vulnerabilities (via govulncheck)
 - Acceptance: `go run harness.go acceptance` — run godog against `features/`
 - Coverage: `go run harness.go test-cov` — tests with race detector + `coverage.out`

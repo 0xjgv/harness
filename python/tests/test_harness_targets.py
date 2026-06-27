@@ -172,9 +172,11 @@ class TestStopHook(unittest.TestCase):
         ):
             harness.cmd_stop_hook()
 
-        # Mutating fix/format runs first and alone; the read-only complexity gate
-        # runs through the parallel batch; CRAP streams last.
-        self.assertEqual(calls, ["post-edit", "batch:Complexity (lizard)", "crap"])
+        # Mutating fix/format runs first and alone; the read-only complexity and
+        # dead-code gates run through the parallel batch; CRAP streams last.
+        self.assertEqual(
+            calls, ["post-edit", "batch:Complexity (lizard),Dead code (vulture)", "crap"]
+        )
 
 
 class TestParallelGates(unittest.TestCase):

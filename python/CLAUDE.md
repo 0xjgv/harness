@@ -5,8 +5,9 @@
 - After edits: `uv run harness check` — fix, format, typecheck, test (or syntax check when no tests exist), suppression report
 - Pre-commit: `uv run harness pre-commit` — staged files only (auto via git hook)
 - Pre-push: `uv run harness pre-push` — read-only push gate over the whole tree: lint, format check, acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
-- CI: `uv run harness ci` — read-only gates (lint, format check, typecheck, audit, complexity, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then coverage (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
+- CI: `uv run harness ci` — read-only gates (lint, format check, typecheck, audit, complexity, deadcode, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then coverage (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
 - Complexity: `uv run harness complexity` — uvx lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over src + tests
+- Deadcode: `uv run harness deadcode` — uvx vulture@2.16 over `src/` only (`--min-confidence 60`); a dead helper that still has a test surfaces rather than hides. Allowlist dynamic references (decorator handlers, getattr) in `vulture_allowlist.py`. Runs in ci + stop-hook.
 - Audit: `uv run harness audit` — audit dependencies for known vulnerabilities (via pip-audit)
 - Acceptance: `uv run harness acceptance` — run behave against `tests/features/`
 - Coverage: `uv run harness coverage --min=0` — coverage.py with threshold + uncovered listing; warns and skips when no `tests/test*.py` files exist
@@ -16,7 +17,7 @@
 - Agents drift: `uv run harness agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `uv run harness sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
 - Setup: `uv run harness setup-hooks` to install git pre-commit and verify Claude/Codex Stop hook wiring
-- Stop hook: auto-formats/fixes changed files, then runs complexity and CRAP (`stop-hook`)
+- Stop hook: auto-formats/fixes changed files, then runs complexity and deadcode (parallel) and advisory CRAP (`stop-hook`)
 
 ## Behavior contract
 

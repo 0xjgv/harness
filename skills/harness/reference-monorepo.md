@@ -18,9 +18,11 @@ Code reads `CLAUDE.md`; Codex (and other AGENTS.md-consuming tools) read
 
 - `## Commands` — `make check` / `pre-commit` / `pre-push` / `ci` dispatch
   to every subproject; each subproject `ci` runs its read-only gates in
-  parallel and includes its advisory CRAP gate, and `pre-push` is the
-  offline push gate (lint, format check, acceptance, arch over the whole
-  pushed tree). `make crap` fans out the advisory CRAP gate directly
+  parallel (including its dead-code gate where the language ships one —
+  python vulture, bun knip; go and rust cover dead code via their linters)
+  and its advisory CRAP gate, and `pre-push` is the offline push gate (lint,
+  format check, acceptance, arch over the whole pushed tree). `make crap`
+  fans out the advisory CRAP gate directly
   (per-subproject `harness crap`, pass `--enforce` for hard-fail);
   `make agents-md-drift` / `make sync-agents-md` fan out the root +
   per-subproject AGENTS.md ↔ CLAUDE.md drift pair; `make check-<subproject>`

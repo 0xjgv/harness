@@ -54,6 +54,10 @@ advisory CRAP.
 `pre-push` is the offline push gate — lint (golangci-lint covers format), acceptance,
 arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
 
+Dead code needs no separate gate — golangci-lint's `unused` linter (run by `lint`)
+already flags unreachable functions, vars, and types. (`x/tools/cmd/deadcode` only
+analyzes programs with a `main` package, not this library template.)
+
 CRAP is advisory: it warns by default and exits 0 unless `--enforce` is passed.
 Mutation testing is also advisory and is NOT wired into `ci` — invoke explicitly.
 

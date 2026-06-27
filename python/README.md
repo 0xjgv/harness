@@ -24,7 +24,7 @@ uv run harness ci                    # Full verification (see below)
 
 ### `ci` pipeline
 
-`harness ci` runs the read-only gates — lint, format check, typecheck, dep audit, complexity (lizard, CCN 15, args 8), acceptance (behave), arch (import-linter) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then streams coverage (coverage.py, `--min=0` by default) and the advisory crap.
+`harness ci` runs the read-only gates — lint, format check, typecheck, dep audit, complexity (lizard, CCN 15, args 8), deadcode (vulture), acceptance (behave), arch (import-linter) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then streams coverage (coverage.py, `--min=0` by default) and the advisory crap.
 
 `pre-push` is the offline push gate — lint, format check, acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip). CRAP is **advisory** but still runs in `ci`. Mutation testing is advisory and invoked explicitly.
 
@@ -38,6 +38,7 @@ uv run harness check --verbose
 
 ```bash
 uv run harness acceptance            # behave against tests/features/
+uv run harness deadcode              # vulture over src/ only (--min-confidence 60); allowlist in vulture_allowlist.py
 uv run harness coverage --min=80     # tests with coverage, fails below threshold
 uv run harness mutation              # mutmut kill-rate on src/ (advisory; see note below)
 uv run harness crap --max=30         # CRAP = CCN² × (1-cov)³ + CCN per function (advisory)

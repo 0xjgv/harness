@@ -21,10 +21,13 @@ paraphrase (it drifts). Two sections:
   failure — then runs `audit`, streams `tests` + `coverage`, and the
   advisory `crap`. `pre-push` is the offline push gate: `clippy`, `format
   check`, `acceptance`, `arch` over the whole pushed tree (the deterministic
-  checks pre-commit and stop-hook skip). `crap` is advisory (warns by
-  default, `--enforce` to hard-fail; joins lizard `--csv` with
-  `target/llvm-cov/lcov.info`). Requires `uvx` on PATH for `complexity`/
-  `crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8, length≤100).
+  checks pre-commit and stop-hook skip). There is **no** `deadcode` target —
+  rust's `dead_code` lint is on by default and `ci`'s strict clippy
+  (`-D warnings`) already denies unused functions, fields, and variants.
+  `crap` is advisory (warns by default, `--enforce` to hard-fail; joins
+  lizard `--csv` with `target/llvm-cov/lcov.info`). Requires `uvx` on PATH
+  for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
+  length≤100).
 - `## Behavior contract` — Layer 2; see
   [reference-behavior-contract.md](reference-behavior-contract.md).
 

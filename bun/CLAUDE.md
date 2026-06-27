@@ -4,9 +4,10 @@
 
 - After edits: `bun run check` — fix, format, typecheck, test (warns/skips when no tests exist), hook-drift + suppression report
 - Pre-commit: `bun run pre-commit` — staged files only (auto via git hook)
-- Pre-push: `bun run pre-push` — read-only push gate over the whole tree: lint (biome covers format), acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
-- CI: `bun run ci` — read-only gates (lint, typecheck, audit, complexity, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then coverage (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
+- Pre-push: `bun run harness.ts pre-push` — read-only push gate over the whole tree: lint (biome covers format), acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
+- CI: `bun run ci` — read-only gates (lint, typecheck, audit, complexity, deadcode, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then coverage (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
 - Complexity: `bun run harness.ts complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over src + tests
+- Deadcode: `bun run harness.ts deadcode` — knip (via bunx, no devDep) flags unused files/exports/deps; `knip.json` lists the cucumber step entries and ignores tool devDeps invoked as binaries. Runs in ci + stop-hook.
 - Audit: `bun run audit` — audit dependencies for known vulnerabilities (via bun audit)
 - Acceptance: `bun run acceptance` — run cucumber against `tests/features/`
 - Coverage: `bun run coverage --min=0` — `bun test` coverage (LCOV) with threshold; warns and skips when no tests exist
@@ -16,7 +17,7 @@
 - Agents drift: `bun run harness.ts agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `bun run harness.ts sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
 - Setup: `bun run setup-hooks` to install git pre-commit and verify Claude/Codex Stop hook wiring
-- Stop hook: auto-formats/fixes changed files, then runs complexity and CRAP (`stop-hook`)
+- Stop hook: auto-formats/fixes changed files, then runs complexity and deadcode (parallel) and advisory CRAP (`stop-hook`)
 
 ## Behavior contract
 

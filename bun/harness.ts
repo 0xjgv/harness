@@ -22,6 +22,7 @@ const APP_SOURCES = ['src'] as const;
 const QUALITY_SOURCES = ['src', 'harness.ts'] as const;
 const TEST_DIR = 'tests';
 const LIZARD = 'lizard@1.22.2';
+const KNIP = 'knip@5.88.1';
 const COMPLEXITY_MAX_ARGS = 8;
 const ROOT = import.meta.dir;
 
@@ -727,6 +728,20 @@ async function cmdComplexity(): Promise<void> {
   for (const gate of await complexityGatesOrWarn()) await run(gate.description, gate.cmd);
 }
 
+function deadcodeGate(): Gate {
+  // knip finds unused files, exports, and dependencies — coverage biome's
+  // per-file noUnusedVariables can't give. Run on-demand via bunx (like lizard
+  // via uvx), no devDep. knip.json declares the cucumber step files as entries
+  // and ignores the tool devDeps invoked as binaries; --no-config-hints keeps
+  // the gate output to genuine findings.
+  return { description: 'Dead code (knip)', cmd: ['bunx', KNIP, '--no-config-hints'] };
+}
+
+async function cmdDeadcode(): Promise<void> {
+  const gate = deadcodeGate();
+  await run(gate.description, gate.cmd);
+}
+
 async function cmdPostEdit(): Promise<void> {
   const files = await changedTsFiles();
   if (files.length === 0) return;
@@ -736,7 +751,8 @@ async function cmdPostEdit(): Promise<void> {
 async function cmdStopHook(): Promise<void> {
   console.log('\n=== Stop Hook Checks ===\n');
   await cmdPostEdit(); // mutating — sequential, first
-  const allOk = await runGatesParallel(await complexityGatesOrWarn()); // read-only batch
+  // read-only batch: complexity + dead code
+  const allOk = await runGatesParallel([...(await complexityGatesOrWarn()), deadcodeGate()]);
   await cmdCrap(); // streaming advisory — after the batch
   if (!allOk) process.exit(1);
 }
@@ -893,6 +909,7 @@ async function cmdCi(): Promise<void> {
     typecheckGate(),
     auditGate(),
     ...(await complexityGatesOrWarn()),
+    deadcodeGate(),
     ...(await acceptanceGatesOrWarn()),
     ...(await archGatesOrWarn()),
   ];
@@ -955,11 +972,12 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   mutation: [cmdMutation, 'Mutation testing (Stryker, advisory)'],
   crap: [cmdCrap, 'CRAP complexity x coverage gate (advisory)'],
   complexity: [cmdComplexity, 'Cyclomatic complexity gate (lizard, CCN 15, args 8)'],
+  deadcode: [cmdDeadcode, 'Detect unused files/exports/deps (knip, via bunx)'],
   arch: [cmdArch, 'Architecture checks (dependency-cruiser)'],
   check: [cmdCheck, 'Full pre-flight: lockfile + fix + typecheck + tests'],
   'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
   'pre-push': [cmdPrePush, 'Read-only push gate: lint, acceptance, arch'],
-  ci: [cmdCi, 'Lint + typecheck + audit + complexity + acceptance + coverage + crap + arch'],
+  ci: [cmdCi, 'Lint + typecheck + audit + complexity + deadcode + acceptance + coverage + crap + arch'],
   'setup-hooks': [cmdHooks, 'Install git pre-commit hook and verify stop-hook wiring'],
   'post-edit': [cmdPostEdit, 'Format if source files changed'],
   'stop-hook': [cmdStopHook, 'Format changed files, then run stop-hook checks'],

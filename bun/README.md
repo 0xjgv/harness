@@ -18,13 +18,13 @@ See the [5-script contract](../README.md#the-5-script-contract) for the full rat
 ```bash
 bun run check                      # Fix + format + typecheck + tests/no-test warning (after editing)
 bun run pre-commit                 # Staged checks + tests (runs via git hook)
-bun run pre-push                   # Read-only push gate: lint, acceptance, arch (runs via git hook)
+bun harness.ts pre-push            # Read-only push gate: lint, acceptance, arch (runs via git hook)
 bun run ci                         # Full verification (see below)
 ```
 
 ### `ci` pipeline
 
-`harness ci` runs the read-only gates — lint + format check (biome), typecheck (tsc), dep audit (bun audit), complexity (lizard, CCN 15, args 8), acceptance (cucumber), arch (dependency-cruiser) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then streams coverage (`bun test --coverage`, `--min=0` by default) and the advisory crap.
+`harness ci` runs the read-only gates — lint + format check (biome), typecheck (tsc), dep audit (bun audit), complexity (lizard, CCN 15, args 8), deadcode (knip), acceptance (cucumber), arch (dependency-cruiser) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then streams coverage (`bun test --coverage`, `--min=0` by default) and the advisory crap.
 
 `pre-push` is the offline push gate — lint (biome covers format), acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
 
@@ -42,6 +42,7 @@ bun harness.ts check --verbose
 
 ```bash
 bun run acceptance                 # cucumber against tests/features/
+bun harness.ts deadcode            # knip (via bunx): unused files/exports/deps; config in knip.json
 bun run coverage --min=80          # tests with coverage, fails below threshold
 bun run mutation                   # Stryker mutation score on src/ (advisory)
 bun run crap --max=30              # CRAP = CCN² × (1-cov)³ + CCN per function (advisory)

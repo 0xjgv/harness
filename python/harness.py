@@ -23,6 +23,9 @@ APP_SOURCES = ("src",)
 QUALITY_SOURCES = ("src", "harness.py")
 TEST_DIR = "tests"
 LIZARD = "lizard@1.22.2"
+VULTURE = "vulture@2.16"
+VULTURE_MIN_CONFIDENCE = "60"
+VULTURE_ALLOWLIST = "vulture_allowlist.py"
 COMPLEXITY_MAX_ARGS = 8
 
 # ── Output ────────────────────────────────────────────────────────
@@ -565,6 +568,33 @@ def cmd_complexity() -> None:
     run(gate.description, gate.cmd)
 
 
+def _deadcode_gate() -> Gate:
+    """Build the vulture dead-code gate.
+
+    Scans the app sources only — never `tests/` — so code referenced solely by a
+    test (a dead helper that still has a test) is reported, not masked. Confidence
+    60 is vulture's floor for unused functions/methods/classes. List legitimate
+    dynamic references (decorator-registered handlers, getattr dispatch) in
+    `vulture_allowlist.py` to silence false positives.
+    """
+    return Gate(
+        "Dead code (vulture)",
+        [
+            "uvx",
+            VULTURE,
+            *_app_targets(),
+            *_existing([VULTURE_ALLOWLIST]),
+            "--min-confidence",
+            VULTURE_MIN_CONFIDENCE,
+        ],
+    )
+
+
+def cmd_deadcode() -> None:
+    gate = _deadcode_gate()
+    run(gate.description, gate.cmd)
+
+
 def cmd_post_edit() -> None:
     """Format if source files have uncommitted changes."""
     files = _changed_py_files()
@@ -578,7 +608,7 @@ def cmd_stop_hook() -> None:
     """Run stop-time checks after agent edits."""
     print("\n=== Stop Hook Checks ===\n")
     cmd_post_edit()  # mutating — sequential, first
-    all_ok = run_gates_parallel([_complexity_gate()])  # read-only batch
+    all_ok = run_gates_parallel([_complexity_gate(), _deadcode_gate()])  # read-only batch
     cmd_crap()  # streaming advisory — after the batch
     _exit_if_failed(all_ok)
 
@@ -694,9 +724,9 @@ def cmd_ci() -> None:
     """Run full read-only verification.
 
     Read-only gates run as a parallel batch (lint, format check, typecheck, audit,
-    complexity, acceptance, arch) — captured and printed in submission order, run to
-    completion so one pass surfaces every failure. Coverage and CRAP run after the
-    batch: coverage streams (a long command), CRAP is advisory unless --enforce.
+    complexity, deadcode, acceptance, arch) — captured and printed in submission order,
+    run to completion so one pass surfaces every failure. Coverage and CRAP run after
+    the batch: coverage streams (a long command), CRAP is advisory unless --enforce.
     """
     print("\n=== CI Checks ===\n")
     gates = [
@@ -705,6 +735,7 @@ def cmd_ci() -> None:
         _typecheck_gate(),
         _audit_gate(),
         _complexity_gate(),
+        _deadcode_gate(),
         *_acceptance_gates_or_warn(),
         *_arch_gates_or_warn(),
     ]
@@ -788,6 +819,7 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "mutation": (cmd_mutation, "Mutation testing (mutmut, advisory)"),
     "crap": (cmd_crap, "CRAP complexity x coverage gate (advisory)"),
     "complexity": (cmd_complexity, "Cyclomatic complexity gate (lizard, CCN 15, args 8)"),
+    "deadcode": (cmd_deadcode, "Detect unused (dead) code with vulture (app sources only)"),
     "arch": (cmd_arch, "Architecture checks (import-linter)"),
     "post-edit": (cmd_post_edit, "Format if source files changed"),
     "stop-hook": (cmd_stop_hook, "Format changed files, then run stop-hook checks"),
