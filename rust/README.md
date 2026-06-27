@@ -71,6 +71,8 @@ All commands minimize output — only errors are shown. Add `--verbose` for full
 cargo harness check --verbose
 ```
 
+Every command is also a `make` target — `make check`, `make ci`, `make pre-push`, and so on forward to the harness. `make bootstrap` does first-time setup (`cargo build` + `setup-hooks`) in one step.
+
 ### Quality subcommands
 
 ```bash

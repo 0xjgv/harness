@@ -94,7 +94,7 @@ make check-api      # scope to one subproject
 
 ## What Each Template Includes
 
-- **Single zero-dep task runner** (`harness.py` / `harness.ts` / `harness.go`) — no Makefile, no task framework
+- **Single zero-dep task runner** (`harness.py` / `harness.ts` / `harness.go` / `cargo harness`) — the source of truth, with a thin optional `Makefile` that just forwards to it (`make ci` == `harness ci`)
 - **Linter + formatter** — ruff (Python) / Biome (Bun) / golangci-lint (Go) / clippy + rustfmt (Rust)
 - **Type checker** — basedpyright (Python) / tsc (Bun) / Go compiler (Go) / Rust compiler (Rust)
 - **Test runner** — unittest (Python) / bun test (Bun) / go test (Go) / cargo test (Rust)

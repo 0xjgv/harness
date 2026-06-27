@@ -22,6 +22,8 @@ uv run harness pre-push              # Read-only push gate: lint, format check, 
 uv run harness ci                    # Full verification (see below)
 ```
 
+Every command above is also a `make` target — `make check`, `make ci`, `make pre-push`, and so on forward to the harness. `make bootstrap` does first-time setup (`uv sync` + `setup-hooks`) in one step.
+
 ### `ci` pipeline
 
 `harness ci` runs the read-only gates — lint, format check, typecheck, dep audit, complexity (lizard, CCN 15, args 8), deadcode (vulture), acceptance (behave), arch (import-linter) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then streams coverage (coverage.py, `--min=0` by default) and the advisory crap.

@@ -74,6 +74,8 @@ All commands minimize output — only errors are shown. Add `--verbose` for full
 go run harness.go check --verbose
 ```
 
+Every command is also a `make` target — `make check`, `make ci`, `make pre-push`, and so on forward to the harness. `make bootstrap` does first-time setup (`go mod download` + `setup-hooks`) in one step.
+
 ## All Commands
 
 | Command | Description |
