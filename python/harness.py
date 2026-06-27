@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import os
 import re
 import shutil
@@ -12,7 +13,7 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -27,6 +28,25 @@ VULTURE = "vulture@2.16"
 VULTURE_MIN_CONFIDENCE = "60"
 VULTURE_ALLOWLIST = "vulture_allowlist.py"
 COMPLEXITY_MAX_ARGS = 8
+
+# ── Hook wiring (installed by `setup-hooks`) ──────────────────────
+# Claude reads .claude/settings.json and runs the harness directly; Codex reads
+# .codex/hooks.json and goes through the codex-stop-hook.sh wrapper (which turns
+# the exit code into the block/continue JSON Codex expects). Keep both forms in
+# sync with the committed template files so re-running the installer is a no-op.
+CLAUDE_SETTINGS_SCHEMA = "https://json.schemastore.org/claude-code-settings.json"
+CLAUDE_STOP_COMMAND = "cd $CLAUDE_PROJECT_DIR && uv run harness stop-hook"
+CODEX_STOP_COMMAND = (
+    'cd "$(git rev-parse --show-toplevel)" && '
+    ".codex/hooks/codex-stop-hook.sh uv run harness stop-hook"
+)
+CLAUDE_STOP_HOOK: dict[str, Any] = {"type": "command", "command": CLAUDE_STOP_COMMAND}
+CODEX_STOP_HOOK: dict[str, Any] = {
+    "type": "command",
+    "command": CODEX_STOP_COMMAND,
+    "timeout": 300,
+    "statusMessage": "Running stop-hook checks",
+}
 
 # ── Output ────────────────────────────────────────────────────────
 
@@ -629,16 +649,6 @@ def _check_hooks_present() -> None:
         print(f"  {RED}⚠{RESET} Missing hook scripts: {', '.join(missing)}")
 
 
-def _check_stop_hook_present() -> None:
-    """Warn when the project Stop hook wiring is missing."""
-    for hook_file in [Path(".claude/settings.json"), Path(".codex/hooks.json")]:
-        content = hook_file.read_text(encoding="utf-8") if hook_file.exists() else ""
-        if "Stop" not in content or "stop-hook" not in content:
-            print(f"  {RED}⚠{RESET} Missing Stop hook wiring: {hook_file}")
-            continue
-        print(f"  {GREEN}✓{RESET} Stop hook wiring ({hook_file})")
-
-
 def _first_diff_line(a: str, b: str) -> int:
     """Return 1-based line number of the first line that differs."""
     al, bl = a.splitlines(), b.splitlines()
@@ -764,14 +774,124 @@ def cmd_pre_push() -> None:
     _exit_if_failed(run_gates_parallel(gates))
 
 
-def cmd_hooks() -> None:
-    """Install local hooks."""
-    hook = Path(".git/hooks/pre-commit")
+def _read_json_object(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return {}
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    return data
+
+
+def _write_json_object(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{json.dumps(data, indent=2)}\n", encoding="utf-8")
+
+
+def _json_object_child(data: dict[str, Any], key: str, path: Path) -> dict[str, Any]:
+    child = data.get(key)
+    if child is None:
+        child = {}
+        data[key] = child
+    if not isinstance(child, dict):
+        raise ValueError(f"{path}:{key} must contain a JSON object")
+    return child
+
+
+def _json_list_child(data: dict[str, Any], key: str, path: Path) -> list[Any]:
+    child = data.get(key)
+    if child is None:
+        child = []
+        data[key] = child
+    if not isinstance(child, list):
+        raise ValueError(f"{path}:{key} must contain a JSON array")
+    return child
+
+
+def _is_stop_hook_handler(handler: object) -> bool:
+    """True for a command handler that already runs our stop-hook (any form)."""
+    return (
+        isinstance(handler, dict)
+        and handler.get("type") == "command"
+        and isinstance(handler.get("command"), str)
+        and "stop-hook" in handler["command"]
+    )
+
+
+def _install_stop_hook(path: Path, hook: dict[str, Any], *, claude_settings: bool = False) -> None:
+    """Inject/refresh the Stop hook in a settings file, preserving every other hook.
+
+    Idempotent: an existing stop-hook handler (current or legacy) is replaced in
+    place and any duplicates are dropped, so re-running never accumulates entries.
+    """
+    data = _read_json_object(path)
+    if claude_settings and "$schema" not in data:
+        data["$schema"] = CLAUDE_SETTINGS_SCHEMA
+
+    hooks = _json_object_child(data, "hooks", path)
+    stop_groups = _json_list_child(hooks, "Stop", path)
+    installed = False
+
+    for group in stop_groups:
+        if not isinstance(group, dict):
+            continue
+        group_hooks = group.get("hooks")
+        if not isinstance(group_hooks, list):
+            continue
+        next_group_hooks: list[Any] = []
+        for handler in group_hooks:
+            if _is_stop_hook_handler(handler):
+                if not installed:
+                    next_group_hooks.append(dict(hook))
+                    installed = True
+                continue
+            next_group_hooks.append(handler)
+        group["hooks"] = next_group_hooks
+
+    if not installed:
+        stop_groups.append({"hooks": [dict(hook)]})
+
+    _write_json_object(path, data)
+
+
+def _git_hook_path(name: str) -> Path:
+    """Resolve a git hook path via `git rev-parse` so worktrees / core.hooksPath work."""
+    git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-path", f"hooks/{name}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=git_env,
+        )
+    except FileNotFoundError:
+        return Path(f".git/hooks/{name}")
+
+    hook = result.stdout.strip()
+    if result.returncode == 0 and hook:
+        return Path(hook)
+    return Path(f".git/hooks/{name}")
+
+
+def _install_git_hook(name: str) -> None:
+    """Install a git hook shim that runs the matching `harness <name>`."""
+    hook = _git_hook_path(name)
     hook.parent.mkdir(parents=True, exist_ok=True)
-    hook.write_text("#!/bin/sh\nuv run harness pre-commit\n", encoding="utf-8")
+    hook.write_text(f"#!/bin/sh\nuv run harness {name}\n", encoding="utf-8")
     hook.chmod(0o755)
-    print("Installed pre-commit hook")
-    _check_stop_hook_present()
+
+
+def cmd_hooks() -> None:
+    """Install git pre-commit + pre-push hooks and the Claude/Codex Stop wiring."""
+    _install_git_hook("pre-commit")
+    _install_git_hook("pre-push")
+    _install_stop_hook(Path(".codex/hooks.json"), CODEX_STOP_HOOK)
+    _install_stop_hook(Path(".claude/settings.json"), CLAUDE_STOP_HOOK, claude_settings=True)
+    print("Installed pre-commit, pre-push, and Claude/Codex Stop hooks")
 
 
 def cmd_clean() -> None:
@@ -825,7 +945,10 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "stop-hook": (cmd_stop_hook, "Format changed files, then run stop-hook checks"),
     "agents-md-drift": (cmd_agents_md_drift, "Fail if AGENTS.md differs from CLAUDE.md"),
     "sync-agents-md": (cmd_sync_agents_md, "Overwrite AGENTS.md from CLAUDE.md"),
-    "setup-hooks": (cmd_hooks, "Install git pre-commit hook and verify stop-hook wiring"),
+    "setup-hooks": (
+        cmd_hooks,
+        "Install git pre-commit + pre-push hooks and Claude/Codex Stop wiring",
+    ),
     "clean": (cmd_clean, "Remove cache and build artifacts"),
 }
 

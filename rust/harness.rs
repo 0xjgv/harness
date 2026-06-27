@@ -5,7 +5,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
@@ -1159,32 +1158,59 @@ fn cmd_pre_push() {
     }
 }
 
-fn cmd_hooks() {
-    let hook_dir = root().join(".git").join("hooks");
-    let hook_path = hook_dir.join("pre-commit");
+/// Resolve a git hook path via `git rev-parse` so worktrees / `core.hooksPath` land
+/// in the right place. `GIT_*` env is stripped so an ambient `GIT_DIR` from a
+/// parent process can't redirect us. Falls back to `.git/hooks/<name>` if git is absent.
+fn git_hook_path(name: &str) -> PathBuf {
+    let fallback = || root().join(".git").join("hooks").join(name);
+    let mut cmd = Command::new("git");
+    cmd.args(["rev-parse", "--git-path", &format!("hooks/{name}")]).current_dir(root());
+    cmd.env_clear();
+    for (key, value) in env::vars() {
+        if !key.starts_with("GIT_") {
+            cmd.env(key, value);
+        }
+    }
+    let Ok(out) = cmd.output() else { return fallback() };
+    if !out.status.success() {
+        return fallback();
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        return fallback();
+    }
+    let candidate = Path::new(&path);
+    if candidate.is_absolute() { candidate.to_path_buf() } else { root().join(candidate) }
+}
 
-    if let Err(e) = fs::create_dir_all(&hook_dir) {
+/// Install a git hook shim that runs the matching `cargo harness <name>`.
+fn install_git_hook(name: &str) {
+    let path = git_hook_path(name);
+    if let Some(parent) = path.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
         eprintln!("Failed to create hooks directory: {e}");
         std::process::exit(1);
     }
-
-    let content = "#!/bin/sh\ncargo harness pre-commit\n";
-    let Ok(mut file) = fs::File::create(&hook_path) else {
-        eprintln!("Failed to write hook");
-        std::process::exit(1);
-    };
-    if file.write_all(content.as_bytes()).is_err() {
-        eprintln!("Failed to write hook");
+    if fs::write(&path, format!("#!/bin/sh\ncargo harness {name}\n")).is_err() {
+        eprintln!("Failed to write {name} hook");
         std::process::exit(1);
     }
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755));
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o755));
     }
+}
 
-    println!("Installed pre-commit hook");
+fn cmd_hooks() {
+    install_git_hook("pre-commit");
+    install_git_hook("pre-push");
+    println!("Installed pre-commit and pre-push git hooks");
+    // The runner is std-only (no JSON parser), so it verifies the Stop wiring
+    // rather than injecting into settings that may carry other hooks. The template
+    // ships .claude/settings.json and .codex/hooks.json already wired; copy them in
+    // (cp -r the template's .claude / .codex) if this warns.
     check_stop_hook_present();
 }
 
@@ -1267,6 +1293,8 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
 
     #[test]

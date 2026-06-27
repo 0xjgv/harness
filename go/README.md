@@ -85,7 +85,7 @@ go run harness.go check --verbose
 | `go run harness.go pre-commit` | Staged checks + tests |
 | `go run harness.go pre-push` | Read-only push gate: lint, acceptance, arch |
 | `go run harness.go ci` | Full verification pipeline |
-| `go run harness.go setup-hooks` | Install git pre-commit and verify Claude/Codex Stop hook wiring |
+| `go run harness.go setup-hooks` | Install git pre-commit + pre-push hooks and the Claude/Codex Stop wiring |
 | `go run harness.go clean` | Remove coverage and test cache |
 
 Add `--verbose` to any command to see all output.

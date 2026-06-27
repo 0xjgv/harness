@@ -8,7 +8,7 @@ Rust project template with built-in harness: linting, formatting, testing, accep
 
 ```bash
 cargo build                          # Build the project
-cargo harness setup-hooks            # Install git pre-commit and verify Claude/Codex Stop hook wiring
+cargo harness setup-hooks            # Install git pre-commit + pre-push hooks; verify Claude/Codex Stop wiring
 ```
 
 The acceptance, coverage, mutation, and arch gates depend on external cargo
@@ -83,7 +83,7 @@ cargo harness fix                  # Fix lint errors (clippy --fix) + format
 cargo harness lint                 # Lint + format check (read-only)
 cargo harness test                 # Run tests
 cargo harness pre-push             # Read-only push gate: clippy, format check, acceptance, arch
-cargo harness setup-hooks          # Install git pre-commit and verify Claude/Codex Stop hook wiring
+cargo harness setup-hooks          # Install git pre-commit + pre-push hooks; verify Claude/Codex Stop wiring (std-only)
 cargo harness clean                # Remove build artifacts
 ```
 

@@ -40,7 +40,7 @@ make check-api      # scope to one subproject
 | `make test` | Run tests only, all subprojects |
 | `make list` | Show detected subprojects |
 | `make setup` | Per-language deps: `bun install`, `uv sync`, `go mod download`, `cargo build` |
-| `make setup-hooks` | Install `.git/hooks/pre-commit` → `make pre-commit` and verify Claude/Codex Stop hook wiring. Re-run with `FORCE=1` to overwrite an existing hook |
+| `make setup-hooks` | Install git pre-commit + pre-push hooks → `make pre-commit` / `make pre-push` (path resolved via `git rev-parse`, worktree-safe) and verify Claude/Codex Stop hook wiring. Idempotent — re-run any time |
 | `make bootstrap` | `setup` + `setup-hooks` |
 | `make clean` | Delegate `clean` to each subproject |
 

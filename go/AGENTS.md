@@ -16,7 +16,7 @@
 - Arch: `go run harness.go arch` — go-arch-lint against `.go-arch-lint.yml`
 - Agents drift: `go run harness.go agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `go run harness.go sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
-- Setup: `go run harness.go setup-hooks` to install git pre-commit and verify Claude/Codex Stop hook wiring
+- Setup: `go run harness.go setup-hooks` installs git pre-commit + pre-push hooks (path resolved via `git rev-parse`, worktree-safe) and idempotently installs the Claude/Codex Stop wiring
 - Stop hook: auto-formats/fixes changed files, then runs complexity and CRAP (`stop-hook`)
 
 ## Behavior contract

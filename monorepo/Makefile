@@ -174,17 +174,17 @@ setup: ## Install per-language deps (one-time)
 	@set -eu; for d in $(RUST_DIRS); do printf "$(BOLD)▶ %s$(RESET) $(DIM)(cargo build)$(RESET)\n"    "$$d"; (cd "$$d" && cargo build); done
 
 .PHONY: setup-hooks
-setup-hooks: ## Install root pre-commit git hook and verify Claude/Codex Stop hook wiring
-	@if [ ! -d .git ]; then \
+setup-hooks: ## Install root pre-commit + pre-push git hooks and verify Claude/Codex Stop hook wiring
+	@if ! git rev-parse --git-dir >/dev/null 2>&1; then \
 	  printf "$(RED)Not a git repo.$(RESET) Run 'git init' first.\n"; exit 1; \
 	fi
-	@if [ -f .git/hooks/pre-commit ] && [ -z "$(FORCE)" ]; then \
-	  printf "$(RED).git/hooks/pre-commit already exists.$(RESET) Re-run with FORCE=1 to overwrite.\n"; exit 1; \
-	fi
-	@mkdir -p .git/hooks
-	@printf '#!/bin/sh\nexec make pre-commit\n' > .git/hooks/pre-commit
-	@chmod +x .git/hooks/pre-commit
-	@printf "$(GREEN)✓$(RESET) Installed .git/hooks/pre-commit → make pre-commit\n"
+	@set -eu; for name in pre-commit pre-push; do \
+	  hook=$$(git rev-parse --git-path "hooks/$$name"); \
+	  mkdir -p "$$(dirname "$$hook")"; \
+	  printf '#!/bin/sh\nexec make %s\n' "$$name" > "$$hook"; \
+	  chmod +x "$$hook"; \
+	  printf "$(GREEN)✓$(RESET) Installed %s → make %s\n" "$$hook" "$$name"; \
+	done
 	@if [ -f .claude/settings.json ] && grep -q 'Stop' .claude/settings.json && grep -q 'stop-hook' .claude/settings.json; then \
 	  printf "$(GREEN)✓$(RESET) Stop hook wiring (.claude/settings.json)\n"; \
 	else \

@@ -8,7 +8,7 @@ Python project template with built-in harness: linting, formatting, type-checkin
 
 ```bash
 uv sync                              # Install dependencies
-uv run harness setup-hooks           # Install git pre-commit and verify Claude/Codex Stop hook wiring
+uv run harness setup-hooks           # Install git pre-commit + pre-push hooks and the Claude/Codex Stop wiring
 ```
 
 ## Development

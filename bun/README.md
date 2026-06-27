@@ -8,7 +8,7 @@ Bun project template with built-in harness: linting, formatting, type-checking, 
 
 ```bash
 bun install                         # Install dependencies
-bun run setup-hooks                 # Install git pre-commit and verify Claude/Codex Stop hook wiring
+bun run setup-hooks                 # Install git pre-commit + pre-push hooks and the Claude/Codex Stop wiring
 ```
 
 ## Development

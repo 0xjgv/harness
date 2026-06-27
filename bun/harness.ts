@@ -26,6 +26,23 @@ const KNIP = 'knip@5.88.1';
 const COMPLEXITY_MAX_ARGS = 8;
 const ROOT = import.meta.dir;
 
+// ── Hook wiring (installed by `setup-hooks`) ────────────────────────
+// Claude reads .claude/settings.json and runs the harness directly; Codex reads
+// .codex/hooks.json and goes through the codex-stop-hook.sh wrapper (which turns
+// the exit code into the block/continue JSON Codex expects). Keep both in sync
+// with the committed template files so re-running the installer is a no-op.
+const CLAUDE_SETTINGS_SCHEMA = 'https://json.schemastore.org/claude-code-settings.json';
+const CLAUDE_STOP_COMMAND = 'cd $CLAUDE_PROJECT_DIR && bun harness.ts stop-hook';
+const CODEX_STOP_COMMAND =
+  'cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh bun harness.ts stop-hook';
+const CLAUDE_STOP_HOOK = { type: 'command', command: CLAUDE_STOP_COMMAND };
+const CODEX_STOP_HOOK = {
+  type: 'command',
+  command: CODEX_STOP_COMMAND,
+  timeout: 300,
+  statusMessage: 'Running stop-hook checks',
+};
+
 // ── Output ──────────────────────────────────────────────────────────
 
 const GREEN = '\x1b[32m';
@@ -774,17 +791,109 @@ async function checkHooksPresent(): Promise<void> {
   }
 }
 
-async function checkStopHookPresent(): Promise<void> {
-  const { existsSync, readFileSync } = await import('node:fs');
-  for (const rel of ['.claude/settings.json', '.codex/hooks.json']) {
-    const path = `${ROOT}/${rel}`;
-    const content = existsSync(path) ? readFileSync(path, 'utf8') : '';
-    if (!content.includes('Stop') || !content.includes('stop-hook')) {
-      console.log(`  ${RED}⚠${RESET} Missing Stop hook wiring: ${rel}`);
-      continue;
-    }
-    console.log(`  ${GREEN}✓${RESET} Stop hook wiring (${rel})`);
+type JsonObject = Record<string, unknown>;
+
+function asObject(value: unknown): JsonObject | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as JsonObject)
+    : null;
+}
+
+function jsonObjectChild(data: JsonObject, key: string, label: string): JsonObject {
+  if (data[key] === undefined) data[key] = {};
+  const child = asObject(data[key]);
+  if (!child) throw new Error(`${label}:${key} must contain a JSON object`);
+  return child;
+}
+
+function jsonListChild(data: JsonObject, key: string, label: string): unknown[] {
+  if (data[key] === undefined) data[key] = [];
+  if (!Array.isArray(data[key])) throw new Error(`${label}:${key} must contain a JSON array`);
+  return data[key] as unknown[];
+}
+
+function isStopHookHandler(handler: unknown): boolean {
+  const obj = asObject(handler);
+  return obj !== null && obj.type === 'command' && typeof obj.command === 'string'
+    ? obj.command.includes('stop-hook')
+    : false;
+}
+
+async function gitHookPath(name: string): Promise<string> {
+  // Resolve via git so worktrees / core.hooksPath land in the right place. Strip
+  // GIT_* env so an ambient GIT_DIR from a parent process can't redirect us.
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined && !key.startsWith('GIT_')) env[key] = value;
   }
+  const proc = Bun.spawn(['git', 'rev-parse', '--git-path', `hooks/${name}`], {
+    cwd: ROOT,
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env,
+  });
+  const out = (await new Response(proc.stdout).text()).trim();
+  const code = await proc.exited;
+  const { isAbsolute, join } = await import('node:path');
+  if (code === 0 && out) return isAbsolute(out) ? out : join(ROOT, out);
+  return join(ROOT, '.git', 'hooks', name);
+}
+
+async function installGitHook(name: string): Promise<void> {
+  const { mkdirSync, writeFileSync, chmodSync } = await import('node:fs');
+  const { dirname } = await import('node:path');
+  const path = await gitHookPath(name);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `#!/bin/sh\nbun harness.ts ${name}\n`);
+  chmodSync(path, 0o755);
+}
+
+async function installStopHook(
+  rel: string,
+  hook: JsonObject,
+  claudeSettings = false,
+): Promise<void> {
+  // Inject/refresh the Stop hook, preserving every other hook. Idempotent: an
+  // existing stop-hook handler (current or legacy) is replaced and duplicates
+  // dropped, so re-running never accumulates entries.
+  const { existsSync, readFileSync, writeFileSync, mkdirSync } = await import('node:fs');
+  const { dirname } = await import('node:path');
+  const path = `${ROOT}/${rel}`;
+  let data: JsonObject = {};
+  if (existsSync(path)) {
+    const text = readFileSync(path, 'utf8').trim();
+    if (text) {
+      const parsed: unknown = JSON.parse(text);
+      const obj = asObject(parsed);
+      if (!obj) throw new Error(`${rel} must contain a JSON object`);
+      data = obj;
+    }
+  }
+  if (claudeSettings && !('$schema' in data)) data.$schema = CLAUDE_SETTINGS_SCHEMA;
+
+  const hooks = jsonObjectChild(data, 'hooks', rel);
+  const stopGroups = jsonListChild(hooks, 'Stop', rel);
+  let installed = false;
+  for (const group of stopGroups) {
+    const groupObj = asObject(group);
+    if (!groupObj || !Array.isArray(groupObj.hooks)) continue;
+    const next: unknown[] = [];
+    for (const handler of groupObj.hooks) {
+      if (isStopHookHandler(handler)) {
+        if (!installed) {
+          next.push({ ...hook });
+          installed = true;
+        }
+        continue;
+      }
+      next.push(handler);
+    }
+    groupObj.hooks = next;
+  }
+  if (!installed) stopGroups.push({ hooks: [{ ...hook }] });
+
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`);
 }
 
 function firstDiffLine(a: string, b: string): number {
@@ -932,15 +1041,11 @@ async function cmdPrePush(): Promise<void> {
 }
 
 async function cmdHooks(): Promise<void> {
-  const hookPath = `${ROOT}/.git/hooks/pre-commit`;
-  const hookDir = `${ROOT}/.git/hooks`;
-
-  const { mkdirSync, writeFileSync, chmodSync } = await import('node:fs');
-  mkdirSync(hookDir, { recursive: true });
-  writeFileSync(hookPath, '#!/bin/sh\nbun harness.ts pre-commit\n');
-  chmodSync(hookPath, 0o755);
-  console.log('Installed pre-commit hook');
-  await checkStopHookPresent();
+  await installGitHook('pre-commit');
+  await installGitHook('pre-push');
+  await installStopHook('.codex/hooks.json', CODEX_STOP_HOOK);
+  await installStopHook('.claude/settings.json', CLAUDE_STOP_HOOK, true);
+  console.log('Installed pre-commit, pre-push, and Claude/Codex Stop hooks');
 }
 
 async function cmdClean(): Promise<void> {
@@ -978,7 +1083,7 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
   'pre-push': [cmdPrePush, 'Read-only push gate: lint, acceptance, arch'],
   ci: [cmdCi, 'Lint + typecheck + audit + complexity + deadcode + acceptance + coverage + crap + arch'],
-  'setup-hooks': [cmdHooks, 'Install git pre-commit hook and verify stop-hook wiring'],
+  'setup-hooks': [cmdHooks, 'Install git pre-commit + pre-push hooks and Claude/Codex Stop wiring'],
   'post-edit': [cmdPostEdit, 'Format if source files changed'],
   'stop-hook': [cmdStopHook, 'Format changed files, then run stop-hook checks'],
   'agents-md-drift': [cmdAgentsMdDrift, 'Fail if AGENTS.md differs from CLAUDE.md'],
