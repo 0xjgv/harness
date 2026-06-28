@@ -175,11 +175,11 @@ setup: ## Install per-language deps (one-time)
 
 .PHONY: setup-hooks
 setup-hooks: ## Install root pre-commit + pre-push git hooks and verify Claude/Codex Stop hook wiring
-	@if ! git rev-parse --git-dir >/dev/null 2>&1; then \
+	@if ! env -u GIT_DIR -u GIT_WORK_TREE git rev-parse --git-dir >/dev/null 2>&1; then \
 	  printf "$(RED)Not a git repo.$(RESET) Run 'git init' first.\n"; exit 1; \
 	fi
 	@set -eu; for name in pre-commit pre-push; do \
-	  hook=$$(git rev-parse --git-path "hooks/$$name"); \
+	  hook=$$(env -u GIT_DIR -u GIT_WORK_TREE git rev-parse --git-path "hooks/$$name"); \
 	  mkdir -p "$$(dirname "$$hook")"; \
 	  printf '#!/bin/sh\nexec make %s\n' "$$name" > "$$hook"; \
 	  chmod +x "$$hook"; \

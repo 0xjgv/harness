@@ -23,7 +23,8 @@ paraphrase (it drifts). Two sections:
   check`, `acceptance`, `arch` over the whole pushed tree (the deterministic
   checks pre-commit and stop-hook skip). There is **no** `deadcode` target —
   rust's `dead_code` lint is on by default and `ci`'s strict clippy
-  (`-D warnings`) already denies unused functions, fields, and variants.
+  (`-D warnings`) already denies unused functions, fields, and variants;
+  unused dependencies surface via `cargo`'s own warnings (or `cargo-machete`).
   `crap` is advisory (warns by default, `--enforce` to hard-fail; joins
   lizard `--csv` with `target/llvm-cov/lcov.info`). Requires `uvx` on PATH
   for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,

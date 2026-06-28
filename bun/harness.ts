@@ -1036,7 +1036,11 @@ async function cmdPrePush(): Promise<void> {
   // pushed tree (after merges/rebases/--no-verify) before it leaves the machine.
   // Network (audit) and advisory (coverage/CRAP) gates stay in ci.
   console.log(`\n${BLUE}[pre-push]${RESET}\n`);
-  const gates: Gate[] = [lintGate(), ...(await acceptanceGatesOrWarn()), ...(await archGatesOrWarn())];
+  const gates: Gate[] = [
+    lintGate(),
+    ...(await acceptanceGatesOrWarn()),
+    ...(await archGatesOrWarn()),
+  ];
   if (!(await runGatesParallel(gates))) process.exit(1);
 }
 
@@ -1082,7 +1086,10 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   check: [cmdCheck, 'Full pre-flight: lockfile + fix + typecheck + tests'],
   'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
   'pre-push': [cmdPrePush, 'Read-only push gate: lint, acceptance, arch'],
-  ci: [cmdCi, 'Lint + typecheck + audit + complexity + deadcode + acceptance + coverage + crap + arch'],
+  ci: [
+    cmdCi,
+    'Lint + typecheck + audit + complexity + deadcode + acceptance + coverage + crap + arch',
+  ],
   'setup-hooks': [cmdHooks, 'Install git pre-commit + pre-push hooks and Claude/Codex Stop wiring'],
   'post-edit': [cmdPostEdit, 'Format if source files changed'],
   'stop-hook': [cmdStopHook, 'Format changed files, then run stop-hook checks'],

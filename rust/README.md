@@ -48,7 +48,7 @@ cargo harness ci                   # Full verification (see below)
 
 `pre-push` is the offline push gate — clippy, format check, acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
 
-Dead code needs no separate gate — rust's `dead_code` lint is on by default and the strict clippy (`-D warnings`) denies unused functions, fields, and variants.
+Dead code needs no separate gate — rust's `dead_code` lint is on by default and the strict clippy (`-D warnings`) denies unused functions, fields, and variants; unused dependencies surface via `cargo`'s own warnings (or `cargo-machete`).
 
 `cmd_coverage` runs the test suite under llvm-cov once and emits both the
 console summary (with the `--min=N` threshold check) and an LCOV file at

@@ -23,8 +23,9 @@ paraphrase (it drifts). Two sections:
   `arch` over the whole pushed tree (the deterministic checks pre-commit and
   stop-hook skip). There is **no** `deadcode` target — golangci-lint's
   `unused` linter (run by the `lint` gate) already flags unreachable
-  functions, vars, and types, and `x/tools/cmd/deadcode` only works on
-  programs with a `main` package, not this library template. `crap` is
+  functions, vars, and types, and `go mod tidy` prunes unused dependencies;
+  `x/tools/cmd/deadcode` only works on programs with a `main` package, not
+  this library template. `crap` is
   advisory (warns by default, `--enforce` to hard-fail). Requires `uvx` on
   PATH for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
   length≤100 — replaces the old gocyclo gate).
