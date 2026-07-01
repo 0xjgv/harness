@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# SessionStart hook: reinject the role block so it survives /clear, /compact, resume.
+# SessionStart hook: reinject the important contract blocks from CLAUDE.md.
 set -euo pipefail
-block="${CLAUDE_PROJECT_DIR:-$PWD}/.claude/scripts/role-block.md"
-[[ -f "$block" ]] && cat "$block"
+dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+claude="$dir/CLAUDE.md"
+[[ -f "$claude" ]] && awk '/<important/{p=1} p{print} /<\/important>/{p=0; print ""}' "$claude"
 exit 0

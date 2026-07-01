@@ -1,0 +1,4 @@
+suppressions.noqa 8
+suppressions.pyright_ignore 2
+suppressions.type_ignore 4
+coverage.min 0

@@ -44,7 +44,7 @@ cargo harness ci                   # Full verification (see below)
 
 ### `ci` pipeline
 
-`harness ci` runs the read-only gates — strict clippy (`-D warnings`), format check, complexity (lizard, CCN 15, args 8), acceptance (cucumber), arch (cargo-modules) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then runs dep audit, streams tests + coverage (cargo-llvm-cov, `--min=0` by default), and the advisory CRAP.
+`harness ci` runs the read-only gates — strict clippy (`-D warnings`), format check, complexity (lizard, CCN 15, args 8), acceptance (cucumber), arch (cargo-modules) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then runs dep audit, streams tests + coverage (cargo-llvm-cov, default threshold from `.harness-baseline`), and the advisory CRAP.
 
 `pre-push` is the offline push gate — clippy, format check, acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
 
@@ -81,6 +81,7 @@ cargo harness complexity           # lizard CCN gate (≤15, args≤8) over src 
 cargo harness coverage --min=80    # tests with coverage, fails below threshold
 cargo harness crap --max=30        # CRAP complexity × coverage gate (advisory)
 cargo harness crap --enforce       # …same, but hard-fail when offenders exist
+cargo harness suppressions         # suppression breakdown; --update-baseline with human sign-off
 cargo harness mutation             # cargo-mutants kill-rate (advisory)
 cargo harness arch                 # cargo-modules checks against arch.toml
 ```
@@ -139,7 +140,8 @@ Rust's module system.
 
 Day-1 defaults are deliberately loose so adopting this template does not fail existing projects:
 
-- `coverage --min=0` — raise over time as the suite matures.
+- `coverage --min=0` — explicit flags win; otherwise the default comes from `.harness-baseline` `coverage.min`.
+- `.harness-baseline` also ratchets suppression counts. New suppressions fail `check`; run `harness suppressions --update-baseline` only with human sign-off.
 - Complexity is gated at CCN 15 and args 8 via lizard; lower it once the codebase is clean.
 - CRAP is advisory (`crap --max=30` is the starting ceiling). Add `--enforce` to make it blocking once your team has paid down the existing offenders.
 - Mutation is advisory — enable as a blocking gate once a baseline kill-rate is established.

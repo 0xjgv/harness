@@ -1,0 +1,3 @@
+suppressions.allow 10
+suppressions.allow_crate 3
+coverage.min 0

@@ -2,7 +2,7 @@
 
 ## Commands
 
-- After edits: `go run harness.go check` — fix, format, lint, test, suppression report
+- After edits: `go run harness.go check` — fix, format, lint, test, suppression ratchet
 - Pre-commit: `go run harness.go pre-commit` — staged files only (auto via git hook)
 - Pre-push: `go run harness.go pre-push` — read-only push gate over the whole tree: lint (golangci-lint covers format), acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
 - CI: `go run harness.go ci` — read-only gates (lint, audit, complexity, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then test-cov (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
@@ -10,14 +10,22 @@
 - Deadcode: no separate target — golangci-lint's `unused` linter (run by `lint`/`ci`) already flags unreachable functions, vars, and types, and `go mod tidy` prunes unused dependencies. (`x/tools/cmd/deadcode` needs a `main` package; this template is a library.)
 - Audit: `go run harness.go audit` — audit dependencies for known vulnerabilities (via govulncheck)
 - Acceptance: `go run harness.go acceptance` — run godog against `features/`
-- Coverage: `go run harness.go test-cov` — tests with race detector + `coverage.out`
+- Coverage: `go run harness.go coverage` (alias: `test-cov`) — tests with race detector + `coverage.out`; default threshold comes from `.harness-baseline` `coverage.min`
 - Mutation (advisory): `go run harness.go mutation` — gremlins kill-rate on `./suppressions`
 - CRAP (advisory): `go run harness.go crap --max=30` — complexity × coverage gate. Add `--enforce` to exit 1 on offenders (default exits 0 with warning).
+- Suppressions: `go run harness.go suppressions` — full suppression breakdown; `--update-baseline` requires human sign-off and updates `.harness-baseline`
 - Arch: `go run harness.go arch` — go-arch-lint against `.go-arch-lint.yml`
 - Agents drift: `go run harness.go agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `go run harness.go sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
 - Setup: `go run harness.go setup-hooks` installs git pre-commit + pre-push hooks (path resolved via `git rev-parse`, worktree-safe) and idempotently installs the Claude/Codex Stop wiring
-- Stop hook: auto-formats/fixes changed files, then runs complexity and CRAP (`stop-hook`)
+- Stop hook: auto-formats/fixes changed files, then runs complexity (`stop-hook`)
+
+## Definition of done
+
+- `go run harness.go check` passes clean — never stop with check failing.
+- User-visible behavior change → a `.feature` scenario exists and acceptance passes.
+- No new suppressions: additions above `.harness-baseline` fail check; suppress only with the human's sign-off, stating why.
+- `pre-push`/`ci` are the human's gates: leave the tree in a state where they would pass, but do not commit or push yourself.
 
 ## Behavior contract
 

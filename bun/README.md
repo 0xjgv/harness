@@ -26,7 +26,7 @@ Every command above is also a `make` target — `make check`, `make ci`, `make p
 
 ### `ci` pipeline
 
-`harness ci` runs the read-only gates — lint + format check (biome), typecheck (tsc), dep audit (bun audit), complexity (lizard, CCN 15, args 8), deadcode (knip), acceptance (cucumber), arch (dependency-cruiser) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then streams coverage (`bun test --coverage`, `--min=0` by default) and the advisory crap.
+`harness ci` runs the read-only gates — lint + format check (biome), typecheck (tsc), dep audit (bun audit), complexity (lizard, CCN 15, args 8), deadcode (knip), acceptance (cucumber), arch (dependency-cruiser) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then streams coverage (`bun test --coverage`, default threshold from `.harness-baseline`) and the advisory crap.
 
 `pre-push` is the offline push gate — lint (biome covers format), acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
 
@@ -52,6 +52,7 @@ bun harness.ts deadcode            # knip (via bunx): unused files/exports/deps;
 bun run coverage --min=80          # tests with coverage, fails below threshold
 bun run mutation                   # Stryker mutation score on src/ (advisory)
 bun run crap --max=30              # CRAP = CCN² × (1-cov)³ + CCN per function (advisory)
+bun harness.ts suppressions        # suppression breakdown; --update-baseline with human sign-off
 bun run arch                       # dependency-cruiser against .dependency-cruiser.json
 ```
 
@@ -95,7 +96,8 @@ Hook scripts live in `.claude/scripts/`. Stop hooks are wired via
 
 Day-1 defaults are deliberately loose so adopting this template does not fail existing projects:
 
-- `coverage --min=0` — raise over time.
+- `coverage --min=0` — explicit flags win; otherwise the default comes from `.harness-baseline` `coverage.min`.
+- `.harness-baseline` also ratchets suppression counts. New suppressions fail `check`; run `harness suppressions --update-baseline` only with human sign-off.
 - `harness test`, coverage, mutation, and CRAP warn and skip when no test files exist.
 - CRAP is advisory in `ci`; pass `--enforce` when you are ready to block on it.
 - Mutation is advisory — enable as a blocking gate once a baseline is established.

@@ -39,8 +39,8 @@ Always read first. Do not restate the contract from memory.
 - `~/Code/harness-templates/<lang>/.codex/hooks.json` — Codex Stop hook
 - `~/Code/harness-templates/<lang>/.codex/hooks/codex-stop-hook.sh` —
   Codex stdout-to-JSON wrapper for Stop hooks
-- `~/Code/harness-templates/<lang>/.claude/scripts/` — hook scripts and
-  `role-block.md` (the contract text)
+- `~/Code/harness-templates/<lang>/.claude/scripts/` — hook scripts; SessionStart
+  extracts the contract text from `CLAUDE.md`
 - `~/Code/harness-templates/python/harness.py` `run()` — canonical quiet output
 
 Never edit anything under `~/Code/harness-templates/`.
@@ -69,23 +69,23 @@ Never edit anything under `~/Code/harness-templates/`.
 Claude/Codex hook + Stop-hook shape: [reference-settings-json.md](reference-settings-json.md).
 The Stop hook runs `stop-hook`; `stop-hook` runs `post-edit`, then the
 read-only complexity gate (plus the dead-code gate where the language ships
-one) in parallel, then advisory CRAP.
+one) in parallel.
 Behavior contract: [reference-behavior-contract.md](reference-behavior-contract.md).
 
 ## Layer 1 — the 5-script contract
 
 | Script | When | What | Fixes? |
 |---|---|---|---|
-| `check` | After edits | fix + format + typecheck + test + suppression report | yes |
+| `check` | After edits | fix + format + typecheck + test + suppression ratchet | yes |
 | `pre-commit` | Git pre-commit hook | same, staged files only | yes |
 | `pre-push` | Before push | read-only push gate: lint + format check + acceptance + arch over the whole tree, in parallel | no |
 | `ci` | CI pipeline | read-only gates (lint + typecheck + dep audit + complexity + acceptance + arch) **run in parallel**, captured and printed in submission order; then tests/coverage + crap (advisory) | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
 | `post-edit` | Stop hook helper | format if source files changed | yes |
-| `stop-hook` | Agent Stop hook | post-edit + complexity + deadcode (python/bun) + crap (advisory) | yes |
+| `stop-hook` | Agent Stop hook | post-edit + complexity + deadcode (python/bun) | yes |
 
 Quality subcommands also callable standalone: `complexity`, `crap`,
-`acceptance`, `coverage` (Go: `test-cov`), `mutation`, `arch`, and
+`acceptance`, `coverage` (Go also keeps `test-cov`), `mutation`, `arch`, `suppressions`, and
 `deadcode` (python/bun). `deadcode` flags unused code and runs in `ci` +
 `stop-hook`: python via vulture (app sources only, `--min-confidence 60`,
 allowlist false positives in `vulture_allowlist.py`), bun via knip (unused
@@ -97,10 +97,12 @@ targets when no `tests/test*.py` files exist. Bun `test`, `coverage`, `mutation`
 `crap` warn and skip when no Bun test files exist. `complexity` runs
 `uvx lizard@1.22.2` (CCN≤15, args≤8, length≤100) — all 4 templates, so
 `uvx` must be on PATH. `crap` is **advisory by default** (warns; pass
-`--enforce` to hard-fail) and runs in `ci` and `stop-hook`.
+`--enforce` to hard-fail) and runs in `ci`.
 
-Suppression report (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`) is
-**report-only** — never affects exit code.
+Suppression counts (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`) are
+ratcheted by `.harness-baseline`. Growth fails `check`/`ci`; the only writer is
+`suppressions --update-baseline`, which requires human sign-off. `coverage.min`
+in the same file is the default coverage floor unless `--min=N` is passed.
 
 Property-based tests run inside the normal `test` step — no extra script.
 Each template carries the language's PBT dev-dep (hypothesis / fast-check /
@@ -115,13 +117,13 @@ Greenfield copies inherit it via `.claude/`. For an existing repo, wire it
 [reference-behavior-contract.md](reference-behavior-contract.md). In short:
 
 - `.claude/scripts/` + `.claude/settings.json` add four hooks around
-  `stop-hook`: reinject a role block each session, capture commit/edit
+  `stop-hook`: reinject the `<important>` blocks from `CLAUDE.md` each session, capture commit/edit
   intent from the user's prompt, deny unauthorized `git commit`/`push`,
   deny unauthorized arch-config edits.
 - `AGENTS.md` and `CLAUDE.md` both carry the `## Behavior contract`
   section. The two files hold the same content (the templates'
-  `agents-md-drift` check enforces no drift); `role-block.md` must stay
-  in sync with that text.
+  `agents-md-drift` check enforces no drift). SessionStart extracts the contract
+  from `CLAUDE.md`, so there is no third copy to sync.
 
 Hook denials require Claude Code's hook runtime; the contract text in
 `AGENTS.md`/`CLAUDE.md` applies as instruction to any agent reading the
@@ -174,7 +176,7 @@ Layer 1:
 4. `audit` passes.
 5. `stop-hook` runs via Stop hook and includes post-edit formatting (Claude/Codex hooks wired per
    [reference-settings-json.md](reference-settings-json.md)).
-6. Suppression report exits 0 regardless of count.
+6. Suppression growth above `.harness-baseline` fails; `suppressions --update-baseline` updates it.
 7. Runner imports nothing outside stdlib/runtime.
 
 Layer 2 (only if wired):

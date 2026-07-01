@@ -16,7 +16,7 @@ applies as instruction to any agent reading the file.
 Two cases:
 
 - **Layer 1 only** — Claude and Codex `Stop` hooks run `stop-hook`, which
-  auto-formats, then runs complexity and advisory CRAP.
+  auto-formats, then runs complexity (+ deadcode where shipped).
 - **Layer 1 + Layer 2** — Claude gets all five hooks (the behavior contract;
   see [reference-behavior-contract.md](reference-behavior-contract.md)).
   Codex still gets the Stop hook through `.codex/hooks.json`.

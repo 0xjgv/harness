@@ -28,6 +28,8 @@ const RED: &str = "\x1b[31m";
 const BLUE: &str = "\x1b[34m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
+const BASELINE_FILE: &str = ".harness-baseline";
+const SUPPRESSION_BASELINE_PREFIX: &str = "suppressions.";
 
 // ── Runner ──────────────────────────────────────────────────────────
 
@@ -141,11 +143,22 @@ struct Gate {
     description: &'static str,
     cmd: Vec<String>,
     extract: Option<fn(&str) -> Option<String>>,
+    hint: Option<&'static str>,
 }
 
 impl Gate {
     fn new(description: &'static str, cmd: &[&str]) -> Self {
-        Self { description, cmd: cmd.iter().map(|&s| s.to_string()).collect(), extract: None }
+        Self {
+            description,
+            cmd: cmd.iter().map(|&s| s.to_string()).collect(),
+            extract: None,
+            hint: None,
+        }
+    }
+
+    const fn with_hint(mut self, hint: &'static str) -> Self {
+        self.hint = Some(hint);
+        self
     }
 }
 
@@ -156,6 +169,7 @@ struct GateResult {
     exit_code: i32,
     output: String,
     detail: Option<String>,
+    hint: Option<&'static str>,
 }
 
 /// Run a gate's command with output captured (no printing, no exit): the
@@ -185,6 +199,7 @@ fn run_capture(gate: &Gate) -> GateResult {
                 exit_code: output.status.code().unwrap_or(1),
                 output: combined,
                 detail,
+                hint: gate.hint,
             }
         }
         Err(e) => GateResult {
@@ -194,6 +209,7 @@ fn run_capture(gate: &Gate) -> GateResult {
             exit_code: 1,
             output: format!("Failed to execute {program}: {e}"),
             detail: None,
+            hint: gate.hint,
         },
     }
 }
@@ -215,6 +231,9 @@ fn print_gate_result(result: &GateResult, no_exit: bool) -> bool {
     println!("  {RED}\u{2717}{RESET} {}", result.description);
     if !is_verbose() && !result.output.is_empty() {
         print!("{}", result.output);
+    }
+    if let Some(hint) = result.hint {
+        println!("  ↳ fix: {hint}");
     }
     if !no_exit {
         std::process::exit(result.exit_code);
@@ -296,6 +315,13 @@ const SUPPRESSION_PREFIXES: &[(&str, &str)] =
 
 type SuppressionCounts = BTreeMap<String, Vec<Vec<String>>>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SuppressionFinding {
+    kind: String,
+    rules: Vec<String>,
+    location: String,
+}
+
 fn parse_line_for_suppressions(line: &str) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
     for (kind, prefix) in SUPPRESSION_PREFIXES {
@@ -315,25 +341,29 @@ fn parse_line_for_suppressions(line: &str) -> Vec<(String, Vec<String>)> {
     out
 }
 
-fn scan_rs_file(path: &Path, results: &mut SuppressionCounts) {
+fn scan_rs_file(path: &Path, findings: &mut Vec<SuppressionFinding>) {
     if path.extension().is_none_or(|e| e != "rs") {
         return;
     }
     let Ok(text) = fs::read_to_string(path) else {
         return;
     };
-    for line in text.lines() {
+    for (index, line) in text.lines().enumerate() {
         for (kind, rules) in parse_line_for_suppressions(line) {
-            results.entry(kind).or_default().push(rules);
+            findings.push(SuppressionFinding {
+                kind,
+                rules,
+                location: format!("{}:{}", path.display(), index + 1),
+            });
         }
     }
 }
 
-fn scan_suppressions(roots: &[PathBuf]) -> SuppressionCounts {
-    let mut results: SuppressionCounts = BTreeMap::new();
+fn scan_suppression_findings(roots: &[PathBuf]) -> Vec<SuppressionFinding> {
+    let mut findings = Vec::new();
     for root_path in roots {
         if root_path.is_file() {
-            scan_rs_file(root_path, &mut results);
+            scan_rs_file(root_path, &mut findings);
             continue;
         }
         let mut stack = vec![root_path.clone()];
@@ -347,27 +377,89 @@ fn scan_suppressions(roots: &[PathBuf]) -> SuppressionCounts {
                 if ft.is_dir() {
                     stack.push(path);
                 } else {
-                    scan_rs_file(&path, &mut results);
+                    scan_rs_file(&path, &mut findings);
                 }
             }
         }
     }
+    findings
+}
+
+fn bucket_suppressions(findings: &[SuppressionFinding]) -> SuppressionCounts {
+    let mut results: SuppressionCounts = BTreeMap::new();
+    for finding in findings {
+        results.entry(finding.kind.clone()).or_default().push(finding.rules.clone());
+    }
     results
+}
+
+#[cfg(test)]
+fn scan_suppressions(roots: &[PathBuf]) -> SuppressionCounts {
+    bucket_suppressions(&scan_suppression_findings(roots))
 }
 
 fn default_suppression_roots() -> Vec<PathBuf> {
     vec![root().join("src"), root().join("tests"), root().join("harness.rs")]
 }
 
-fn print_suppressions_report() {
-    let results = scan_suppressions(&default_suppression_roots());
+fn suppression_counts(results: &SuppressionCounts) -> BTreeMap<String, u32> {
+    results
+        .iter()
+        .map(|(kind, entries)| {
+            (
+                format!("{SUPPRESSION_BASELINE_PREFIX}{kind}"),
+                u32::try_from(entries.len()).unwrap_or(u32::MAX),
+            )
+        })
+        .collect()
+}
+
+fn parse_baseline_str(text: &str) -> BTreeMap<String, u32> {
+    let mut values = BTreeMap::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let (Some(key), Some(value), None) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(parsed) = value.parse::<u32>() else { continue };
+        values.insert(key.to_string(), parsed);
+    }
+    values
+}
+
+fn read_baseline() -> Option<BTreeMap<String, u32>> {
+    let text = fs::read_to_string(root().join(BASELINE_FILE)).ok()?;
+    Some(parse_baseline_str(&text))
+}
+
+fn coverage_min_default() -> u32 {
+    if let Some(value) = arg_value("--min").and_then(|v| v.parse::<u32>().ok()) {
+        return value;
+    }
+    read_baseline().and_then(|b| b.get("coverage.min").copied()).unwrap_or(0)
+}
+
+fn write_baseline(results: &SuppressionCounts) -> std::io::Result<()> {
+    let coverage_min = read_baseline().and_then(|b| b.get("coverage.min").copied()).unwrap_or(0);
+    let counts = suppression_counts(results);
+    let mut lines: Vec<String> =
+        counts.iter().map(|(key, count)| format!("{key} {count}")).collect();
+    lines.push(format!("coverage.min {coverage_min}"));
+    fs::write(root().join(BASELINE_FILE), format!("{}\n", lines.join("\n")))
+}
+
+fn print_suppressions_breakdown(results: &SuppressionCounts) {
     let total: usize = results.values().map(Vec::len).sum();
     println!("\n=== Suppressions ===\n");
     println!("Suppressions: {total} total");
     if total == 0 {
         return;
     }
-    for (kind, entries) in &results {
+    for (kind, entries) in results {
         println!("  {}: {}", kind, entries.len());
         let mut rule_counts: HashMap<String, u32> = HashMap::new();
         for rules in entries {
@@ -380,6 +472,80 @@ fn print_suppressions_report() {
         for (rule, count) in sorted.into_iter().take(10) {
             println!("    {rule}: {count}");
         }
+    }
+}
+
+fn check_suppressions_baseline(no_exit: bool) -> bool {
+    let findings = scan_suppression_findings(&default_suppression_roots());
+    let results = bucket_suppressions(&findings);
+    let current = suppression_counts(&results);
+    let Some(baseline) = read_baseline() else {
+        print_suppressions_breakdown(&results);
+        println!("  {GREEN}\u{26a0}{RESET} Suppressions are report-only: no {BASELINE_FILE} found");
+        println!("  ↳ fix: run `cargo harness suppressions --update-baseline` to start ratcheting");
+        return true;
+    };
+
+    let total: u32 = current.values().sum();
+    let baseline_total: u32 = baseline
+        .iter()
+        .filter(|(key, _)| key.starts_with(SUPPRESSION_BASELINE_PREFIX))
+        .map(|(_, count)| count)
+        .sum();
+    let grown: Vec<(&String, &u32)> = current
+        .iter()
+        .filter(|(key, count)| **count > baseline.get(*key).copied().unwrap_or(0))
+        .collect();
+    if grown.is_empty() {
+        let suffix = if total < baseline_total {
+            " — run `cargo harness suppressions --update-baseline` to ratchet down"
+        } else {
+            ""
+        };
+        println!(
+            "  {GREEN}\u{2713}{RESET} Suppressions: {total} (baseline {baseline_total}){suffix}"
+        );
+        return true;
+    }
+
+    let mut locations: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for finding in &findings {
+        locations.entry(&finding.kind).or_default().push(&finding.location);
+    }
+    println!("  {RED}\u{2717}{RESET} Suppressions grew: {total} (baseline {baseline_total})");
+    for (key, count) in grown {
+        let kind = key.trim_start_matches(SUPPRESSION_BASELINE_PREFIX);
+        println!("    {kind}: {count} > {}", baseline.get(key).copied().unwrap_or(0));
+        if let Some(kind_locations) = locations.get(kind) {
+            for location in kind_locations.iter().take(10) {
+                println!("      {location}");
+            }
+        }
+    }
+    println!(
+        "  ↳ fix: fix it, or with human sign-off: `cargo harness suppressions --update-baseline`"
+    );
+    if !no_exit {
+        std::process::exit(1);
+    }
+    false
+}
+
+fn cmd_suppressions() {
+    let findings = scan_suppression_findings(&default_suppression_roots());
+    let results = bucket_suppressions(&findings);
+    if arg_flag("--update-baseline") {
+        if let Err(e) = write_baseline(&results) {
+            println!("  {RED}\u{2717}{RESET} {BASELINE_FILE}: {e}");
+            std::process::exit(1);
+        }
+        let total: usize = results.values().map(Vec::len).sum();
+        println!("  {GREEN}\u{2713}{RESET} {BASELINE_FILE}: suppressions baseline set to {total}");
+        return;
+    }
+    print_suppressions_breakdown(&results);
+    if !check_suppressions_baseline(true) {
+        std::process::exit(1);
     }
 }
 
@@ -452,10 +618,11 @@ fn cmd_lint() {
 /// `cmd_lint` stays lenient so a warning does not block an in-progress edit loop.)
 fn lint_gate() -> Gate {
     Gate::new("Clippy (strict)", &["cargo", "clippy", "--", "-D", "warnings"])
+        .with_hint("run `cargo harness fix`")
 }
 
 fn format_check_gate() -> Gate {
-    Gate::new("Format check", &["cargo", "fmt", "--check"])
+    Gate::new("Format check", &["cargo", "fmt", "--check"]).with_hint("run `cargo fmt`")
 }
 
 fn cmd_test() {
@@ -480,12 +647,16 @@ fn cmd_audit_inner(strict: bool) -> bool {
         .is_ok_and(|s| s.success());
 
     if installed {
-        return run(
+        let result = run(
             "Dep audit",
             &["cargo", "audit"],
             Some(&RunOpts { no_exit: strict, ..RunOpts::default() }),
         )
         .ok;
+        if !result {
+            println!("  ↳ fix: bump the vulnerable dependency or escalate");
+        }
+        return result;
     }
     if strict {
         println!("  {RED}\u{2717}{RESET} Dep audit (cargo-audit not installed)");
@@ -506,7 +677,6 @@ fn cmd_stop_hook() {
     println!("\n=== Stop Hook Checks ===\n");
     cmd_post_edit(); // mutating — sequential, first
     let all_ok = run_gates_parallel(&[complexity_gate()]); // read-only batch
-    cmd_crap(); // streaming advisory — after the batch
     if !all_ok {
         std::process::exit(1);
     }
@@ -527,7 +697,10 @@ fn acceptance_gates_or_warn() -> Vec<Gate> {
         );
         return Vec::new();
     }
-    vec![Gate::new("Acceptance (cucumber)", &["cargo", "test", "--test", "acceptance", "--quiet"])]
+    vec![
+        Gate::new("Acceptance (cucumber)", &["cargo", "test", "--test", "acceptance", "--quiet"])
+            .with_hint("align implementation with the `.feature`, not vice versa"),
+    ]
 }
 
 fn cmd_acceptance() {
@@ -564,7 +737,7 @@ fn has_feature_files(dir: &Path) -> bool {
 /// reports from the cached profdata: an LCOV file (consumed by `cmd_crap` to
 /// avoid a second test run) and a console summary with the threshold check.
 fn cmd_coverage() {
-    let min_pct = arg_value("--min").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+    let min_pct = coverage_min_default();
 
     if !tool_installed("llvm-cov") {
         println!("  {DIM}\u{2298} Coverage skipped (install: cargo install cargo-llvm-cov){RESET}");
@@ -673,8 +846,13 @@ fn arch_gates_or_warn() -> Vec<Gate> {
         Gate::new(
             "Arch: no module cycles",
             &["cargo", "modules", "dependencies", "--lib", "--no-externs", "--acyclic"],
+        )
+        .with_hint(
+            "boundary crossed; surface the design decision to the human; don't edit arch config",
         ),
-        Gate::new("Arch: no orphan files", &["cargo", "modules", "orphans", "--lib"]),
+        Gate::new("Arch: no orphan files", &["cargo", "modules", "orphans", "--lib"]).with_hint(
+            "boundary crossed; surface the design decision to the human; don't edit arch config",
+        ),
     ]
 }
 
@@ -705,6 +883,7 @@ fn complexity_gate() -> Gate {
             "0",
         ],
     )
+    .with_hint("extract helpers or flatten branches until CCN <= 15; do not raise the threshold")
 }
 
 fn cmd_complexity() {
@@ -1070,7 +1249,7 @@ fn cmd_check() {
     let start = Instant::now();
     println!("\n{BLUE}[check]{RESET} Running pre-flight checks...\n");
 
-    let results = [
+    let mut results = vec![
         run(
             "Clippy fix",
             &["cargo", "clippy", "--fix", "--allow-dirty", "--allow-staged"],
@@ -1090,7 +1269,7 @@ fn cmd_check() {
     ];
 
     check_hooks_present();
-    print_suppressions_report();
+    results.push(RunResult { ok: check_suppressions_baseline(true), output: String::new() });
 
     let elapsed = start.elapsed().as_secs_f64();
     let passed = results.iter().filter(|r| r.ok).count();
@@ -1137,7 +1316,8 @@ fn cmd_ci() {
     .ok;
     cmd_coverage();
     cmd_crap();
-    if !batch_ok || !audit_ok || !tests_ok {
+    let suppressions_ok = check_suppressions_baseline(true);
+    if !batch_ok || !audit_ok || !tests_ok || !suppressions_ok {
         std::process::exit(1);
     }
 }
@@ -1260,6 +1440,7 @@ const COMMANDS: &[(&str, fn())] = &[
     ("arch", cmd_arch),
     ("complexity", cmd_complexity),
     ("crap", cmd_crap),
+    ("suppressions", cmd_suppressions),
     ("pre-commit", cmd_pre_commit),
     ("pre-push", cmd_pre_push),
     ("ci", cmd_ci),
@@ -1399,6 +1580,31 @@ mod tests {
         let map = parse_lcov_str(input);
         assert_eq!(map.get("src/foo.rs"), Some(&HashMap::from([(1, 3), (2, 0), (5, 1)])));
         assert_eq!(map.get("src/bar.rs"), Some(&HashMap::from([(10, 7)])));
+    }
+
+    #[test]
+    fn parse_lizard_csv_row_extracts_location_field() {
+        let row =
+            r#"7,16,45,2,20,"risky@12-31@src/lib.rs",src/lib.rs,risky,"fn risky(a, b)",12,31"#;
+        assert_eq!(
+            parse_lizard_csv_row(row),
+            Some((16, "risky".to_string(), 12, 31, "src/lib.rs".to_string())),
+        );
+    }
+
+    #[test]
+    fn parse_lizard_csv_row_skips_malformed_rows() {
+        assert_eq!(parse_lizard_csv_row("not,csv"), None);
+    }
+
+    #[test]
+    fn parse_baseline_str_reads_key_values() {
+        let parsed = parse_baseline_str(
+            "\n# comment\nsuppressions.allow 2\ncoverage.min 50\nmalformed\nbad nope\n",
+        );
+        assert_eq!(parsed.get("suppressions.allow"), Some(&2));
+        assert_eq!(parsed.get("coverage.min"), Some(&50));
+        assert!(!parsed.contains_key("bad"));
     }
 
     #[test]

@@ -23,7 +23,7 @@ Every template must follow the same conventions. Use an existing template (e.g. 
 - [ ] Include **security-focused lint rules** enabled in the linter config
 - [ ] Include a **dependency audit** command (`audit`) wired into `ci`
 - [ ] Include a **post-edit** command that formats changed source files (non-blocking)
-- [ ] Include a **stop-hook** command that runs post-edit, complexity, and advisory CRAP
+- [ ] Include a **stop-hook** command that runs post-edit, then complexity (+ deadcode where shipped)
 - [ ] Include **`.claude/settings.json`** and **`.codex/hooks.json`** with Stop hooks for stop-hook
 - [ ] Include at least one **smoke test**
 - [ ] Add the template to the root `README.md` tables (Available Templates, Getting Started)

@@ -2,7 +2,7 @@
 
 ## Commands
 
-- After edits: `cargo harness check` — fix, format, lint, test, suppression report
+- After edits: `cargo harness check` — fix, format, lint, test, suppression ratchet
 - Pre-commit: `cargo harness pre-commit` — staged files only (auto via git hook)
 - Pre-push: `cargo harness pre-push` — read-only push gate over the whole tree: clippy, format check, acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
 - CI: `cargo harness ci` — read-only gates (clippy, format check, complexity, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then audit, tests + coverage (stream), crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
@@ -11,13 +11,21 @@
 - CRAP (advisory): `cargo harness crap --max=30` — complexity × coverage gate (joins lizard --csv with `target/llvm-cov/lcov.info`). Add `--enforce` to exit 1 on offenders (default exits 0 with warning).
 - Audit: `cargo harness audit` — audit dependencies for known vulnerabilities (via cargo-audit)
 - Acceptance: `cargo harness acceptance` — run cucumber against `tests/features/`
-- Coverage: `cargo harness coverage --min=0` — cargo-llvm-cov line coverage with threshold
+- Coverage: `cargo harness coverage --min=0` — cargo-llvm-cov line coverage with threshold; default comes from `.harness-baseline` `coverage.min`
 - Mutation (advisory): `cargo harness mutation` — cargo-mutants kill-rate on the crate
+- Suppressions: `cargo harness suppressions` — full suppression breakdown; `--update-baseline` requires human sign-off and updates `.harness-baseline`
 - Arch: `cargo harness arch` — cargo-modules checks against `arch.toml`
 - Agents drift: `cargo harness agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `cargo harness sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
 - Setup: `cargo harness setup-hooks` installs git pre-commit + pre-push hooks (path resolved via `git rev-parse`, worktree-safe) and verifies the Claude/Codex Stop wiring (the runner is std-only — it checks rather than rewrites JSON that carries other hooks; copy the template's `.claude`/`.codex` if it warns)
-- Stop hook: auto-formats/fixes changed files, then runs complexity and CRAP (`stop-hook`)
+- Stop hook: auto-formats/fixes changed files, then runs complexity (`stop-hook`)
+
+## Definition of done
+
+- `cargo harness check` passes clean — never stop with check failing.
+- User-visible behavior change → a `.feature` scenario exists and acceptance passes.
+- No new suppressions: additions above `.harness-baseline` fail check; suppress only with the human's sign-off, stating why.
+- `pre-push`/`ci` are the human's gates: leave the tree in a state where they would pass, but do not commit or push yourself.
 
 ## Behavior contract
 

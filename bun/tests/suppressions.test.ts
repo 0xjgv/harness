@@ -2,7 +2,12 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseLineForSuppressions, scanSuppressions } from '../harness';
+import {
+  coverageMinDefault,
+  parseLineForSuppressions,
+  readBaseline,
+  scanSuppressions,
+} from '../harness';
 
 describe('parseLineForSuppressions', () => {
   test('plain code returns no matches', () => {
@@ -75,5 +80,39 @@ describe('scanSuppressions', () => {
     expect(results['ts-ignore']).toHaveLength(1);
     expect(results['eslint-disable']).toEqual([['no-unused-vars']]);
     expect(results['biome-ignore']).toEqual([['lint/style/useSingleVarDeclarator']]);
+  });
+});
+
+describe('baseline helpers', () => {
+  const baselineRoots: string[] = [];
+
+  afterAll(() => {
+    for (const root of baselineRoots) rmSync(root, { recursive: true, force: true });
+  });
+
+  test('readBaseline parses key value lines', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bun-baseline-'));
+    baselineRoots.push(root);
+    writeFileSync(join(root, '.harness-baseline'), 'suppressions.ts-ignore 2\ncoverage.min 70\n');
+
+    expect(await readBaseline(root)).toEqual({
+      'suppressions.ts-ignore': 2,
+      'coverage.min': 70,
+    });
+  });
+
+  test('coverageMinDefault uses flag before baseline', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bun-baseline-'));
+    baselineRoots.push(root);
+    writeFileSync(join(root, '.harness-baseline'), 'coverage.min 60\n');
+    const originalArgv = process.argv;
+    try {
+      process.argv = ['bun', 'harness.ts', 'coverage'];
+      expect(await coverageMinDefault(root)).toBe(60);
+      process.argv = ['bun', 'harness.ts', 'coverage', '--min=10'];
+      expect(await coverageMinDefault(root)).toBe(10);
+    } finally {
+      process.argv = originalArgv;
+    }
   });
 });

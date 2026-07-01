@@ -13,7 +13,7 @@ paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
   quality subcommands `complexity`, `acceptance`, `coverage`, `mutation`,
-  `crap`, `arch`, and the drift pair `agents-md-drift` / `sync-agents-md`
+  `crap`, `arch`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
   (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
   fail on drift). `ci` runs the read-only gates (`clippy`, `format check`,
   `complexity`, `acceptance`, `arch`) **in parallel** — captured and
@@ -26,7 +26,8 @@ paraphrase (it drifts). Two sections:
   (`-D warnings`) already denies unused functions, fields, and variants;
   unused dependencies surface via `cargo`'s own warnings (or `cargo-machete`).
   `crap` is advisory (warns by default, `--enforce` to hard-fail; joins
-  lizard `--csv` with `target/llvm-cov/lcov.info`). Requires `uvx` on PATH
+  lizard `--csv` with `target/llvm-cov/lcov.info`). Suppressions are ratcheted
+  by `.harness-baseline`; `coverage.min` in the same file is the default coverage floor. Requires `uvx` on PATH
   for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
   length≤100).
 - `## Behavior contract` — Layer 2; see

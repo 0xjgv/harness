@@ -31,7 +31,7 @@ make check-api      # scope to one subproject
 | Target | What it does |
 |---|---|
 | `make` / `make help` | Show help + detected subprojects |
-| `make check` | Run `check` across all subprojects (auto-fix) |
+| `make check` | Run `check` across all subprojects (auto-fix + suppression ratchet) |
 | `make check-<name>` | Run `check` in one subproject (tab-complete via help) |
 | `make check-dirty` | Run `check` only in subprojects with working-tree changes |
 | `make pre-commit` | Run `pre-commit` only in subprojects with staged files |

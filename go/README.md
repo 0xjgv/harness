@@ -35,20 +35,21 @@ go run harness.go setup-hooks
 
 | Script | When | What it does | Fixes code? |
 |---|---|---|---|
-| `go run harness.go check` | After edits | Fix, format, lint, test | Yes |
+| `go run harness.go check` | After edits | Fix, format, lint, test, suppression ratchet | Yes |
 | `go run harness.go pre-commit` | Git hook | Staged files only | Yes |
 | `go run harness.go pre-push` | Git pre-push hook | Read-only push gate: lint, acceptance, arch over the whole tree | No |
 | `go run harness.go ci` | CI pipeline | Read-only verification (see below) | No |
 | `go run harness.go audit` | CI pipeline | Dependency vulnerability audit | No |
 | `go run harness.go post-edit` | Stop hook helper | Format if source files changed | No |
-| `go run harness.go stop-hook` | Stop hook entrypoint | Format/fix changed files, then run complexity and advisory CRAP | Yes |
+| `go run harness.go stop-hook` | Stop hook entrypoint | Format/fix changed files, then run complexity | Yes |
 
 ### `ci` pipeline
 
 `harness ci` runs the read-only gates — lint, dep audit, complexity (lizard, CCN 15,
 args 8), acceptance (godog), arch (go-arch-lint) — **in parallel**: each is captured
 and printed in submission order, and the batch runs to completion so one pass surfaces
-every failure. It then streams coverage (`go test -race -coverprofile`) and the
+every failure. It then streams coverage (`go test -race -coverprofile`, default
+threshold from `.harness-baseline`) and the
 advisory CRAP.
 
 `pre-push` is the offline push gate — lint (golangci-lint covers format), acceptance,
@@ -85,13 +86,14 @@ Every command is also a `make` target — `make check`, `make ci`, `make pre-pus
 | `go run harness.go fix` | Fix lint errors + format code |
 | `go run harness.go lint` | Lint + format check (read-only) |
 | `go run harness.go test` | Run tests |
-| `go run harness.go test-cov` | Run tests with race detector + coverage |
+| `go run harness.go coverage` / `test-cov` | Run tests with race detector + coverage |
 | `go run harness.go audit` | Audit dependencies for known vulnerabilities |
 | `go run harness.go complexity` | Cyclomatic complexity gate (lizard, CCN 15, args 8; excludes `_test.go` + `harness.go`) |
 | `go run harness.go acceptance` | Run acceptance scenarios (godog) against `features/` |
 | `go run harness.go arch` | Architecture checks (go-arch-lint) |
 | `go run harness.go mutation` | Mutation testing (gremlins, advisory) |
 | `go run harness.go crap` | CRAP complexity × coverage gate (advisory) |
+| `go run harness.go suppressions` | Suppression breakdown; `--update-baseline` with human sign-off |
 | `go run harness.go pre-commit` | Staged checks + tests |
 | `go run harness.go pre-push` | Read-only push gate: lint, acceptance, arch |
 | `go run harness.go ci` | Full verification pipeline |
@@ -130,6 +132,8 @@ Day-1 defaults are deliberately loose so adopting this template does not fail ex
 
 - Complexity is gated at CCN 15 and args 8 (lizard + golangci-lint's `gocyclo`); lower it once the codebase is clean.
 - Acceptance ships one smoke `.feature`; an empty `features/` dir warns and passes. Add real scenarios.
+- `coverage --min=0` — explicit flags win; otherwise the default comes from `.harness-baseline` `coverage.min`.
+- `.harness-baseline` also ratchets suppression counts. New suppressions fail `check`; run `harness suppressions --update-baseline` only with human sign-off.
 - Mutation / CRAP are advisory — enable as blocking gates once baselines are established.
 - `crap --max=30` is the starting ceiling; tighten it as coverage rises.
 - `.go-arch-lint.yml` ships with one starter rule (the sample `suppressions` package is a leaf — it may not import other project components). Extend the component graph as the module grows.

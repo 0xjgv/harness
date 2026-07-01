@@ -10,6 +10,8 @@ import (
 )
 
 const ruleErrcheck = "errcheck"
+const ruleFoo = "FOO"
+const ruleConstAssign = "CONST_ASSIGN"
 
 func TestParseLine(t *testing.T) {
 	tests := []struct {
@@ -35,7 +37,7 @@ func TestParseLine(t *testing.T) {
 		{
 			name: "lint ignore with rule",
 			line: "const Foo = 1 // lint:ignore CONST_ASSIGN",
-			want: []Match{{Kind: kindLintIgnore, Rules: []string{"CONST_ASSIGN"}}},
+			want: []Match{{Kind: kindLintIgnore, Rules: []string{ruleConstAssign}}},
 		},
 		{
 			name: "nolint with whitespace in rules",
@@ -47,7 +49,7 @@ func TestParseLine(t *testing.T) {
 			line: "x := 1 // nolint: errcheck // lint:ignore FOO",
 			want: []Match{
 				{Kind: kindNolint, Rules: []string{ruleErrcheck}},
-				{Kind: kindLintIgnore, Rules: []string{"FOO"}},
+				{Kind: kindLintIgnore, Rules: []string{ruleFoo}},
 			},
 		},
 	}
@@ -86,7 +88,7 @@ func TestScan(t *testing.T) {
 		t.Errorf("results[nolint] = %+v, want %+v", results[kindNolint], wantNolint)
 	}
 
-	wantLintIgnore := [][]string{{"CONST_ASSIGN"}}
+	wantLintIgnore := [][]string{{ruleConstAssign}}
 	if !reflect.DeepEqual(results[kindLintIgnore], wantLintIgnore) {
 		t.Errorf("results[lint_ignore] = %+v, want %+v", results[kindLintIgnore], wantLintIgnore)
 	}
@@ -122,7 +124,7 @@ func TestPrintReport(t *testing.T) {
 	t.Run("populated", func(t *testing.T) {
 		results := map[string][][]string{
 			kindNolint:     {{ruleErrcheck}, {ruleErrcheck, "gosec"}},
-			kindLintIgnore: {{"FOO"}},
+			kindLintIgnore: {{ruleFoo}},
 		}
 		out := captureStdout(t, func() { PrintReport(results) })
 		for _, want := range []string{
@@ -136,4 +138,50 @@ func TestPrintReport(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestBaselineReadWrite(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, ".harness-baseline"), []byte(
+		"suppressions.nolint 2\ncoverage.min 65\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok := ReadBaseline(tmp)
+	if !ok {
+		t.Fatal("expected baseline to be read")
+	}
+	if got["suppressions.nolint"] != 2 || got["coverage.min"] != 65 {
+		t.Fatalf("ReadBaseline() = %#v", got)
+	}
+
+	results := map[string][][]string{
+		kindNolint:     {{ruleErrcheck}},
+		kindLintIgnore: {{ruleFoo}},
+	}
+	if err := WriteBaseline(tmp, results); err != nil {
+		t.Fatal(err)
+	}
+	updated, ok := ReadBaseline(tmp)
+	if !ok {
+		t.Fatal("expected updated baseline")
+	}
+	if updated["suppressions.nolint"] != 1 ||
+		updated["suppressions.lint_ignore"] != 1 ||
+		updated["coverage.min"] != 65 {
+		t.Fatalf("updated baseline = %#v", updated)
+	}
+}
+
+func TestCheckBaselineDetectsGrowth(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, ".harness-baseline"), []byte("coverage.min 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	findings := []Finding{{Match: Match{Kind: kindNolint}, Location: "a.go:1"}}
+
+	if CheckBaseline(tmp, findings, true, "go run harness.go suppressions --update-baseline", false) {
+		t.Fatal("expected suppression growth to fail")
+	}
 }

@@ -18,6 +18,8 @@ The contract lives in two places that must agree:
   edits.
 - `.claude/scripts/` + `.claude/settings.json` — hooks that enforce them
   mechanically, so the contract survives `/clear`, `/compact`, and resume.
+  SessionStart extracts the contract from `CLAUDE.md`; there is no separate
+  role block copy.
 
 | Rule | Contract says | Hook enforcement |
 |---|---|---|
@@ -30,8 +32,7 @@ The contract lives in two places that must agree:
 
 | File | Hook event | Role |
 |---|---|---|
-| `role-block.md` | — | the contract text, reinjected each session |
-| `session-start.sh` | SessionStart | `cat`s `role-block.md` so the contract survives `/clear`, `/compact`, resume |
+| `session-start.sh` | SessionStart | extracts every `<important>…</important>` block from `CLAUDE.md` so the contract survives `/clear`, `/compact`, resume |
 | `ups-classify.sh` | UserPromptSubmit | scans the prompt; writes short-TTL state files to `.claude/state/` |
 | `pre-bash-gate.sh` | PreToolUse(Bash) | denies `git commit`/`push` unless unexpired `commit-intent` state exists |
 | `pre-edit-gate.sh` | PreToolUse(Write\|Edit\|MultiEdit) | denies edits to the arch config unless `edit-auth` state names that path |
@@ -98,10 +99,10 @@ Only when the user explicitly asks for the behavior contract:
    the existing `Stop` hook — preserve every other key.
 3. Append the `## Behavior contract` section to **both** `AGENTS.md` and
    `CLAUDE.md` (or wire the harness `agents-md-drift` check to keep them
-   in sync — `sync-agents-md` writes AGENTS.md ← CLAUDE.md), and copy
-   `role-block.md` to match it. All three must stay in sync. If only one
-   file exists, copy the contract into the other; never reduce either to
-   a stub.
+   in sync — `sync-agents-md` writes AGENTS.md ← CLAUDE.md). SessionStart
+   extracts `<important>` blocks from `CLAUDE.md`; no separate role block is
+   copied. If only one file exists, copy the contract into the other; never
+   reduce either to a stub.
 4. Git-ignore `.claude/state/`.
 5. Verify (below), then onboard the user.
 

@@ -13,21 +13,22 @@ used by the Stop hook:
 
 | Script | When | What it does | Fixes code? |
 |---|---|---|---|
-| `check` | After edits | Fix, format, typecheck, test | Yes |
+| `check` | After edits | Fix, format, typecheck, test, suppression ratchet | Yes |
 | `pre-commit` | Git pre-commit hook | Staged files only — fix, format, typecheck, test if source changed | Yes |
 | `pre-push` | Git pre-push hook | Read-only push gate: lint, format check, acceptance, arch over the whole tree, in parallel | No |
 | `ci` | CI pipeline | Read-only gates (lint, typecheck, dep audit, complexity, acceptance, arch) run in parallel, then coverage + advisory CRAP | No |
 | `audit` | CI pipeline | Audit dependencies for known vulnerabilities | No |
 | `post-edit` | Stop hook helper | Format if source files changed | Yes |
-| `stop-hook` | Agent Stop hook | Run `post-edit`, complexity, advisory CRAP | Yes |
+| `stop-hook` | Agent Stop hook | Run `post-edit`, then complexity (+ deadcode where shipped) | Yes |
 
-**`check`** is the one you run constantly. It auto-fixes what it can so you stay in flow. It also reports suppression comments (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`, etc.) as a report-only signal — visibility, never exit-code change.
+**`check`** is the one you run constantly. It auto-fixes what it can so you stay in flow. It also ratchets suppression comments (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`, etc.) against `.harness-baseline`: new suppressions fail unless a human signs off on `suppressions --update-baseline`.
 **`pre-commit`** runs the same checks scoped to staged files, installed as a git hook.
 **`pre-push`** is the read-only push gate — lint, format check, acceptance, arch over the whole pushed tree (the offline checks `pre-commit` and `stop-hook` skip), run in parallel. Installed as a git pre-push hook.
+For Go and Bun, the lint gate subsumes format checking.
 **`ci`** is the read-only gate — no fixes, just verification. Its read-only gates run in parallel (captured, printed in submission order, run to completion), then coverage streams and CRAP runs advisory.
 **`audit`** audits dependencies for known vulnerabilities.
 **`post-edit`** formats source files if changed by an agent.
-**`stop-hook`** is the Stop hook entrypoint: it runs `post-edit`, then complexity and advisory CRAP.
+**`stop-hook`** is the Stop hook entrypoint: it runs `post-edit`, then complexity and deadcode where the language ships a separate deadcode gate.
 
 ## Available Templates
 
@@ -103,6 +104,7 @@ make check-api      # scope to one subproject
 - **Cyclomatic complexity gate** (CCN 15, args 8) — lizard via `uvx` (Python/Bun/Go/Rust) / gocyclo via golangci-lint (Go) — runs in `ci`
 - **Dead-code detection** — vulture (Python, via `uvx`) / knip (Bun, via `bunx`); Go & Rust use their linters (golangci-lint `unused` / clippy `dead_code`) — runs in `ci` + `stop-hook`
 - **CRAP advisory** — complexity × coverage signal, advisory by default and still run in `ci`
+- **Suppression baseline ratchet** — `.harness-baseline` tracks allowed suppression counts and the coverage floor (`coverage.min`)
 - **Agent Stop hooks** — `.claude/settings.json` runs `stop-hook`; `.codex/hooks.json` runs the Codex JSON wrapper around `stop-hook`
 - **Property-based testing** — hypothesis (Python) / fast-check (Bun) / rapid (Go) / proptest (Rust), seeded with a property suite over each template's own CRAP and parser helpers as the worked example; runs under the normal `test` step
 - **AGENTS.md + CLAUDE.md** — tell AI agents which commands to run and when

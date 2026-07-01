@@ -1,10 +1,24 @@
 """Tests for the suppression scanner in harness.py."""
 
+import os
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
+import harness
 from harness import _parse_line_for_suppressions, _scan_suppressions
+
+
+@contextmanager
+def cwd(path: Path):
+    old = Path.cwd()
+    try:
+        os.chdir(path)
+        yield
+    finally:
+        os.chdir(old)
 
 
 class TestParseLine(unittest.TestCase):
@@ -61,6 +75,39 @@ class TestScanFixture(unittest.TestCase):
         self.assertEqual(results.get("noqa"), [["E501"]])
         self.assertEqual(results.get("type_ignore"), [["assignment"]])
         self.assertEqual(results.get("pyright_ignore"), [["reportGeneralTypeIssues"]])
+
+
+class TestBaseline(unittest.TestCase):
+    def test_read_baseline_parses_key_value_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".harness-baseline").write_text(
+                "suppressions.noqa 2\ncoverage.min 75\n", encoding="utf-8"
+            )
+            with cwd(root):
+                self.assertEqual(
+                    harness._read_baseline(),
+                    {"suppressions.noqa": 2, "coverage.min": 75},
+                )
+
+    def test_coverage_min_uses_flag_before_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".harness-baseline").write_text("coverage.min 60\n", encoding="utf-8")
+            with cwd(root):
+                with mock.patch.object(harness.sys, "argv", ["harness", "coverage"]):
+                    self.assertEqual(harness._coverage_min_default(), 60)
+                with mock.patch.object(harness.sys, "argv", ["harness", "coverage", "--min=10"]):
+                    self.assertEqual(harness._coverage_min_default(), 10)
+
+    def test_suppression_growth_fails_against_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("x = 1  # noqa: E501\n", encoding="utf-8")
+            (root / ".harness-baseline").write_text("coverage.min 0\n", encoding="utf-8")
+            with cwd(root):
+                self.assertFalse(harness._check_suppressions_baseline(no_exit=True))
 
 
 if __name__ == "__main__":

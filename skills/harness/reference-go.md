@@ -12,13 +12,13 @@ a link. Copy `~/Code/harness-templates/go/CLAUDE.md` verbatim; do not
 paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
-  quality subcommands `complexity`, `acceptance`, `test-cov`, `mutation`,
-  `crap`, `arch`, and the drift pair `agents-md-drift` / `sync-agents-md`
+  quality subcommands `complexity`, `acceptance`, `coverage` (`test-cov` alias), `mutation`,
+  `crap`, `arch`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
   (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
   fail on drift). `ci` runs the read-only gates (`lint`, `audit`,
   `complexity`, `acceptance`, `arch`) **in parallel** — captured and
   printed in submission order, run to completion so one pass surfaces every
-  failure — then streams `test-cov` and the advisory `crap`. `pre-push` is
+  failure — then streams `coverage` and the advisory `crap`. `pre-push` is
   the offline push gate: `lint` (golangci-lint covers format), `acceptance`,
   `arch` over the whole pushed tree (the deterministic checks pre-commit and
   stop-hook skip). There is **no** `deadcode` target — golangci-lint's
@@ -26,7 +26,9 @@ paraphrase (it drifts). Two sections:
   functions, vars, and types, and `go mod tidy` prunes unused dependencies;
   `x/tools/cmd/deadcode` only works on programs with a `main` package, not
   this library template. `crap` is
-  advisory (warns by default, `--enforce` to hard-fail). Requires `uvx` on
+  advisory (warns by default, `--enforce` to hard-fail). Suppressions are
+  ratcheted by `.harness-baseline`; `coverage.min` in the same file is the
+  default coverage floor. Requires `uvx` on
   PATH for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
   length≤100 — replaces the old gocyclo gate).
 - `## Behavior contract` — Layer 2; see

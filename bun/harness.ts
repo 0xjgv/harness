@@ -25,6 +25,8 @@ const LIZARD = 'lizard@1.22.2';
 const KNIP = 'knip@5.88.1';
 const COMPLEXITY_MAX_ARGS = 8;
 const ROOT = import.meta.dir;
+const BASELINE_FILE = '.harness-baseline';
+const SUPPRESSION_BASELINE_PREFIX = 'suppressions.';
 
 // ── Hook wiring (installed by `setup-hooks`) ────────────────────────
 // Claude reads .claude/settings.json and runs the harness directly; Codex reads
@@ -144,6 +146,7 @@ export interface Gate {
   description: string;
   cmd: string[];
   extract?: (output: string) => string | undefined;
+  hint?: string;
 }
 
 interface GateResult {
@@ -153,6 +156,7 @@ interface GateResult {
   exitCode: number;
   output: string;
   detail?: string;
+  hint?: string;
 }
 
 /** Run a command with output captured (no printing, no exit): the unit the batch runs. */
@@ -172,6 +176,7 @@ async function runCapture(gate: Gate): Promise<GateResult> {
     exitCode,
     output,
     detail: ok ? gate.extract?.(output) : undefined,
+    hint: gate.hint,
   };
 }
 
@@ -187,6 +192,7 @@ function printGateResult(result: GateResult, opts?: { noExit?: boolean }): boole
   }
   console.log(`  ${RED}✗${RESET} ${result.description}`);
   if (!VERBOSE && result.output.trim()) console.log(result.output);
+  if (result.hint) console.log(`  ↳ fix: ${result.hint}`);
   if (!opts?.noExit) process.exit(result.exitCode);
   return false;
 }
@@ -260,6 +266,10 @@ export interface SuppressionMatch {
   rules: string[];
 }
 
+interface SuppressionFinding extends SuppressionMatch {
+  location: string;
+}
+
 const TS_DIRECTIVE_PATTERNS: { kind: string; pattern: RegExp }[] = [
   { kind: 'ts-ignore', pattern: /\/\/\s*@ts-ignore\b/ },
   { kind: 'ts-expect-error', pattern: /\/\/\s*@ts-expect-error\b/ },
@@ -291,11 +301,11 @@ export function parseLineForSuppressions(line: string): SuppressionMatch[] {
   return out;
 }
 
-export async function scanSuppressions(roots?: string[]): Promise<Record<string, string[][]>> {
+async function scanSuppressionFindings(roots?: string[]): Promise<SuppressionFinding[]> {
   const { readdir, readFile, stat } = await import('node:fs/promises');
   const { isAbsolute, join } = await import('node:path');
   const actualRoots = roots ?? (await qualityTargets());
-  const results: Record<string, string[][]> = {};
+  const findings: SuppressionFinding[] = [];
 
   async function scanPath(rawPath: string): Promise<void> {
     const full = isAbsolute(rawPath) ? rawPath : join(ROOT, rawPath);
@@ -305,11 +315,9 @@ export async function scanSuppressions(roots?: string[]): Promise<Record<string,
       if (!full.endsWith('.ts')) return;
       const text = await readFile(full, 'utf8').catch(() => null);
       if (text == null) return;
-      for (const line of text.split('\n')) {
+      for (const [index, line] of text.split('\n').entries()) {
         for (const m of parseLineForSuppressions(line)) {
-          const bucket = results[m.kind] ?? [];
-          bucket.push(m.rules);
-          results[m.kind] = bucket;
+          findings.push({ ...m, location: `${rawPath}:${index + 1}` });
         }
       }
       return;
@@ -324,11 +332,9 @@ export async function scanSuppressions(roots?: string[]): Promise<Record<string,
       } else if (e.isFile() && e.name.endsWith('.ts')) {
         const text = await readFile(child, 'utf8').catch(() => null);
         if (text == null) continue;
-        for (const line of text.split('\n')) {
+        for (const [index, line] of text.split('\n').entries()) {
           for (const m of parseLineForSuppressions(line)) {
-            const bucket = results[m.kind] ?? [];
-            bucket.push(m.rules);
-            results[m.kind] = bucket;
+            findings.push({ ...m, location: `${child}:${index + 1}` });
           }
         }
       }
@@ -338,11 +344,63 @@ export async function scanSuppressions(roots?: string[]): Promise<Record<string,
   for (const dir of actualRoots) {
     await scanPath(dir);
   }
+  return findings;
+}
+
+export async function scanSuppressions(roots?: string[]): Promise<Record<string, string[][]>> {
+  const results: Record<string, string[][]> = {};
+  for (const finding of await scanSuppressionFindings(roots)) {
+    const bucket = results[finding.kind] ?? [];
+    bucket.push(finding.rules);
+    results[finding.kind] = bucket;
+  }
   return results;
 }
 
-async function printSuppressionsReport(): Promise<void> {
-  const results = await scanSuppressions();
+function suppressionCounts(results: Record<string, string[][]>): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(results).map(([kind, entries]) => [
+      `${SUPPRESSION_BASELINE_PREFIX}${kind}`,
+      entries.length,
+    ]),
+  );
+}
+
+export async function readBaseline(base = ROOT): Promise<Record<string, number> | null> {
+  const { readFile } = await import('node:fs/promises');
+  const text = await readFile(`${base}/${BASELINE_FILE}`, 'utf8').catch(() => null);
+  if (text == null) return null;
+  const baseline: Record<string, number> = {};
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const [key, rawValue, ...rest] = trimmed.split(/\s+/);
+    if (!key || rawValue == null || rest.length > 0) continue;
+    const value = Number(rawValue);
+    if (Number.isInteger(value)) baseline[key] = value;
+  }
+  return baseline;
+}
+
+export async function coverageMinDefault(base = ROOT): Promise<number> {
+  const minArg = process.argv.find((a) => a.startsWith('--min='));
+  if (minArg) return Number(minArg.split('=', 2)[1]);
+  const baseline = await readBaseline(base);
+  return baseline?.['coverage.min'] ?? 0;
+}
+
+async function writeBaseline(results: Record<string, string[][]>): Promise<void> {
+  const { writeFile } = await import('node:fs/promises');
+  const existing = (await readBaseline()) ?? {};
+  const counts = suppressionCounts(results);
+  const lines = Object.keys(counts)
+    .sort()
+    .map((key) => `${key} ${counts[key]}`);
+  lines.push(`coverage.min ${existing['coverage.min'] ?? 0}`);
+  await writeFile(`${ROOT}/${BASELINE_FILE}`, `${lines.join('\n')}\n`);
+}
+
+function printSuppressionsBreakdown(results: Record<string, string[][]>): void {
   const total = Object.values(results).reduce((sum, arr) => sum + arr.length, 0);
   console.log('\n=== Suppressions ===\n');
   console.log(`Suppressions: ${total} total`);
@@ -363,6 +421,70 @@ async function printSuppressionsReport(): Promise<void> {
       console.log(`    ${rule}: ${count}`);
     }
   }
+}
+
+async function checkSuppressionsBaseline(opts?: { noExit?: boolean }): Promise<boolean> {
+  const findings = await scanSuppressionFindings();
+  const results: Record<string, string[][]> = {};
+  const locations: Record<string, string[]> = {};
+  for (const finding of findings) {
+    const bucket = results[finding.kind] ?? [];
+    bucket.push(finding.rules);
+    results[finding.kind] = bucket;
+    const locs = locations[finding.kind] ?? [];
+    locs.push(finding.location);
+    locations[finding.kind] = locs;
+  }
+
+  const current = suppressionCounts(results);
+  const baseline = await readBaseline();
+  if (baseline == null) {
+    printSuppressionsBreakdown(results);
+    console.log(`  ${GREEN}⚠${RESET} Suppressions are report-only: no ${BASELINE_FILE} found`);
+    console.log('  ↳ fix: run `bun harness.ts suppressions --update-baseline` to start ratcheting');
+    return true;
+  }
+
+  const total = Object.values(current).reduce((sum, count) => sum + count, 0);
+  const baselineTotal = Object.entries(baseline)
+    .filter(([key]) => key.startsWith(SUPPRESSION_BASELINE_PREFIX))
+    .reduce((sum, [, count]) => sum + count, 0);
+  const grown = Object.entries(current).filter(([key, count]) => count > (baseline[key] ?? 0));
+
+  if (grown.length === 0) {
+    const suffix =
+      total < baselineTotal
+        ? ' — run `bun harness.ts suppressions --update-baseline` to ratchet down'
+        : '';
+    console.log(`  ${GREEN}✓${RESET} Suppressions: ${total} (baseline ${baselineTotal})${suffix}`);
+    return true;
+  }
+
+  console.log(`  ${RED}✗${RESET} Suppressions grew: ${total} (baseline ${baselineTotal})`);
+  for (const [key, count] of grown.sort()) {
+    const kind = key.slice(SUPPRESSION_BASELINE_PREFIX.length);
+    console.log(`    ${kind}: ${count} > ${baseline[key] ?? 0}`);
+    for (const location of (locations[kind] ?? []).slice(0, 10)) {
+      console.log(`      ${location}`);
+    }
+  }
+  console.log(
+    '  ↳ fix: fix it, or with human sign-off: `bun harness.ts suppressions --update-baseline`',
+  );
+  if (!opts?.noExit) process.exit(1);
+  return false;
+}
+
+async function cmdSuppressions(): Promise<void> {
+  const results = await scanSuppressions();
+  if (process.argv.includes('--update-baseline')) {
+    await writeBaseline(results);
+    const total = Object.values(results).reduce((sum, arr) => sum + arr.length, 0);
+    console.log(`  ${GREEN}✓${RESET} ${BASELINE_FILE}: suppressions baseline set to ${total}`);
+    return;
+  }
+  printSuppressionsBreakdown(results);
+  await checkSuppressionsBaseline();
 }
 
 // ── Git helpers ─────────────────────────────────────────────────────
@@ -409,7 +531,11 @@ async function cmdFix(files?: string[]): Promise<void> {
 
 function lintGate(files?: string[]): Gate {
   const target = files ?? ['.'];
-  return { description: 'Lint & format check', cmd: ['bunx', 'biome', 'check', ...target] };
+  return {
+    description: 'Lint & format check',
+    cmd: ['bunx', 'biome', 'check', ...target],
+    hint: 'run `bun harness.ts fix`',
+  };
 }
 
 async function cmdLint(files?: string[]): Promise<void> {
@@ -418,7 +544,12 @@ async function cmdLint(files?: string[]): Promise<void> {
 }
 
 function typecheckGate(): Gate {
-  return { description: 'Typecheck', cmd: ['bunx', 'tsc', '--noEmit'], extract: extractTscSummary };
+  return {
+    description: 'Typecheck',
+    cmd: ['bunx', 'tsc', '--noEmit'],
+    extract: extractTscSummary,
+    hint: 'fix the type; ignores are counted by the suppression ratchet',
+  };
 }
 
 async function cmdTypecheck(): Promise<void> {
@@ -436,7 +567,11 @@ async function cmdTest(): Promise<void> {
 }
 
 function auditGate(): Gate {
-  return { description: 'Dep audit', cmd: ['bun', 'audit'] };
+  return {
+    description: 'Dep audit',
+    cmd: ['bun', 'audit'],
+    hint: 'bump the vulnerable dependency or escalate',
+  };
 }
 
 async function cmdAudit(): Promise<void> {
@@ -452,8 +587,7 @@ async function cmdCoverage(): Promise<void> {
 
   // Bun's test runner has no built-in per-percentage gate; we emit LCOV and
   // compute the line-coverage percentage ourselves, mirroring python's --min=N.
-  const minArg = process.argv.find((a) => a.startsWith('--min='));
-  const minPct = minArg ? Number(minArg.split('=', 2)[1]) : 0;
+  const minPct = await coverageMinDefault();
 
   await run(
     'Coverage (run)',
@@ -505,6 +639,7 @@ async function acceptanceGatesOrWarn(): Promise<Gate[]> {
     {
       description: 'Acceptance (cucumber)',
       cmd: ['bun', './node_modules/@cucumber/cucumber/bin/cucumber.js'],
+      hint: 'align implementation with the `.feature`, not vice versa',
     },
   ];
 }
@@ -535,6 +670,7 @@ async function archGatesOrWarn(): Promise<Gate[]> {
         '--no-progress',
         ...targets,
       ],
+      hint: "boundary crossed; surface the design decision to the human; don't edit arch config",
     },
   ];
 }
@@ -737,6 +873,7 @@ async function complexityGatesOrWarn(): Promise<Gate[]> {
         '-i',
         '0',
       ],
+      hint: 'extract helpers or flatten branches until CCN <= 15; do not raise the threshold',
     },
   ];
 }
@@ -751,7 +888,11 @@ function deadcodeGate(): Gate {
   // via uvx), no devDep. knip.json declares the cucumber step files as entries
   // and ignores the tool devDeps invoked as binaries; --no-config-hints keeps
   // the gate output to genuine findings.
-  return { description: 'Dead code (knip)', cmd: ['bunx', KNIP, '--no-config-hints'] };
+  return {
+    description: 'Dead code (knip)',
+    cmd: ['bunx', KNIP, '--no-config-hints'],
+    hint: 'delete unused code, or allowlist genuine dynamic refs in knip.json',
+  };
 }
 
 async function cmdDeadcode(): Promise<void> {
@@ -770,7 +911,6 @@ async function cmdStopHook(): Promise<void> {
   await cmdPostEdit(); // mutating — sequential, first
   // read-only batch: complexity + dead code
   const allOk = await runGatesParallel([...(await complexityGatesOrWarn()), deadcodeGate()]);
-  await cmdCrap(); // streaming advisory — after the batch
   if (!allOk) process.exit(1);
 }
 
@@ -975,7 +1115,7 @@ async function cmdCheck(): Promise<void> {
 
   await checkHooksPresent();
   results.push(await checkAgentsMdDrift(true));
-  await printSuppressionsReport();
+  results.push({ ok: await checkSuppressionsBaseline({ noExit: true }), output: '' });
 
   const elapsed = ((performance.now() - start) / 1000).toFixed(1);
   const passed = results.filter((r) => r.ok).length;
@@ -1025,7 +1165,8 @@ async function cmdCi(): Promise<void> {
   const allOk = await runGatesParallel(gates);
   await cmdCoverage(); // streams; self-skips; after the batch
   await cmdCrap(); // advisory unless --enforce
-  if (!allOk) process.exit(1);
+  const suppressionsOk = await checkSuppressionsBaseline({ noExit: true });
+  if (!allOk || !suppressionsOk) process.exit(1);
 }
 
 async function cmdPrePush(): Promise<void> {
@@ -1080,6 +1221,7 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   coverage: [cmdCoverage, 'Tests with coverage threshold (--min=N)'],
   mutation: [cmdMutation, 'Mutation testing (Stryker, advisory)'],
   crap: [cmdCrap, 'CRAP complexity x coverage gate (advisory)'],
+  suppressions: [cmdSuppressions, 'Show or update suppression baseline'],
   complexity: [cmdComplexity, 'Cyclomatic complexity gate (lizard, CCN 15, args 8)'],
   deadcode: [cmdDeadcode, 'Detect unused files/exports/deps (knip, via bunx)'],
   arch: [cmdArch, 'Architecture checks (dependency-cruiser)'],

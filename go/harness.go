@@ -72,6 +72,7 @@ type gate struct {
 	description string
 	cmd         []string
 	extract     func(output string) string
+	hint        string
 }
 
 type gateResult struct {
@@ -81,6 +82,7 @@ type gateResult struct {
 	exitCode    int
 	output      string
 	detail      string
+	hint        string
 }
 
 // runCapture runs a gate's command with output captured (no printing, no exit):
@@ -100,7 +102,7 @@ func runCapture(g gate) gateResult {
 	} else {
 		code = exitCode(err)
 	}
-	return gateResult{g.description, g.cmd, ok, code, output, detail}
+	return gateResult{g.description, g.cmd, ok, code, output, detail, g.hint}
 }
 
 // printGateResult prints a gate's ✓/✗ line (with the failure body); exits on
@@ -123,6 +125,9 @@ func printGateResult(r gateResult, noExit bool) bool {
 	fmt.Printf("  %s✗%s %s\n", red, reset, r.description)
 	if !verbose && r.output != "" {
 		fmt.Print(r.output)
+	}
+	if r.hint != "" {
+		fmt.Printf("  ↳ fix: %s\n", r.hint)
 	}
 	if !noExit {
 		os.Exit(r.exitCode)
@@ -295,7 +300,11 @@ func lintGate(pkgs []string) gate {
 	if len(pkgs) == 0 {
 		pkgs = []string{"./..."}
 	}
-	return gate{description: "Lint & format check", cmd: append([]string{"golangci-lint", "run"}, pkgs...)}
+	return gate{
+		description: "Lint & format check",
+		cmd:         append([]string{"golangci-lint", "run"}, pkgs...),
+		hint:        "run `go run harness.go fix`",
+	}
 }
 
 func cmdLint(pkgs []string) {
@@ -313,10 +322,26 @@ func cmdTestCov() {
 		"go", "test", "-race", "-count=1",
 		"-coverprofile=coverage.out", "./...",
 	}, &runOpts{stream: true})
+	minPct := coverageMinDefault()
+	pct, ok := coveragePercent()
+	if !ok {
+		fmt.Printf("  %s✗%s Coverage: coverage.out not found\n", red, reset)
+		os.Exit(1)
+	}
+	if pct >= float64(minPct) {
+		fmt.Printf("  %s✓%s Coverage >= %d%% %s(%.1f%%)%s\n", green, reset, minPct, dim, pct, reset)
+		return
+	}
+	fmt.Printf("  %s✗%s Coverage >= %d%% %s(got %.1f%%)%s\n", red, reset, minPct, dim, pct, reset)
+	os.Exit(1)
 }
 
 func auditGate() gate {
-	return gate{description: "Dep audit", cmd: []string{"go", "run", "golang.org/x/vuln/cmd/govulncheck@v1.1.4", "./..."}}
+	return gate{
+		description: "Dep audit",
+		cmd:         []string{"go", "run", "golang.org/x/vuln/cmd/govulncheck@v1.1.4", "./..."},
+		hint:        "bump the vulnerable dependency or escalate",
+	}
 }
 
 func cmdAudit() {
@@ -335,7 +360,6 @@ func cmdStopHook() {
 	fmt.Println("\n=== Stop Hook Checks ===\n")
 	cmdPostEdit()                                       // mutating — sequential, first
 	allOk := runGatesParallel([]gate{complexityGate()}) // read-only batch
-	cmdCrap()                                           // streaming advisory — after the batch
 	if !allOk {
 		os.Exit(1)
 	}
@@ -367,6 +391,36 @@ func hasFlag(name string) bool {
 	return false
 }
 
+func coverageMinDefault() int {
+	raw := flagValue("min", "")
+	if raw != "" {
+		value, _ := strconv.Atoi(raw)
+		return value
+	}
+	if baseline, ok := suppressions.ReadBaseline(root); ok {
+		return baseline["coverage.min"]
+	}
+	return 0
+}
+
+func coveragePercent() (float64, bool) {
+	c := exec.Command("go", "tool", "cover", "-func=coverage.out")
+	c.Dir = root
+	out, err := c.Output()
+	if err != nil {
+		return 0, false
+	}
+	for line := range strings.SplitSeq(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 3 && fields[0] == "total:" {
+			raw := strings.TrimSuffix(fields[2], "%")
+			pct, err := strconv.ParseFloat(raw, 64)
+			return pct, err == nil
+		}
+	}
+	return 0, false
+}
+
 // acceptanceGatesOrWarn builds the godog Gherkin gate (run as a `go test`), or
 // warns + returns nil when there are no scenarios — mirrors python's cmd_acceptance.
 func acceptanceGatesOrWarn() []gate {
@@ -382,7 +436,11 @@ func acceptanceGatesOrWarn() []gate {
 		fmt.Printf("  %s⚠%s Acceptance: no .feature files in features/ (add one to enable this gate)\n", green, reset)
 		return nil
 	}
-	return []gate{{description: "Acceptance (godog)", cmd: []string{"go", "test", "./features/..."}}}
+	return []gate{{
+		description: "Acceptance (godog)",
+		cmd:         []string{"go", "test", "./features/..."},
+		hint:        "align implementation with the `.feature`, not vice versa",
+	}}
 }
 
 func cmdAcceptance() {
@@ -400,7 +458,7 @@ func archGatesOrWarn() []gate {
 	}
 	return []gate{{description: "Arch (go-arch-lint)", cmd: []string{
 		"go", "run", "github.com/fe3dback/go-arch-lint@v1.15.0", "check",
-	}}}
+	}, hint: "boundary crossed; surface the design decision to the human; don't edit arch config"}}
 }
 
 func cmdArch() {
@@ -765,7 +823,15 @@ func cmdCheck() {
 
 	checkHooksPresent()
 	results = append(results, checkAgentsMdDrift(true))
-	suppressions.PrintReport(suppressions.Scan(root))
+	results = append(results, runResult{
+		ok: suppressions.CheckBaseline(
+			root,
+			suppressions.ScanFindings(root),
+			true,
+			"go run harness.go suppressions --update-baseline",
+			true,
+		),
+	})
 
 	elapsed := time.Since(start).Seconds()
 	passed := 0
@@ -814,7 +880,14 @@ func cmdCi() {
 	allOk := runGatesParallel(gates)
 	cmdTestCov() // streams; after the batch
 	cmdCrap()    // advisory unless --enforce
-	if !allOk {
+	suppressionsOk := suppressions.CheckBaseline(
+		root,
+		suppressions.ScanFindings(root),
+		true,
+		"go run harness.go suppressions --update-baseline",
+		true,
+	)
+	if !allOk || !suppressionsOk {
 		os.Exit(1)
 	}
 }
@@ -849,7 +922,7 @@ func complexityGate() gate {
 		"uvx", lizard, "-l", "go", ".",
 		"-C", "15", "-a", complexityMaxArgs, "-L", "100", "-i", "0",
 		"-x", "*_test.go", "-x", "./harness.go",
-	}}
+	}, hint: "extract helpers or flatten branches until CCN <= 15; do not raise the threshold"}
 }
 
 func cmdComplexity() {
@@ -1034,6 +1107,33 @@ func cmdClean() {
 	run("Clear test cache", []string{"go", "clean", "-testcache"}, nil)
 }
 
+func cmdSuppressions() {
+	findings := suppressions.ScanFindings(root)
+	results := suppressions.BucketByKind(findings)
+	if hasFlag("update-baseline") {
+		if err := suppressions.WriteBaseline(root, results); err != nil {
+			fmt.Printf("  %s✗%s .harness-baseline: %v\n", red, reset, err)
+			os.Exit(1)
+		}
+		total := 0
+		for _, entries := range results {
+			total += len(entries)
+		}
+		fmt.Printf("  %s✓%s .harness-baseline: suppressions baseline set to %d\n", green, reset, total)
+		return
+	}
+	suppressions.PrintReport(results)
+	if !suppressions.CheckBaseline(
+		root,
+		findings,
+		true,
+		"go run harness.go suppressions --update-baseline",
+		false,
+	) {
+		os.Exit(1)
+	}
+}
+
 // ── CLI dispatch ────────────────────────────────────────────────────
 
 type task struct {
@@ -1048,12 +1148,14 @@ var tasks = []task{
 	{"lint", func() { cmdLint(nil) }, "Lint + format check (read-only)"},
 	{"test", cmdTest, "Run tests"},
 	{"test-cov", cmdTestCov, "Run tests with race detector and coverage"},
+	{"coverage", cmdTestCov, "Run tests with race detector and coverage"},
 	{"audit", cmdAudit, "Audit dependencies for known vulnerabilities"},
 	{"complexity", cmdComplexity, "Cyclomatic complexity gate (lizard, CCN 15, args 8)"},
 	{"acceptance", cmdAcceptance, "Run acceptance scenarios (godog)"},
 	{"arch", cmdArch, "Architecture checks (go-arch-lint)"},
 	{"mutation", cmdMutation, "Mutation testing (gremlins, advisory)"},
 	{"crap", cmdCrap, "CRAP complexity x coverage gate (advisory)"},
+	{"suppressions", cmdSuppressions, "Show or update suppression baseline"},
 	{"pre-commit", cmdPreCommit, "Staged checks + tests"},
 	{"pre-push", cmdPrePush, "Read-only push gate: lint, acceptance, arch"},
 	{"ci", cmdCi, "Full verification: lint, audit, complexity, acceptance, coverage, crap, arch"},

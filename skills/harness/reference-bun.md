@@ -13,7 +13,7 @@ paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
   quality subcommands `complexity`, `deadcode`, `acceptance`, `coverage`,
-  `mutation`, `crap`, `arch`, and the drift pair `agents-md-drift` /
+  `mutation`, `crap`, `arch`, `suppressions`, and the drift pair `agents-md-drift` /
   `sync-agents-md` (keeps `AGENTS.md` byte-identical to `CLAUDE.md`;
   `check` + `pre-commit` fail on drift). `ci` runs the read-only gates
   (`lint`, `typecheck`, `audit`, `complexity`, `deadcode`, `acceptance`,
@@ -26,7 +26,8 @@ paraphrase (it drifts). Two sections:
   exports, and dependencies; `knip.json` declares the cucumber step files as
   entries and ignores the tool devDeps invoked as binaries. It runs in `ci`
   and `stop-hook`. `crap` is advisory (warns by default, `--enforce` to
-  hard-fail) but still runs in `ci`. `test`, `coverage`, `mutation`, and
+  hard-fail) but runs in `ci`, not `stop-hook`. Suppressions are ratcheted by
+  `.harness-baseline`; `coverage.min` in the same file is the default coverage floor. `test`, `coverage`, `mutation`, and
   `crap` warn and skip when no Bun test files exist. `check` also runs a
   `hook-drift` check that flags `.claude/` hook config drift. Requires `uvx`
   on PATH for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,

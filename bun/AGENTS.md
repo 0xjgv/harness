@@ -2,7 +2,7 @@
 
 ## Commands
 
-- After edits: `bun run check` — fix, format, typecheck, test (warns/skips when no tests exist), hook-drift + suppression report
+- After edits: `bun run check` — fix, format, typecheck, test (warns/skips when no tests exist), hook-drift + suppression ratchet
 - Pre-commit: `bun run pre-commit` — staged files only (auto via git hook)
 - Pre-push: `bun run harness.ts pre-push` — read-only push gate over the whole tree: lint (biome covers format), acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
 - CI: `bun run ci` — read-only gates (lint, typecheck, audit, complexity, deadcode, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then coverage (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
@@ -10,14 +10,22 @@
 - Deadcode: `bun run harness.ts deadcode` — knip (via bunx, no devDep) flags unused files/exports/deps; `knip.json` lists the cucumber step entries and ignores tool devDeps invoked as binaries. Runs in ci + stop-hook.
 - Audit: `bun run audit` — audit dependencies for known vulnerabilities (via bun audit)
 - Acceptance: `bun run acceptance` — run cucumber against `tests/features/`
-- Coverage: `bun run coverage --min=0` — `bun test` coverage (LCOV) with threshold; warns and skips when no tests exist
+- Coverage: `bun run coverage --min=0` — `bun test` coverage (LCOV) with threshold; default comes from `.harness-baseline` `coverage.min`; warns and skips when no tests exist
 - Mutation (advisory): `bun run mutation` — Stryker mutation score on src/; warns and skips when no tests exist
 - CRAP (advisory): `bun run crap --max=30` — complexity × coverage gate. Add `--enforce` to exit 1 on offenders (default exits 0 with warning). Warns and skips when no tests or coverage artifact exist.
+- Suppressions: `bun harness.ts suppressions` — full suppression breakdown; `--update-baseline` requires human sign-off and updates `.harness-baseline`
 - Arch: `bun run arch` — dependency-cruiser against `.dependency-cruiser.json`
 - Agents drift: `bun run harness.ts agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `bun run harness.ts sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
 - Setup: `bun run setup-hooks` installs git pre-commit + pre-push hooks (path resolved via `git rev-parse`, worktree-safe) and idempotently installs the Claude/Codex Stop wiring
-- Stop hook: auto-formats/fixes changed files, then runs complexity and deadcode (parallel) and advisory CRAP (`stop-hook`)
+- Stop hook: auto-formats/fixes changed files, then runs complexity and deadcode in parallel (`stop-hook`)
+
+## Definition of done
+
+- `bun run check` passes clean — never stop with check failing.
+- User-visible behavior change → a `.feature` scenario exists and acceptance passes.
+- No new suppressions: additions above `.harness-baseline` fail check; suppress only with the human's sign-off, stating why.
+- `pre-push`/`ci` are the human's gates: leave the tree in a state where they would pass, but do not commit or push yourself.
 
 ## Behavior contract
 

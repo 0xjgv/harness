@@ -13,7 +13,7 @@ not paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
   quality subcommands `complexity`, `deadcode`, `acceptance`, `coverage`,
-  `mutation`, `crap`, `arch`, and the drift pair `agents-md-drift` / `sync-agents-md`
+  `mutation`, `crap`, `arch`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
   (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
   fail on drift). `test` runs `unittest`, or `py_compile` over `src/` and
   `harness.py` when no `tests/test*.py` files exist. `ci` runs the
@@ -28,7 +28,9 @@ not paraphrase (it drifts). Two sections:
   masked — at `--min-confidence 60`; allowlist dynamic references
   (decorator-registered handlers, getattr dispatch) in `vulture_allowlist.py`.
   It runs in `ci` and `stop-hook`. `crap` is advisory (warns by default,
-  `--enforce` to hard-fail) but still runs in `ci`. Requires `uvx` on PATH
+  `--enforce` to hard-fail) but runs in `ci`, not `stop-hook`. Suppressions
+  are ratcheted by `.harness-baseline`; `coverage.min` in the same file is
+  the default coverage floor. Requires `uvx` on PATH
   for `complexity`/`crap`/`deadcode` (lizard pinned to `1.22.2`, CCN≤15,
   args≤8, length≤100).
 - `## Behavior contract` — Layer 2; see

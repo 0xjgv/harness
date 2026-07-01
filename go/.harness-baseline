@@ -1,0 +1,3 @@
+suppressions.lint_ignore 3
+suppressions.nolint 11
+coverage.min 0

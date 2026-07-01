@@ -28,6 +28,8 @@ VULTURE = "vulture@2.16"
 VULTURE_MIN_CONFIDENCE = "60"
 VULTURE_ALLOWLIST = "vulture_allowlist.py"
 COMPLEXITY_MAX_ARGS = 8
+BASELINE_FILE = ".harness-baseline"
+SUPPRESSION_BASELINE_PREFIX = "suppressions."
 
 # ── Hook wiring (installed by `setup-hooks`) ──────────────────────
 # Claude reads .claude/settings.json and runs the harness directly; Codex reads
@@ -65,6 +67,7 @@ class GateResult:
     returncode: int
     stdout: str
     stderr: str
+    hint: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -77,12 +80,13 @@ class Gate:
 
     description: str
     cmd: list[str]
+    hint: str | None = None
 
 
-def run_capture(description: str, cmd: list[str]) -> GateResult:
+def run_capture(description: str, cmd: list[str], hint: str | None = None) -> GateResult:
     """Run a command with output captured; the thread-safe unit for the parallel batch."""
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    return GateResult(description, cmd, result.returncode, result.stdout, result.stderr)
+    return GateResult(description, cmd, result.returncode, result.stdout, result.stderr, hint)
 
 
 def print_gate_result(result: GateResult, *, no_exit: bool = False) -> None:
@@ -98,11 +102,20 @@ def print_gate_result(result: GateResult, *, no_exit: bool = False) -> None:
         print(result.stdout, end="")
     if result.stderr:
         print(result.stderr, end="")
+    if result.hint:
+        print(f"  ↳ fix: {result.hint}")
     if not no_exit:
         sys.exit(result.returncode)
 
 
-def run(description: str, cmd: list[str], *, no_exit: bool = False, stream: bool = False) -> None:
+def run(
+    description: str,
+    cmd: list[str],
+    *,
+    no_exit: bool = False,
+    stream: bool = False,
+    hint: str | None = None,
+) -> None:
     """Run command silently; show output only on failure.
 
     Pass stream=True for long-running commands (tests, coverage) so their live
@@ -115,7 +128,7 @@ def run(description: str, cmd: list[str], *, no_exit: bool = False, stream: bool
             sys.exit(result.returncode)
         return
 
-    print_gate_result(run_capture(description, cmd), no_exit=no_exit)
+    print_gate_result(run_capture(description, cmd, hint), no_exit=no_exit)
 
 
 def run_gates_parallel(gates: list[Gate]) -> bool:
@@ -141,7 +154,9 @@ def run_gates_parallel(gates: list[Gate]) -> bool:
 
     max_workers = min(len(gates), os.cpu_count() or 4)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        results = list(executor.map(lambda gate: run_capture(gate.description, gate.cmd), gates))
+        results = list(
+            executor.map(lambda gate: run_capture(gate.description, gate.cmd, gate.hint), gates)
+        )
 
     all_ok = True
     for result in results:
@@ -250,6 +265,13 @@ _SUPPRESSION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
+@dataclasses.dataclass(frozen=True)
+class SuppressionFinding:
+    kind: str
+    rules: list[str]
+    location: str
+
+
 def _parse_line_for_suppressions(line: str) -> list[tuple[str, list[str]]]:
     """Return all (kind, rules) matches found on a single line."""
     matches: list[tuple[str, list[str]]] = []
@@ -261,24 +283,73 @@ def _parse_line_for_suppressions(line: str) -> list[tuple[str, list[str]]]:
     return matches
 
 
-def _scan_suppressions(roots: Iterable[str] | None = None) -> dict[str, list[list[str]]]:
-    """Scan Python files for suppression comments. Returns {kind: [rules...]}."""
-    results: dict[str, list[list[str]]] = {}
+def _scan_suppression_findings(roots: Iterable[str] | None = None) -> list[SuppressionFinding]:
+    """Scan Python files for suppression comments with file:line locations."""
+    findings: list[SuppressionFinding] = []
     actual_roots = roots if roots is not None else _quality_targets()
     for py_file in _iter_python_files(actual_roots):
         try:
             text = py_file.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        for line in text.splitlines():
+        for line_no, line in enumerate(text.splitlines(), start=1):
             for kind, rules in _parse_line_for_suppressions(line):
-                results.setdefault(kind, []).append(rules)
+                findings.append(SuppressionFinding(kind, rules, f"{py_file}:{line_no}"))
+    return findings
+
+
+def _scan_suppressions(roots: Iterable[str] | None = None) -> dict[str, list[list[str]]]:
+    """Scan Python files for suppression comments. Returns {kind: [rules...]}."""
+    results: dict[str, list[list[str]]] = {}
+    for finding in _scan_suppression_findings(roots):
+        results.setdefault(finding.kind, []).append(finding.rules)
     return results
 
 
-def _print_suppressions_report() -> None:
-    """Print a report-only summary of suppressions found in source."""
-    results = _scan_suppressions()
+def _suppression_counts(results: dict[str, list[list[str]]]) -> dict[str, int]:
+    return {
+        f"{SUPPRESSION_BASELINE_PREFIX}{kind}": len(entries) for kind, entries in results.items()
+    }
+
+
+def _read_baseline() -> dict[str, int] | None:
+    path = Path(BASELINE_FILE)
+    if not path.exists():
+        return None
+    values: dict[str, int] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) != 2:
+            continue
+        key, value = parts
+        try:
+            values[key] = int(value)
+        except ValueError:
+            continue
+    return values
+
+
+def _coverage_min_default() -> int:
+    explicit = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--min=")), None)
+    if explicit is not None:
+        return int(explicit)
+    baseline = _read_baseline()
+    return 0 if baseline is None else baseline.get("coverage.min", 0)
+
+
+def _write_baseline(results: dict[str, list[list[str]]]) -> None:
+    baseline = _read_baseline() or {}
+    counts = _suppression_counts(results)
+    coverage_min = baseline.get("coverage.min", 0)
+    lines = [f"{key} {counts[key]}" for key in sorted(counts)]
+    lines.append(f"coverage.min {coverage_min}")
+    Path(BASELINE_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _print_suppressions_breakdown(results: dict[str, list[list[str]]]) -> None:
     total = sum(len(v) for v in results.values())
     print("\n=== Suppressions ===\n")
     print(f"Suppressions: {total} total")
@@ -293,6 +364,59 @@ def _print_suppressions_report() -> None:
                 rule_counts[r] = rule_counts.get(r, 0) + 1
         for rule, count in sorted(rule_counts.items(), key=lambda x: (-x[1], x[0]))[:10]:
             print(f"    {rule}: {count}")
+
+
+def _check_suppressions_baseline(*, no_exit: bool = False) -> bool:
+    """Compare current suppression counts to the committed baseline."""
+    findings = _scan_suppression_findings()
+    results: dict[str, list[list[str]]] = {}
+    locations: dict[str, list[str]] = {}
+    for finding in findings:
+        results.setdefault(finding.kind, []).append(finding.rules)
+        locations.setdefault(finding.kind, []).append(finding.location)
+
+    current = _suppression_counts(results)
+    baseline = _read_baseline()
+    if baseline is None:
+        _print_suppressions_breakdown(results)
+        print(f"  {GREEN}⚠{RESET} Suppressions are report-only: no {BASELINE_FILE} found")
+        print("  ↳ fix: run `harness suppressions --update-baseline` to start ratcheting")
+        return True
+
+    total = sum(current.values())
+    baseline_total = sum(
+        count for key, count in baseline.items() if key.startswith(SUPPRESSION_BASELINE_PREFIX)
+    )
+    grown = {key: count for key, count in current.items() if count > baseline.get(key, 0)}
+    if not grown:
+        suffix = ""
+        if total < baseline_total:
+            suffix = " — run `harness suppressions --update-baseline` to ratchet down"
+        print(f"  {GREEN}✓{RESET} Suppressions: {total} (baseline {baseline_total}){suffix}")
+        return True
+
+    print(f"  {RED}✗{RESET} Suppressions grew: {total} (baseline {baseline_total})")
+    for key in sorted(grown):
+        kind = key.removeprefix(SUPPRESSION_BASELINE_PREFIX)
+        print(f"    {kind}: {grown[key]} > {baseline.get(key, 0)}")
+        for location in locations.get(kind, [])[:10]:
+            print(f"      {location}")
+    print("  ↳ fix: fix it, or with human sign-off: `harness suppressions --update-baseline`")
+    if not no_exit:
+        sys.exit(1)
+    return False
+
+
+def cmd_suppressions() -> None:
+    """Print suppression details, or update the committed suppression baseline."""
+    results = _scan_suppressions()
+    if "--update-baseline" in sys.argv:
+        _write_baseline(results)
+        total = sum(len(v) for v in results.values())
+        print(f"  {GREEN}✓{RESET} {BASELINE_FILE}: suppressions baseline set to {total}")
+        return
+    _print_suppressions_breakdown(results)
+    _check_suppressions_baseline()
 
 
 # ── Git helpers ───────────────────────────────────────────────────
@@ -342,7 +466,7 @@ def cmd_format(files: list[str] | None = None) -> None:
 
 def _lint_gate(files: list[str] | None = None) -> Gate:
     target = files or ["."]
-    return Gate("Lint check", ["uv", "run", "ruff", "check", *target])
+    return Gate("Lint check", ["uv", "run", "ruff", "check", *target], "run `harness fix`")
 
 
 def cmd_lint(files: list[str] | None = None) -> None:
@@ -351,11 +475,17 @@ def cmd_lint(files: list[str] | None = None) -> None:
 
 
 def _format_check_gate() -> Gate:
-    return Gate("Format check", ["uv", "run", "ruff", "format", "--check", "."])
+    return Gate(
+        "Format check", ["uv", "run", "ruff", "format", "--check", "."], "run `harness format`"
+    )
 
 
 def _typecheck_gate() -> Gate:
-    return Gate("Type check", ["uv", "run", "basedpyright", *_quality_targets()])
+    return Gate(
+        "Type check",
+        ["uv", "run", "basedpyright", *_quality_targets()],
+        "fix the type; ignores are counted by the suppression ratchet",
+    )
 
 
 def cmd_typecheck() -> None:
@@ -385,7 +515,7 @@ def cmd_coverage() -> None:
         warn(f"Coverage: no {TEST_DIR}/test*.py files; skipped")
         return
 
-    min_pct = int(next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--min=")), "0"))
+    min_pct = _coverage_min_default()
     run(
         "Coverage (run)",
         ["uv", "run", "coverage", "run", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"],
@@ -403,7 +533,13 @@ def _acceptance_gates_or_warn() -> list[Gate]:
     if not features_dir.exists() or not list(features_dir.rglob("*.feature")):
         warn(f"Acceptance: no .feature files in {features_dir}/ (add one to enable this gate)")
         return []
-    return [Gate("Acceptance (behave)", ["uv", "run", "behave", str(features_dir), "--no-color"])]
+    return [
+        Gate(
+            "Acceptance (behave)",
+            ["uv", "run", "behave", str(features_dir), "--no-color"],
+            "align implementation with the `.feature`, not vice versa",
+        )
+    ]
 
 
 def cmd_acceptance() -> None:
@@ -556,7 +692,11 @@ def cmd_crap() -> None:
 
 
 def _audit_gate() -> Gate:
-    return Gate("Dep audit", ["uv", "run", "--with", "pip-audit", "pip-audit"])
+    return Gate(
+        "Dep audit",
+        ["uv", "run", "--with", "pip-audit", "pip-audit"],
+        "bump the vulnerable dependency or escalate",
+    )
 
 
 def cmd_audit() -> None:
@@ -580,6 +720,7 @@ def _complexity_gate() -> Gate:
             "-i",
             "0",
         ],
+        "extract helpers or flatten branches until CCN <= 15; do not raise the threshold",
     )
 
 
@@ -607,6 +748,7 @@ def _deadcode_gate() -> Gate:
             "--min-confidence",
             VULTURE_MIN_CONFIDENCE,
         ],
+        f"delete unused code, or allowlist genuine dynamic refs in {VULTURE_ALLOWLIST}",
     )
 
 
@@ -629,7 +771,6 @@ def cmd_stop_hook() -> None:
     print("\n=== Stop Hook Checks ===\n")
     cmd_post_edit()  # mutating — sequential, first
     all_ok = run_gates_parallel([_complexity_gate(), _deadcode_gate()])  # read-only batch
-    cmd_crap()  # streaming advisory — after the batch
     _exit_if_failed(all_ok)
 
 
@@ -710,7 +851,7 @@ def cmd_check() -> None:
         _check_hooks_present()
         _check_agents_md_drift()
     finally:
-        _print_suppressions_report()
+        _check_suppressions_baseline()
 
 
 def cmd_pre_commit() -> None:
@@ -752,6 +893,7 @@ def cmd_ci() -> None:
     all_ok = run_gates_parallel(gates)
     cmd_coverage()  # streams; self-skips; sequential, after the batch
     cmd_crap()  # reads .coverage/coverage.xml; advisory unless --enforce
+    all_ok = _check_suppressions_baseline(no_exit=True) and all_ok
     _exit_if_failed(all_ok)
 
 
@@ -938,6 +1080,7 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "coverage": (cmd_coverage, "Tests with coverage threshold (--min=N)"),
     "mutation": (cmd_mutation, "Mutation testing (mutmut, advisory)"),
     "crap": (cmd_crap, "CRAP complexity x coverage gate (advisory)"),
+    "suppressions": (cmd_suppressions, "Show or update suppression baseline"),
     "complexity": (cmd_complexity, "Cyclomatic complexity gate (lizard, CCN 15, args 8)"),
     "deadcode": (cmd_deadcode, "Detect unused (dead) code with vulture (app sources only)"),
     "arch": (cmd_arch, "Architecture checks (import-linter)"),

@@ -156,7 +156,7 @@ class TestNoTestBehavior(unittest.TestCase):
 
 
 class TestStopHook(unittest.TestCase):
-    def test_stop_hook_runs_post_edit_then_parallel_batch_then_crap(self):
+    def test_stop_hook_runs_post_edit_then_parallel_batch(self):
         calls: list[str] = []
 
         def record_batch(gates: list[harness.Gate]) -> bool:
@@ -168,15 +168,12 @@ class TestStopHook(unittest.TestCase):
                 harness, "cmd_post_edit", side_effect=lambda: calls.append("post-edit")
             ),
             mock.patch.object(harness, "run_gates_parallel", side_effect=record_batch),
-            mock.patch.object(harness, "cmd_crap", side_effect=lambda: calls.append("crap")),
         ):
             harness.cmd_stop_hook()
 
         # Mutating fix/format runs first and alone; the read-only complexity and
-        # dead-code gates run through the parallel batch; CRAP streams last.
-        self.assertEqual(
-            calls, ["post-edit", "batch:Complexity (lizard),Dead code (vulture)", "crap"]
-        )
+        # dead-code gates run through the parallel batch.
+        self.assertEqual(calls, ["post-edit", "batch:Complexity (lizard),Dead code (vulture)"])
 
 
 class TestParallelGates(unittest.TestCase):
