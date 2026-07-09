@@ -72,18 +72,17 @@ The Makefile fans out `<cmd>` to each matching subproject, continues past failur
 
 ## Behavior contract
 
-`AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract at the monorepo root. Claude Code hooks enforce it for Claude; agents that read `AGENTS.md` receive the same instructions across every subproject:
+`AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract at the monorepo root. Agents that read either file receive the same instructions across every subproject:
 
 - **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
-- **Human-is-engineer**: `git commit` / `git push` denied unless the user's current prompt explicitly asked (verbs: `commit`, `push`, `ship`, `land`, `merge`).
+- **Human-is-engineer**: do not `git commit` / `git push` unless the user's current prompt explicitly asked.
 - **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
-- **Config write-protection**: edits to any subproject's arch config (`.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, `arch.toml`) denied unless the user names the path in their prompt.
+- **Arch config guard**: edits to any subproject's arch config (`.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, `arch.toml`) warn during `check`/`stop-hook` and fail `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 
-Hook scripts live in `.claude/scripts/`. Stop hooks are wired via
-`.claude/settings.json` for Claude and `.codex/hooks.json` for Codex. Each
-single-language template also ships these hooks for standalone use; at a
-monorepo root only the root copy runs, so a subproject's own hooks lie dormant
-until you open it as its own project.
+Stop hooks are wired via `.claude/settings.json` for Claude and
+`.codex/hooks.json` for Codex. Each single-language template also ships this
+wiring for standalone use; at a monorepo root only the root copy runs, so a
+subproject's own hooks lie dormant until you open it as its own project.
 
 ## Adding a subproject
 

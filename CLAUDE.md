@@ -86,12 +86,11 @@ templates copied inside it as subprojects (`cp -r python/ api`), not edited stan
 **Two-layer contract, shipped per template:**
 - **Layer 1 — quality harness** (always on): the 5-script contract above.
 - **Layer 2 — behavior contract** (greenfield: automatic; ported into an existing repo:
-  opt-in only): hooks under each template's `.claude/scripts/` that mechanically enforce
-  task-sizing, human-owned commits, Gherkin-first for behavior changes, and arch-config
-  write-protection. The contract text lives in `## Behavior contract` in both
-  `AGENTS.md` and `CLAUDE.md`; the hooks (`pre-bash-gate.sh`, `pre-edit-gate.sh`,
-  `session-start.sh`, `ups-classify.sh`) make it survive `/clear`/`/compact`/resume.
-  Full design: `skills/harness/reference-behavior-contract.md`.
+  opt-in only): instruction text in `AGENTS.md` and `CLAUDE.md` for task-sizing,
+  human-owned commits, and Gherkin-first behavior changes, plus a portable
+  `arch-config-guard` that warns during `check`/`stop-hook` and blocks
+  `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after
+  review. Full design: `skills/harness/reference/behavior-contract.md`.
 
 **`AGENTS.md`/`CLAUDE.md` are byte-identical within each template**, enforced by that
 template's own `agents-md-drift` harness command and fixed by `sync-agents-md`

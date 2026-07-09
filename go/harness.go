@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -358,7 +359,8 @@ func cmdPostEdit() {
 
 func cmdStopHook() {
 	fmt.Println("\n=== Stop Hook Checks ===\n")
-	cmdPostEdit()                                       // mutating — sequential, first
+	cmdPostEdit() // mutating — sequential, first
+	checkArchConfigGuard(true, false, false)
 	allOk := runGatesParallel([]gate{complexityGate()}) // read-only batch
 	if !allOk {
 		os.Exit(1)
@@ -367,7 +369,10 @@ func cmdStopHook() {
 
 // ── Quality gates ───────────────────────────────────────────────────
 
-const archConfig = ".go-arch-lint.yml"
+const (
+	archConfig         = ".go-arch-lint.yml"
+	archConfigAllowEnv = "HARNESS_ALLOW_ARCH_CONFIG"
+)
 
 // flagValue returns the value of a `--name=value` flag from os.Args, or def.
 func flagValue(name, def string) string {
@@ -464,6 +469,143 @@ func archGatesOrWarn() []gate {
 func cmdArch() {
 	for _, g := range archGatesOrWarn() {
 		run(g.description, g.cmd, nil)
+	}
+}
+
+func gitLines(args ...string) []string {
+	c := exec.Command("git", args...)
+	c.Dir = root
+	out, err := c.Output()
+	if err != nil {
+		return nil
+	}
+	var lines []string
+	for line := range strings.SplitSeq(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func gitPrefix() string {
+	lines := gitLines("rev-parse", "--show-prefix")
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Trim(strings.TrimPrefix(filepath.ToSlash(lines[0]), "./"), "/")
+}
+
+func normalizeChangedPath(path, prefix string) string {
+	normalized := strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(path)), "./")
+	if prefix != "" && strings.HasPrefix(normalized, prefix+"/") {
+		return strings.TrimPrefix(normalized, prefix+"/")
+	}
+	return normalized
+}
+
+func changedPathsFromBase() []string {
+	var bases []string
+	if base := os.Getenv("HARNESS_ARCH_BASE"); base != "" {
+		bases = append(bases, base)
+	}
+	if githubBase := os.Getenv("GITHUB_BASE_REF"); githubBase != "" {
+		bases = append(bases, "origin/"+githubBase)
+	}
+	var paths []string
+	for _, base := range bases {
+		if len(gitLines("rev-parse", "--verify", base)) == 0 {
+			continue
+		}
+		paths = append(paths, gitLines("diff", "--name-only", "--diff-filter=d", base+"...HEAD", "--", ".")...)
+	}
+	return paths
+}
+
+func changedPathsFromPrePushStdin() []string {
+	info, err := os.Stdin.Stat()
+	if err != nil || info.Mode()&os.ModeCharDevice != 0 {
+		return nil
+	}
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil || len(strings.TrimSpace(string(data))) == 0 {
+		return nil
+	}
+	zero := strings.Repeat("0", 40)
+	var paths []string
+	for line := range strings.SplitSeq(string(data), "\n") {
+		parts := strings.Fields(line)
+		if len(parts) < 4 {
+			continue
+		}
+		localSha, remoteSha := parts[1], parts[3]
+		if localSha == zero {
+			continue
+		}
+		if remoteSha == zero {
+			paths = append(paths, gitLines("diff-tree", "--no-commit-id", "--name-only", "-r", localSha, "--", ".")...)
+		} else {
+			paths = append(paths, gitLines("diff", "--name-only", "--diff-filter=d", remoteSha, localSha, "--", ".")...)
+		}
+	}
+	return paths
+}
+
+func changedArchConfigs(staged, includePrePushStdin bool) []string {
+	var paths []string
+	if staged {
+		paths = append(paths, gitLines("diff", "--cached", "--name-only", "--diff-filter=d", "--", ".")...)
+	} else {
+		paths = append(paths, gitLines("diff", "--name-only", "--diff-filter=d", "--", ".")...)
+		paths = append(paths, gitLines("diff", "--cached", "--name-only", "--diff-filter=d", "--", ".")...)
+		paths = append(paths, gitLines("ls-files", "--others", "--exclude-standard", "--", ".")...)
+		paths = append(paths, changedPathsFromBase()...)
+	}
+	if includePrePushStdin {
+		paths = append(paths, changedPathsFromPrePushStdin()...)
+	}
+
+	seen := map[string]bool{}
+	prefix := gitPrefix()
+	for _, p := range paths {
+		normalized := normalizeChangedPath(p, prefix)
+		if normalized == archConfig {
+			seen[normalized] = true
+		}
+	}
+	var changed []string
+	for p := range seen {
+		changed = append(changed, p)
+	}
+	sort.Strings(changed)
+	return changed
+}
+
+func checkArchConfigGuard(warnOnly, staged, includePrePushStdin bool) bool {
+	changed := changedArchConfigs(staged, includePrePushStdin)
+	if len(changed) == 0 {
+		fmt.Printf("  %s✓%s Arch config guard\n", green, reset)
+		return true
+	}
+	joined := strings.Join(changed, ", ")
+	if os.Getenv(archConfigAllowEnv) == "1" {
+		fmt.Printf("  %s⚠%s Arch config guard override: %s\n", green, reset, joined)
+		return true
+	}
+	if warnOnly {
+		fmt.Printf("  %s⚠%s Arch config changed: %s\n", green, reset, joined)
+		fmt.Printf("  ↳ fix: review intentionally, then use %s=1 for commit/push/CI\n", archConfigAllowEnv)
+		return true
+	}
+	fmt.Printf("  %s✗%s Arch config changed: %s\n", red, reset, joined)
+	fmt.Printf("  ↳ fix: review intentionally, then rerun with %s=1\n", archConfigAllowEnv)
+	return false
+}
+
+func cmdArchConfigGuard() {
+	if !checkArchConfigGuard(hasFlag("warn"), hasFlag("staged"), false) {
+		os.Exit(1)
 	}
 }
 
@@ -729,22 +871,16 @@ func complexityMetrics() []funcMetric {
 
 // ── Stages ──────────────────────────────────────────────────────────
 
-// checkHooksPresent warns when required hook scripts are missing (drift detection).
-func checkHooksPresent() {
-	required := []string{
-		".claude/scripts/session-start.sh",
-		".claude/scripts/ups-classify.sh",
-		".claude/scripts/pre-bash-gate.sh",
-		".claude/scripts/pre-edit-gate.sh",
-	}
-	var missing []string
-	for _, p := range required {
-		if _, err := os.Stat(filepath.Join(root, p)); err != nil {
-			missing = append(missing, p)
+// checkStopHooksPresent warns when Claude/Codex Stop hook wiring is missing.
+func checkStopHooksPresent() {
+	for _, rel := range []string{".claude/settings.json", ".codex/hooks.json"} {
+		data, _ := os.ReadFile(filepath.Join(root, rel))
+		text := string(data)
+		if strings.Contains(text, "Stop") && strings.Contains(text, "stop-hook") {
+			fmt.Printf("  %s✓%s Stop hook wiring (%s)\n", green, reset, rel)
+		} else {
+			fmt.Printf("  %s⚠%s Missing Stop hook wiring: %s\n", red, reset, rel)
 		}
-	}
-	if len(missing) > 0 {
-		fmt.Printf("  %s⚠%s Missing hook scripts: %s\n", red, reset, strings.Join(missing, ", "))
 	}
 }
 
@@ -821,7 +957,8 @@ func cmdCheck() {
 		run("Tests", []string{"go", "test", "./..."}, &runOpts{extract: extractTestSummary, noExit: true}),
 	}
 
-	checkHooksPresent()
+	checkStopHooksPresent()
+	checkArchConfigGuard(true, false, false)
 	results = append(results, checkAgentsMdDrift(true))
 	results = append(results, runResult{
 		ok: suppressions.CheckBaseline(
@@ -861,6 +998,9 @@ func cmdPreCommit() {
 
 	fmt.Printf("\n%s[pre-commit]%s\n\n", blue, reset)
 
+	if !checkArchConfigGuard(false, true, false) {
+		os.Exit(1)
+	}
 	pkgs := stagedPackages(files)
 	cmdFix(pkgs)
 	checkAgentsMdDrift(false)
@@ -880,6 +1020,7 @@ func cmdCi() {
 	allOk := runGatesParallel(gates)
 	cmdTestCov() // streams; after the batch
 	cmdCrap()    // advisory unless --enforce
+	archConfigOk := checkArchConfigGuard(false, false, false)
 	suppressionsOk := suppressions.CheckBaseline(
 		root,
 		suppressions.ScanFindings(root),
@@ -887,7 +1028,7 @@ func cmdCi() {
 		"go run harness.go suppressions --update-baseline",
 		true,
 	)
-	if !allOk || !suppressionsOk {
+	if !allOk || !archConfigOk || !suppressionsOk {
 		os.Exit(1)
 	}
 }
@@ -900,10 +1041,11 @@ func cmdCi() {
 // leaves the machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
 func cmdPrePush() {
 	fmt.Printf("\n%s[pre-push]%s\n\n", blue, reset)
+	archConfigOk := checkArchConfigGuard(false, false, true)
 	gates := []gate{lintGate(nil)}
 	gates = append(gates, acceptanceGatesOrWarn()...)
 	gates = append(gates, archGatesOrWarn()...)
-	if !runGatesParallel(gates) {
+	if !runGatesParallel(gates) || !archConfigOk {
 		os.Exit(1)
 	}
 }
@@ -1153,6 +1295,7 @@ var tasks = []task{
 	{"complexity", cmdComplexity, "Cyclomatic complexity gate (lizard, CCN 15, args 8)"},
 	{"acceptance", cmdAcceptance, "Run acceptance scenarios (godog)"},
 	{"arch", cmdArch, "Architecture checks (go-arch-lint)"},
+	{"arch-config-guard", cmdArchConfigGuard, "Block unreviewed arch config changes"},
 	{"mutation", cmdMutation, "Mutation testing (gremlins, advisory)"},
 	{"crap", cmdCrap, "CRAP complexity x coverage gate (advisory)"},
 	{"suppressions", cmdSuppressions, "Show or update suppression baseline"},

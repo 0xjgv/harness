@@ -7,7 +7,7 @@ HARNESS := bun harness.ts
 
 HARNESS_TARGETS := \
 	fix lint typecheck test audit acceptance coverage mutation \
-	crap complexity deadcode arch check post-edit stop-hook \
+	crap complexity deadcode arch arch-config-guard check post-edit stop-hook \
 	pre-commit pre-push ci setup-hooks agents-md-drift sync-agents-md clean
 
 .DEFAULT_GOAL := check

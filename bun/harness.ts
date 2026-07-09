@@ -27,6 +27,8 @@ const COMPLEXITY_MAX_ARGS = 8;
 const ROOT = import.meta.dir;
 const BASELINE_FILE = '.harness-baseline';
 const SUPPRESSION_BASELINE_PREFIX = 'suppressions.';
+const ARCH_CONFIGS = ['.dependency-cruiser.json'] as const;
+const ARCH_CONFIG_ALLOW_ENV = 'HARNESS_ALLOW_ARCH_CONFIG';
 
 // ── Hook wiring (installed by `setup-hooks`) ────────────────────────
 // Claude reads .claude/settings.json and runs the harness directly; Codex reads
@@ -679,6 +681,149 @@ async function cmdArch(): Promise<void> {
   for (const gate of await archGatesOrWarn()) await run(gate.description, gate.cmd);
 }
 
+async function gitLines(args: string[]): Promise<string[]> {
+  const proc = Bun.spawn(['git', ...args], {
+    cwd: ROOT,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  if (code !== 0) return [];
+  return out
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+async function gitPrefix(): Promise<string> {
+  const [prefix] = await gitLines(['rev-parse', '--show-prefix']);
+  return (prefix ?? '').replace(/^\.\//, '').replace(/\\/g, '/').replace(/\/$/, '');
+}
+
+function normalizeChangedPath(path: string, prefix: string): string {
+  const normalized = path.trim().replace(/^\.\//, '').replace(/\\/g, '/');
+  if (prefix !== '' && normalized.startsWith(`${prefix}/`)) {
+    return normalized.slice(prefix.length + 1);
+  }
+  return normalized;
+}
+
+async function changedPathsFromBase(): Promise<string[]> {
+  const bases: string[] = [];
+  if (process.env.HARNESS_ARCH_BASE) bases.push(process.env.HARNESS_ARCH_BASE);
+  if (process.env.GITHUB_BASE_REF) bases.push(`origin/${process.env.GITHUB_BASE_REF}`);
+
+  const paths: string[] = [];
+  for (const base of bases) {
+    if ((await gitLines(['rev-parse', '--verify', base])).length === 0) continue;
+    paths.push(
+      ...(await gitLines(['diff', '--name-only', '--diff-filter=d', `${base}...HEAD`, '--', '.'])),
+    );
+  }
+  return paths;
+}
+
+async function changedPathsFromPrePushStdin(): Promise<string[]> {
+  if (process.stdin.isTTY) return [];
+  const text = await new Response(Bun.stdin.stream()).text();
+  if (text.trim() === '') return [];
+  const zero = '0'.repeat(40);
+  const paths: string[] = [];
+  for (const line of text.split('\n')) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 4) continue;
+    const [, localSha, , remoteSha] = parts;
+    if (localSha === zero) continue;
+    if (remoteSha === zero) {
+      paths.push(
+        ...(await gitLines([
+          'diff-tree',
+          '--no-commit-id',
+          '--name-only',
+          '-r',
+          localSha,
+          '--',
+          '.',
+        ])),
+      );
+    } else {
+      paths.push(
+        ...(await gitLines([
+          'diff',
+          '--name-only',
+          '--diff-filter=d',
+          remoteSha,
+          localSha,
+          '--',
+          '.',
+        ])),
+      );
+    }
+  }
+  return paths;
+}
+
+async function changedArchConfigs(
+  opts: { staged?: boolean; includePrePushStdin?: boolean } = {},
+): Promise<string[]> {
+  const paths: string[] = [];
+  if (opts.staged) {
+    paths.push(
+      ...(await gitLines(['diff', '--cached', '--name-only', '--diff-filter=d', '--', '.'])),
+    );
+  } else {
+    paths.push(...(await gitLines(['diff', '--name-only', '--diff-filter=d', '--', '.'])));
+    paths.push(
+      ...(await gitLines(['diff', '--cached', '--name-only', '--diff-filter=d', '--', '.'])),
+    );
+    paths.push(...(await gitLines(['ls-files', '--others', '--exclude-standard', '--', '.'])));
+    paths.push(...(await changedPathsFromBase()));
+  }
+  if (opts.includePrePushStdin) paths.push(...(await changedPathsFromPrePushStdin()));
+
+  const protectedPaths = new Set<string>(ARCH_CONFIGS);
+  const prefix = await gitPrefix();
+  return Array.from(
+    new Set(paths.map((p) => normalizeChangedPath(p, prefix)).filter((p) => protectedPaths.has(p))),
+  ).sort();
+}
+
+async function checkArchConfigGuard(
+  opts: { warnOnly?: boolean; staged?: boolean; includePrePushStdin?: boolean } = {},
+): Promise<boolean> {
+  const changed = await changedArchConfigs({
+    staged: opts.staged,
+    includePrePushStdin: opts.includePrePushStdin,
+  });
+  if (changed.length === 0) {
+    console.log(`  ${GREEN}✓${RESET} Arch config guard`);
+    return true;
+  }
+  const joined = changed.join(', ');
+  if (process.env[ARCH_CONFIG_ALLOW_ENV] === '1') {
+    console.log(`  ${GREEN}⚠${RESET} Arch config guard override: ${joined}`);
+    return true;
+  }
+  if (opts.warnOnly) {
+    console.log(`  ${GREEN}⚠${RESET} Arch config changed: ${joined}`);
+    console.log(
+      `  ↳ fix: review intentionally, then use ${ARCH_CONFIG_ALLOW_ENV}=1 for commit/push/CI`,
+    );
+    return true;
+  }
+  console.log(`  ${RED}✗${RESET} Arch config changed: ${joined}`);
+  console.log(`  ↳ fix: review intentionally, then rerun with ${ARCH_CONFIG_ALLOW_ENV}=1`);
+  return false;
+}
+
+async function cmdArchConfigGuard(): Promise<void> {
+  const ok = await checkArchConfigGuard({
+    warnOnly: process.argv.includes('--warn'),
+    staged: process.argv.includes('--staged'),
+  });
+  if (!ok) process.exit(1);
+}
+
 async function cmdMutation(): Promise<void> {
   // StrykerJS mutation testing. Advisory — not wired into ci.
   // No official Bun runner plugin exists; stryker.conf.json uses the universal
@@ -909,6 +1054,7 @@ async function cmdPostEdit(): Promise<void> {
 async function cmdStopHook(): Promise<void> {
   console.log('\n=== Stop Hook Checks ===\n');
   await cmdPostEdit(); // mutating — sequential, first
+  await checkArchConfigGuard({ warnOnly: true });
   // read-only batch: complexity + dead code
   const allOk = await runGatesParallel([...(await complexityGatesOrWarn()), deadcodeGate()]);
   if (!allOk) process.exit(1);
@@ -916,18 +1062,18 @@ async function cmdStopHook(): Promise<void> {
 
 // ── Stages ──────────────────────────────────────────────────────────
 
-async function checkHooksPresent(): Promise<void> {
-  // Warn when required hook scripts are missing (drift detection).
+async function checkStopHooksPresent(): Promise<void> {
+  // Warn when Claude/Codex Stop hook wiring is missing.
   const { existsSync } = await import('node:fs');
-  const required = [
-    '.claude/scripts/session-start.sh',
-    '.claude/scripts/ups-classify.sh',
-    '.claude/scripts/pre-bash-gate.sh',
-    '.claude/scripts/pre-edit-gate.sh',
-  ];
-  const missing = required.filter((p) => !existsSync(`${ROOT}/${p}`));
-  if (missing.length > 0) {
-    console.log(`  ${RED}⚠${RESET} Missing hook scripts: ${missing.join(', ')}`);
+  const { readFile } = await import('node:fs/promises');
+  for (const rel of ['.claude/settings.json', '.codex/hooks.json']) {
+    const full = `${ROOT}/${rel}`;
+    const text = existsSync(full) ? await readFile(full, 'utf8') : '';
+    if (text.includes('Stop') && text.includes('stop-hook')) {
+      console.log(`  ${GREEN}✓${RESET} Stop hook wiring (${rel})`);
+    } else {
+      console.log(`  ${RED}⚠${RESET} Missing Stop hook wiring: ${rel}`);
+    }
   }
 }
 
@@ -1113,7 +1259,8 @@ async function cmdCheck(): Promise<void> {
     results.push({ ok: true, output: '' });
   }
 
-  await checkHooksPresent();
+  await checkStopHooksPresent();
+  await checkArchConfigGuard({ warnOnly: true });
   results.push(await checkAgentsMdDrift(true));
   results.push({ ok: await checkSuppressionsBaseline({ noExit: true }), output: '' });
 
@@ -1140,6 +1287,7 @@ async function cmdPreCommit(): Promise<void> {
   }
 
   console.log(`\n${BLUE}[pre-commit]${RESET}\n`);
+  if (!(await checkArchConfigGuard({ staged: true }))) process.exit(1);
   await cmdFix(files);
   await cmdTypecheck();
   await checkAgentsMdDrift();
@@ -1165,8 +1313,9 @@ async function cmdCi(): Promise<void> {
   const allOk = await runGatesParallel(gates);
   await cmdCoverage(); // streams; self-skips; after the batch
   await cmdCrap(); // advisory unless --enforce
+  const archConfigOk = await checkArchConfigGuard();
   const suppressionsOk = await checkSuppressionsBaseline({ noExit: true });
-  if (!allOk || !suppressionsOk) process.exit(1);
+  if (!allOk || !archConfigOk || !suppressionsOk) process.exit(1);
 }
 
 async function cmdPrePush(): Promise<void> {
@@ -1177,12 +1326,13 @@ async function cmdPrePush(): Promise<void> {
   // pushed tree (after merges/rebases/--no-verify) before it leaves the machine.
   // Network (audit) and advisory (coverage/CRAP) gates stay in ci.
   console.log(`\n${BLUE}[pre-push]${RESET}\n`);
+  const archConfigOk = await checkArchConfigGuard({ includePrePushStdin: true });
   const gates: Gate[] = [
     lintGate(),
     ...(await acceptanceGatesOrWarn()),
     ...(await archGatesOrWarn()),
   ];
-  if (!(await runGatesParallel(gates))) process.exit(1);
+  if (!(await runGatesParallel(gates)) || !archConfigOk) process.exit(1);
 }
 
 async function cmdHooks(): Promise<void> {
@@ -1225,6 +1375,7 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   complexity: [cmdComplexity, 'Cyclomatic complexity gate (lizard, CCN 15, args 8)'],
   deadcode: [cmdDeadcode, 'Detect unused files/exports/deps (knip, via bunx)'],
   arch: [cmdArch, 'Architecture checks (dependency-cruiser)'],
+  'arch-config-guard': [cmdArchConfigGuard, 'Block unreviewed arch config changes'],
   check: [cmdCheck, 'Full pre-flight: lockfile + fix + typecheck + tests'],
   'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
   'pre-push': [cmdPrePush, 'Read-only push gate: lint, acceptance, arch'],

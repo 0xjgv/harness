@@ -18,13 +18,14 @@ RESET := \033[0m
 CANONICAL := skills/harness
 TARGETS   := $(HOME)/.claude/skills/harness $(HOME)/.agents/skills/harness
 FILES     := SKILL.md \
-             reference-behavior-contract.md \
-             reference-settings-json.md \
-             reference-python.md \
-             reference-bun.md \
-             reference-go.md \
-             reference-rust.md \
-             reference-monorepo.md
+             reference/behavior-contract.md \
+             reference/adoption-checklist.md \
+             reference/settings-json.md \
+             reference/python.md \
+             reference/bun.md \
+             reference/go.md \
+             reference/rust.md \
+             reference/monorepo.md
 
 .PHONY: check
 check: skills-drift ## Run all repo-level gates (currently just skills-drift)
@@ -59,7 +60,9 @@ sync-skills: ## Copy skills/harness/ → ~/.claude and ~/.agents
 	@set -u; \
 	for tgt in $(TARGETS); do \
 	  mkdir -p "$$tgt"; \
+	  rm -f "$$tgt"/reference-*.md "$$tgt"/reference/reference-*.md; \
 	  for f in $(FILES); do \
+	    mkdir -p "$$tgt/$$(dirname "$$f")"; \
 	    cp "$(CANONICAL)/$$f" "$$tgt/$$f"; \
 	  done; \
 	  printf "  $(GREEN)✓$(RESET) sync-skills: $$tgt ← $(CANONICAL)\n"; \

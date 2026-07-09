@@ -1,4 +1,4 @@
-# reference-go
+# go
 
 Source: `~/Code/harness-templates/go/`
 
@@ -13,15 +13,16 @@ paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
   quality subcommands `complexity`, `acceptance`, `coverage` (`test-cov` alias), `mutation`,
-  `crap`, `arch`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
+  `crap`, `arch`, `arch-config-guard`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
   (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
   fail on drift). `ci` runs the read-only gates (`lint`, `audit`,
   `complexity`, `acceptance`, `arch`) **in parallel** — captured and
   printed in submission order, run to completion so one pass surfaces every
-  failure — then streams `coverage` and the advisory `crap`. `pre-push` is
+  failure — then streams `coverage` and the advisory `crap`; `ci` also runs
+  `arch-config-guard` in strict mode. `pre-push` is
   the offline push gate: `lint` (golangci-lint covers format), `acceptance`,
-  `arch` over the whole pushed tree (the deterministic checks pre-commit and
-  stop-hook skip). There is **no** `deadcode` target — golangci-lint's
+  `arch`, and strict `arch-config-guard` over the whole pushed tree (the
+  deterministic checks pre-commit and stop-hook skip). There is **no** `deadcode` target — golangci-lint's
   `unused` linter (run by the `lint` gate) already flags unreachable
   functions, vars, and types, and `go mod tidy` prunes unused dependencies;
   `x/tools/cmd/deadcode` only works on programs with a `main` package, not
@@ -32,7 +33,7 @@ paraphrase (it drifts). Two sections:
   PATH for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
   length≤100 — replaces the old gocyclo gate).
 - `## Behavior contract` — Layer 2; see
-  [reference-behavior-contract.md](reference-behavior-contract.md).
+  [behavior-contract.md](behavior-contract.md).
 
 When adapting an existing repo with `make`/`just`, rewrite the prefix but
 keep the command names and semantics.
@@ -48,14 +49,15 @@ go mod edit -module my-project
 go run harness.go setup-hooks
 ```
 
-Requires Go 1.24+. This brings `.claude/` (Layer 2), `.codex/hooks.json`,
-and `.codex/hooks/codex-stop-hook.sh` intact — keep them.
+Requires Go 1.24+. This brings `AGENTS.md`/`CLAUDE.md` (Layer 2),
+`.claude/settings.json`, `.codex/hooks.json`, and
+`.codex/hooks/codex-stop-hook.sh` intact — keep them.
 
 ## Hooks
 
-`.claude/settings.json` wires Claude hooks; `.codex/hooks.json` wires the
-Codex Stop hook. Full shape:
-[reference-settings-json.md](reference-settings-json.md).
+`.claude/settings.json` wires the Claude Stop hook; `.codex/hooks.json` wires
+the Codex Stop hook. Full shape:
+[settings-json.md](settings-json.md).
 Claude Stop command:
 `cd $CLAUDE_PROJECT_DIR && go run harness.go stop-hook`.
 Codex Stop command:
@@ -69,4 +71,4 @@ Codex Stop command:
   govulncheck, lizard (complexity, via `uvx`), godog (acceptance),
   gremlins (mutation), rapid (property-based tests, see
   `crap/properties_test.go`), go-arch-lint (arch)
-- Protected arch config: `.go-arch-lint.yml`
+- Protected arch config: `.go-arch-lint.yml` (`go run harness.go arch-config-guard`)

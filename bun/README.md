@@ -77,20 +77,19 @@ harness.ts                 Development task runner (zero dependencies)
 .dependency-cruiser.json   Architecture rules (dependency-cruiser)
 stryker.conf.json          Mutation testing config (Stryker)
 cucumber.json              Acceptance runner config (cucumber)
-.claude/scripts/           Hook scripts (session reinject, commit-intent classifier, pre-tool gates)
 ```
 
 ## Behavior contract
 
-`AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract. Claude Code hooks enforce it for Claude; agents that read `AGENTS.md` receive the same instructions.
+`AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract. Agents that read either file receive the same instructions.
 
 - **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
-- **Human-is-engineer**: `git commit` / `git push` denied unless the user's current prompt explicitly asked (verbs: `commit`, `push`, `ship`, `land`, `merge`).
+- **Human-is-engineer**: do not `git commit` / `git push` unless the user's current prompt explicitly asked.
 - **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
-- **Config write-protection**: edits to `.dependency-cruiser.json` denied unless the user names the path in their prompt.
+- **Arch config guard**: `.dependency-cruiser.json` changes warn during `check`/`stop-hook` and fail `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 
-Hook scripts live in `.claude/scripts/`. Stop hooks are wired via
-`.claude/settings.json` for Claude and `.codex/hooks.json` for Codex.
+Stop hooks are wired via `.claude/settings.json` for Claude and
+`.codex/hooks.json` for Codex.
 
 ## Thresholds: start at 0, ratchet up
 

@@ -6,9 +6,10 @@
 # cannot be reasoned about — or extracted — independently.
 #
 # This file declares the architectural invariants the `arch` gate checks.
-# It is a PROTECTED path: the Claude Code pre-edit hook denies edits unless
-# the user's prompt explicitly authorizes them. Architectural violations are
-# design decisions — surface them to the human, do not silence them here.
+# It is guarded by `cargo harness arch-config-guard`: changes warn during
+# `check`/`stop-hook` and block `pre-commit`/`pre-push`/`ci` unless reviewed
+# with HARNESS_ALLOW_ARCH_CONFIG=1. Architectural violations are design
+# decisions — surface them to the human, do not silence them here.
 
 [arch]
 # Forbid circular dependencies between modules of the library crate.

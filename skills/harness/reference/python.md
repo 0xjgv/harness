@@ -1,4 +1,4 @@
-# reference-python
+# python
 
 Source: `~/Code/harness-templates/python/`
 
@@ -13,17 +13,18 @@ not paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
   quality subcommands `complexity`, `deadcode`, `acceptance`, `coverage`,
-  `mutation`, `crap`, `arch`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
+  `mutation`, `crap`, `arch`, `arch-config-guard`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
   (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
   fail on drift). `test` runs `unittest`, or `py_compile` over `src/` and
   `harness.py` when no `tests/test*.py` files exist. `ci` runs the
   read-only gates (`lint`, `format check`, `typecheck`, `audit`,
   `complexity`, `deadcode`, `acceptance`, `arch`) **in parallel** — captured
   and printed in submission order, run to completion so one pass surfaces
-  every failure — then streams `coverage` and the advisory `crap`.
+  every failure — then streams `coverage` and the advisory `crap`; `ci`
+  also runs `arch-config-guard` in strict mode.
   `pre-push` is the offline push gate: `lint`, `format check`, `acceptance`,
-  `arch` over the whole pushed tree (the deterministic checks pre-commit and
-  stop-hook skip). `deadcode` runs vulture (pinned `2.16`) over `src/` only —
+  `arch`, and strict `arch-config-guard` over the whole pushed tree (the
+  deterministic checks pre-commit and stop-hook skip). `deadcode` runs vulture (pinned `2.16`) over `src/` only —
   never `tests/`, so a dead helper that still has a test is reported, not
   masked — at `--min-confidence 60`; allowlist dynamic references
   (decorator-registered handlers, getattr dispatch) in `vulture_allowlist.py`.
@@ -34,7 +35,7 @@ not paraphrase (it drifts). Two sections:
   for `complexity`/`crap`/`deadcode` (lizard pinned to `1.22.2`, CCN≤15,
   args≤8, length≤100).
 - `## Behavior contract` — Layer 2; see
-  [reference-behavior-contract.md](reference-behavior-contract.md).
+  [behavior-contract.md](behavior-contract.md).
 
 When adapting an existing repo, rewrite the `uv run harness …` prefix to
 match the repo's runner (e.g. `just check`, `make check`) but keep the
@@ -48,14 +49,14 @@ uv sync && uv run harness setup-hooks
 # Start coding in src/
 ```
 
-This brings `.claude/` (Layer 2), `.codex/hooks.json`, and
-`.codex/hooks/codex-stop-hook.sh` intact — keep them.
+This brings `AGENTS.md`/`CLAUDE.md` (Layer 2), `.claude/settings.json`,
+`.codex/hooks.json`, and `.codex/hooks/codex-stop-hook.sh` intact — keep them.
 
 ## Hooks
 
-`.claude/settings.json` wires Claude hooks; `.codex/hooks.json` wires the
-Codex Stop hook. Full shape:
-[reference-settings-json.md](reference-settings-json.md).
+`.claude/settings.json` wires the Claude Stop hook; `.codex/hooks.json` wires
+the Codex Stop hook. Full shape:
+[settings-json.md](settings-json.md).
 Claude Stop command:
 `cd $CLAUDE_PROJECT_DIR && uv run harness stop-hook`.
 Codex Stop command:
@@ -69,5 +70,5 @@ Codex Stop command:
   unittest, coverage, pip-audit, lizard (complexity, via `uvx`), vulture
   (dead code, via `uvx`), behave (acceptance), mutmut (mutation), hypothesis
   (property-based tests, see `tests/test_properties.py`), import-linter (arch)
-- Protected arch config: `.importlinter`
+- Protected arch config: `.importlinter` (`uv run harness arch-config-guard`)
 - Dead-code allowlist: `vulture_allowlist.py`

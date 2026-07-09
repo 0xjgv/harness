@@ -111,20 +111,19 @@ features/steps/      Step definitions
 harness.go           Development task runner (zero dependencies; //go:build ignore)
 .go-arch-lint.yml    Architecture rules (go-arch-lint)
 .golangci.yaml       Lint + format config (golangci-lint v2)
-.claude/scripts/     Hook scripts (session reinject, commit-intent classifier, pre-tool gates)
 ```
 
 ## Behavior contract
 
-`AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract. Claude Code hooks enforce it for Claude; agents that read `AGENTS.md` receive the same instructions.
+`AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract. Agents that read either file receive the same instructions.
 
 - **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
-- **Human-is-engineer**: `git commit` / `git push` denied unless the user's current prompt explicitly asked (verbs: `commit`, `push`, `ship`, `land`, `merge`).
+- **Human-is-engineer**: do not `git commit` / `git push` unless the user's current prompt explicitly asked.
 - **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
-- **Config write-protection**: edits to `.go-arch-lint.yml` denied unless the user names the path in their prompt. Note `.golangci.yaml` is deliberately *not* protected — it is the general lint config, and protecting it would block all lint-config edits.
+- **Arch config guard**: `.go-arch-lint.yml` changes warn during `check`/`stop-hook` and fail `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. Note `.golangci.yaml` is deliberately *not* protected — it is the general lint config, and protecting it would block all lint-config edits.
 
-Hook scripts live in `.claude/scripts/`. Stop hooks are wired via
-`.claude/settings.json` for Claude and `.codex/hooks.json` for Codex.
+Stop hooks are wired via `.claude/settings.json` for Claude and
+`.codex/hooks.json` for Codex.
 
 ## Thresholds: start at 0, ratchet up
 

@@ -1,4 +1,4 @@
-# reference-rust
+# rust
 
 Source: `~/Code/harness-templates/rust/`
 
@@ -13,14 +13,15 @@ paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
   quality subcommands `complexity`, `acceptance`, `coverage`, `mutation`,
-  `crap`, `arch`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
+  `crap`, `arch`, `arch-config-guard`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
   (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
   fail on drift). `ci` runs the read-only gates (`clippy`, `format check`,
   `complexity`, `acceptance`, `arch`) **in parallel** — captured and
   printed in submission order, run to completion so one pass surfaces every
   failure — then runs `audit`, streams `tests` + `coverage`, and the
-  advisory `crap`. `pre-push` is the offline push gate: `clippy`, `format
-  check`, `acceptance`, `arch` over the whole pushed tree (the deterministic
+  advisory `crap`; `ci` also runs `arch-config-guard` in strict mode.
+  `pre-push` is the offline push gate: `clippy`, `format
+  check`, `acceptance`, `arch`, and strict `arch-config-guard` over the whole pushed tree (the deterministic
   checks pre-commit and stop-hook skip). There is **no** `deadcode` target —
   rust's `dead_code` lint is on by default and `ci`'s strict clippy
   (`-D warnings`) already denies unused functions, fields, and variants;
@@ -31,7 +32,7 @@ paraphrase (it drifts). Two sections:
   for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
   length≤100).
 - `## Behavior contract` — Layer 2; see
-  [reference-behavior-contract.md](reference-behavior-contract.md).
+  [behavior-contract.md](behavior-contract.md).
 
 `cargo harness` is wired via `.cargo/config.toml` aliasing the binary in
 `src/main.rs`. When adapting an existing repo with a different runner
@@ -45,14 +46,14 @@ cargo build && cargo harness setup-hooks
 # Start coding in src/
 ```
 
-This brings `.claude/` (Layer 2), `.codex/hooks.json`, and
-`.codex/hooks/codex-stop-hook.sh` intact — keep them.
+This brings `AGENTS.md`/`CLAUDE.md` (Layer 2), `.claude/settings.json`,
+`.codex/hooks.json`, and `.codex/hooks/codex-stop-hook.sh` intact — keep them.
 
 ## Hooks
 
-`.claude/settings.json` wires Claude hooks; `.codex/hooks.json` wires the
-Codex Stop hook. Full shape:
-[reference-settings-json.md](reference-settings-json.md).
+`.claude/settings.json` wires the Claude Stop hook; `.codex/hooks.json` wires
+the Codex Stop hook. Full shape:
+[settings-json.md](settings-json.md).
 Claude Stop command:
 `cd $CLAUDE_PROJECT_DIR && cargo harness stop-hook`.
 Codex Stop command:
@@ -67,4 +68,4 @@ Codex Stop command:
   cargo-llvm-cov (coverage), cucumber (acceptance), cargo-mutants
   (mutation), proptest (property-based tests, see `mod property_tests`
   in `harness.rs`), cargo-modules (arch)
-- Protected arch config: `arch.toml`
+- Protected arch config: `arch.toml` (`cargo harness arch-config-guard`)

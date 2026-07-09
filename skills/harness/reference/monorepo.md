@@ -1,4 +1,4 @@
-# reference-monorepo
+# monorepo
 
 Source: `~/Code/harness-templates/monorepo/`
 
@@ -21,7 +21,9 @@ Code reads `CLAUDE.md`; Codex (and other AGENTS.md-consuming tools) read
   parallel (including its dead-code gate where the language ships one —
   python vulture, bun knip; go and rust cover dead code via their linters)
   and its advisory CRAP gate, and `pre-push` is the offline push gate (lint,
-  format check, acceptance, arch over the whole pushed tree). `make crap`
+  format check, acceptance, arch, and strict `arch-config-guard` over the
+  whole pushed tree). `make arch-config-guard` protects all known arch config
+  filenames across the repo. `make crap`
   fans out the advisory CRAP gate directly
   (per-subproject `harness crap`, pass `--enforce` for hard-fail);
   `make agents-md-drift` / `make sync-agents-md` fan out the root +
@@ -32,7 +34,7 @@ Code reads `CLAUDE.md`; Codex (and other AGENTS.md-consuming tools) read
   buffered fan-out; `make list` lists subprojects; `make bootstrap`
   installs everything.
 - `## Behavior contract` — Layer 2; see
-  [reference-behavior-contract.md](reference-behavior-contract.md).
+  [behavior-contract.md](behavior-contract.md).
 
 Each subproject keeps its own zero-dep harness (`harness.ts` /
 `harness.py` / `harness.go` / `cargo harness`). Running one directly from
@@ -57,23 +59,23 @@ make check       # dispatches to every subproject
 make check-api   # scope to one subproject
 ```
 
-The monorepo root `.claude/` (Layer 2), `.codex/hooks.json`, and
+The monorepo root `AGENTS.md`/`CLAUDE.md` (Layer 2),
+`.claude/settings.json`, `.codex/hooks.json`, and
 `.codex/hooks/codex-stop-hook.sh` come in with the copy — keep them.
 
 ## Hooks
 
-`.claude/settings.json` wires Claude hooks; `.codex/hooks.json` wires the
-Codex Stop hook. Full shape:
-[reference-settings-json.md](reference-settings-json.md).
+`.claude/settings.json` wires the Claude Stop hook; `.codex/hooks.json` wires
+the Codex Stop hook. Full shape:
+[settings-json.md](settings-json.md).
 Claude Stop command:
 `cd $CLAUDE_PROJECT_DIR && make stop-hook`.
 Codex Stop command:
 `cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh make stop-hook`.
 
-The monorepo's `pre-edit-gate.sh` and `ups-classify.sh` protect **all
-four** arch configs by basename (`.importlinter`,
-`.dependency-cruiser.json`, `.go-arch-lint.yml`, `arch.toml`),
-suffix-matched so a config nested in any subproject is covered.
+The monorepo's `arch-config-guard` protects **all four** arch configs by
+basename (`.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`,
+`arch.toml`), suffix-matched so a config nested in any subproject is covered.
 
 ## Canonical anchors
 

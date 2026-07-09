@@ -12,6 +12,7 @@
 - Scope to dirty subprojects: `make check-dirty` (working-tree + untracked changes)
 - Parallel fan-out: `PARALLEL=1 make check` — opt-in, buffered per-subproject output. Keep off for CI and agent-visible runs.
 - List subprojects: `make list`
+- Arch config guard: `make arch-config-guard` — blocks unreviewed `.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, or `arch.toml` changes in pre-commit/pre-push/CI; use `HARNESS_ALLOW_ARCH_CONFIG=1` after review
 - Agents drift: `make agents-md-drift` — fail if any subproject's AGENTS.md differs from its CLAUDE.md (root pair included). Scope: `make agents-md-drift-<sub>`
 - Sync: `make sync-agents-md` — overwrite each subproject's AGENTS.md from its CLAUDE.md. Scope: `make sync-agents-md-<sub>`
 - Setup: `make bootstrap` — per-language install + install the root git hook
@@ -22,6 +23,7 @@
 - `make check` passes clean — never stop with check failing.
 - User-visible behavior change → a `.feature` scenario exists and acceptance passes.
 - No new suppressions: additions above `.harness-baseline` fail check; suppress only with the human's sign-off, stating why.
+- Arch config changes are integration-blocked: `check`/`stop-hook` warn, and `pre-commit`/`pre-push`/`ci` fail unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 - `pre-push`/`ci` are the human's gates: leave the tree in a state where they would pass, but do not commit or push yourself.
 
 Each subproject keeps its own zero-dep harness (`harness.ts` / `harness.py` / `harness.go` / `cargo harness`). The Makefile only dispatches — never reimplements lint, format, or test logic. Running a subproject's harness directly from its own directory still works:
@@ -43,7 +45,6 @@ cd api && uv run harness check
 
 - The human is the engineer. They own design, API shape, and merge authority. You propose, they dispose.
 - Do NOT run `git commit`, `git push`, or equivalent publishing commands unless the user's current prompt asked for it. The verbs `commit`, `push`, `ship`, `land`, `merge` in action context authorize that turn only.
-- If you decide on your own to "commit this and move on," the `PreToolUse` hook will deny the command. That is working as intended.
 </important>
 
 <important if="the task changes user-visible behavior">
@@ -56,5 +57,5 @@ cd api && uv run harness check
 <important if="you want to edit a subproject's arch config">
 - Each language subproject has its own arch config: `.importlinter` (python), `.dependency-cruiser.json` (bun), `.go-arch-lint.yml` (go), `arch.toml` (rust).
 - Do not silently edit an arch config to silence a violation. Architectural violations imply a design decision — surface them to the human.
-- The `PreToolUse` hook denies edits to any of these unless the user's current prompt explicitly authorized that path.
+- The harness warns about arch config changes during `check`/`stop-hook` and blocks `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 </important>

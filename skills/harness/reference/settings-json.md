@@ -1,6 +1,6 @@
-# reference-settings-json
+# settings-json
 
-`.claude/settings.json` and `.codex/hooks.json` wire the harness hooks.
+`.claude/settings.json` and `.codex/hooks.json` wire the agent Stop hooks.
 Source files live at:
 
 - `~/Code/harness-templates/<lang>/.claude/settings.json`
@@ -9,71 +9,31 @@ Source files live at:
 
 Copy the pair matching the target language. Claude hooks run inside Claude
 Code's hook runtime. Codex hooks run inside Codex's hook runtime and are
-trust-gated per project. The contract text in `AGENTS.md`/`CLAUDE.md` (same
-content byte-for-byte; the harness `agents-md-drift` check enforces no drift)
-applies as instruction to any agent reading the file.
+trust-gated per project. The contract text in `AGENTS.md`/`CLAUDE.md` applies
+as instruction to any agent reading the file.
 
-Two cases:
+The templates wire only `Stop` hooks. The Stop hook runs `stop-hook`, which
+formats changed files, then runs complexity plus deadcode where the language
+ships a separate deadcode gate.
 
-- **Layer 1 only** — Claude and Codex `Stop` hooks run `stop-hook`, which
-  auto-formats, then runs complexity (+ deadcode where shipped).
-- **Layer 1 + Layer 2** — Claude gets all five hooks (the behavior contract;
-  see [reference-behavior-contract.md](reference-behavior-contract.md)).
-  Codex still gets the Stop hook through `.codex/hooks.json`.
+## Claude Stop hook
 
-When merging into existing hook config, add only the hook entries you need and
-preserve every other key.
-
-## Claude full shape (Layer 1 + Layer 2)
-
-Every template now ships this. Only the `Stop` commands differ per
-language — every other hook is byte-identical.
+Every template ships this shape. Only the command differs per language.
 
 ```json
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|resume|clear|compact",
-        "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/session-start.sh" }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/ups-classify.sh" }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/pre-bash-gate.sh" }
-        ]
-      },
-      {
-        "matcher": "Write|Edit|MultiEdit",
-        "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/pre-edit-gate.sh" }
-        ]
-      }
-    ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "<STOP-HOOK COMMAND — see table below>" }
+          { "type": "command", "command": "<STOP-HOOK COMMAND - see table below>" }
         ]
       }
     ]
   }
 }
 ```
-
-## Claude Stop commands per language
 
 | Template | Stop-hook command |
 |---|---|
@@ -94,8 +54,8 @@ to stderr and prints exactly one JSON object to stdout:
 - `{"continue":true}` when checks pass.
 - `{"decision":"block","reason":"..."}` when checks fail.
 
-Do not point Codex directly at `make stop-hook` or a language runner that prints
-human status lines to stdout.
+Do not point Codex directly at `make stop-hook` or a language runner that
+prints human status lines to stdout.
 
 ```json
 {
@@ -105,7 +65,7 @@ human status lines to stdout.
         "hooks": [
           {
             "type": "command",
-            "command": "<CODEX STOP-HOOK COMMAND — see table below>",
+            "command": "<CODEX STOP-HOOK COMMAND - see table below>",
             "timeout": 300,
             "statusMessage": "Running stop-hook checks"
           }
@@ -124,12 +84,6 @@ human status lines to stdout.
 | Rust | `cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh cargo harness stop-hook` |
 | Monorepo | `cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh make stop-hook` |
 
-## Layer 1 only (no behavior contract)
-
-If the user does not want the behavior contract, wire just the Claude `Stop`
-block and the Codex `.codex/hooks.json` block above. Drop `SessionStart`,
-`UserPromptSubmit`, and `PreToolUse`, and do not copy `.claude/scripts/`.
-
 ## Adapting to a different runner
 
 If the repo uses `just`, `make`, or npm scripts instead of the template
@@ -137,3 +91,7 @@ runner, only the trailing `Stop` commands change. Keep the Claude
 `cd $CLAUDE_PROJECT_DIR &&` prefix, keep the Codex
 `cd "$(git rev-parse --show-toplevel)" &&` prefix, and preserve every hook
 array shape.
+
+Do not add SessionStart, UserPromptSubmit, or PreToolUse behavior gates. The
+current behavior contract is enforced through instructions plus
+`arch-config-guard` in the runner.

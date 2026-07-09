@@ -3,8 +3,8 @@ name: harness
 description: >
   Bootstrap or align a repo with the harness-templates contract: the
   5-script quality harness (check, pre-commit, ci, audit, post-edit) plus
-  the hook-enforced behavior contract (task sizing, human-owned commits,
-  Gherkin-first, arch-config write-protection). Use when starting a new
+  the behavior contract (task sizing, human-owned commits, Gherkin-first,
+  arch-config integration guard). Use when starting a new
   python/bun/go/rust/monorepo project, adding a quality harness to an
   existing repo, or asked to match ~/Code/harness-templates conventions.
   Triggers: "add a harness", "set up check/ci/pre-commit", "align with
@@ -20,9 +20,10 @@ has **two layers**:
 - **Layer 1 — quality harness** (always): the 5 scripts `check`,
   `pre-commit`, `ci`, `audit`, `post-edit`.
 - **Layer 2 — behavior contract** (greenfield: automatic; existing repo:
-  opt-in): `.claude/` hooks that enforce task sizing, human-owned commits,
-  Gherkin-first, and arch-config write-protection. See
-  [reference-behavior-contract.md](reference-behavior-contract.md).
+  opt-in): `AGENTS.md`/`CLAUDE.md` instructions plus `arch-config-guard`,
+  which warns during `check`/`stop-hook` and blocks `pre-commit`/`pre-push`/`ci`
+  unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. See
+  [behavior-contract.md](reference/behavior-contract.md).
 
 ## Source of truth
 
@@ -39,8 +40,6 @@ Always read first. Do not restate the contract from memory.
 - `~/Code/harness-templates/<lang>/.codex/hooks.json` — Codex Stop hook
 - `~/Code/harness-templates/<lang>/.codex/hooks/codex-stop-hook.sh` —
   Codex stdout-to-JSON wrapper for Stop hooks
-- `~/Code/harness-templates/<lang>/.claude/scripts/` — hook scripts; SessionStart
-  extracts the contract text from `CLAUDE.md`
 - `~/Code/harness-templates/python/harness.py` `run()` — canonical quiet output
 
 Never edit anything under `~/Code/harness-templates/`.
@@ -48,29 +47,35 @@ Never edit anything under `~/Code/harness-templates/`.
 ## Decide first
 
 1. **Empty dir** → copy a template verbatim (see per-language reference).
-   Layer 2 comes inside `.claude/` — keep it.
+   Layer 2 comes through `AGENTS.md`/`CLAUDE.md` and the runner's
+   `arch-config-guard` — keep it.
 2. **Existing repo with a runner** (just/make/npm scripts/cargo) → adapt
    Layer 1; reuse the existing runner. Do **not** add a second one.
-   Layer 2 is **opt-in** — ask before wiring it; the hooks deny the
-   agent's commits and arch-config edits, which surprises an unprepared
-   user.
+   Layer 2 is **opt-in** — ask before wiring it because it adds explicit
+   agent instructions and arch-config integration failures.
 3. **Polyglot / multi-project** → use `monorepo/` Makefile dispatch.
+
+When auditing or repairing a repo that already has some harness pieces,
+read [adoption-checklist.md](reference/adoption-checklist.md)
+before language-specific references. Use it to find missing commands,
+incorrect command substages, noisy success output, and incomplete hook/docs
+wiring, then apply the smallest compatible fix.
 
 ## Language detection
 
 | Signal | Template |
 |---|---|
-| `pyproject.toml` / `uv.lock` | `python/` → [reference-python.md](reference-python.md) |
-| `package.json` + `bun.lock` | `bun/` → [reference-bun.md](reference-bun.md) |
-| `Cargo.toml` | `rust/` → [reference-rust.md](reference-rust.md) |
-| `go.mod` | `go/` → [reference-go.md](reference-go.md) |
-| `Makefile` + multiple subprojects | `monorepo/` → [reference-monorepo.md](reference-monorepo.md) |
+| `pyproject.toml` / `uv.lock` | `python/` → [python.md](reference/python.md) |
+| `package.json` + `bun.lock` | `bun/` → [bun.md](reference/bun.md) |
+| `Cargo.toml` | `rust/` → [rust.md](reference/rust.md) |
+| `go.mod` | `go/` → [go.md](reference/go.md) |
+| `Makefile` + multiple subprojects | `monorepo/` → [monorepo.md](reference/monorepo.md) |
 
-Claude/Codex hook + Stop-hook shape: [reference-settings-json.md](reference-settings-json.md).
+Claude/Codex hook + Stop-hook shape: [settings-json.md](reference/settings-json.md).
 The Stop hook runs `stop-hook`; `stop-hook` runs `post-edit`, then the
 read-only complexity gate (plus the dead-code gate where the language ships
 one) in parallel.
-Behavior contract: [reference-behavior-contract.md](reference-behavior-contract.md).
+Behavior contract: [behavior-contract.md](reference/behavior-contract.md).
 
 ## Layer 1 — the 5-script contract
 
@@ -85,8 +90,11 @@ Behavior contract: [reference-behavior-contract.md](reference-behavior-contract.
 | `stop-hook` | Agent Stop hook | post-edit + complexity + deadcode (python/bun) | yes |
 
 Quality subcommands also callable standalone: `complexity`, `crap`,
-`acceptance`, `coverage` (Go also keeps `test-cov`), `mutation`, `arch`, `suppressions`, and
-`deadcode` (python/bun). `deadcode` flags unused code and runs in `ci` +
+`acceptance`, `coverage` (Go also keeps `test-cov`), `mutation`, `arch`,
+`arch-config-guard`, `suppressions`, and `deadcode` (python/bun).
+`arch-config-guard` warns in `check`/`stop-hook` and fails
+`pre-commit`/`pre-push`/`ci` when protected arch config paths changed unless
+`HARNESS_ALLOW_ARCH_CONFIG=1` is set. `deadcode` flags unused code and runs in `ci` +
 `stop-hook`: python via vulture (app sources only, `--min-confidence 60`,
 allowlist false positives in `vulture_allowlist.py`), bun via knip (unused
 files/exports/deps, configured by `knip.json`, fetched on demand via
@@ -112,26 +120,21 @@ points agents at that suite.
 
 ## Layer 2 — the behavior contract
 
-Greenfield copies inherit it via `.claude/`. For an existing repo, wire it
-**only when the user opts in**. Full porting + onboarding steps:
-[reference-behavior-contract.md](reference-behavior-contract.md). In short:
+Greenfield copies inherit it through `AGENTS.md`/`CLAUDE.md` and the runner.
+For an existing repo, wire it **only when the user opts in**. Full porting + onboarding steps:
+[behavior-contract.md](reference/behavior-contract.md). In short:
 
-- `.claude/scripts/` + `.claude/settings.json` add four hooks around
-  `stop-hook`: reinject the `<important>` blocks from `CLAUDE.md` each session, capture commit/edit
-  intent from the user's prompt, deny unauthorized `git commit`/`push`,
-  deny unauthorized arch-config edits.
 - `AGENTS.md` and `CLAUDE.md` both carry the `## Behavior contract`
   section. The two files hold the same content (the templates'
-  `agents-md-drift` check enforces no drift). SessionStart extracts the contract
-  from `CLAUDE.md`, so there is no third copy to sync.
+  `agents-md-drift` check enforces no drift).
+- `arch-config-guard` protects the repo's architecture config at integration
+  time: warning mode in `check`/`stop-hook`, strict mode in
+  `pre-commit`/`pre-push`/`ci`, reviewed override via
+  `HARNESS_ALLOW_ARCH_CONFIG=1`.
 
-Hook denials require Claude Code's hook runtime; the contract text in
-`AGENTS.md`/`CLAUDE.md` applies as instruction to any agent reading the
-file.
-
-After wiring Layer 2, **onboard the user** — state plainly what now gets
-denied and why (see the reference), so a denied commit reads as designed,
-not broken.
+After wiring Layer 2, **onboard the user** — state plainly that commit/push
+ownership is instruction-only, while arch-config changes are blocked by the
+runner gates until reviewed.
 
 ## Adapt rules (existing repos)
 
@@ -149,8 +152,8 @@ not broken.
 - Template runner files (`harness.py`, `harness.ts`, `harness.go`,
   `cargo harness`) are for greenfield/copy flow — not the default for
   repos that already have a runner.
-- Layer 2 is opt-in: never wire the behavior-contract hooks into a repo
-  that did not ask for them.
+- Layer 2 is opt-in: never wire behavior-contract instructions or the
+  arch-config integration guard into a repo that did not ask for them.
 - The contract's law-like rule (property tests) needs the language's PBT
   dev-dep: hypothesis (python), fast-check (bun), rapid (go), proptest
   (rust). Wire it when porting the contract — or on the first law-like
@@ -175,13 +178,13 @@ Layer 1:
 3. Pre-commit hook fires on a staged change (`.git/hooks/pre-commit` exists).
 4. `audit` passes.
 5. `stop-hook` runs via Stop hook and includes post-edit formatting (Claude/Codex hooks wired per
-   [reference-settings-json.md](reference-settings-json.md)).
+   [settings-json.md](reference/settings-json.md)).
 6. Suppression growth above `.harness-baseline` fails; `suppressions --update-baseline` updates it.
-7. Runner imports nothing outside stdlib/runtime.
+7. `arch-config-guard` warns in `check`/`stop-hook` and fails
+   `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set.
+8. Runner imports nothing outside stdlib/runtime.
 
 Layer 2 (only if wired):
 
-8. A new/resumed session prints the role block (SessionStart hook).
-9. An unprompted `git commit` is denied; a user-requested one passes.
-10. An unauthorized arch-config edit is denied; a path-named one passes.
-11. `.claude/state/` is git-ignored.
+9. `AGENTS.md` and `CLAUDE.md` include the same full behavior contract text.
+10. Commit/push ownership and Gherkin-first rules are present as instructions.

@@ -73,11 +73,71 @@ staged_dirs() { filter_dirs 'git diff --cached --name-only --diff-filter=d'; }
 endef
 export SH_FILTER_DIRS
 
+define SH_ARCH_CONFIG_GUARD
+arch_config_filter() {
+  grep -E '(^|/)(\.importlinter|\.dependency-cruiser\.json|\.go-arch-lint\.yml|arch\.toml)$$' | sort -u
+}
+arch_config_changed_paths() {
+  local staged="$$1" include_pre_push="$$2" base=""
+  if [ "$$staged" = 1 ]; then
+    git diff --cached --name-only --diff-filter=d 2>/dev/null || true
+    return 0
+  fi
+  git diff --name-only --diff-filter=d 2>/dev/null || true
+  git diff --cached --name-only --diff-filter=d 2>/dev/null || true
+  git ls-files --others --exclude-standard 2>/dev/null || true
+  if [ -n "$${HARNESS_ARCH_BASE:-}" ]; then
+    base="$$HARNESS_ARCH_BASE"
+  elif [ -n "$${GITHUB_BASE_REF:-}" ]; then
+    base="origin/$$GITHUB_BASE_REF"
+  fi
+  if [ -n "$$base" ] && git rev-parse --verify "$$base" >/dev/null 2>&1; then
+    git diff --name-only --diff-filter=d "$$base...HEAD" 2>/dev/null || true
+  fi
+  if [ "$$include_pre_push" = 1 ] && [ ! -t 0 ]; then
+    local local_ref local_sha remote_ref remote_sha zero
+    zero=0000000000000000000000000000000000000000
+    while read -r local_ref local_sha remote_ref remote_sha; do
+      [ -z "$$local_sha" ] && continue
+      [ "$$local_sha" = "$$zero" ] && continue
+      if [ "$$remote_sha" = "$$zero" ]; then
+        git diff-tree --no-commit-id --name-only -r "$$local_sha" 2>/dev/null || true
+      else
+        git diff --name-only --diff-filter=d "$$remote_sha" "$$local_sha" 2>/dev/null || true
+      fi
+    done
+  fi
+}
+arch_config_guard() {
+  local staged="$$1" warn_only="$$2" include_pre_push="$$3" changed
+  changed=$$(arch_config_changed_paths "$$staged" "$$include_pre_push" | arch_config_filter)
+  if [ -z "$$changed" ]; then
+    printf "  $(GREEN)✓$(RESET) Arch config guard\n"
+    return 0
+  fi
+  changed=$$(printf '%s\n' "$$changed" | paste -sd ', ' -)
+  if [ "$${HARNESS_ALLOW_ARCH_CONFIG:-}" = 1 ]; then
+    printf "  $(GREEN)⚠$(RESET) Arch config guard override: %s\n" "$$changed"
+    return 0
+  fi
+  if [ "$$warn_only" = 1 ]; then
+    printf "  $(GREEN)⚠$(RESET) Arch config changed: %s\n" "$$changed"
+    printf "  ↳ fix: review intentionally, then use HARNESS_ALLOW_ARCH_CONFIG=1 for commit/push/CI\n"
+    return 0
+  fi
+  printf "  $(RED)✗$(RESET) Arch config changed: %s\n" "$$changed"
+  printf "  ↳ fix: review intentionally, then rerun with HARNESS_ALLOW_ARCH_CONFIG=1\n"
+  return 1
+}
+endef
+export SH_ARCH_CONFIG_GUARD
+
 ##@ Daily
 
 .PHONY: check
 check: ## Run check across all subprojects (auto-fix)
 	@$(MAKE) --no-print-directory _root_agents_drift || exit 1
+	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 0 1 0
 	@$(MAKE) --no-print-directory _run CMD=check DIRS="$(SUBPROJECTS)"
 
 .PHONY: check-dirty
@@ -92,6 +152,7 @@ check-dirty: ## Run check only in subprojects with working-tree changes
 .PHONY: pre-commit
 pre-commit: ## Staged-only checks across affected subprojects
 	@set -u -o pipefail; eval "$$SH_FILTER_DIRS"; \
+	eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 1 0 0 || exit 1; \
 	dirs=$$(staged_dirs); \
 	staged_root=$$(git diff --cached --name-only --diff-filter=d | grep -E '^(CLAUDE|AGENTS)\.md$$' || true); \
 	if [ -n "$$staged_root" ]; then \
@@ -104,10 +165,12 @@ pre-commit: ## Staged-only checks across affected subprojects
 
 .PHONY: ci
 ci: ## Read-only gate across all subprojects
+	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 0 0 0
 	@$(MAKE) --no-print-directory _run CMD=ci DIRS="$(SUBPROJECTS)"
 
 .PHONY: pre-push
 pre-push: ## Read-only push gate across all subprojects (lint, format check, acceptance, arch)
+	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 0 0 1
 	@$(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)"
 
 .PHONY: test
@@ -133,6 +196,14 @@ sync-agents-md: ## Overwrite each AGENTS.md from its CLAUDE.md (root + subprojec
 	@set -u -o pipefail; \
 	$(MAKE) --no-print-directory _root_agents_sync; \
 	$(MAKE) --no-print-directory _run CMD=sync-agents-md DIRS="$(SUBPROJECTS)"
+
+.PHONY: arch-config-guard
+arch-config-guard: ## Block unreviewed arch config changes; pass ARGS=--warn for advisory mode
+	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; \
+	warn=0; staged=0; \
+	case " $(ARGS) " in *" --warn "*) warn=1 ;; esac; \
+	case " $(ARGS) " in *" --staged "*) staged=1 ;; esac; \
+	arch_config_guard "$$staged" "$$warn" 0
 
 # ── Root-pair drift / sync (monorepo top-level AGENTS.md ↔ CLAUDE.md) ──
 .PHONY: _root_agents_drift _root_agents_sync
@@ -283,9 +354,11 @@ post-edit:
 .PHONY: stop-hook
 stop-hook:
 	@set -u -o pipefail; eval "$$SH_FILTER_DIRS"; \
+	eval "$$SH_ARCH_CONFIG_GUARD"; \
 	dirs=$$(dirty_dirs); \
-	[ -z "$$dirs" ] && exit 0; \
 	printf "\n=== Stop Hook Checks ===\n"; \
+	arch_config_guard 0 1 0; \
+	[ -z "$$dirs" ] && exit 0; \
 	$(MAKE) --no-print-directory _run CMD=stop-hook DIRS="$$dirs" PARALLEL=
 
 # ── Internal dispatch ─────────────────────────────────────────────

@@ -30,6 +30,8 @@ VULTURE_ALLOWLIST = "vulture_allowlist.py"
 COMPLEXITY_MAX_ARGS = 8
 BASELINE_FILE = ".harness-baseline"
 SUPPRESSION_BASELINE_PREFIX = "suppressions."
+ARCH_CONFIGS = (".importlinter",)
+ARCH_CONFIG_ALLOW_ENV = "HARNESS_ALLOW_ARCH_CONFIG"
 
 # ── Hook wiring (installed by `setup-hooks`) ──────────────────────
 # Claude reads .claude/settings.json and runs the harness directly; Codex reads
@@ -576,6 +578,146 @@ def cmd_arch() -> None:
         run(gate.description, gate.cmd)
 
 
+def _git_lines(args: list[str]) -> list[str]:
+    result = subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _git_prefix() -> str:
+    lines = _git_lines(["rev-parse", "--show-prefix"])
+    if not lines:
+        return ""
+    return lines[0].removeprefix("./").replace("\\", "/").strip("/")
+
+
+def _normalize_changed_path(path: str, prefix: str) -> str:
+    normalized = path.strip().removeprefix("./").replace("\\", "/")
+    if prefix and normalized.startswith(f"{prefix}/"):
+        return normalized[len(prefix) + 1 :]
+    return normalized
+
+
+def _changed_paths_from_base() -> list[str]:
+    bases: list[str] = []
+    if base := os.environ.get("HARNESS_ARCH_BASE"):
+        bases.append(base)
+    if github_base := os.environ.get("GITHUB_BASE_REF"):
+        bases.append(f"origin/{github_base}")
+
+    paths: list[str] = []
+    for base in bases:
+        if not _git_lines(["rev-parse", "--verify", base]):
+            continue
+        paths.extend(
+            _git_lines(["diff", "--name-only", "--diff-filter=d", f"{base}...HEAD", "--", "."])
+        )
+    return paths
+
+
+def _changed_paths_from_pre_push_stdin() -> list[str]:
+    if sys.stdin.isatty():
+        return []
+    text = sys.stdin.read()
+    if not text.strip():
+        return []
+    zero = "0" * 40
+    paths: list[str] = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        _, local_sha, _, remote_sha = parts[:4]
+        if local_sha == zero:
+            continue
+        if remote_sha == zero:
+            paths.extend(
+                _git_lines([
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    local_sha,
+                    "--",
+                    ".",
+                ])
+            )
+        else:
+            paths.extend(
+                _git_lines([
+                    "diff",
+                    "--name-only",
+                    "--diff-filter=d",
+                    remote_sha,
+                    local_sha,
+                    "--",
+                    ".",
+                ])
+            )
+    return paths
+
+
+def _changed_arch_configs(
+    *, staged: bool = False, include_pre_push_stdin: bool = False
+) -> list[str]:
+    paths: list[str] = []
+    if staged:
+        paths.extend(_git_lines(["diff", "--cached", "--name-only", "--diff-filter=d", "--", "."]))
+    else:
+        paths.extend(_git_lines(["diff", "--name-only", "--diff-filter=d", "--", "."]))
+        paths.extend(_git_lines(["diff", "--cached", "--name-only", "--diff-filter=d", "--", "."]))
+        paths.extend(_git_lines(["ls-files", "--others", "--exclude-standard", "--", "."]))
+        paths.extend(_changed_paths_from_base())
+    if include_pre_push_stdin:
+        paths.extend(_changed_paths_from_pre_push_stdin())
+
+    protected = set(ARCH_CONFIGS)
+    prefix = _git_prefix()
+    changed: set[str] = set()
+    for path in paths:
+        normalized = _normalize_changed_path(path, prefix)
+        if normalized in protected:
+            changed.add(normalized)
+    return sorted(changed)
+
+
+def _check_arch_config_guard(
+    *,
+    warn_only: bool = False,
+    staged: bool = False,
+    include_pre_push_stdin: bool = False,
+) -> bool:
+    changed = _changed_arch_configs(staged=staged, include_pre_push_stdin=include_pre_push_stdin)
+    if not changed:
+        print(f"  {GREEN}✓{RESET} Arch config guard")
+        return True
+    joined = ", ".join(changed)
+    if os.environ.get(ARCH_CONFIG_ALLOW_ENV) == "1":
+        print(f"  {GREEN}⚠{RESET} Arch config guard override: {joined}")
+        return True
+    if warn_only:
+        print(f"  {GREEN}⚠{RESET} Arch config changed: {joined}")
+        print(
+            f"  ↳ fix: review intentionally, then use {ARCH_CONFIG_ALLOW_ENV}=1 for commit/push/CI"
+        )
+        return True
+    print(f"  {RED}✗{RESET} Arch config changed: {joined}")
+    print(f"  ↳ fix: review intentionally, then rerun with {ARCH_CONFIG_ALLOW_ENV}=1")
+    return False
+
+
+def cmd_arch_config_guard() -> None:
+    ok = _check_arch_config_guard(warn_only="--warn" in sys.argv, staged="--staged" in sys.argv)
+    if not ok:
+        sys.exit(1)
+
+
 def _crap_score(ccn: int, cov: float) -> float:
     """CRAP = ccn^2 * (1-cov)^3 + ccn."""
     return ccn * ccn * (1 - cov) ** 3 + ccn
@@ -770,6 +912,7 @@ def cmd_stop_hook() -> None:
     """Run stop-time checks after agent edits."""
     print("\n=== Stop Hook Checks ===\n")
     cmd_post_edit()  # mutating — sequential, first
+    _check_arch_config_guard(warn_only=True)
     all_ok = run_gates_parallel([_complexity_gate(), _deadcode_gate()])  # read-only batch
     _exit_if_failed(all_ok)
 
@@ -777,17 +920,14 @@ def cmd_stop_hook() -> None:
 # ── Stages ────────────────────────────────────────────────────────
 
 
-def _check_hooks_present() -> None:
-    """Warn when required hook scripts are missing (drift detection)."""
-    required = [
-        ".claude/scripts/session-start.sh",
-        ".claude/scripts/ups-classify.sh",
-        ".claude/scripts/pre-bash-gate.sh",
-        ".claude/scripts/pre-edit-gate.sh",
-    ]
-    missing = [p for p in required if not Path(p).exists()]
-    if missing:
-        print(f"  {RED}⚠{RESET} Missing hook scripts: {', '.join(missing)}")
+def _check_stop_hooks_present() -> None:
+    """Warn when Claude/Codex Stop hook wiring is missing."""
+    for rel in (".claude/settings.json", ".codex/hooks.json"):
+        text = Path(rel).read_text(encoding="utf-8") if Path(rel).exists() else ""
+        if "Stop" in text and "stop-hook" in text:
+            print(f"  {GREEN}✓{RESET} Stop hook wiring ({rel})")
+        else:
+            print(f"  {RED}⚠{RESET} Missing Stop hook wiring: {rel}")
 
 
 def _first_diff_line(a: str, b: str) -> int:
@@ -848,7 +988,8 @@ def cmd_check() -> None:
         cmd_format()
         cmd_typecheck()
         cmd_test()
-        _check_hooks_present()
+        _check_stop_hooks_present()
+        _check_arch_config_guard(warn_only=True)
         _check_agents_md_drift()
     finally:
         _check_suppressions_baseline()
@@ -862,6 +1003,8 @@ def cmd_pre_commit() -> None:
         return
 
     print("\n=== Pre-commit Checks ===\n")
+    if not _check_arch_config_guard(staged=True):
+        sys.exit(1)
     cmd_fix(files)
     cmd_format(files)
     cmd_typecheck()
@@ -893,6 +1036,7 @@ def cmd_ci() -> None:
     all_ok = run_gates_parallel(gates)
     cmd_coverage()  # streams; self-skips; sequential, after the batch
     cmd_crap()  # reads .coverage/coverage.xml; advisory unless --enforce
+    all_ok = _check_arch_config_guard() and all_ok
     all_ok = _check_suppressions_baseline(no_exit=True) and all_ok
     _exit_if_failed(all_ok)
 
@@ -907,13 +1051,14 @@ def cmd_pre_push() -> None:
     leaves the machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
     """
     print("\n=== Pre-push Checks ===\n")
+    arch_config_ok = _check_arch_config_guard(include_pre_push_stdin=True)
     gates = [
         _lint_gate(),
         _format_check_gate(),
         *_acceptance_gates_or_warn(),
         *_arch_gates_or_warn(),
     ]
-    _exit_if_failed(run_gates_parallel(gates))
+    _exit_if_failed(run_gates_parallel(gates) and arch_config_ok)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -1084,6 +1229,7 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "complexity": (cmd_complexity, "Cyclomatic complexity gate (lizard, CCN 15, args 8)"),
     "deadcode": (cmd_deadcode, "Detect unused (dead) code with vulture (app sources only)"),
     "arch": (cmd_arch, "Architecture checks (import-linter)"),
+    "arch-config-guard": (cmd_arch_config_guard, "Block unreviewed arch config changes"),
     "post-edit": (cmd_post_edit, "Format if source files changed"),
     "stop-hook": (cmd_stop_hook, "Format changed files, then run stop-hook checks"),
     "agents-md-drift": (cmd_agents_md_drift, "Fail if AGENTS.md differs from CLAUDE.md"),

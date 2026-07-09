@@ -15,6 +15,7 @@
 - CRAP (advisory): `bun run crap --max=30` — complexity × coverage gate. Add `--enforce` to exit 1 on offenders (default exits 0 with warning). Warns and skips when no tests or coverage artifact exist.
 - Suppressions: `bun harness.ts suppressions` — full suppression breakdown; `--update-baseline` requires human sign-off and updates `.harness-baseline`
 - Arch: `bun run arch` — dependency-cruiser against `.dependency-cruiser.json`
+- Arch config guard: `bun harness.ts arch-config-guard` — blocks unreviewed `.dependency-cruiser.json` changes in pre-commit/pre-push/CI; use `HARNESS_ALLOW_ARCH_CONFIG=1` after review
 - Agents drift: `bun run harness.ts agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `bun run harness.ts sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
 - Setup: `bun run setup-hooks` installs git pre-commit + pre-push hooks (path resolved via `git rev-parse`, worktree-safe) and idempotently installs the Claude/Codex Stop wiring
@@ -25,6 +26,7 @@
 - `bun run check` passes clean — never stop with check failing.
 - User-visible behavior change → a `.feature` scenario exists and acceptance passes.
 - No new suppressions: additions above `.harness-baseline` fail check; suppress only with the human's sign-off, stating why.
+- Arch config changes are integration-blocked: `check`/`stop-hook` warn, and `pre-commit`/`pre-push`/`ci` fail unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 - `pre-push`/`ci` are the human's gates: leave the tree in a state where they would pass, but do not commit or push yourself.
 
 ## Behavior contract
@@ -40,7 +42,6 @@
 
 - The human is the engineer. They own design, API shape, and merge authority. You propose, they dispose.
 - Do NOT run `git commit`, `git push`, or equivalent publishing commands unless the user's current prompt asked for it. The verbs `commit`, `push`, `ship`, `land`, `merge` in action context authorize that turn only.
-- If you decide on your own to "commit this and move on," the `PreToolUse` hook will deny the command. That is working as intended.
 </important>
 
 <important if="the task changes user-visible behavior">
@@ -52,5 +53,5 @@
 
 <important if="you want to edit `.dependency-cruiser.json` (arch config)">
 - Do not silently edit the arch config to silence a violation. Architectural violations imply a design decision — surface them to the human.
-- The `PreToolUse` hook denies edits to `.dependency-cruiser.json` unless the user's current prompt explicitly authorized it.
+- The harness warns about `.dependency-cruiser.json` changes during `check`/`stop-hook` and blocks `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 </important>

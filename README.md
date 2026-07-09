@@ -105,6 +105,7 @@ make check-api      # scope to one subproject
 - **Dead-code detection** — vulture (Python, via `uvx`) / knip (Bun, via `bunx`); Go & Rust use their linters (golangci-lint `unused` / clippy `dead_code`) — runs in `ci` + `stop-hook`
 - **CRAP advisory** — complexity × coverage signal, advisory by default and still run in `ci`
 - **Suppression baseline ratchet** — `.harness-baseline` tracks allowed suppression counts and the coverage floor (`coverage.min`)
+- **Arch config guard** — protected architecture config changes warn in `check` / `stop-hook` and fail `pre-commit` / `pre-push` / `ci` unless reviewed with `HARNESS_ALLOW_ARCH_CONFIG=1`
 - **Agent Stop hooks** — `.claude/settings.json` runs `stop-hook`; `.codex/hooks.json` runs the Codex JSON wrapper around `stop-hook`
 - **Property-based testing** — hypothesis (Python) / fast-check (Bun) / rapid (Go) / proptest (Rust), seeded with a property suite over each template's own CRAP and parser helpers as the worked example; runs under the normal `test` step
 - **AGENTS.md + CLAUDE.md** — tell AI agents which commands to run and when

@@ -2,9 +2,10 @@
 //!
 //! Usage: cargo harness <command> [--verbose]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
@@ -30,6 +31,8 @@ const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 const BASELINE_FILE: &str = ".harness-baseline";
 const SUPPRESSION_BASELINE_PREFIX: &str = "suppressions.";
+const ARCH_CONFIG: &str = "arch.toml";
+const ARCH_CONFIG_ALLOW_ENV: &str = "HARNESS_ALLOW_ARCH_CONFIG";
 
 // ── Runner ──────────────────────────────────────────────────────────
 
@@ -676,6 +679,7 @@ fn cmd_post_edit() {
 fn cmd_stop_hook() {
     println!("\n=== Stop Hook Checks ===\n");
     cmd_post_edit(); // mutating — sequential, first
+    check_arch_config_guard(true, false, false);
     let all_ok = run_gates_parallel(&[complexity_gate()]); // read-only batch
     if !all_ok {
         std::process::exit(1);
@@ -831,8 +835,8 @@ fn cmd_mutation() {
 /// Rust's compiler enforces visibility and crate layering but NOT freedom
 /// from circular dependencies between modules of one crate, nor the absence
 /// of orphaned (unlinked) source files. Those are the invariants this gate
-/// checks. `arch.toml` is a PROTECTED path — the pre-edit hook denies edits
-/// unless the user's prompt authorizes them. Absent config → skip.
+/// checks. `arch.toml` is guarded by `arch-config-guard`, which blocks
+/// integration until the change is reviewed. Absent config → skip.
 fn arch_gates_or_warn() -> Vec<Gate> {
     if !root().join("arch.toml").exists() {
         println!("  {GREEN}\u{26a0}{RESET} Arch: no arch.toml \u{2014} skipped");
@@ -859,6 +863,165 @@ fn arch_gates_or_warn() -> Vec<Gate> {
 fn cmd_arch() {
     for gate in arch_gates_or_warn() {
         print_gate_result(&run_capture(&gate), false);
+    }
+}
+
+fn git_lines(args: &[&str]) -> Vec<String> {
+    let Ok(output) = Command::new("git").args(args).current_dir(root()).output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn git_prefix() -> String {
+    let Some(prefix) = git_lines(&["rev-parse", "--show-prefix"]).into_iter().next() else {
+        return String::new();
+    };
+    let normalized = prefix.trim_start_matches("./").replace('\\', "/");
+    normalized.trim_matches('/').to_string()
+}
+
+fn normalize_changed_path(path: &str, prefix: &str) -> String {
+    let normalized = path.trim().trim_start_matches("./").replace('\\', "/");
+    if !prefix.is_empty() && normalized.starts_with(&format!("{prefix}/")) {
+        return normalized[prefix.len() + 1..].to_string();
+    }
+    normalized
+}
+
+fn changed_paths_from_base() -> Vec<String> {
+    let mut bases: Vec<String> = Vec::new();
+    if let Ok(base) = env::var("HARNESS_ARCH_BASE")
+        && !base.is_empty()
+    {
+        bases.push(base);
+    }
+    if let Ok(github_base) = env::var("GITHUB_BASE_REF")
+        && !github_base.is_empty()
+    {
+        bases.push(format!("origin/{github_base}"));
+    }
+
+    let mut paths = Vec::new();
+    for base in bases {
+        if git_lines(&["rev-parse", "--verify", &base]).is_empty() {
+            continue;
+        }
+        paths.extend(git_lines(&[
+            "diff",
+            "--name-only",
+            "--diff-filter=d",
+            &format!("{base}...HEAD"),
+            "--",
+            ".",
+        ]));
+    }
+    paths
+}
+
+fn changed_paths_from_pre_push_stdin() -> Vec<String> {
+    let mut stdin = io::stdin();
+    if stdin.is_terminal() {
+        return Vec::new();
+    }
+    let mut text = String::new();
+    if stdin.read_to_string(&mut text).is_err() || text.trim().is_empty() {
+        return Vec::new();
+    }
+    let zero = "0".repeat(40);
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let local_sha = parts[1];
+        let remote_sha = parts[3];
+        if local_sha == zero {
+            continue;
+        }
+        if remote_sha == zero {
+            paths.extend(git_lines(&[
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                local_sha,
+                "--",
+                ".",
+            ]));
+        } else {
+            paths.extend(git_lines(&[
+                "diff",
+                "--name-only",
+                "--diff-filter=d",
+                remote_sha,
+                local_sha,
+                "--",
+                ".",
+            ]));
+        }
+    }
+    paths
+}
+
+fn changed_arch_configs(staged: bool, include_pre_push_stdin: bool) -> Vec<String> {
+    let mut paths = Vec::new();
+    if staged {
+        paths.extend(git_lines(&["diff", "--cached", "--name-only", "--diff-filter=d", "--", "."]));
+    } else {
+        paths.extend(git_lines(&["diff", "--name-only", "--diff-filter=d", "--", "."]));
+        paths.extend(git_lines(&["diff", "--cached", "--name-only", "--diff-filter=d", "--", "."]));
+        paths.extend(git_lines(&["ls-files", "--others", "--exclude-standard", "--", "."]));
+        paths.extend(changed_paths_from_base());
+    }
+    if include_pre_push_stdin {
+        paths.extend(changed_paths_from_pre_push_stdin());
+    }
+
+    let prefix = git_prefix();
+    let changed: BTreeSet<String> = paths
+        .into_iter()
+        .map(|p| normalize_changed_path(&p, &prefix))
+        .filter(|p| p.as_str() == ARCH_CONFIG)
+        .collect();
+    changed.into_iter().collect()
+}
+
+fn check_arch_config_guard(warn_only: bool, staged: bool, include_pre_push_stdin: bool) -> bool {
+    let changed = changed_arch_configs(staged, include_pre_push_stdin);
+    if changed.is_empty() {
+        println!("  {GREEN}\u{2713}{RESET} Arch config guard");
+        return true;
+    }
+    let joined = changed.join(", ");
+    if env::var(ARCH_CONFIG_ALLOW_ENV).as_deref() == Ok("1") {
+        println!("  {GREEN}\u{26a0}{RESET} Arch config guard override: {joined}");
+        return true;
+    }
+    if warn_only {
+        println!("  {GREEN}\u{26a0}{RESET} Arch config changed: {joined}");
+        println!(
+            "  \u{21b3} fix: review intentionally, then use {ARCH_CONFIG_ALLOW_ENV}=1 for commit/push/CI"
+        );
+        return true;
+    }
+    println!("  {RED}\u{2717}{RESET} Arch config changed: {joined}");
+    println!("  \u{21b3} fix: review intentionally, then rerun with {ARCH_CONFIG_ALLOW_ENV}=1");
+    false
+}
+
+fn cmd_arch_config_guard() {
+    if !check_arch_config_guard(arg_flag("--warn"), arg_flag("--staged"), false) {
+        std::process::exit(1);
     }
 }
 
@@ -1166,18 +1329,15 @@ fn arg_flag(name: &str) -> bool {
 
 // ── Stages ──────────────────────────────────────────────────────────
 
-/// Warn when required hook scripts are missing (drift detection).
-fn check_hooks_present() {
-    let required = [
-        ".claude/scripts/session-start.sh",
-        ".claude/scripts/ups-classify.sh",
-        ".claude/scripts/pre-bash-gate.sh",
-        ".claude/scripts/pre-edit-gate.sh",
-    ];
-    let missing: Vec<&str> =
-        required.iter().filter(|p| !root().join(p).exists()).copied().collect();
-    if !missing.is_empty() {
-        println!("  {RED}\u{26a0}{RESET} Missing hook scripts: {}", missing.join(", "));
+/// Warn when Claude/Codex Stop hook wiring is missing.
+fn check_stop_hooks_present() {
+    for rel in [".claude/settings.json", ".codex/hooks.json"] {
+        let text = fs::read_to_string(root().join(rel)).unwrap_or_default();
+        if text.contains("Stop") && text.contains("stop-hook") {
+            println!("  {GREEN}\u{2713}{RESET} Stop hook wiring ({rel})");
+        } else {
+            println!("  {RED}\u{26a0}{RESET} Missing Stop hook wiring: {rel}");
+        }
     }
 }
 
@@ -1268,7 +1428,8 @@ fn cmd_check() {
         check_agents_md_drift(true),
     ];
 
-    check_hooks_present();
+    check_stop_hooks_present();
+    check_arch_config_guard(true, false, false);
     results.push(RunResult { ok: check_suppressions_baseline(true), output: String::new() });
 
     let elapsed = start.elapsed().as_secs_f64();
@@ -1292,6 +1453,9 @@ fn cmd_pre_commit() {
 
     println!("\n{BLUE}[pre-commit]{RESET}\n");
 
+    if !check_arch_config_guard(false, true, false) {
+        std::process::exit(1);
+    }
     cmd_fix();
     check_agents_md_drift(false);
     cmd_test();
@@ -1316,8 +1480,9 @@ fn cmd_ci() {
     .ok;
     cmd_coverage();
     cmd_crap();
+    let arch_config_ok = check_arch_config_guard(false, false, false);
     let suppressions_ok = check_suppressions_baseline(true);
-    if !batch_ok || !audit_ok || !tests_ok || !suppressions_ok {
+    if !batch_ok || !audit_ok || !tests_ok || !arch_config_ok || !suppressions_ok {
         std::process::exit(1);
     }
 }
@@ -1330,10 +1495,11 @@ fn cmd_ci() {
 /// (audit) and advisory (coverage/CRAP) gates stay in ci.
 fn cmd_pre_push() {
     println!("\n{BLUE}[pre-push]{RESET}\n");
+    let arch_config_ok = check_arch_config_guard(false, false, true);
     let mut gates = vec![lint_gate(), format_check_gate()];
     gates.extend(acceptance_gates_or_warn());
     gates.extend(arch_gates_or_warn());
-    if !run_gates_parallel(&gates) {
+    if !run_gates_parallel(&gates) || !arch_config_ok {
         std::process::exit(1);
     }
 }
@@ -1438,6 +1604,7 @@ const COMMANDS: &[(&str, fn())] = &[
     ("coverage", cmd_coverage),
     ("mutation", cmd_mutation),
     ("arch", cmd_arch),
+    ("arch-config-guard", cmd_arch_config_guard),
     ("complexity", cmd_complexity),
     ("crap", cmd_crap),
     ("suppressions", cmd_suppressions),
