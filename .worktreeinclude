@@ -1,4 +1,3 @@
-openspec/
-.factory/
-.claude
+.claude/
+.codex/
 .env*
