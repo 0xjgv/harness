@@ -124,6 +124,11 @@ The skill that bootstraps repos to match these templates lives in
 skills-drift` (run by `make check`) fails if the deployed copies have
 diverged.
 
+This repo root dogfoods the same Stop-hook shape: `.claude/settings.json` runs
+`make stop-hook`, and `.codex/hooks.json` runs the Codex JSON wrapper around
+`make stop-hook`. Root `make check` verifies skill drift, root
+`AGENTS.md`/`CLAUDE.md` drift, and protected arch-config changes.
+
 ## License
 
 [MIT](LICENSE)

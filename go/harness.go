@@ -63,8 +63,7 @@ type runResult struct {
 type runOpts struct {
 	extract func(output string) string
 	noExit  bool
-	// stream inherits stdio for long commands (tests, coverage) so their live
-	// output shows instead of being captured — captured silence looks like a hang.
+	// stream inherits stdio for commands whose live output is part of the contract.
 	stream bool
 }
 
@@ -246,7 +245,7 @@ func stagedPackages(files []string) []string {
 	for _, f := range files {
 		dir := filepath.Dir(f)
 		if dir == "" || dir == "." {
-			dir = "."
+			return []string{"./..."}
 		} else {
 			dir = "./" + dir
 		}
@@ -314,15 +313,14 @@ func cmdLint(pkgs []string) {
 }
 
 func cmdTest() {
-	// Stream: `go test ./...` is a long command, so live output beats captured silence.
-	run("Tests", []string{"go", "test", "./..."}, &runOpts{stream: true})
+	run("Tests", []string{"go", "test", "./..."}, nil)
 }
 
 func cmdTestCov() {
 	run("Tests with coverage", []string{
 		"go", "test", "-race", "-count=1",
 		"-coverprofile=coverage.out", "./...",
-	}, &runOpts{stream: true})
+	}, nil)
 	minPct := coverageMinDefault()
 	pct, ok := coveragePercent()
 	if !ok {
@@ -1013,12 +1011,12 @@ func cmdPreCommit() {
 func cmdCi() {
 	fmt.Printf("\n%s[ci]%s\n\n", blue, reset)
 	// Read-only gates run as a parallel batch (captured, printed in submission
-	// order, run to completion). Coverage streams and CRAP is advisory — after.
+	// order, run to completion). Coverage is captured and CRAP is advisory — after.
 	gates := []gate{lintGate(nil), auditGate(), complexityGate()}
 	gates = append(gates, acceptanceGatesOrWarn()...)
 	gates = append(gates, archGatesOrWarn()...)
 	allOk := runGatesParallel(gates)
-	cmdTestCov() // streams; after the batch
+	cmdTestCov() // after the batch
 	cmdCrap()    // advisory unless --enforce
 	archConfigOk := checkArchConfigGuard(false, false, false)
 	suppressionsOk := suppressions.CheckBaseline(

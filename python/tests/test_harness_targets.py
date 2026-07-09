@@ -129,9 +129,8 @@ class TestNoTestBehavior(unittest.TestCase):
             harness.cmd_test()
 
         run_mock.assert_called_once_with(
-            "Run tests",
+            "Tests",
             ["uv", "run", "python", "-m", "unittest", "discover", "-s", "tests", "-q"],
-            stream=True,
         )
 
     def test_warning_only_gates_skip_when_no_tests_exist(self):

@@ -48,8 +48,7 @@ struct RunOpts {
     no_exit: bool,
     /// Extra environment variables for the child process.
     env: Vec<(String, String)>,
-    /// Stream inherits stdio for long commands (tests, coverage) so their live
-    /// output shows instead of being captured — captured silence looks like a hang.
+    /// Stream inherits stdio for commands whose live output is part of the contract.
     stream: bool,
 }
 
@@ -629,8 +628,7 @@ fn format_check_gate() -> Gate {
 }
 
 fn cmd_test() {
-    // Stream: `cargo test` is a long command, so live output beats captured silence.
-    run("Tests", &["cargo", "test"], Some(&RunOpts { stream: true, ..RunOpts::default() }));
+    run("Tests", &["cargo", "test"], None);
 }
 
 fn cmd_audit() {
@@ -763,7 +761,7 @@ fn cmd_coverage() {
     run(
         "Coverage (run)",
         &["cargo", "llvm-cov", "--no-report"],
-        Some(&RunOpts { env: env.clone(), stream: true, ..RunOpts::default() }),
+        Some(&RunOpts { env: env.clone(), ..RunOpts::default() }),
     );
     run(
         "Coverage: LCOV report",
@@ -1085,7 +1083,7 @@ fn cmd_crap() {
         let run_result = run(
             "CRAP: running tests under llvm-cov",
             &["cargo", "llvm-cov", "--no-report"],
-            Some(&RunOpts { env: env.clone(), no_exit: true, stream: true, ..RunOpts::default() }),
+            Some(&RunOpts { env: env.clone(), no_exit: true, ..RunOpts::default() }),
         );
         let report_result = if run_result.ok {
             run(
@@ -1464,7 +1462,7 @@ fn cmd_pre_commit() {
 fn cmd_ci() {
     println!("\n{BLUE}[ci]{RESET}\n");
     // Read-only gates run as a parallel batch (captured, printed in submission
-    // order, run to completion). Tests + coverage stream; CRAP is advisory — after.
+    // order, run to completion). Tests + coverage are captured; CRAP is advisory.
     let mut gates = vec![lint_gate(), format_check_gate(), complexity_gate()];
     gates.extend(acceptance_gates_or_warn());
     gates.extend(arch_gates_or_warn());
@@ -1472,12 +1470,8 @@ fn cmd_ci() {
     // so one pass surfaces every failure. Audit is install-aware and strict in ci.
     let batch_ok = run_gates_parallel(&gates);
     let audit_ok = cmd_audit_inner(true);
-    let tests_ok = run(
-        "Tests",
-        &["cargo", "test"],
-        Some(&RunOpts { no_exit: true, stream: true, ..RunOpts::default() }),
-    )
-    .ok;
+    let tests_ok =
+        run("Tests", &["cargo", "test"], Some(&RunOpts { no_exit: true, ..RunOpts::default() })).ok;
     cmd_coverage();
     cmd_crap();
     let arch_config_ok = check_arch_config_guard(false, false, false);

@@ -204,8 +204,7 @@ async function run(
   cmd: string[],
   opts?: { extract?: (output: string) => string | undefined; noExit?: boolean; stream?: boolean },
 ): Promise<RunResult> {
-  // stream=true inherits stdio for long commands (tests, coverage) so their live
-  // output shows instead of being captured — captured silence looks like a hang.
+  // stream=true inherits stdio for commands whose live output is part of the contract.
   if (opts?.stream) {
     if (VERBOSE) console.log(`${DIM}  → ${cmd.join(' ')}${RESET}`);
     const proc = Bun.spawn(cmd, { cwd: ROOT, stdout: 'inherit', stderr: 'inherit' });
@@ -564,8 +563,7 @@ async function cmdTest(): Promise<void> {
     warn(`Tests: no ${TEST_DIR}/*.test.ts or *.spec.ts files; skipped`);
     return;
   }
-  // Stream: `bun test` is a long command, so live output beats captured silence.
-  await run('Tests', ['bun', 'test'], { stream: true });
+  await run('Tests', ['bun', 'test'], { extract: extractTestSummary });
 }
 
 function auditGate(): Gate {
@@ -594,7 +592,7 @@ async function cmdCoverage(): Promise<void> {
   await run(
     'Coverage (run)',
     ['bun', 'test', '--coverage', '--coverage-reporter=lcov', '--coverage-dir=coverage'],
-    { stream: true },
+    { extract: extractTestSummary },
   );
 
   const { readFile } = await import('node:fs/promises');
@@ -1300,7 +1298,7 @@ async function cmdPreCommit(): Promise<void> {
 async function cmdCi(): Promise<void> {
   console.log(`\n${BLUE}[ci]${RESET}\n`);
   // Read-only gates run as a parallel batch (captured, printed in submission order,
-  // run to completion). Coverage streams and CRAP is advisory — both after the batch.
+  // run to completion). Coverage is captured and CRAP is advisory — both after the batch.
   const gates: Gate[] = [
     lintGate(),
     typecheckGate(),
@@ -1311,7 +1309,7 @@ async function cmdCi(): Promise<void> {
     ...(await archGatesOrWarn()),
   ];
   const allOk = await runGatesParallel(gates);
-  await cmdCoverage(); // streams; self-skips; after the batch
+  await cmdCoverage(); // self-skips; after the batch
   await cmdCrap(); // advisory unless --enforce
   const archConfigOk = await checkArchConfigGuard();
   const suppressionsOk = await checkSuppressionsBaseline({ noExit: true });

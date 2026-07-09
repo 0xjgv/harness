@@ -120,8 +120,7 @@ def run(
 ) -> None:
     """Run command silently; show output only on failure.
 
-    Pass stream=True for long-running commands (tests, coverage) so their live
-    output is shown instead of being captured — captured silence looks like a hang.
+    Pass stream=True only when live output is part of the command contract.
     """
     if VERBOSE or stream:
         print(f"  -> {' '.join(cmd)}")
@@ -498,9 +497,8 @@ def cmd_typecheck() -> None:
 def cmd_test() -> None:
     if _has_tests():
         run(
-            "Run tests",
+            "Tests",
             ["uv", "run", "python", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"],
-            stream=True,
         )
         return
 
@@ -521,7 +519,6 @@ def cmd_coverage() -> None:
     run(
         "Coverage (run)",
         ["uv", "run", "coverage", "run", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"],
-        stream=True,
     )
     run(
         f"Coverage >= {min_pct}%",
@@ -1020,7 +1017,7 @@ def cmd_ci() -> None:
     Read-only gates run as a parallel batch (lint, format check, typecheck, audit,
     complexity, deadcode, acceptance, arch) — captured and printed in submission order,
     run to completion so one pass surfaces every failure. Coverage and CRAP run after
-    the batch: coverage streams (a long command), CRAP is advisory unless --enforce.
+    the batch: coverage is captured, CRAP is advisory unless --enforce.
     """
     print("\n=== CI Checks ===\n")
     gates = [
@@ -1034,7 +1031,7 @@ def cmd_ci() -> None:
         *_arch_gates_or_warn(),
     ]
     all_ok = run_gates_parallel(gates)
-    cmd_coverage()  # streams; self-skips; sequential, after the batch
+    cmd_coverage()  # self-skips; sequential, after the batch
     cmd_crap()  # reads .coverage/coverage.xml; advisory unless --enforce
     all_ok = _check_arch_config_guard() and all_ok
     all_ok = _check_suppressions_baseline(no_exit=True) and all_ok
