@@ -33,6 +33,7 @@ const BASELINE_FILE: &str = ".harness-baseline";
 const SUPPRESSION_BASELINE_PREFIX: &str = "suppressions.";
 const ARCH_CONFIG: &str = "arch.toml";
 const ARCH_CONFIG_ALLOW_ENV: &str = "HARNESS_ALLOW_ARCH_CONFIG";
+const GHERKIN_ALLOW_ENV: &str = "HARNESS_ALLOW_NO_FEATURE";
 
 // ── Runner ──────────────────────────────────────────────────────────
 
@@ -250,9 +251,13 @@ fn print_gate_result(result: &GateResult, no_exit: bool) -> bool {
 /// non-zero afterward. Each gate captures on its own scoped thread; results collect
 /// into a Vec by submission order (not as they finish) so a parallel run reads the
 /// same every time — matching the monorepo Makefile's buffered, deterministic dump.
-fn run_gates_parallel(gates: &[Gate]) -> bool {
+/// Run gates concurrently, print each result (submission order), and return
+/// the descriptions of any that failed — empty means every gate passed.
+/// Split out from `run_gates_parallel` so `cmd_stop_hook` can name failed
+/// gates in its stderr summary without duplicating the execution/printing.
+fn run_gates_parallel_detailed(gates: &[Gate]) -> Vec<&'static str> {
     if gates.is_empty() {
-        return true;
+        return Vec::new();
     }
     let results: Vec<GateResult> = std::thread::scope(|scope| {
         // Spawn every gate first (collect handles), then join — so the gates run
@@ -263,9 +268,31 @@ fn run_gates_parallel(gates: &[Gate]) -> bool {
         }
         handles.into_iter().map(|handle| handle.join().expect("gate thread panicked")).collect()
     });
-    let mut all_ok = true;
+    let mut failed = Vec::new();
     for result in &results {
         if !print_gate_result(result, true) {
+            failed.push(result.description);
+        }
+    }
+    failed
+}
+
+fn run_gates_parallel(gates: &[Gate]) -> bool {
+    run_gates_parallel_detailed(gates).is_empty()
+}
+
+/// Run gates one at a time, in submission order, printing each result as it
+/// finishes; never short-circuits on failure. Used for gates that invoke
+/// `cargo build`/`cargo test`/etc.: each takes cargo's exclusive lock on
+/// `target/`, so handing them to `run_gates_parallel` does not parallelize
+/// anything — every builder queues behind whichever one holds the lock — it
+/// just interleaves captured output with "Blocking waiting for file lock on
+/// build directory" noise. Sequential keeps the same "run everything to
+/// completion, then report" semantics as the parallel batch, honestly.
+fn run_gates_sequential(gates: &[Gate]) -> bool {
+    let mut all_ok = true;
+    for gate in gates {
+        if !print_gate_result(&run_capture(gate), true) {
             all_ok = false;
         }
     }
@@ -438,9 +465,23 @@ fn read_baseline() -> Option<BTreeMap<String, u32>> {
     Some(parse_baseline_str(&text))
 }
 
+/// Parse a `--min=N` value into a coverage threshold, or an error message to
+/// print before exiting 1. Extracted so the invalid-value path is testable
+/// without calling `std::process::exit` from a test — mirrors python's
+/// `_coverage_min_default` try/except and bun's `parseMinArg`.
+fn parse_coverage_min(raw: &str) -> Result<u32, String> {
+    raw.parse::<u32>().map_err(|_| format!("Coverage: --min={raw} is not an integer"))
+}
+
 fn coverage_min_default() -> u32 {
-    if let Some(value) = arg_value("--min").and_then(|v| v.parse::<u32>().ok()) {
-        return value;
+    if let Some(raw) = arg_value("--min") {
+        return match parse_coverage_min(&raw) {
+            Ok(value) => value,
+            Err(msg) => {
+                println!("  {RED}\u{2717}{RESET} {msg}");
+                std::process::exit(1);
+            }
+        };
     }
     read_baseline().and_then(|b| b.get("coverage.min").copied()).unwrap_or(0)
 }
@@ -575,9 +616,52 @@ fn staged_rs_files() -> Vec<String> {
         .collect()
 }
 
+/// Parse one `git status --porcelain` line into the path it refers to, or
+/// `None` for malformed/too-short lines and deletions (`D` in either status
+/// column — matching python/bun, which also skip deletes here). Resolves
+/// rename lines (`R  old.rs -> new.rs`) to the new path.
+///
+/// Status columns are always exactly one ASCII byte each (space or a
+/// letter), so byte index 3 is always a valid char boundary once `line`
+/// clears the length check — but `line.get(3..)` (rather than `&line[3..]`)
+/// makes that safe by construction instead of by argument, so a multibyte
+/// path can never panic here even if that invariant ever changes upstream.
+fn parse_porcelain_line(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    if bytes.len() < 4 {
+        return None;
+    }
+    if bytes[0] == b'D' || bytes[1] == b'D' {
+        return None;
+    }
+    let path = line.get(3..)?;
+    Some(path.find(" -> ").map_or(path, |idx| &path[idx + 4..]))
+}
+
+/// Convert `git status --porcelain` output into changed `.rs` paths relative
+/// to the current template's subtree. `prefix` (from `git_prefix()`) is the
+/// repo-root-relative path of `root()`; porcelain paths are always
+/// repo-root-relative regardless of cwd, so a path outside `prefix`'s
+/// subtree belongs to a sibling template (or another crate in a monorepo)
+/// and must be dropped rather than normalized — normalizing it would strip
+/// nothing and let it pass the extension filter unchanged.
+fn parse_changed_rs_files(porcelain: &str, prefix: &str) -> Vec<String> {
+    porcelain
+        .lines()
+        .filter_map(parse_porcelain_line)
+        .filter(|p| prefix.is_empty() || p.starts_with(&format!("{prefix}/")))
+        .map(|p| normalize_changed_path(p, prefix))
+        .filter(|f| Path::new(f).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rs")))
+        .collect()
+}
+
 fn changed_rs_files() -> Vec<String> {
+    // `-- .` scopes the porcelain output to this template's subtree, same
+    // idiom the arch-config-guard helpers below already use — without it, a
+    // sibling template's change (or another crate in a monorepo) reads as
+    // "this template changed" and triggers a repo-wide reformat.
     let output = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--", "."])
         .current_dir(root())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -587,20 +671,7 @@ fn changed_rs_files() -> Vec<String> {
         return Vec::new();
     };
 
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            if line.len() < 4 {
-                return None;
-            }
-            let f = &line[3..];
-            if Path::new(f).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rs")) {
-                Some(f.to_string())
-            } else {
-                None
-            }
-        })
-        .collect()
+    parse_changed_rs_files(&String::from_utf8_lossy(&output.stdout), &git_prefix())
 }
 
 // ── Commands ────────────────────────────────────────────────────────
@@ -618,8 +689,13 @@ fn cmd_lint() {
 
 /// The strict clippy gate used by ci/pre-push: warnings are errors. (The dev-facing
 /// `cmd_lint` stays lenient so a warning does not block an in-progress edit loop.)
+///
+/// `--locked` doubles as the lockfile-freshness gate ci/pre-push otherwise
+/// lack (mirroring bun's `bun install --frozen-lockfile`): it fails instead
+/// of silently rewriting `Cargo.lock` when a dependency edit left it stale,
+/// without adding a separate command just for that one check.
 fn lint_gate() -> Gate {
-    Gate::new("Clippy (strict)", &["cargo", "clippy", "--", "-D", "warnings"])
+    Gate::new("Clippy (strict)", &["cargo", "clippy", "--locked", "--", "-D", "warnings"])
         .with_hint("run `cargo harness fix`")
 }
 
@@ -674,13 +750,23 @@ fn cmd_post_edit() {
     run("Format", &["cargo", "fmt"], Some(&RunOpts { no_exit: true, ..RunOpts::default() }));
 }
 
+/// Claude Code's Stop hook treats exit code 2 as blocking and feeds stderr
+/// back to the model; any other non-zero exit is a non-blocking error the
+/// model never sees. (Codex's wrapper, `.codex/hooks/codex-stop-hook.sh`,
+/// turns any non-zero exit into a JSON block regardless, so this only
+/// matters for Claude.) So on failure this keeps the usual per-gate detail
+/// on stdout, then writes a short summary of which gates failed to stderr
+/// and exits 2 — the one command in this file where the exit code carries
+/// meaning beyond "ok or not".
 fn cmd_stop_hook() {
     println!("\n=== Stop Hook Checks ===\n");
     cmd_post_edit(); // mutating — sequential, first
-    check_arch_config_guard(true, false, false);
-    let all_ok = run_gates_parallel(&[complexity_gate()]); // read-only batch
-    if !all_ok {
-        std::process::exit(1);
+    check_arch_config_guard(true, false, false); // warn-only in stop-hook, never fails it
+    check_gherkin_guard(true, false, false); // warn-only in stop-hook, never fails it
+    let failed = run_gates_parallel_detailed(&[complexity_gate()]); // read-only batch
+    if !failed.is_empty() {
+        eprintln!("Stop hook failed: {}", failed.join(", "));
+        std::process::exit(2);
     }
 }
 
@@ -895,6 +981,26 @@ fn normalize_changed_path(path: &str, prefix: &str) -> String {
     normalized
 }
 
+/// Ordered fallback refs consulted when neither `HARNESS_ARCH_BASE` nor
+/// `GITHUB_BASE_REF` is set. GitHub only populates `GITHUB_BASE_REF` for
+/// `pull_request` events — a direct `push` to main gets neither, so without
+/// a fallback `changed_paths_from_base()` silently returns nothing and an
+/// arch-config change arriving by direct push passes `ci` clean.
+const DEFAULT_BASE_REF_CANDIDATES: &[&str] = &["origin/HEAD", "origin/main", "main"];
+
+/// First candidate in `DEFAULT_BASE_REF_CANDIDATES` for which `resolves`
+/// returns true, or `None` if none do. Pure and dependency-injected so the
+/// fallback ordering is testable without shelling out to git.
+fn pick_default_base_ref(resolves: impl Fn(&str) -> bool) -> Option<&'static str> {
+    DEFAULT_BASE_REF_CANDIDATES.iter().copied().find(|candidate| resolves(candidate))
+}
+
+/// `pick_default_base_ref` wired to `git rev-parse --verify`.
+fn default_base_ref() -> Option<String> {
+    pick_default_base_ref(|candidate| !git_lines(&["rev-parse", "--verify", candidate]).is_empty())
+        .map(String::from)
+}
+
 fn changed_paths_from_base() -> Vec<String> {
     let mut bases: Vec<String> = Vec::new();
     if let Ok(base) = env::var("HARNESS_ARCH_BASE")
@@ -906,6 +1012,11 @@ fn changed_paths_from_base() -> Vec<String> {
         && !github_base.is_empty()
     {
         bases.push(format!("origin/{github_base}"));
+    }
+    if bases.is_empty() {
+        // Local runs and CI `push` events land here — fall back to whichever
+        // default ref resolves; skip silently (empty `paths`) if none do.
+        bases.extend(default_base_ref());
     }
 
     let mut paths = Vec::new();
@@ -971,7 +1082,12 @@ fn changed_paths_from_pre_push_stdin() -> Vec<String> {
     paths
 }
 
-fn changed_arch_configs(staged: bool, include_pre_push_stdin: bool) -> Vec<String> {
+/// Every changed path — working tree + staged + untracked, or staged-only
+/// when `staged`, plus the base-branch diff and (optionally) pre-push stdin
+/// refs — normalized relative to this template's subtree. Shared collection
+/// step behind `changed_arch_configs` and the Gherkin-first guard; each
+/// filters this raw set down to what it cares about instead of re-deriving it.
+fn changed_paths(staged: bool, include_pre_push_stdin: bool) -> Vec<String> {
     let mut paths = Vec::new();
     if staged {
         paths.extend(git_lines(&["diff", "--cached", "--name-only", "--diff-filter=d", "--", "."]));
@@ -986,12 +1102,16 @@ fn changed_arch_configs(staged: bool, include_pre_push_stdin: bool) -> Vec<Strin
     }
 
     let prefix = git_prefix();
-    let changed: BTreeSet<String> = paths
-        .into_iter()
-        .map(|p| normalize_changed_path(&p, &prefix))
-        .filter(|p| p.as_str() == ARCH_CONFIG)
-        .collect();
+    let changed: BTreeSet<String> =
+        paths.into_iter().map(|p| normalize_changed_path(&p, &prefix)).collect();
     changed.into_iter().collect()
+}
+
+fn changed_arch_configs(staged: bool, include_pre_push_stdin: bool) -> Vec<String> {
+    changed_paths(staged, include_pre_push_stdin)
+        .into_iter()
+        .filter(|p| p.as_str() == ARCH_CONFIG)
+        .collect()
 }
 
 fn check_arch_config_guard(warn_only: bool, staged: bool, include_pre_push_stdin: bool) -> bool {
@@ -1019,6 +1139,83 @@ fn check_arch_config_guard(warn_only: bool, staged: bool, include_pre_push_stdin
 
 fn cmd_arch_config_guard() {
     if !check_arch_config_guard(arg_flag("--warn"), arg_flag("--staged"), false) {
+        std::process::exit(1);
+    }
+}
+
+/// True when `path` (already normalized relative to this template's subtree)
+/// is "production source" for the Gherkin-first rule: a `.rs` file under
+/// `src/`, excluding anything under `tests/` and excluding `harness.rs`
+/// itself — the harness's own tooling code is not product behavior. See root
+/// CLAUDE.md's Gherkin-first workflow.
+fn is_production_source(path: &str) -> bool {
+    path.starts_with("src/")
+        && path != "harness.rs"
+        && Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("rs"))
+}
+
+/// True when `changed` contains at least one production-source file and no
+/// `.feature` file — the Gherkin-first trigger condition. Pure so it is
+/// testable without shelling out to git.
+fn gherkin_guard_triggered(changed: &[String]) -> bool {
+    changed.iter().any(|p| is_production_source(p))
+        && !changed.iter().any(|p| p.ends_with(".feature"))
+}
+
+/// Pure Gherkin-first decision: `None` means the rule does not apply yet (no
+/// `.feature` files exist anywhere in the template — retrofitting into a repo
+/// without an acceptance suite must never block); `Some(true)` means the
+/// guard should block; `Some(false)` means it passed.
+fn gherkin_guard_decision(has_features: bool, changed: &[String]) -> Option<bool> {
+    has_features.then(|| gherkin_guard_triggered(changed))
+}
+
+/// Pure override check for the `HARNESS_ALLOW_NO_FEATURE` escape hatch,
+/// dependency-injected so a test does not need to touch a process-global env var.
+fn gherkin_guard_overridden(env_value: Option<&str>) -> bool {
+    env_value == Some("1")
+}
+
+/// Gherkin-first guard: blocks (or warns) when production source changed
+/// without a matching `.feature` scenario. Mirrors `check_arch_config_guard`
+/// in shape, modes, and override style.
+fn check_gherkin_guard(warn_only: bool, staged: bool, include_pre_push_stdin: bool) -> bool {
+    let has_features = has_feature_files(&root().join("tests").join("features"));
+    let changed =
+        if has_features { changed_paths(staged, include_pre_push_stdin) } else { Vec::new() };
+    let Some(triggered) = gherkin_guard_decision(has_features, &changed) else {
+        return true; // no acceptance suite yet — retrofitting must never block (silent)
+    };
+    if !triggered {
+        println!("  {GREEN}\u{2713}{RESET} Gherkin-first");
+        return true;
+    }
+    let joined =
+        changed.iter().filter(|p| is_production_source(p)).cloned().collect::<Vec<_>>().join(", ");
+    if gherkin_guard_overridden(env::var(GHERKIN_ALLOW_ENV).ok().as_deref()) {
+        println!("  {GREEN}\u{26a0}{RESET} Gherkin-first override: {joined}");
+        return true;
+    }
+    if warn_only {
+        println!(
+            "  {GREEN}\u{26a0}{RESET} Gherkin-first: production source changed with no .feature: {joined}"
+        );
+        println!(
+            "  \u{21b3} fix: add a scenario under tests/features/, or set {GHERKIN_ALLOW_ENV}=1 after review"
+        );
+        return true;
+    }
+    println!(
+        "  {RED}\u{2717}{RESET} Gherkin-first: production source changed with no .feature: {joined}"
+    );
+    println!(
+        "  \u{21b3} fix: add a scenario under tests/features/, or set {GHERKIN_ALLOW_ENV}=1 after review"
+    );
+    false
+}
+
+fn cmd_gherkin_guard() {
+    if !check_gherkin_guard(arg_flag("--warn"), arg_flag("--staged"), false) {
         std::process::exit(1);
     }
 }
@@ -1061,6 +1258,15 @@ fn cmd_complexity() {
 /// `target/llvm-cov/lcov.info`; this command reuses it. Standalone runs (or
 /// runs where `src/` is newer than the existing LCOV) trigger a full test
 /// re-execution to avoid scoring against stale coverage.
+/// Selects the CRAP gate's status glyph/color and the `(advisory)` suffix.
+/// `✗`/red is reserved for `--enforce` runs, which actually exit 1; the
+/// default advisory mode always exits 0, so it gets `⚠`/green even when it
+/// lists offenders or a lizard failure — a red ✗ that still exits 0 tells the
+/// human the build failed when it did not.
+const fn crap_status_glyph(enforce: bool) -> (&'static str, &'static str, &'static str) {
+    if enforce { (RED, "\u{2717}", "") } else { (GREEN, "\u{26a0}", " (advisory)") }
+}
+
 fn cmd_crap() {
     let max_crap: f64 = arg_value("--max").and_then(|v| v.parse::<f64>().ok()).unwrap_or(30.0);
     let enforce = arg_flag("--enforce");
@@ -1116,8 +1322,8 @@ fn cmd_crap() {
             // Lizard ran but exited non-zero. Trusting partial output would
             // print a green ✓ while leaving high-CCN functions unscored;
             // surface the failure and degrade to advisory unless --enforce.
-            let suffix = if enforce { "" } else { " (advisory)" };
-            println!("  {RED}\u{2717}{RESET} CRAP: lizard exited {:?}{suffix}", o.status.code());
+            let (color, symbol, suffix) = crap_status_glyph(enforce);
+            println!("  {color}{symbol}{RESET} CRAP: lizard exited {:?}{suffix}", o.status.code());
             if !o.stderr.is_empty() {
                 print!("{}", String::from_utf8_lossy(&o.stderr));
             }
@@ -1127,8 +1333,8 @@ fn cmd_crap() {
             return;
         }
         Err(e) => {
-            let suffix = if enforce { "" } else { " (advisory)" };
-            println!("  {RED}\u{2717}{RESET} CRAP: failed to run lizard: {e}{suffix}");
+            let (color, symbol, suffix) = crap_status_glyph(enforce);
+            println!("  {color}{symbol}{RESET} CRAP: failed to run lizard: {e}{suffix}");
             if enforce {
                 std::process::exit(1);
             }
@@ -1177,9 +1383,9 @@ fn cmd_crap() {
         return;
     }
     offenders.sort_by(|a, b| b.crap.partial_cmp(&a.crap).unwrap_or(std::cmp::Ordering::Equal));
-    let suffix = if enforce { "" } else { " (advisory)" };
+    let (color, symbol, suffix) = crap_status_glyph(enforce);
     println!(
-        "  {RED}\u{2717}{RESET} CRAP: {} function(s) exceed {max_crap:.0}{suffix}",
+        "  {color}{symbol}{RESET} CRAP: {} function(s) exceed {max_crap:.0}{suffix}",
         offenders.len()
     );
     for o in offenders.iter().take(20) {
@@ -1415,7 +1621,13 @@ fn cmd_check() {
         ),
         run("Format", &["cargo", "fmt"], Some(&RunOpts { no_exit: true, ..RunOpts::default() })),
         run(
-            "Tests",
+            // `[[test]]` targets (Cargo.toml) always run under plain `cargo
+            // test`, including the `acceptance` binary (harness = false,
+            // tests/acceptance.rs) — so this one line already exercises the
+            // Gherkin/cucumber scenarios too. No separate acceptance gate
+            // here: see the `ci` minus `check` invariant documented in
+            // CLAUDE.md.
+            "Tests (incl. acceptance)",
             &["cargo", "test"],
             Some(&RunOpts {
                 extract: Some(extract_test_summary),
@@ -1426,8 +1638,12 @@ fn cmd_check() {
         check_agents_md_drift(true),
     ];
 
+    let complexity_failed = run_gates_parallel_detailed(&[complexity_gate()]);
+    results.push(RunResult { ok: complexity_failed.is_empty(), output: String::new() });
+
     check_stop_hooks_present();
     check_arch_config_guard(true, false, false);
+    check_gherkin_guard(true, false, false);
     results.push(RunResult { ok: check_suppressions_baseline(true), output: String::new() });
 
     let elapsed = start.elapsed().as_secs_f64();
@@ -1442,41 +1658,104 @@ fn cmd_check() {
     println!("{GREEN}OK{RESET} {passed} passed {DIM}({elapsed:.1}s){RESET}");
 }
 
+/// The arch-config and gherkin-first guards run before the staged-files early
+/// return: both are staged-mode and cheap, and a commit that stages only a
+/// non-Rust file (an arch config edit alone, a `.md`, a lockfile) must not
+/// bypass them.
 fn cmd_pre_commit() {
+    println!("\n{BLUE}[pre-commit]{RESET}\n");
+
+    if !check_arch_config_guard(false, true, false) {
+        std::process::exit(1);
+    }
+    if !check_gherkin_guard(false, true, false) {
+        std::process::exit(1);
+    }
+
     let files = staged_rs_files();
     if files.is_empty() {
         println!("No staged Rust files \u{2014} skipping checks");
         return;
     }
 
-    println!("\n{BLUE}[pre-commit]{RESET}\n");
-
-    if !check_arch_config_guard(false, true, false) {
-        std::process::exit(1);
-    }
     cmd_fix();
+    restage_fixed_files(&files);
     check_agents_md_drift(false);
     cmd_test();
 }
 
+/// Paths from `files` that still exist under `base` — the cheap, testable
+/// guard `restage_fixed_files` uses to skip re-staging anything `cmd_fix()`
+/// might have deleted (clippy --fix / cargo fmt don't delete files, but
+/// checking costs nothing). Pure: takes `base` explicitly so tests don't
+/// need to touch `root()` or the real repo layout.
+fn existing_paths<'a>(base: &Path, files: &'a [String]) -> Vec<&'a str> {
+    files.iter().map(String::as_str).filter(|f| base.join(f).exists()).collect()
+}
+
+/// Re-stage files `cmd_fix()` may have rewritten. `cmd_fix()` (clippy --fix,
+/// cargo fmt) mutates the working tree, but a commit records the INDEX — so
+/// without this, a fixed file's pre-fix blob is what actually gets
+/// committed. Caveat: if a file was only partially staged, `git add` also
+/// stages its remaining unstaged hunks (documented in CLAUDE.md).
+fn restage_fixed_files(files: &[String]) {
+    let existing = existing_paths(root(), files);
+    if existing.is_empty() {
+        return;
+    }
+    let mut args = vec!["add", "--"];
+    args.extend(existing.iter().copied());
+    let status = Command::new("git").args(&args).current_dir(root()).status();
+    if status.is_ok_and(|s| s.success()) {
+        println!("  {GREEN}\u{2713}{RESET} Re-staged {} fixed file(s)", existing.len());
+    } else {
+        println!("  {RED}\u{2717}{RESET} Failed to re-stage fixed files");
+        std::process::exit(1);
+    }
+}
+
 fn cmd_ci() {
     println!("\n{BLUE}[ci]{RESET}\n");
-    // Read-only gates run as a parallel batch (captured, printed in submission
-    // order, run to completion). Tests + coverage are captured; CRAP is advisory.
-    let mut gates = vec![lint_gate(), format_check_gate(), complexity_gate()];
-    gates.extend(acceptance_gates_or_warn());
-    gates.extend(arch_gates_or_warn());
+    // Only gates that never shell out to cargo run as a true parallel batch —
+    // captured, printed in submission order, run to completion. Clippy,
+    // acceptance, and arch all invoke cargo, which takes an exclusive lock on
+    // target/ per invocation, so they run sequentially below instead of
+    // queuing behind each other under the illusion of concurrency — see
+    // run_gates_sequential.
+    let parallel_ok = run_gates_parallel(&[format_check_gate(), complexity_gate()]);
+
+    let mut cargo_gates = vec![lint_gate()];
+    cargo_gates.extend(acceptance_gates_or_warn());
+    cargo_gates.extend(arch_gates_or_warn());
+    let cargo_ok = run_gates_sequential(&cargo_gates);
+
     // Bind each result before combining: every step must run (no &&-short-circuit)
     // so one pass surfaces every failure. Audit is install-aware and strict in ci.
-    let batch_ok = run_gates_parallel(&gates);
     let audit_ok = cmd_audit_inner(true);
-    let tests_ok =
-        run("Tests", &["cargo", "test"], Some(&RunOpts { no_exit: true, ..RunOpts::default() })).ok;
+    // cmd_coverage() below already runs the full suite once under
+    // `cargo llvm-cov --no-report` when the tool is installed — a standalone
+    // `cargo test` here would be a second, redundant full build+test pass.
+    // Only run it when llvm-cov is absent, so ci still exercises the suite
+    // either way (cmd_coverage's own run already surfaces test failures —
+    // see its `run()` calls, which are not `no_exit`).
+    let tests_ok = if tool_installed("llvm-cov") {
+        true
+    } else {
+        run("Tests", &["cargo", "test"], Some(&RunOpts { no_exit: true, ..RunOpts::default() })).ok
+    };
     cmd_coverage();
     cmd_crap();
     let arch_config_ok = check_arch_config_guard(false, false, false);
+    let gherkin_ok = check_gherkin_guard(false, false, false);
     let suppressions_ok = check_suppressions_baseline(true);
-    if !batch_ok || !audit_ok || !tests_ok || !arch_config_ok || !suppressions_ok {
+    if !parallel_ok
+        || !cargo_ok
+        || !audit_ok
+        || !tests_ok
+        || !arch_config_ok
+        || !gherkin_ok
+        || !suppressions_ok
+    {
         std::process::exit(1);
     }
 }
@@ -1487,13 +1766,22 @@ fn cmd_ci() {
 /// clippy (strict), format check, acceptance, arch — validating the whole pushed
 /// tree (after merges/rebases/--no-verify) before it leaves the machine. Network
 /// (audit) and advisory (coverage/CRAP) gates stay in ci.
+///
+/// Format check is the only gate here that doesn't shell out to cargo, so it
+/// runs on its own; clippy, acceptance, and arch all take cargo's exclusive
+/// target/ lock and run sequentially instead — see `run_gates_sequential`.
 fn cmd_pre_push() {
     println!("\n{BLUE}[pre-push]{RESET}\n");
     let arch_config_ok = check_arch_config_guard(false, false, true);
-    let mut gates = vec![lint_gate(), format_check_gate()];
-    gates.extend(acceptance_gates_or_warn());
-    gates.extend(arch_gates_or_warn());
-    if !run_gates_parallel(&gates) || !arch_config_ok {
+    let gherkin_ok = check_gherkin_guard(false, false, true);
+    let format_ok = print_gate_result(&run_capture(&format_check_gate()), true);
+
+    let mut cargo_gates = vec![lint_gate()];
+    cargo_gates.extend(acceptance_gates_or_warn());
+    cargo_gates.extend(arch_gates_or_warn());
+    let cargo_ok = run_gates_sequential(&cargo_gates);
+
+    if !format_ok || !cargo_ok || !arch_config_ok || !gherkin_ok {
         std::process::exit(1);
     }
 }
@@ -1599,6 +1887,7 @@ const COMMANDS: &[(&str, fn())] = &[
     ("mutation", cmd_mutation),
     ("arch", cmd_arch),
     ("arch-config-guard", cmd_arch_config_guard),
+    ("gherkin-guard", cmd_gherkin_guard),
     ("complexity", cmd_complexity),
     ("crap", cmd_crap),
     ("suppressions", cmd_suppressions),
@@ -1844,6 +2133,255 @@ mod tests {
     fn parallel_gates_empty_batch_passes() {
         assert!(run_gates_parallel(&[]));
     }
+
+    #[test]
+    fn parallel_gates_detailed_reports_failed_descriptions() {
+        let gates = vec![Gate::new("ok-gate", &["true"]), Gate::new("fail-gate", &["false"])];
+        let failed = run_gates_parallel_detailed(&gates);
+        assert_eq!(failed, vec!["fail-gate"]);
+    }
+
+    #[test]
+    fn sequential_gates_run_all_on_seeded_failure() {
+        // Same no-short-circuit contract as the parallel batch (see
+        // parallel_gates_run_all_on_seeded_failure above), just executed
+        // one gate at a time.
+        let dir = std::env::temp_dir().join(format!("rust-seq-gates-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first");
+        let last = dir.join("last");
+        let first_s = first.to_string_lossy().into_owned();
+        let last_s = last.to_string_lossy().into_owned();
+        let gates = vec![
+            Gate::new("first", &["touch", first_s.as_str()]),
+            Gate::new("seeded fail", &["false"]),
+            Gate::new("last", &["touch", last_s.as_str()]),
+        ];
+
+        let all_ok = run_gates_sequential(&gates);
+
+        assert!(!all_ok, "a seeded failure makes the whole batch fail");
+        assert!(first.exists(), "the gate before the failure ran");
+        assert!(last.exists(), "the gate after the failure still ran (no short-circuit)");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sequential_gates_empty_batch_passes() {
+        assert!(run_gates_sequential(&[]));
+    }
+
+    // ── changed_rs_files / git porcelain parsing (Fix 1) ────────────────
+
+    #[test]
+    fn parse_porcelain_line_skips_deleted_worktree_file() {
+        assert_eq!(parse_porcelain_line(" D removed.rs"), None);
+    }
+
+    #[test]
+    fn parse_porcelain_line_skips_deleted_staged_file() {
+        assert_eq!(parse_porcelain_line("D  removed.rs"), None);
+    }
+
+    #[test]
+    fn parse_porcelain_line_resolves_rename_arrow() {
+        assert_eq!(parse_porcelain_line("R  old.rs -> new.rs"), Some("new.rs"));
+    }
+
+    #[test]
+    fn parse_porcelain_line_plain_modified_path() {
+        assert_eq!(parse_porcelain_line(" M src/foo.rs"), Some("src/foo.rs"));
+    }
+
+    #[test]
+    fn parse_porcelain_line_too_short_is_none() {
+        assert_eq!(parse_porcelain_line("M"), None);
+        assert_eq!(parse_porcelain_line(""), None);
+    }
+
+    #[test]
+    fn parse_porcelain_line_multibyte_path_does_not_panic() {
+        assert_eq!(parse_porcelain_line("?? caf\u{e9}.rs"), Some("caf\u{e9}.rs"));
+    }
+
+    #[test]
+    fn parse_changed_rs_files_normalizes_repo_root_relative_path() {
+        let porcelain = " M rust/src/foo.rs\n";
+        assert_eq!(parse_changed_rs_files(porcelain, "rust"), vec!["src/foo.rs".to_string()]);
+    }
+
+    #[test]
+    fn parse_changed_rs_files_rejects_sibling_template() {
+        // A change in a sibling template (or another crate in a monorepo)
+        // must not be mistaken for a change in this one.
+        let porcelain = " M python/x.rs\n";
+        assert!(parse_changed_rs_files(porcelain, "rust").is_empty());
+    }
+
+    #[test]
+    fn parse_changed_rs_files_resolves_rename_and_filters_extension() {
+        let porcelain = "R  rust/old.rs -> rust/new.rs\nM  rust/README.md\n";
+        assert_eq!(parse_changed_rs_files(porcelain, "rust"), vec!["new.rs".to_string()]);
+    }
+
+    #[test]
+    fn parse_changed_rs_files_skips_deleted_entries() {
+        let porcelain = " D rust/gone.rs\n";
+        assert!(parse_changed_rs_files(porcelain, "rust").is_empty());
+    }
+
+    #[test]
+    fn parse_changed_rs_files_empty_prefix_keeps_repo_root_relative_path() {
+        // Empty prefix means root() IS the repo root (e.g. the template
+        // copied out as its own standalone repo) — nothing to strip.
+        let porcelain = " M src/foo.rs\n";
+        assert_eq!(parse_changed_rs_files(porcelain, ""), vec!["src/foo.rs".to_string()]);
+    }
+
+    // ── restage_fixed_files (Fix 2) ──────────────────────────────────────
+
+    #[test]
+    fn existing_paths_filters_out_missing_files() {
+        let dir = std::env::temp_dir().join(format!("rust-existing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("present.rs"), "").unwrap();
+
+        let files = vec!["present.rs".to_string(), "missing.rs".to_string()];
+        assert_eq!(existing_paths(&dir, &files), vec!["present.rs"]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ── lint_gate --locked (Fix 6) ───────────────────────────────────────
+
+    #[test]
+    fn lint_gate_uses_locked_flag_for_lockfile_freshness() {
+        let gate = lint_gate();
+        assert!(gate.cmd.iter().any(|a| a == "--locked"));
+    }
+
+    // ── --min= parsing (Fix 7) ───────────────────────────────────────────
+
+    #[test]
+    fn parse_coverage_min_accepts_valid_integer() {
+        assert_eq!(parse_coverage_min("50"), Ok(50));
+    }
+
+    #[test]
+    fn parse_coverage_min_rejects_non_integer() {
+        assert!(parse_coverage_min("abc").is_err());
+    }
+
+    #[test]
+    fn parse_coverage_min_rejects_negative() {
+        assert!(parse_coverage_min("-5").is_err());
+    }
+
+    // ── arch-config-guard base-ref fallback (Fix 5) ──────────────────────
+
+    #[test]
+    fn pick_default_base_ref_prefers_origin_head() {
+        assert_eq!(
+            pick_default_base_ref(|c| matches!(c, "origin/HEAD" | "origin/main" | "main")),
+            Some("origin/HEAD")
+        );
+    }
+
+    #[test]
+    fn pick_default_base_ref_falls_back_to_origin_main() {
+        assert_eq!(
+            pick_default_base_ref(|c| matches!(c, "origin/main" | "main")),
+            Some("origin/main")
+        );
+    }
+
+    #[test]
+    fn pick_default_base_ref_falls_back_to_main() {
+        assert_eq!(pick_default_base_ref(|c| c == "main"), Some("main"));
+    }
+
+    #[test]
+    fn pick_default_base_ref_none_when_nothing_resolves() {
+        assert_eq!(pick_default_base_ref(|_| false), None);
+    }
+
+    // ── Gherkin-first guard (Change 2) ───────────────────────────────────
+
+    #[test]
+    fn is_production_source_recognizes_src_rs_files() {
+        assert!(is_production_source("src/lib.rs"));
+        assert!(is_production_source("src/main.rs"));
+        assert!(is_production_source("src/nested/mod.rs"));
+    }
+
+    #[test]
+    fn is_production_source_excludes_harness_rs() {
+        assert!(!is_production_source("harness.rs"));
+    }
+
+    #[test]
+    fn is_production_source_excludes_tests_dir() {
+        assert!(!is_production_source("tests/acceptance.rs"));
+    }
+
+    #[test]
+    fn is_production_source_excludes_non_rust_files_under_src() {
+        assert!(!is_production_source("src/data.json"));
+    }
+
+    #[test]
+    fn gherkin_guard_triggers_on_production_source_without_feature() {
+        let changed = vec!["src/lib.rs".to_string()];
+        assert_eq!(gherkin_guard_decision(true, &changed), Some(true));
+    }
+
+    #[test]
+    fn gherkin_guard_passes_when_a_feature_file_changed_too() {
+        let changed = vec!["src/lib.rs".to_string(), "tests/features/x.feature".to_string()];
+        assert_eq!(gherkin_guard_decision(true, &changed), Some(false));
+    }
+
+    #[test]
+    fn gherkin_guard_passes_when_no_production_source_changed() {
+        let changed = vec!["README.md".to_string(), "tests/acceptance.rs".to_string()];
+        assert_eq!(gherkin_guard_decision(true, &changed), Some(false));
+    }
+
+    #[test]
+    fn gherkin_guard_skips_when_no_feature_files_exist_anywhere() {
+        // has_features=false models a repo with zero .feature files under
+        // tests/features/ — the rule must not apply yet, regardless of what
+        // else changed.
+        let changed = vec!["src/lib.rs".to_string()];
+        assert_eq!(gherkin_guard_decision(false, &changed), None);
+    }
+
+    #[test]
+    fn gherkin_guard_override_env_value_one_passes() {
+        assert!(gherkin_guard_overridden(Some("1")));
+    }
+
+    #[test]
+    fn gherkin_guard_override_rejects_other_values() {
+        assert!(!gherkin_guard_overridden(Some("0")));
+        assert!(!gherkin_guard_overridden(Some("true")));
+        assert!(!gherkin_guard_overridden(None));
+    }
+
+    // ── CRAP advisory glyph (Change 3) ───────────────────────────────────
+
+    #[test]
+    fn crap_status_glyph_advisory_uses_green_warn_glyph() {
+        assert_eq!(crap_status_glyph(false), (GREEN, "\u{26a0}", " (advisory)"));
+    }
+
+    #[test]
+    fn crap_status_glyph_enforce_uses_red_cross_glyph() {
+        assert_eq!(crap_status_glyph(true), (RED, "\u{2717}", ""));
+    }
 }
 
 // Property-based tests for the pure helpers above.
@@ -1936,6 +2474,51 @@ mod property_tests {
         fn lcov_total_on_arbitrary_text(text in ".*") {
             // Never panics; every file entry has a line map.
             let _map = parse_lcov_str(&text);
+        }
+
+        #[test]
+        fn porcelain_line_never_panics_on_arbitrary_text(line in ".*") {
+            // Guards the byte-index-3 slice: must never panic on a
+            // multibyte path, a too-short line, or any other garbage.
+            let _ = parse_porcelain_line(&line);
+        }
+
+        #[test]
+        fn changed_rs_files_never_panics_on_arbitrary_porcelain(
+            porcelain in ".*",
+            prefix in "[a-z][a-z0-9_/-]{0,12}",
+        ) {
+            let _ = parse_changed_rs_files(&porcelain, &prefix);
+        }
+
+        #[test]
+        fn is_production_source_never_panics_on_arbitrary_text(path in ".*") {
+            let _ = is_production_source(&path);
+        }
+
+        #[test]
+        fn is_production_source_recognizes_generated_src_rs_paths(
+            name in "[a-z][a-z0-9_]{0,12}",
+        ) {
+            let path = format!("src/{name}.rs");
+            prop_assert!(is_production_source(&path));
+        }
+
+        #[test]
+        fn is_production_source_rejects_paths_outside_src(
+            dir in "[a-z][a-z0-9_]{0,12}",
+            name in "[a-z][a-z0-9_]{0,12}",
+        ) {
+            prop_assume!(dir != "src");
+            let path = format!("{dir}/{name}.rs");
+            prop_assert!(!is_production_source(&path));
+        }
+
+        #[test]
+        fn gherkin_guard_triggered_never_panics_on_arbitrary_paths(
+            paths in prop::collection::vec(".*", 0..6),
+        ) {
+            let _ = gherkin_guard_triggered(&paths);
         }
     }
 }

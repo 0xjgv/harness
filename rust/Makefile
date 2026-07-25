@@ -7,7 +7,7 @@ HARNESS := cargo harness
 
 HARNESS_TARGETS := \
 	fix lint test audit acceptance coverage mutation arch complexity \
-	crap check post-edit stop-hook arch-config-guard pre-commit pre-push ci setup-hooks \
+	crap suppressions check post-edit stop-hook arch-config-guard gherkin-guard pre-commit pre-push ci setup-hooks \
 	agents-md-drift sync-agents-md clean
 
 .DEFAULT_GOAL := check

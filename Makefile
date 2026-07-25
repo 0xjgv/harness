@@ -1,7 +1,7 @@
 # harness-templates root Makefile
 #
 # Owns repo-level dogfooding for harness-templates:
-# - drift + sync between the canonical `skills/harness/` source and the two
+# - drift + sync between the canonical `skills/<name>/` sources and the two
 #   deployed locations Claude Code/Codex actually read
 # - AGENTS.md/CLAUDE.md parity at the meta-repo root
 # - root Claude/Codex Stop hook entrypoints
@@ -16,17 +16,31 @@ DIM   := \033[2m
 BOLD  := \033[1m
 RESET := \033[0m
 
-CANONICAL := skills/harness
-TARGETS   := $(HOME)/.claude/skills/harness $(HOME)/.agents/skills/harness
-FILES     := SKILL.md \
-             reference/behavior-contract.md \
-             reference/adoption-checklist.md \
-             reference/settings-json.md \
-             reference/python.md \
-             reference/bun.md \
-             reference/go.md \
-             reference/rust.md \
-             reference/monorepo.md
+CANONICAL   := skills
+SKILL_BASES := $(HOME)/.claude/skills $(HOME)/.agents/skills
+SKILLS      := harness ratchet
+HARNESS_FILES := SKILL.md \
+                 reference/behavior-contract.md \
+                 reference/adoption-checklist.md \
+                 reference/settings-json.md \
+                 reference/python.md \
+                 reference/bun.md \
+                 reference/go.md \
+                 reference/rust.md \
+                 reference/monorepo.md
+RATCHET_FILES := SKILL.md \
+                 reference/python.md
+
+define SH_SKILLS_HELPERS
+skill_files() {
+  case "$$1" in
+    harness) printf '%s\n' $(HARNESS_FILES) ;;
+    ratchet) printf '%s\n' $(RATCHET_FILES) ;;
+    *) return 1 ;;
+  esac
+}
+endef
+export SH_SKILLS_HELPERS
 
 BUN_DIRS  := $(patsubst %/harness.ts,%,$(wildcard */harness.ts))
 PY_DIRS   := $(patsubst %/harness.py,%,$(wildcard */harness.py))
@@ -127,45 +141,60 @@ endef
 export SH_ARCH_CONFIG_GUARD
 
 .PHONY: check
-check: skills-drift agents-md-drift ## Run repo-level gates
+check: skills-drift agents-md-drift parity ## Run repo-level gates
 	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 0 1 0
 
+.PHONY: parity
+parity: ## Fail if python/bun/go/rust harness command surfaces have drifted apart
+	@bash scripts/parity-gate.sh
+
 .PHONY: skills-drift
-skills-drift: ## Fail if deployed skill copies diverge from skills/harness/
-	@set -u; failed=0; \
-	for tgt in $(TARGETS); do \
-	  for f in $(FILES); do \
-	    src="$(CANONICAL)/$$f"; dst="$$tgt/$$f"; \
-	    if [ ! -f "$$src" ]; then \
-	      printf "  $(RED)✗$(RESET) skills-drift: canonical $$src missing\n"; failed=1; continue; \
-	    fi; \
-	    if [ ! -f "$$dst" ]; then \
-	      printf "  $(RED)✗$(RESET) skills-drift: $$dst missing — run \`make sync-skills\`\n"; failed=1; continue; \
-	    fi; \
-	    if ! cmp -s "$$src" "$$dst"; then \
-	      printf "  $(RED)✗$(RESET) skills-drift: $$dst differs from $$src — run \`make sync-skills\`\n"; \
-	      diff -u "$$src" "$$dst" | head -20; \
-	      failed=1; \
-	    fi; \
+skills-drift: ## Fail if deployed skill copies diverge from skills/<name>/
+	@set -u; eval "$$SH_SKILLS_HELPERS"; \
+	if [ "$${HARNESS_SKIP_SKILLS_DRIFT:-}" = 1 ]; then \
+	  printf "  $(DIM)⋯$(RESET) skills-drift: skipped (no deployed skills on this host)\n"; \
+	  exit 0; \
+	fi; \
+	failed=0; targets=0; \
+	for skill in $(SKILLS); do \
+	  for base in $(SKILL_BASES); do \
+	    tgt="$$base/$$skill"; targets=$$((targets+1)); \
+	    for f in $$(skill_files "$$skill"); do \
+	      src="$(CANONICAL)/$$skill/$$f"; dst="$$tgt/$$f"; \
+	      if [ ! -f "$$src" ]; then \
+	        printf "  $(RED)✗$(RESET) skills-drift: canonical $$src missing\n"; failed=1; continue; \
+	      fi; \
+	      if [ ! -f "$$dst" ]; then \
+	        printf "  $(RED)✗$(RESET) skills-drift: $$dst missing — run \`make sync-skills\`\n"; failed=1; continue; \
+	      fi; \
+	      if ! cmp -s "$$src" "$$dst"; then \
+	        printf "  $(RED)✗$(RESET) skills-drift: $$dst differs from $$src — run \`make sync-skills\`\n"; \
+	        diff -u "$$src" "$$dst" | head -20; \
+	        failed=1; \
+	      fi; \
+	    done; \
 	  done; \
 	done; \
 	if [ $$failed -eq 0 ]; then \
-	  printf "  $(GREEN)✓$(RESET) skills-drift (canonical == $(words $(TARGETS)) targets)\n"; \
+	  printf "  $(GREEN)✓$(RESET) skills-drift (canonical == %d targets)\n" "$$targets"; \
 	else \
 	  exit 1; \
 	fi
 
 .PHONY: sync-skills
-sync-skills: ## Copy skills/harness/ → ~/.claude and ~/.agents
-	@set -u; \
-	for tgt in $(TARGETS); do \
-	  mkdir -p "$$tgt"; \
-	  rm -f "$$tgt"/reference-*.md "$$tgt"/reference/reference-*.md; \
-	  for f in $(FILES); do \
-	    mkdir -p "$$tgt/$$(dirname "$$f")"; \
-	    cp "$(CANONICAL)/$$f" "$$tgt/$$f"; \
+sync-skills: ## Copy skills/<name>/ → ~/.claude/skills and ~/.agents/skills
+	@set -u; eval "$$SH_SKILLS_HELPERS"; \
+	for skill in $(SKILLS); do \
+	  for base in $(SKILL_BASES); do \
+	    tgt="$$base/$$skill"; \
+	    mkdir -p "$$tgt"; \
+	    rm -f "$$tgt"/reference-*.md "$$tgt"/reference/reference-*.md; \
+	    for f in $$(skill_files "$$skill"); do \
+	      mkdir -p "$$tgt/$$(dirname "$$f")"; \
+	      cp "$(CANONICAL)/$$skill/$$f" "$$tgt/$$f"; \
+	    done; \
+	    printf "  $(GREEN)✓$(RESET) sync-skills: $$tgt ← $(CANONICAL)/$$skill\n"; \
 	  done; \
-	  printf "  $(GREEN)✓$(RESET) sync-skills: $$tgt ← $(CANONICAL)\n"; \
 	done
 
 .PHONY: agents-md-drift
@@ -207,12 +236,18 @@ post-edit: ## Root Stop helper: sync derived docs/skills and format dirty templa
 	@set -u -o pipefail; \
 	claude_dirty=$$(git diff --name-only --diff-filter=d -- CLAUDE.md; git ls-files --others --exclude-standard -- CLAUDE.md); \
 	if [ -n "$$claude_dirty" ]; then $(MAKE) --no-print-directory sync-agents-md; fi; \
-	skill_dirty=$$(git diff --name-only --diff-filter=d -- skills/harness; git ls-files --others --exclude-standard -- skills/harness); \
+	skill_dirty=$$(git diff --name-only --diff-filter=d -- skills; git ls-files --others --exclude-standard -- skills); \
 	if [ -n "$$skill_dirty" ]; then $(MAKE) --no-print-directory sync-skills; fi; \
 	eval "$$SH_FILTER_DIRS"; dirs=$$(dirty_dirs); \
 	[ -z "$$dirs" ] && exit 0; \
 	$(MAKE) --no-print-directory _run CMD=post-edit DIRS="$$dirs" QUIET=1
 
+# NOTE: a failing recipe here makes `make` itself exit 2 (GNU Make's own
+# "recipe failed" status), regardless of the wrapped command's own exit code.
+# Claude Code's Stop hook only treats exit 2 as blocking (stderr fed back to
+# the model); any other non-zero exit is silently swallowed. This is
+# load-bearing — do not wrap this recipe (or `_run`/`post-edit` below it) in
+# `|| true` or otherwise suppress a non-zero exit.
 .PHONY: stop-hook
 stop-hook: ## Agent Stop hook: post-edit, arch-config warning, dirty template stop-hooks
 	@printf "\n=== Root Stop Hook Checks ===\n"
@@ -233,10 +268,18 @@ pre-commit: ## Root git pre-commit hook
 
 .PHONY: pre-push
 pre-push: ## Root git pre-push hook
-	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 0 0 1
-	@$(MAKE) --no-print-directory agents-md-drift
-	@$(MAKE) --no-print-directory skills-drift
-	@$(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)"
+	@set -u -o pipefail; \
+	stdin_file=""; \
+	if [ ! -t 0 ]; then \
+	  stdin_file=$$(mktemp); \
+	  trap 'rm -f "$$stdin_file"' EXIT INT TERM; \
+	  cat >"$$stdin_file"; \
+	fi; \
+	eval "$$SH_ARCH_CONFIG_GUARD"; \
+	if [ -n "$$stdin_file" ]; then arch_config_guard 0 0 1 <"$$stdin_file"; else arch_config_guard 0 0 1; fi; \
+	$(MAKE) --no-print-directory agents-md-drift; \
+	$(MAKE) --no-print-directory skills-drift; \
+	$(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)" STDIN_FILE="$$stdin_file"
 
 .PHONY: ci
 ci: ## Root read-only verification
@@ -286,14 +329,19 @@ list: ## Show detected language templates
 .PHONY: _run
 _run:
 	@set -u -o pipefail; \
-	dirs="$(DIRS)"; cmd="$(CMD)"; args="$(ARGS)"; quiet="$(QUIET)"; \
+	dirs="$(DIRS)"; cmd="$(CMD)"; args="$(ARGS)"; quiet="$(QUIET)"; stdin_file="$(STDIN_FILE)"; \
 	[ -z "$$dirs" ] && { printf "$(DIM)No templates to run '%s'.$(RESET)\n" "$$cmd"; exit 0; }; \
 	eval "$$SH_LANG_HELPERS"; \
 	passed=0; failed=0; failed_dirs=""; \
 	for dir in $$dirs; do \
 	  runner=$$(runner_of "$$dir") || { printf "  $(RED)✗$(RESET) %s: no recognized runner\n" "$$dir"; failed=$$((failed+1)); continue; }; \
 	  [ -z "$$quiet" ] && printf "\n$(BOLD)▶ %s$(RESET) $(DIM)(%s · %s)$(RESET)\n" "$$dir" "$$(lang_of "$$dir")" "$$cmd"; \
-	  if (cd "$$dir" && $$runner "$$cmd" $$args); then \
+	  if [ -n "$$stdin_file" ]; then \
+	    (cd "$$dir" && $$runner "$$cmd" $$args) <"$$stdin_file"; \
+	  else \
+	    (cd "$$dir" && $$runner "$$cmd" $$args); \
+	  fi; \
+	  if [ $$? -eq 0 ]; then \
 	    passed=$$((passed+1)); \
 	  else \
 	    failed=$$((failed+1)); failed_dirs="$$failed_dirs $$dir"; \

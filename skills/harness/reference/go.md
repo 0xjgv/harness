@@ -13,20 +13,34 @@ paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
   quality subcommands `complexity`, `acceptance`, `coverage` (`test-cov` alias), `mutation`,
-  `crap`, `arch`, `arch-config-guard`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
+  `crap`, `arch`, `arch-config-guard`, `gherkin-guard`, `suppressions`, and the
+  drift pair `agents-md-drift` / `sync-agents-md`
   (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
-  fail on drift). `ci` runs the read-only gates (`lint`, `audit`,
-  `complexity`, `acceptance`, `arch`) **in parallel** — captured and
+  fail on drift). `check` runs fix + format + lint (`--fix`), test, then — as
+  a read-only parallel batch — complexity, `go mod tidy -diff` (fails if
+  `go.mod`/`go.sum` don't match what `go mod tidy` would produce), and
+  acceptance (self-skips with a warning when no `.feature` files exist), then
+  warns (does not block) via `arch-config-guard` and `gherkin-guard`, checks
+  `agents-md-drift`, and ratchets suppressions. Invariant: `ci` minus `check`
+  == every gate that needs the network or a build lock (`audit`, `coverage`,
+  advisory `crap`) plus the architecture boundary check itself (`arch`, which
+  stays `ci`/`pre-push`-only to keep this edit-triggered local loop fast — it
+  needs to fetch a module). `ci` runs the read-only gates (`lint`, `audit`,
+  `complexity`, `go mod tidy -diff`, `acceptance`, `arch`) **in parallel** — captured and
   printed in submission order, run to completion so one pass surfaces every
   failure — then streams `coverage` and the advisory `crap`; `ci` also runs
-  `arch-config-guard` in strict mode. `pre-push` is
+  `arch-config-guard` and `gherkin-guard` in strict (blocking) mode. `pre-push` is
   the offline push gate: `lint` (golangci-lint covers format), `acceptance`,
-  `arch`, and strict `arch-config-guard` over the whole pushed tree (the
+  `arch`, and strict `arch-config-guard` + `gherkin-guard` over the whole pushed tree (the
   deterministic checks pre-commit and stop-hook skip). There is **no** `deadcode` target — golangci-lint's
   `unused` linter (run by the `lint` gate) already flags unreachable
   functions, vars, and types, and `go mod tidy` prunes unused dependencies;
   `x/tools/cmd/deadcode` only works on programs with a `main` package, not
-  this library template. `crap` is
+  this library template. `gherkin-guard` blocks a changed non-test `.go` file
+  outside `features/` (excluding `harness.go`) with no changed `.feature` in
+  `pre-commit`/`pre-push`/`ci` (`HARNESS_ALLOW_NO_FEATURE=1` overrides after
+  review); it only warns in `check`/`stop-hook`, and skips silently when the
+  repo has no `.feature` files anywhere. `crap` is
   advisory (warns by default, `--enforce` to hard-fail). Suppressions are
   ratcheted by `.harness-baseline`; `coverage.min` in the same file is the
   default coverage floor. Requires `uvx` on

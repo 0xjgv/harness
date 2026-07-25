@@ -17,13 +17,25 @@ Code reads `CLAUDE.md`; Codex (and other AGENTS.md-consuming tools) read
 (it drifts). Two sections:
 
 - `## Commands` — `make check` / `pre-commit` / `pre-push` / `ci` dispatch
-  to every subproject; each subproject `ci` runs its read-only gates in
-  parallel (including its dead-code gate where the language ships one —
-  python vulture, bun knip; go and rust cover dead code via their linters)
-  and its advisory CRAP gate, and `pre-push` is the offline push gate (lint,
-  format check, acceptance, arch, and strict `arch-config-guard` over the
-  whole pushed tree). `make arch-config-guard` protects all known arch config
-  filenames across the repo. `make crap`
+  to every subproject; each subproject's own `check` already runs every gate
+  that is offline, fast, and takes no build lock (fix, format, typecheck,
+  test, complexity, acceptance, its dead-code gate where the language ships
+  one — python vulture, bun knip; go and rust cover dead code via their
+  linters — plus a lockfile check in python/bun, `go mod tidy -diff` in go,
+  and — python/bun only — the architecture boundary check `arch` itself,
+  since import-linter/dependency-cruiser are offline and take no build lock),
+  and warns via its own `arch-config-guard` and `gherkin-guard`; each
+  subproject `ci` runs its read-only gates in parallel (adding `arch` for
+  go/rust, which keep it `ci`/`pre-push`-only — go's needs to fetch a module,
+  rust's takes cargo's build lock) and its advisory CRAP gate; `pre-push` is the offline
+  push gate (lint, format check, acceptance, arch, and strict
+  `arch-config-guard` + `gherkin-guard` over the whole pushed tree). `make
+  arch-config-guard` protects all known arch config filenames across the
+  repo — this is a root-level implementation, not a fan-out. There is no
+  equivalent root `make gherkin-guard`: Gherkin-first is enforced per
+  subproject, inside each subproject's own `check`/`stop-hook` (warn) and
+  `pre-commit`/`pre-push`/`ci` (block via `HARNESS_ALLOW_NO_FEATURE=1`),
+  which `make check`/`ci`/etc. already dispatch into. `make crap`
   fans out the advisory CRAP gate directly
   (per-subproject `harness crap`, pass `--enforce` for hard-fail);
   `make agents-md-drift` / `make sync-agents-md` fan out the root +

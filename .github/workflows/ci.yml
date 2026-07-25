@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Local gate == remote gate: this meta-repo has no lint/test logic of its own,
+# so CI installs every template's toolchain in one job (mirroring
+# monorepo/.github/workflows/ci.yml, which fans a single `make ci` out to all
+# four languages the same way) and runs the same root Makefile targets you'd
+# run locally. A matrix per language would need per-subproject scoped Make
+# targets the root Makefile intentionally doesn't have (only `monorepo/`
+# exposes `ci-<subproject>`) and would still duplicate this toolchain setup
+# four times over, so a single job is the simpler, more consistent choice.
+#
+# skills-drift compares against the deployed skill copies under $HOME
+# (~/.claude/skills/harness, ~/.agents/skills/harness), which don't exist on
+# a CI runner — HARNESS_SKIP_SKILLS_DRIFT=1 skips that check here; it still
+# runs at full strength for local `make check`/`make ci`.
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    env:
+      HARNESS_SKIP_SKILLS_DRIFT: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt, llvm-tools-preview
+
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit, cargo-llvm-cov, cargo-modules
+
+      - name: Root repo-level gates
+        run: make check
+
+      - name: Run each template's CI gate
+        run: make ci

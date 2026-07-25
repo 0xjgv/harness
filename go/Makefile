@@ -6,8 +6,8 @@
 HARNESS := go run harness.go
 
 HARNESS_TARGETS := \
-	fix lint test test-cov audit complexity acceptance arch mutation \
-	crap check post-edit stop-hook arch-config-guard pre-commit pre-push ci setup-hooks \
+	fix lint test test-cov coverage audit complexity acceptance arch mutation \
+	crap suppressions check post-edit stop-hook arch-config-guard gherkin-guard pre-commit pre-push ci setup-hooks \
 	agents-md-drift sync-agents-md clean
 
 .DEFAULT_GOAL := check

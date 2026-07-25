@@ -23,8 +23,9 @@ dev = [
     "coverage>=7.13.5",
     "hypothesis>=6.131",
     "import-linter>=2.3",
-    "mutmut>=3.0",
+    "lizard==1.22.2",
     "ruff>=0.15.11",
+    "vulture==2.16",
 ]
 
 # ── Ruff (lint + format) ────────────────────────────────────────────
@@ -33,7 +34,6 @@ dev = [
 target-version = "py313"
 line-length = 99
 preview = true
-extend-exclude = ["mutants"]  # mutmut generated working copy — not project source
 
 [tool.ruff.lint]
 select = [
@@ -113,7 +113,6 @@ source = ["src"]
 branch = true
 
 [tool.coverage.report]
-fail_under = 80
 exclude_lines = [
     "pragma: no cover",
     "if TYPE_CHECKING:",

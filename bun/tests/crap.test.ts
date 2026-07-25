@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { crapScore, parseLcov } from '../harness';
+import { crapOffenderGlyph, crapScore, parseLcov } from '../harness';
 
 describe('crapScore', () => {
   test('full coverage reduces to ccn', () => {
@@ -16,6 +16,22 @@ describe('crapScore', () => {
 
   test('minimal ccn at zero coverage is 2', () => {
     expect(crapScore(1, 0.0)).toBe(2);
+  });
+});
+
+describe('crapOffenderGlyph', () => {
+  // A passing gate (exit 0, the default advisory mode) must never show the
+  // red ✗ glyph — that's reserved for --enforce, which actually exits 1.
+  test('advisory mode (default) uses the green warn glyph', () => {
+    const glyph = crapOffenderGlyph(false);
+    expect(glyph).toContain('⚠');
+    expect(glyph).not.toContain('✗');
+  });
+
+  test('--enforce mode uses the red fail glyph', () => {
+    const glyph = crapOffenderGlyph(true);
+    expect(glyph).toContain('✗');
+    expect(glyph).not.toContain('⚠');
   });
 });
 

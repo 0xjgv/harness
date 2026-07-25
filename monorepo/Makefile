@@ -170,8 +170,20 @@ ci: ## Read-only gate across all subprojects
 
 .PHONY: pre-push
 pre-push: ## Read-only push gate across all subprojects (lint, format check, acceptance, arch)
-	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 0 0 1
-	@$(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)"
+	@set -u -o pipefail; \
+	stdin_file=""; \
+	if [ ! -t 0 ]; then \
+	  stdin_file=$$(mktemp); \
+	  trap 'rm -f "$$stdin_file"' EXIT INT TERM; \
+	  cat >"$$stdin_file"; \
+	fi; \
+	eval "$$SH_ARCH_CONFIG_GUARD"; \
+	if [ -n "$$stdin_file" ]; then arch_config_guard 0 0 1 <"$$stdin_file"; else arch_config_guard 0 0 1; fi; \
+	$(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)" STDIN_FILE="$$stdin_file"
+
+.PHONY: audit
+audit: ## Dependency audit across all subprojects
+	@$(MAKE) --no-print-directory _run CMD=audit DIRS="$(SUBPROJECTS)"
 
 .PHONY: test
 test: ## Run tests only, all subprojects
@@ -351,6 +363,12 @@ post-edit:
 	[ -z "$$dirs" ] && exit 0; \
 	$(MAKE) --no-print-directory _run CMD=post-edit DIRS="$$dirs" QUIET=1 PARALLEL=
 
+# NOTE: a failing recipe here makes `make` itself exit 2 (GNU Make's own
+# "recipe failed" status), regardless of the wrapped command's own exit code.
+# Claude Code's Stop hook only treats exit 2 as blocking (stderr fed back to
+# the model); any other non-zero exit is silently swallowed. This is
+# load-bearing — do not wrap this recipe (or `_run` below it) in `|| true` or
+# otherwise suppress a non-zero exit.
 .PHONY: stop-hook
 stop-hook:
 	@set -u -o pipefail; eval "$$SH_FILTER_DIRS"; \
@@ -359,7 +377,10 @@ stop-hook:
 	printf "\n=== Stop Hook Checks ===\n"; \
 	arch_config_guard 0 1 0; \
 	[ -z "$$dirs" ] && exit 0; \
-	$(MAKE) --no-print-directory _run CMD=stop-hook DIRS="$$dirs" PARALLEL=
+	if ! $(MAKE) --no-print-directory _run CMD=stop-hook DIRS="$$dirs" PARALLEL=; then \
+	  printf "stop-hook failed: %s\n" "$$dirs" >&2; \
+	  exit 1; \
+	fi
 
 # ── Internal dispatch ─────────────────────────────────────────────
 
@@ -377,28 +398,32 @@ _scoped_run:
 
 _run:
 	@set -u -o pipefail; \
-	dirs="$(DIRS)"; cmd="$(CMD)"; vf="$(if $(VERBOSE),--verbose)"; quiet="$(QUIET)"; args="$(ARGS)"; \
+	dirs="$(DIRS)"; cmd="$(CMD)"; vf="$(if $(VERBOSE),--verbose)"; quiet="$(QUIET)"; args="$(ARGS)"; stdin_file="$(STDIN_FILE)"; \
 	if [ -z "$$dirs" ]; then \
 	  printf "$(DIM)No subprojects to run '%s'.$(RESET)\n" "$$cmd"; \
 	  exit 0; \
 	fi; \
 	eval "$$SH_LANG_HELPERS"; \
 	run_one() { \
-	  local dir="$$1" cmd="$$2" vf="$$3" quiet="$$4" args="$$5" runner; \
+	  local dir="$$1" cmd="$$2" vf="$$3" quiet="$$4" args="$$5" stdin_file="$$6" runner; \
 	  if ! runner=$$(runner_of "$$dir"); then \
 	    printf "$(RED)✗ %s$(RESET) $(DIM)(no recognized harness — skipped)$(RESET)\n" "$$dir"; \
 	    return 1; \
 	  fi; \
 	  [ -z "$$quiet" ] && printf "\n$(BOLD)▶ %s$(RESET) $(DIM)($(CYAN)%s$(RESET)$(DIM) · %s)$(RESET)\n" "$$dir" "$$(lang_of "$$dir")" "$$cmd"; \
-	  ( cd "$$dir" && $$runner $$cmd $$vf $$args ); \
+	  if [ -n "$$stdin_file" ]; then \
+	    ( cd "$$dir" && $$runner $$cmd $$vf $$args ) <"$$stdin_file"; \
+	  else \
+	    ( cd "$$dir" && $$runner $$cmd $$vf $$args ); \
+	  fi; \
 	}; \
 	passed=0; failed=0; failed_dirs=""; t_start=$$(date +%s); \
 	if [ -n "$(PARALLEL)" ]; then \
 	  tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT INT TERM; \
 	  export -f run_one lang_of runner_of; \
 	  printf '%s\n' $$dirs | xargs -n1 -P$(JOBS) -I{} bash -c ' \
-	    run_one "$$1" "$$2" "$$3" "$$4" "$$5" >"$$6/$$1.out" 2>&1; \
-	    echo $$? >"$$6/$$1.rc"' _ {} "$$cmd" "$$vf" "$$quiet" "$$args" "$$tmp"; \
+	    run_one "$$1" "$$2" "$$3" "$$4" "$$5" "$$6" >"$$7/$$1.out" 2>&1; \
+	    echo $$? >"$$7/$$1.rc"' _ {} "$$cmd" "$$vf" "$$quiet" "$$args" "$$stdin_file" "$$tmp"; \
 	  for dir in $$dirs; do \
 	    [ -z "$$quiet" ] && cat "$$tmp/$$dir.out"; \
 	    rc=$$(cat "$$tmp/$$dir.rc" 2>/dev/null || echo 1); \
@@ -407,7 +432,7 @@ _run:
 	  done; \
 	else \
 	  for dir in $$dirs; do \
-	    if run_one "$$dir" "$$cmd" "$$vf" "$$quiet" "$$args"; then \
+	    if run_one "$$dir" "$$cmd" "$$vf" "$$quiet" "$$args" "$$stdin_file"; then \
 	      passed=$$((passed+1)); \
 	    else \
 	      failed=$$((failed+1)); failed_dirs="$$failed_dirs $$dir"; \

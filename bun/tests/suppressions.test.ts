@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import {
   coverageMinDefault,
   parseLineForSuppressions,
+  parseMinArg,
   readBaseline,
+  scanSuppressionFindings,
   scanSuppressions,
 } from '../harness';
 
@@ -83,6 +85,35 @@ describe('scanSuppressions', () => {
   });
 });
 
+describe('scanSuppressionFindings locations (FIX 5)', () => {
+  test('locations are always relative to ROOT, for both scan branches', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'bun-suppr-loc-'));
+    try {
+      // A root that is itself a .ts file exercises the single-file branch; a root
+      // that is a directory exercises the directory-walk branch. Before the fix,
+      // the single-file branch echoed the raw (here: absolute) input path while
+      // the directory branch always built an absolute path — a mix of formats.
+      // Assembled at runtime, not written as a literal directive comment, so this
+      // fixture doesn't trip the real suppression ratchet when this file is itself
+      // scanned as part of tests/.
+      const ignoreDirective = ['//', '@ts-ignore'].join(' ');
+      const topFile = join(tmp, 'top.ts');
+      writeFileSync(topFile, `${ignoreDirective}\nconst x = 1;\n`);
+      mkdirSync(join(tmp, 'nested'));
+      writeFileSync(join(tmp, 'nested', 'child.ts'), `${ignoreDirective}\nconst y = 2;\n`);
+
+      const findings = await scanSuppressionFindings([topFile, join(tmp, 'nested')]);
+      expect(findings).toHaveLength(2);
+      for (const finding of findings) {
+        expect(finding.location.startsWith('/')).toBe(false);
+        expect(finding.location).toMatch(/:\d+$/);
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('baseline helpers', () => {
   const baselineRoots: string[] = [];
 
@@ -114,5 +145,35 @@ describe('baseline helpers', () => {
     } finally {
       process.argv = originalArgv;
     }
+  });
+});
+
+describe('parseMinArg (FIX 4)', () => {
+  test('flag absent', () => {
+    expect(parseMinArg(['bun', 'harness.ts', 'coverage'])).toEqual({ present: false });
+  });
+
+  test('valid integer value', () => {
+    expect(parseMinArg(['bun', 'harness.ts', 'coverage', '--min=42'])).toEqual({
+      present: true,
+      ok: true,
+      value: 42,
+    });
+  });
+
+  test('non-numeric value is reported instead of silently becoming NaN', () => {
+    expect(parseMinArg(['bun', 'harness.ts', 'coverage', '--min=abc'])).toEqual({
+      present: true,
+      ok: false,
+      raw: 'abc',
+    });
+  });
+
+  test('non-integer numeric value is rejected', () => {
+    expect(parseMinArg(['bun', 'harness.ts', 'coverage', '--min=50.5'])).toEqual({
+      present: true,
+      ok: false,
+      raw: '50.5',
+    });
   });
 });

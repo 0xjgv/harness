@@ -2,3 +2,6 @@
 .claude/skills/
 openspec/
 .factory/
+
+# OS
+.DS_Store

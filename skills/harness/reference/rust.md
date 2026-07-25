@@ -13,19 +13,35 @@ paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
   quality subcommands `complexity`, `acceptance`, `coverage`, `mutation`,
-  `crap`, `arch`, `arch-config-guard`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
+  `crap`, `arch`, `arch-config-guard`, `gherkin-guard`, `suppressions`, and
+  the drift pair `agents-md-drift` / `sync-agents-md`
   (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
-  fail on drift). `ci` runs the read-only gates (`clippy`, `format check`,
+  fail on drift). `check` runs clippy `--fix`, `cargo fmt`, and tests — the
+  `acceptance` `[[test]]` target runs under plain `cargo test`, so this
+  already covers the cucumber scenarios, unlike python/bun/go, which need a
+  separate acceptance step in `check` — then complexity, then warns (does not
+  block) via `arch-config-guard` and `gherkin-guard`, checks `agents-md-drift`,
+  and ratchets suppressions. Invariant: `ci` minus `check` == every gate that
+  needs the network or a build lock (`audit`, `coverage`, advisory `crap`)
+  plus the architecture boundary check itself (`arch`, which stays
+  `ci`/`pre-push`-only because cargo-modules takes cargo's exclusive build
+  lock on `target/`). `ci` runs the read-only gates (`clippy`, `format check`,
   `complexity`, `acceptance`, `arch`) **in parallel** — captured and
   printed in submission order, run to completion so one pass surfaces every
   failure — then runs `audit`, streams `tests` + `coverage`, and the
-  advisory `crap`; `ci` also runs `arch-config-guard` in strict mode.
+  advisory `crap`; `ci` also runs `arch-config-guard` and `gherkin-guard` in
+  strict (blocking) mode.
   `pre-push` is the offline push gate: `clippy`, `format
-  check`, `acceptance`, `arch`, and strict `arch-config-guard` over the whole pushed tree (the deterministic
+  check`, `acceptance`, `arch`, and strict `arch-config-guard` + `gherkin-guard` over the whole pushed tree (the deterministic
   checks pre-commit and stop-hook skip). There is **no** `deadcode` target —
   rust's `dead_code` lint is on by default and `ci`'s strict clippy
   (`-D warnings`) already denies unused functions, fields, and variants;
   unused dependencies surface via `cargo`'s own warnings (or `cargo-machete`).
+  `gherkin-guard` blocks a changed `src/` file (excluding `harness.rs`) with
+  no changed `.feature` in `pre-commit`/`pre-push`/`ci`
+  (`HARNESS_ALLOW_NO_FEATURE=1` overrides after review); it only warns in
+  `check`/`stop-hook`, and skips silently when the repo has no `.feature`
+  files anywhere.
   `crap` is advisory (warns by default, `--enforce` to hard-fail; joins
   lizard `--csv` with `target/llvm-cov/lcov.info`). Suppressions are ratcheted
   by `.harness-baseline`; `coverage.min` in the same file is the default coverage floor. Requires `uvx` on PATH
