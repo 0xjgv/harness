@@ -22,6 +22,7 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import difflib
+import functools
 import json
 import os
 import re
@@ -29,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -136,14 +138,42 @@ def _tool(name: str, *, read_only: bool = False) -> list[str]:
        `uv sync` cannot install dev dependencies at all, so tier 1 would fail
        forever. `uvx` resolves a distribution name, so tools whose console script
        differs from their distribution (see TOOL_DISTRIBUTIONS) get `--from`.
+       When `uv.lock` records the distribution, `--from <dist>==<version>` pins
+       the fallback to the release `uv run` would have used, so the gate reports
+       the same findings whether or not the venv happens to be synced. No lock,
+       or no entry for the tool, means unpinned — never a failure.
     """
     local = Path(".venv", "bin", name)
     if not local.exists():
-        distribution = TOOL_DISTRIBUTIONS.get(name)
-        return ["uvx", *(["--from", distribution] if distribution else []), name]
+        distribution = TOOL_DISTRIBUTIONS.get(name, name)
+        version = _lock_versions().get(distribution)
+        spec = f"{distribution}=={version}" if version else distribution
+        pin = ["--from", spec] if version or distribution != name else []
+        return ["uvx", *pin, name]
     if Path("pyproject.toml").exists():
         return ["uv", "run", *(["--no-sync"] if read_only else []), name]
     return [str(local)]
+
+
+def _lock_versions() -> dict[str, str]:
+    """`{distribution: version}` from `uv.lock`, or `{}` when it is absent or unreadable.
+
+    The lock holds exact versions where `pyproject.toml` holds ranges, so it is the
+    only place the uvx fallback can learn what `uv run` would have run. Any failure
+    to read it — no file, bad TOML, no `package` table — yields `{}`: the pin is a
+    fidelity gain, never a reason for the runner to stop starting.
+    """
+    return _read_lock_versions(Path("uv.lock").resolve())
+
+
+@functools.cache
+def _read_lock_versions(lock: Path) -> dict[str, str]:
+    """Parse one lock file once per run; keyed on the path so a cwd change re-reads."""
+    try:
+        packages = tomllib.loads(lock.read_text(encoding="utf-8"))["package"]
+        return {package["name"]: package["version"] for package in packages}
+    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError):
+        return {}
 
 
 def _python(*, read_only: bool = False) -> list[str]:

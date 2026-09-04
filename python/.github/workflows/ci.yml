@@ -14,9 +14,15 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Pinned so the remote gate resolves the same toolchain as the lock, not
+      # whatever the runner image ships that week. `python-version` sets
+      # UV_PYTHON, which both `uv python install` and `uv sync` honor; it is the
+      # `requires-python` floor from pyproject.toml.
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
+          version: "0.12.9"
+          python-version: "3.13"
           enable-cache: true
 
       - name: Set up Python

@@ -961,6 +961,61 @@ class TestToolResolution(unittest.TestCase):
                 harness._tool("lint-imports"), [str(Path(".venv", "bin", "lint-imports"))]
             )
 
+    @staticmethod
+    def _lock(*packages: tuple[str, str]) -> None:
+        body = "".join(
+            f'[[package]]\nname = "{name}"\nversion = "{version}"\n\n'
+            for name, version in packages
+        )
+        Path("uv.lock").write_text(f"version = 1\n\n{body}", encoding="utf-8")
+
+    def test_tier3_pins_the_locked_version_with_from(self):
+        # The lock holds the exact release `uv run` would use; the fallback runs
+        # the same one, so a gate reports the same findings with or without a venv.
+        with temp_project():
+            self._lock(("ruff", "0.15.11"), ("lizard", "1.22.2"))
+            self.assertEqual(harness._tool("ruff"), ["uvx", "--from", "ruff==0.15.11", "ruff"])
+            self.assertEqual(
+                harness._tool("lizard", read_only=True),
+                ["uvx", "--from", "lizard==1.22.2", "lizard"],
+            )
+
+    def test_tier3_pins_the_distribution_of_a_renamed_console_script(self):
+        with temp_project():
+            self._lock(("import-linter", "2.11"))
+            self.assertEqual(
+                harness._tool("lint-imports"),
+                ["uvx", "--from", "import-linter==2.11", "lint-imports"],
+            )
+
+    def test_tier3_stays_unpinned_when_the_lock_has_no_entry(self):
+        with temp_project():
+            self._lock(("coverage", "7.13.5"))
+            self.assertEqual(harness._tool("ruff"), ["uvx", "ruff"])
+            self.assertEqual(
+                harness._tool("lint-imports"), ["uvx", "--from", "import-linter", "lint-imports"]
+            )
+
+    def test_tier3_stays_unpinned_when_the_lock_is_unreadable(self):
+        # A pin is a fidelity gain, never a reason for the runner to stop starting.
+        for body in ("version = [\n", "version = 1\n", '[[package]]\nname = "ruff"\n'):
+            with self.subTest(body=body), temp_project():
+                Path("uv.lock").write_text(body, encoding="utf-8")
+                self.assertEqual(harness._tool("ruff"), ["uvx", "ruff"])
+
+    def test_lock_versions_are_read_once_per_run(self):
+        with temp_project():
+            self._lock(("ruff", "0.15.11"))
+            self.assertEqual(harness._lock_versions(), {"ruff": "0.15.11"})
+            self._lock(("ruff", "9.9.9"))
+            self.assertEqual(harness._lock_versions(), {"ruff": "0.15.11"})
+
+    def test_a_local_binary_still_wins_over_the_lock_pin(self):
+        with temp_project() as root:
+            self._lock(("ruff", "0.15.11"))
+            self._install(root)
+            self.assertEqual(harness._tool("ruff"), [str(Path(".venv", "bin", "ruff"))])
+
 
 class TestLockfileGate(unittest.TestCase):
     """A pip + requirements.txt repo has no uv.lock; absence is not drift."""

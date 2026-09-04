@@ -357,6 +357,12 @@ Two CI-specific requirements:
   `.venv` and warns-and-skips otherwise, precisely so `ci` never creates one.
   The cost, stated plainly: a dependency bumped in `pyproject.toml` but never
   installed goes unaudited.
+- **Pin the toolchain.** `astral-sh/setup-uv` takes `version:` (the uv
+  release) and `python-version:` (sets `UV_PYTHON`, which `uv python install`
+  and `uv sync` both honor); the template pins both, the Python one to the
+  `requires-python` floor. Without them the runner image decides which uv and
+  which interpreter the remote gate runs, and a gate that is green locally can
+  go red on a Tuesday for no change of yours.
 
 ---
 
@@ -368,7 +374,11 @@ Three tiers, in descending order of fidelity:
    `pyproject.toml` exists (`--no-sync` added for read-only gates).
 2. **`.venv/bin/<tool>`** — when the binary exists but there is no
    `pyproject.toml`: a pip-installed virtualenv, not a uv project.
-3. **`uvx <tool>`** — whenever `.venv/bin/<tool>` does not exist.
+3. **`uvx --from <dist>==<version> <tool>`** — whenever `.venv/bin/<tool>` does
+   not exist, pinned to the version `uv.lock` records for the tool's
+   distribution (`_lock_versions()`, stdlib `tomllib`). No lock, unreadable
+   lock, or no entry for the tool → plain `uvx <tool>`, unpinned, never a
+   failure.
 
 Tier 1 is gated on the **binary already existing**, not on `pyproject.toml`
 alone: `uv run` on a missing tool does not fall through — it exits 2 with
@@ -381,6 +391,11 @@ Two measured details:
 - Tier 3 resolves a **distribution** name, so a tool whose console script
   differs needs `--from`: `uvx --from import-linter lint-imports`
   (`TOOL_DISTRIBUTIONS` in `harness.py`).
+- Tier 3 reads the pin from `uv.lock`, not `pyproject.toml`: the project file
+  holds ranges (`ruff>=0.15.11`), the lock holds the exact release `uv run`
+  would use. A pip repo with no lock gets the unpinned fallback — the same
+  floating version it had before — so adoption never gets worse, only better
+  once a lock exists.
 - **Install `coverage` into the project's own venv.** If it falls through to
   `uvx coverage`, the isolated environment has no pytest and `coverage run -m
   pytest` dies. The same applies to `lint-imports` when the repo has a real
@@ -665,7 +680,7 @@ repo that did not have them.
 - Runner: `~/Code/harness-templates/python/harness.py`
 - Configuration constants: `harness.py` `# ── Configuration ──` block
 - Scoping + tool resolution: `harness.py` module docstring, `_tool()`,
-  `_lockfile_gate()`, `WHOLE_FILE_CODES`
+  `_lock_versions()`, `_lockfile_gate()`, `WHOLE_FILE_CODES`
 - Baseline writer: `harness.py` `_write_baseline()`, `RATCHETED_KEYS`
 - Hook JSON writer: `harness.py` `_install_stop_hook()`
 - Quiet-output `run()` pattern: `harness.py` `run()`
