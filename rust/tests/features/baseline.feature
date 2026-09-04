@@ -23,3 +23,11 @@ Feature: Ratcheted floors come from .harness-baseline
     Then the exit code is 0
     And the output contains "report-only: no .harness-baseline floor"
     And the output contains "suppressions --update-baseline"
+
+  # Asserted as "never fails" rather than by label: without cargo-modules the
+  # gate skips instead, and a copy-pasted template must be green either way.
+  Scenario: Arch cannot fail before a floor is recorded
+    Given a project with an arch.toml and no .harness-baseline
+    When I run "harness arch"
+    Then the exit code is 0
+    And the output does not contain "✗"

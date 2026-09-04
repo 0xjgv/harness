@@ -564,6 +564,7 @@ const RATCHETED_KEYS: &[(&str, MeasureFn)] = &[
     ("coverage.min", measured_coverage_min),
     ("complexity.max_violations", measured_complexity_violations),
     ("crap.max_violations", measured_crap_violations),
+    ("arch.max_violations", measured_arch_violations),
 ];
 
 /// Measure every ratcheted metric, stopping at the first one that failed.
@@ -1100,40 +1101,137 @@ fn cmd_mutation() {
     );
 }
 
-/// Run architecture checks via cargo-modules against `arch.toml`.
+/// The two cargo-modules passes that make up the arch gate.
 ///
-/// Rust's compiler enforces visibility and crate layering but NOT freedom
-/// from circular dependencies between modules of one crate, nor the absence
-/// of orphaned (unlinked) source files. Those are the invariants this gate
-/// checks. `arch.toml` is guarded by `arch-config-guard`, which blocks
-/// integration until the change is reviewed. Absent config → skip.
-fn arch_gates_or_warn() -> Vec<Gate> {
+/// Kept as constants because the gate, the baseline measurement and the
+/// `--verbose` echo must all name the same commands: a floor measured from a
+/// different invocation does not reproduce.
+const ARCH_CYCLES_CMD: &[&str] =
+    &["cargo", "modules", "dependencies", "--lib", "--no-externs", "--acyclic"];
+const ARCH_ORPHANS_CMD: &[&str] = &["cargo", "modules", "orphans", "--lib"];
+
+const ARCH_HINT: &str =
+    "boundary crossed; surface the design decision to the human; don't edit arch config";
+
+/// The orphan count cargo-modules reports, or `None` when its output does not say.
+///
+/// cargo-modules prints a plain `N orphans found:` header before the per-orphan
+/// blocks (the blocks themselves are ANSI-colored, the header is not), and a
+/// colored `No orphans found.` line when there are none — matched by substring
+/// because the phrase itself is contiguous between the escape sequences.
+fn parse_orphan_count(stdout: &str) -> Option<u32> {
+    let counted = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_suffix(" orphans found:")?.parse::<u32>().ok());
+    counted.or_else(|| stdout.contains("No orphans found.").then_some(0))
+}
+
+/// Architectural violations as one number: `orphan_count + cycle_flag`.
+///
+/// cargo-modules 0.26.0 exposes no JSON and no aggregate count — `dependencies
+/// --acyclic` is pass/fail and `orphans` only adds `--deny` — so the count is
+/// *defined* here, and this definition is what the `arch.max_violations` floor
+/// ratchets:
+///
+/// * `cycle_flag` is 1 when `ARCH_CYCLES_CMD` exits non-zero. A cycle exists but
+///   the tool never says how many, so the whole condition counts once.
+/// * `orphan_count` is the `N orphans found:` header. When that line is missing
+///   and the command still failed, the run counts as 1 rather than 0: an output
+///   format change then degrades to "something is wrong" instead of a silently
+///   green gate.
+///
+/// The dot graph is deliberately not parsed — it renders the module tree, not the
+/// violations, and reconstructing cycles from it would put a graph algorithm in a
+/// task runner that must stay dependency-free.
+///
+/// Pure so the arithmetic is unit-tested without invoking cargo.
+fn arch_violation_count(cycles_ok: bool, orphans_ok: bool, orphans_stdout: &str) -> u32 {
+    let cycle_flag = u32::from(!cycles_ok);
+    let orphans = parse_orphan_count(orphans_stdout).unwrap_or_else(|| u32::from(!orphans_ok));
+    cycle_flag + orphans
+}
+
+/// Run both cargo-modules passes: the violation count, plus the output to show
+/// when the gate fails (only the passes that actually failed contribute).
+fn arch_scan() -> (u32, String) {
+    let cycles = run_capture(&Gate::new("Arch: no module cycles", ARCH_CYCLES_CMD));
+    let orphans = run_capture(&Gate::new("Arch: no orphan files", ARCH_ORPHANS_CMD));
+    let count = arch_violation_count(cycles.ok, orphans.ok, &orphans.output);
+    let mut detail = String::new();
+    for failed in [&cycles, &orphans].into_iter().filter(|result| !result.ok) {
+        detail.push_str(&failed.output);
+    }
+    (count, detail)
+}
+
+/// The arch gate's label: names the floor it is held to, or says there is none.
+fn arch_description(floor: Option<u32>, count: u32) -> String {
+    match floor {
+        None => format!("Arch (cargo-modules, report-only: no {BASELINE_FILE} floor)"),
+        Some(floor) if count > floor => {
+            format!("Arch (cargo-modules): {count} violations exceed baseline {floor}")
+        }
+        Some(0) => "Arch (cargo-modules)".to_string(),
+        Some(floor) => format!("Arch (cargo-modules, baseline {floor})"),
+    }
+}
+
+/// Check architecture via cargo-modules against `arch.toml`; `false` when the
+/// violation count is over the recorded floor.
+///
+/// Rust's compiler enforces visibility and crate layering but NOT freedom from
+/// circular dependencies between modules of one crate, nor the absence of
+/// orphaned (unlinked) source files. Those are the invariants this gate counts —
+/// see `arch_violation_count` for the definition. `arch.toml` is guarded by
+/// `arch-config-guard`, which blocks integration until the change is reviewed.
+/// Absent config, or cargo-modules not installed → skip.
+///
+/// With no `arch.max_violations` floor recorded the gate is report-only: it
+/// prints the count and passes. A legacy crate full of orphans has to be green on
+/// day one, and a floor of 0 inferred from a missing number is not a floor.
+fn arch_check(no_exit: bool) -> bool {
     if !root().join("arch.toml").exists() {
         println!("  {GREEN}\u{26a0}{RESET} Arch: no arch.toml \u{2014} skipped");
-        return Vec::new();
+        return true;
     }
     if !tool_installed("modules") {
         println!("  {DIM}\u{2298} Arch skipped (install: cargo install cargo-modules){RESET}");
-        return Vec::new();
+        return true;
     }
-    vec![
-        Gate::new(
-            "Arch: no module cycles",
-            &["cargo", "modules", "dependencies", "--lib", "--no-externs", "--acyclic"],
-        )
-        .with_hint(
-            "boundary crossed; surface the design decision to the human; don't edit arch config",
-        ),
-        Gate::new("Arch: no orphan files", &["cargo", "modules", "orphans", "--lib"]).with_hint(
-            "boundary crossed; surface the design decision to the human; don't edit arch config",
-        ),
-    ]
+    let floor = baseline_floor("arch.max_violations");
+    let (count, output) = arch_scan();
+    let ok = floor.is_none_or(|floor| count <= floor);
+    let hint = if floor.is_none() {
+        "run `cargo harness suppressions --update-baseline` to record a floor".to_string()
+    } else {
+        ARCH_HINT.to_string()
+    };
+    let result = GateResult {
+        description: arch_description(floor, count),
+        cmd: vec![ARCH_CYCLES_CMD.join(" "), "&&".to_string(), ARCH_ORPHANS_CMD.join(" ")],
+        ok,
+        exit_code: 1,
+        output,
+        detail: (count > 0).then(|| format!("{count} violations")),
+        hint: Some(hint),
+        report_only: floor.is_none(),
+    };
+    print_gate_result(&result, no_exit)
+}
+
+/// Count of architectural violations, for the baseline writer.
+fn measured_arch_violations() -> Measurement {
+    if !root().join("arch.toml").exists() {
+        return Measurement::Unavailable("no arch.toml".to_string());
+    }
+    if !tool_installed("modules") {
+        return Measurement::Unavailable("cargo-modules is not installed".to_string());
+    }
+    Measurement::Value(arch_scan().0)
 }
 
 fn cmd_arch() {
-    for gate in arch_gates_or_warn() {
-        print_gate_result(&run_capture(&gate), false);
-    }
+    arch_check(false);
 }
 
 fn git_lines(args: &[&str]) -> Vec<String> {
@@ -2151,8 +2249,11 @@ fn cmd_ci() {
 
     let mut cargo_gates = vec![lint_gate()];
     cargo_gates.extend(acceptance_gates_or_warn());
-    cargo_gates.extend(arch_gates_or_warn());
     let cargo_ok = run_gates_sequential(&cargo_gates);
+    // Arch runs after the batch, not inside it: it is two cargo-modules passes
+    // summed into one count and compared to a floor, which no single-command
+    // Gate can express. It still takes cargo's build lock, so it stays here.
+    let arch_ok = arch_check(true);
 
     // Bind each result before combining: every step must run (no &&-short-circuit)
     // so one pass surfaces every failure. Audit is install-aware and strict in ci.
@@ -2175,6 +2276,7 @@ fn cmd_ci() {
     let suppressions_ok = check_suppressions_baseline(true);
     if !parallel_ok
         || !cargo_ok
+        || !arch_ok
         || !audit_ok
         || !tests_ok
         || !arch_config_ok
@@ -2203,10 +2305,13 @@ fn cmd_pre_push() {
 
     let mut cargo_gates = vec![lint_gate()];
     cargo_gates.extend(acceptance_gates_or_warn());
-    cargo_gates.extend(arch_gates_or_warn());
     let cargo_ok = run_gates_sequential(&cargo_gates);
+    // Arch runs after the batch, not inside it: it is two cargo-modules passes
+    // summed into one count and compared to a floor, which no single-command
+    // Gate can express. It still takes cargo's build lock, so it stays here.
+    let arch_ok = arch_check(true);
 
-    if !format_ok || !cargo_ok || !arch_config_ok || !gherkin_ok {
+    if !format_ok || !cargo_ok || !arch_ok || !arch_config_ok || !gherkin_ok {
         std::process::exit(1);
     }
 }
@@ -2551,6 +2656,56 @@ mod tests {
     fn serialize_baseline_writes_sorted_key_value_lines() {
         let text = serialize_baseline(&baseline_of(&[("coverage.min", 80), ("arch.max", 1)]));
         assert_eq!(text, "arch.max 1\ncoverage.min 80\n");
+    }
+
+    // ── Arch violation count ─────────────────────────────────────────────
+
+    const ORPHANS_HEADER: &str = "\n2 orphans found:\n\nwarning: orphaned module `a` at src/a.rs\n";
+
+    #[test]
+    fn arch_counts_orphans_from_the_header_line() {
+        assert_eq!(parse_orphan_count(ORPHANS_HEADER), Some(2));
+    }
+
+    #[test]
+    fn arch_counts_zero_orphans_from_the_empty_line() {
+        // The phrase is contiguous between cargo-modules' ANSI escapes.
+        assert_eq!(parse_orphan_count("\n\u{1b}[1mNo orphans found.\u{1b}[0m\n"), Some(0));
+    }
+
+    #[test]
+    fn arch_count_is_orphans_plus_one_per_cycle_condition() {
+        // Clean tree.
+        assert_eq!(arch_violation_count(true, true, "No orphans found."), 0);
+        // A cycle counts once: cargo-modules never says how many there are.
+        assert_eq!(arch_violation_count(false, true, "No orphans found."), 1);
+        // Orphans come from the header, and both conditions add up.
+        assert_eq!(arch_violation_count(true, false, ORPHANS_HEADER), 2);
+        assert_eq!(arch_violation_count(false, false, ORPHANS_HEADER), 3);
+    }
+
+    #[test]
+    fn arch_count_falls_back_to_one_when_the_orphan_output_is_unparseable() {
+        // A tool failure that prints no count must not read as zero violations.
+        assert_eq!(arch_violation_count(true, false, "Error: no projects"), 1);
+        // ...but an unparseable success is still zero — nothing was reported.
+        assert_eq!(arch_violation_count(true, true, "Error: no projects"), 0);
+    }
+
+    #[test]
+    fn arch_gate_without_a_floor_is_report_only() {
+        let label = arch_description(None, 4);
+        assert!(label.contains("report-only: no .harness-baseline floor"), "{label}");
+    }
+
+    #[test]
+    fn arch_gate_names_the_floor_it_exceeded() {
+        assert_eq!(arch_description(Some(0), 0), "Arch (cargo-modules)");
+        assert_eq!(arch_description(Some(3), 2), "Arch (cargo-modules, baseline 3)");
+        assert_eq!(
+            arch_description(Some(1), 4),
+            "Arch (cargo-modules): 4 violations exceed baseline 1"
+        );
     }
 
     #[test]

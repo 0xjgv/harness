@@ -122,6 +122,14 @@ fn complexity_floor_zero(world: &mut CrateWorld) {
         .expect("write .harness-baseline");
 }
 
+#[given("a project with an arch.toml and no .harness-baseline")]
+fn arch_config_no_baseline(world: &mut CrateWorld) {
+    let dir = world.make_tmp();
+    // Content is irrelevant: the arch gate only checks the file exists before
+    // shelling out to cargo-modules, which reports against the crate, not this.
+    fs::write(dir.join("arch.toml"), "[arch]\n").expect("write arch.toml");
+}
+
 #[given("no coverage artifact")]
 fn artifact_missing(world: &mut CrateWorld) {
     world.make_tmp();

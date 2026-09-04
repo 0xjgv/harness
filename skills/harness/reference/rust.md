@@ -44,14 +44,21 @@ paraphrase (it drifts). Two sections:
   files anywhere.
   `crap` is advisory (warns by default, `--enforce` to hard-fail; joins
   lizard `--csv` with `target/llvm-cov/lcov.info`). Suppressions,
-  `coverage.min`, `complexity.max_violations` and `crap.max_violations` are all
-  ratcheted by `.harness-baseline`. `complexity` passes its floor to lizard as
-  `-i N`; `crap` compares its offender count to `crap.max_violations`. A missing
-  file, or a missing key, makes either gate report-only — labelled `report-only:
-  no .harness-baseline floor`, with the hint to record one — and it passes, for
+  `coverage.min`, `complexity.max_violations`, `crap.max_violations` and
+  `arch.max_violations` are all ratcheted by `.harness-baseline`. `complexity`
+  passes its floor to lizard as `-i N`; `crap` and `arch` do the comparison in
+  the runner, because neither cargo-modules nor the CRAP join has a tolerance
+  flag. cargo-modules 0.26.0 reports no count at all — `dependencies --acyclic`
+  is pass/fail and `orphans` only adds `--deny` — so the runner *defines* one:
+  `arch.max_violations = orphan_count + cycle_flag`, where `cycle_flag` is 1
+  when the acyclic check exits non-zero (the tool never says how many cycles)
+  and `orphan_count` is the `N orphans found:` header, falling back to 1 when
+  that line is absent and the command failed. A missing file, or a missing key,
+  makes any of these gates report-only — labelled `report-only: no
+  .harness-baseline floor`, with the hint to record one — and it passes, for
   `crap --enforce` too: nothing recorded is a repo that was never measured, not
   a floor of zero, and a legacy tree has to be green on day one.
-  `suppressions --update-baseline` measures all three, merges them over the
+  `suppressions --update-baseline` measures all four, merges them over the
   existing file (unknown keys such as `mutation.min` are preserved untouched, a
   suppression kind that ratcheted to zero is recorded as `0`), and is
   all-or-nothing: a metric that cannot be measured aborts the write, a metric
