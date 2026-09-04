@@ -2,7 +2,13 @@ import assert from 'node:assert/strict';
 import { copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { After, Given, Then, When } from '@cucumber/cucumber';
+import { After, Given, setDefaultTimeout, Then, When } from '@cucumber/cucumber';
+
+// Every `When I run` step spawns a whole harness subprocess, and some of them
+// cold-start a Node tool (lizard, dependency-cruiser) while `check`/`ci` are
+// running the rest of the parallel batch on the same machine. Cucumber's 5s
+// default is under that worst case, so the suite would flake rather than fail.
+setDefaultTimeout(60_000);
 
 interface CrapWorld {
   tmp: string;

@@ -1,6 +1,6 @@
 Feature: The baseline is a ratchet, not a wall
   `.harness-baseline` records where the repo already is — coverage, complexity,
-  CRAP and suppressions — so adoption never starts on a red gate, and each
+  CRAP, arch and suppressions — so adoption never starts on a red gate, and each
   number may only move down. A metric with no recorded floor reports instead of
   blocking. The merge semantics themselves (drop, preserve, abort) are unit
   tested against `writeBaseline`; these scenarios are the end-to-end slice.
@@ -25,6 +25,18 @@ Feature: The baseline is a ratchet, not a wall
     When I run "harness complexity"
     Then the exit code is 1
     And the output contains "Complexity (lizard)"
+
+  Scenario: Arch is report-only until a floor is recorded
+    Given a project with a boundary violation and no baseline
+    When I run "harness arch"
+    Then the exit code is 0
+    And the output contains "report-only: no .harness-baseline floor"
+
+  Scenario: The arch floor blocks a new boundary violation
+    Given a project with a boundary violation and a baseline line "arch.max_violations 0"
+    When I run "harness arch"
+    Then the exit code is 1
+    And the output contains "no-internal-leak"
 
   Scenario: The CRAP floor tolerates exactly the recorded offenders
     Given a coverage artifact for a high-CCN, zero-coverage function

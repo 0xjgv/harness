@@ -165,6 +165,13 @@ export interface Gate {
   cmd: string[];
   extract?: (output: string) => string | undefined;
   hint?: string;
+  /**
+   * Decide the outcome from the output instead of the exit code, and optionally
+   * replace the body printed on failure. Needed by a count-ratcheted gate whose
+   * tool has no `-i N`-style tolerance flag: dependency-cruiser's exit code is
+   * its own error count, which says nothing about the `.harness-baseline` floor.
+   */
+  evaluate?: (output: string) => { ok: boolean; detail?: string; output?: string };
 }
 
 interface GateResult {
@@ -186,14 +193,17 @@ async function runCapture(gate: Gate): Promise<GateResult> {
   ]);
   const exitCode = await proc.exited;
   const output = stdout + stderr;
-  const ok = exitCode === 0;
+  const verdict = gate.evaluate?.(output);
+  const ok = verdict ? verdict.ok : exitCode === 0;
   return {
     description: gate.description,
     cmd: gate.cmd,
     ok,
-    exitCode,
-    output,
-    detail: ok ? gate.extract?.(output) : undefined,
+    // A gate that evaluates its own output may fail on a tool that exited 0;
+    // printGateResult exits with this code, so it must never be 0 when !ok.
+    exitCode: ok ? 0 : exitCode || 1,
+    output: verdict?.output ?? output,
+    detail: ok ? (verdict?.detail ?? gate.extract?.(output)) : undefined,
     hint: gate.hint,
   };
 }
@@ -218,7 +228,7 @@ function printGateResult(result: GateResult, opts?: { noExit?: boolean }): boole
 async function run(
   description: string,
   cmd: string[],
-  opts?: { extract?: (output: string) => string | undefined; noExit?: boolean; stream?: boolean },
+  opts?: Omit<Gate, 'description' | 'cmd'> & { noExit?: boolean; stream?: boolean },
 ): Promise<RunResult> {
   // stream=true inherits stdio for commands whose live output is part of the contract.
   if (opts?.stream) {
@@ -234,7 +244,13 @@ async function run(
     return { ok: false, output: '' };
   }
 
-  const result = await runCapture({ description, cmd, extract: opts?.extract });
+  const result = await runCapture({
+    description,
+    cmd,
+    extract: opts?.extract,
+    hint: opts?.hint,
+    evaluate: opts?.evaluate,
+  });
   const ok = printGateResult(result, { noExit: opts?.noExit });
   return { ok, output: result.output };
 }
@@ -818,35 +834,125 @@ async function cmdAcceptance(): Promise<void> {
   for (const gate of await acceptanceGatesOrWarn()) await run(gate.description, gate.cmd);
 }
 
-async function archGatesOrWarn(): Promise<Gate[]> {
+/** dependency-cruiser argv over `targets`, reporting JSON so the runner can count. */
+function archArgv(targets: string[]): string[] {
+  return [
+    './node_modules/.bin/depcruise',
+    '--config',
+    ARCH_CONFIGS[0],
+    '--no-progress',
+    '--output-type',
+    'json',
+    ...targets,
+  ];
+}
+
+async function archTargets(base = ROOT): Promise<string[]> {
+  return (await appTargets({ base })).map((target) => `${target}/**/*.ts`);
+}
+
+/**
+ * Count the blocking violations in a dependency-cruiser JSON report.
+ *
+ * `summary.error + summary.warn`, never `summary.violations.length`: the latter
+ * also counts `info` and `ignore` findings, so a floor measured from it would
+ * ratchet against advisories the gate never fails on.
+ */
+export function depcruiseViolationCount(output: string): number | null {
+  const summary = archReport(output)?.summary;
+  const { error, warn: warnings } = (summary ?? {}) as { error?: unknown; warn?: unknown };
+  if (!Number.isInteger(error) || !Number.isInteger(warnings)) return null;
+  return (error as number) + (warnings as number);
+}
+
+/**
+ * Parse the JSON report out of a captured run, or null.
+ *
+ * The capture is `stdout + stderr`, so anything the process writes to fd 2 —
+ * a Node deprecation warning, say — lands *after* the report and breaks a
+ * whole-string parse. The report is always the prefix, so retry at the last
+ * closing brace before giving up.
+ */
+type ArchReport = { summary?: { violations?: unknown[] } };
+
+function archReport(output: string): ArchReport | null {
+  const parse = (text: string): ArchReport | null => {
+    try {
+      return JSON.parse(text) as ArchReport;
+    } catch {
+      return null;
+    }
+  };
+  return parse(output) ?? parse(output.slice(0, output.lastIndexOf('}') + 1));
+}
+
+/** The error/warn violations, one readable line each — the JSON report is not a failure body. */
+function formatArchViolations(output: string): string {
+  const { violations = [] } = archReport(output)?.summary ?? {};
+  const lines = (
+    violations as { from?: string; to?: string; rule?: { name: string; severity: string } }[]
+  )
+    .filter((v) => v.rule?.severity === 'error' || v.rule?.severity === 'warn')
+    .map((v) => `  ${v.rule?.severity} ${v.rule?.name}: ${v.from} → ${v.to}`);
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * The dependency-cruiser gate at the committed floor, or report-only when there
+ * is none. Same rule as complexity: an adopting repo with pre-existing boundary
+ * violations has to be green on day one, so an unrecorded metric reports its
+ * count instead of demanding zero.
+ */
+export async function archGatesOrWarn(base = ROOT): Promise<Gate[]> {
   // Build the dependency-cruiser gate, or warn + return [] when it cannot run.
   const { existsSync } = await import('node:fs');
-  if (!existsSync(`${ROOT}/.dependency-cruiser.json`)) {
-    console.log(`  ${GREEN}⚠${RESET} Arch: no .dependency-cruiser.json — skipped`);
+  if (!existsSync(`${base}/${ARCH_CONFIGS[0]}`)) {
+    console.log(`  ${GREEN}⚠${RESET} Arch: no ${ARCH_CONFIGS[0]} — skipped`);
     return [];
   }
-  const targets = (await appTargets()).map((target) => `${target}/**/*.ts`);
+  const targets = await archTargets(base);
   if (targets.length === 0) {
     warn('Arch: no app sources; skipped');
     return [];
   }
+  const floor = await baselineFloor('arch.max_violations', base);
   return [
     {
-      description: 'Arch (dependency-cruiser)',
-      cmd: [
-        './node_modules/.bin/depcruise',
-        '--config',
-        '.dependency-cruiser.json',
-        '--no-progress',
-        ...targets,
-      ],
-      hint: "boundary crossed; surface the design decision to the human; don't edit arch config",
+      description:
+        floor === undefined
+          ? `Arch (dependency-cruiser, report-only: no ${BASELINE_FILE} floor)`
+          : floor
+            ? `Arch (dependency-cruiser, baseline ${floor})`
+            : 'Arch (dependency-cruiser)',
+      cmd: archArgv(targets),
+      // depcruise's exit code is its error count, so it is ignored: only the
+      // violation count measured against the floor decides this gate.
+      evaluate: (output) => {
+        const count = depcruiseViolationCount(output);
+        // No count means dependency-cruiser itself broke (bad config, crash);
+        // its own message is the only actionable thing here, so keep it.
+        if (count == null) {
+          return { ok: false, output: `${output}\nno JSON report to count violations from\n` };
+        }
+        // `output: ''` on the passing paths: the raw report is thousands of
+        // lines and `--verbose` would otherwise dump all of it.
+        if (floor === undefined) {
+          return { ok: true, detail: `${count}; ${BASELINE_FLOOR_HINT}`, output: '' };
+        }
+        if (count <= floor) return { ok: true, detail: `${count} <= ${floor}`, output: '' };
+        return { ok: false, output: formatArchViolations(output) };
+      },
+      hint:
+        floor === undefined
+          ? BASELINE_FLOOR_HINT
+          : "boundary crossed; surface the design decision to the human; don't edit arch config",
     },
   ];
 }
 
 async function cmdArch(): Promise<void> {
-  for (const gate of await archGatesOrWarn()) await run(gate.description, gate.cmd);
+  for (const { description, cmd, ...opts } of await archGatesOrWarn())
+    await run(description, cmd, opts);
 }
 
 async function gitLines(args: string[]): Promise<string[]> {
@@ -1443,6 +1549,24 @@ export async function complexityGatesOrWarn(base = ROOT): Promise<Gate[]> {
   ];
 }
 
+async function measuredArchViolations(): Promise<Measurement> {
+  const { existsSync } = await import('node:fs');
+  if (!existsSync(`${ROOT}/${ARCH_CONFIGS[0]}`)) return { unavailable: `no ${ARCH_CONFIGS[0]}` };
+  const targets = await archTargets();
+  if (targets.length === 0) return { unavailable: 'no app sources' };
+  // The exit code is dependency-cruiser's own error count, not a run failure —
+  // only a missing binary or unparsable report means the metric can't be read.
+  let res: GateResult;
+  try {
+    res = await runCapture({ description: 'Arch', cmd: archArgv(targets) });
+  } catch (err) {
+    return { error: `dependency-cruiser failed to run (${err})` };
+  }
+  const count = depcruiseViolationCount(res.output);
+  if (count == null) return { error: 'dependency-cruiser printed no JSON summary to count' };
+  return { value: count };
+}
+
 /**
  * Every key `--update-baseline` rewrites, in measurement order. Later gates
  * append here; a key absent from this table is carried through the file
@@ -1452,6 +1576,7 @@ export const RATCHETED_METRICS: RatchetedMetric[] = [
   { key: 'coverage.min', measure: measuredCoverage },
   { key: 'complexity.max_violations', measure: measuredComplexityViolations },
   { key: 'crap.max_violations', measure: measuredCrapViolations },
+  { key: 'arch.max_violations', measure: measuredArchViolations },
 ];
 
 /**

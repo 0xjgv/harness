@@ -3,9 +3,11 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  archGatesOrWarn,
   baselineFloor,
   complexityGatesOrWarn,
   coverageMinDefault,
+  depcruiseViolationCount,
   lizardWarningCount,
   type Measurement,
   measureRatcheted,
@@ -272,6 +274,7 @@ describe('measureRatcheted', () => {
       'coverage.min',
       'complexity.max_violations',
       'crap.max_violations',
+      'arch.max_violations',
     ]);
   });
 });
@@ -317,6 +320,122 @@ describe('complexity floor', () => {
 
     expect(gate?.description).toBe('Complexity (lizard)');
     expect(gate?.cmd.slice(-2)).toEqual(['-i', '0']);
+  });
+});
+
+describe('depcruiseViolationCount', () => {
+  const report = (summary: Record<string, unknown>) => JSON.stringify({ summary });
+
+  test('counts the error and warn severities', () => {
+    expect(depcruiseViolationCount(report({ error: 2, warn: 3, info: 9, ignore: 4 }))).toBe(5);
+  });
+
+  test('info and ignore findings are not violations the gate blocks on', () => {
+    expect(depcruiseViolationCount(report({ error: 0, warn: 0, info: 7, ignore: 1 }))).toBe(0);
+  });
+
+  test('a report without the counters is null, never a silent 0', () => {
+    expect(depcruiseViolationCount(report({ violations: [] }))).toBeNull();
+  });
+
+  test('non-JSON output (a crashed binary) is null', () => {
+    expect(depcruiseViolationCount('depcruise: command not found')).toBeNull();
+  });
+
+  test('a Node warning on stderr does not hide the report', () => {
+    // The capture is stdout + stderr, so fd 2 noise lands after the JSON.
+    const noisy = `${report({ error: 1, warn: 0 })}\n(node:1) [DEP0040] DeprecationWarning: punycode\n`;
+    expect(depcruiseViolationCount(noisy)).toBe(1);
+  });
+});
+
+describe('arch floor', () => {
+  const roots: string[] = [];
+
+  afterAll(() => {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  });
+
+  function project(existing?: string): string {
+    const root = mkdtempSync(join(tmpdir(), 'bun-arch-'));
+    roots.push(root);
+    mkdirSync(join(root, 'src'));
+    writeFileSync(join(root, 'src', 'index.ts'), 'export const x = 1;\n');
+    writeFileSync(join(root, '.dependency-cruiser.json'), '{ "forbidden": [] }\n');
+    if (existing !== undefined) writeFileSync(join(root, '.harness-baseline'), existing);
+    return root;
+  }
+
+  const report = (error: number, warn: number, violations: unknown[] = []) =>
+    JSON.stringify({ summary: { error, warn, info: 0, ignore: 0, violations } });
+
+  test('no floor recorded means report-only, not a demand for zero', async () => {
+    const [gate] = await archGatesOrWarn(project());
+
+    expect(gate?.description).toContain('report-only: no .harness-baseline floor');
+    expect(gate?.evaluate?.(report(3, 1))).toEqual({
+      ok: true,
+      detail: '4; run `bun harness.ts suppressions --update-baseline` to record a floor',
+      // The passing gate prints no body — `--verbose` must not dump the report.
+      output: '',
+    });
+  });
+
+  test('a recorded floor tolerates exactly that many violations', async () => {
+    const [gate] = await archGatesOrWarn(project('arch.max_violations 2\n'));
+
+    expect(gate?.description).toBe('Arch (dependency-cruiser, baseline 2)');
+    expect(gate?.evaluate?.(report(1, 1))).toEqual({ ok: true, detail: '2 <= 2', output: '' });
+  });
+
+  test('one violation over the floor fails, with the offenders as the body', async () => {
+    const [gate] = await archGatesOrWarn(project('arch.max_violations 0\n'));
+    const verdict = gate?.evaluate?.(
+      report(1, 0, [
+        {
+          from: 'src/leak.ts',
+          to: 'src/internal/secret.ts',
+          rule: { name: 'no-internal-leak', severity: 'error' },
+        },
+        {
+          from: 'src/noise.ts',
+          to: 'src/other.ts',
+          rule: { name: 'not-to-unresolvable', severity: 'info' },
+        },
+      ]),
+    );
+
+    expect(verdict?.ok).toBe(false);
+    expect(verdict?.output).toBe(
+      '  error no-internal-leak: src/leak.ts → src/internal/secret.ts\n',
+    );
+  });
+
+  test('a floor of 0 is a real floor, not a missing one', async () => {
+    const [gate] = await archGatesOrWarn(project('arch.max_violations 0\n'));
+
+    expect(gate?.description).toBe('Arch (dependency-cruiser)');
+    expect(gate?.evaluate?.(report(0, 0))).toEqual({ ok: true, detail: '0 <= 0', output: '' });
+  });
+
+  test('an unreadable report fails instead of passing on a null count', async () => {
+    const [gate] = await archGatesOrWarn(project('arch.max_violations 0\n'));
+
+    expect(gate?.evaluate?.('depcruise: command not found')?.ok).toBe(false);
+  });
+
+  test('the depcruise argv asks for JSON so the runner can count', async () => {
+    const [gate] = await archGatesOrWarn(project());
+
+    expect(gate?.cmd).toEqual([
+      './node_modules/.bin/depcruise',
+      '--config',
+      '.dependency-cruiser.json',
+      '--no-progress',
+      '--output-type',
+      'json',
+      'src/**/*.ts',
+    ]);
   });
 });
 

@@ -45,14 +45,21 @@ paraphrase (it drifts). Two sections:
   files anywhere. `crap` is advisory (warns by default, `--enforce` to
   hard-fail) but runs in `ci`, not `stop-hook` or `check`. `.harness-baseline` is
   a merge-based ratchet: `suppressions --update-baseline` re-measures `coverage.min`,
-  `complexity.max_violations`, `crap.max_violations` and every `suppressions.<kind>`
+  `complexity.max_violations`, `crap.max_violations`, `arch.max_violations` and every
+  `suppressions.<kind>`
   (a vanished kind is written as 0), drops a key it cannot measure in this repo
   (with a warning), preserves keys it does not own (`mutation.min`), and writes
   nothing if any measurement errors. `complexity` passes the floor to lizard as
-  `-i N`; `crap` compares its offender count to the floor. A missing file or key
-  makes both gates report-only: they pass — `crap` under `--enforce` too —
+  `-i N`; `crap` compares its offender count to the floor; `arch` runs
+  dependency-cruiser with `--output-type json`, counts
+  `summary.error + summary.warn` (never `summary.violations.length`, which also
+  counts `info`/`ignore` findings), ignores dependency-cruiser's exit code, and
+  fails only above the floor. A missing file or key makes all three gates
+  report-only: they pass — `crap` under `--enforce` too —
   labelled `report-only: no .harness-baseline floor`, with a hint to run
-  `bun harness.ts suppressions --update-baseline`. `test`, `coverage`, `mutation`, and
+  `bun harness.ts suppressions --update-baseline`, so a repo adopting the harness
+  with pre-existing boundary violations is green on day one and can only ratchet
+  down from there. `test`, `coverage`, `mutation`, and
   `crap` warn and skip when no Bun test files exist. `check` also warns on
   missing Stop hook wiring and arch config changes. Requires `uvx`
   on PATH for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
