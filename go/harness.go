@@ -83,15 +83,14 @@ type gate struct {
 	description string
 	cmd         []string
 	extract     func(output string) string
-	hint        string
-	// verdict replaces the exit-code pass/fail rule for a tool that exits
-	// non-zero merely because it found something to report — a count-ratcheted
-	// gate passes while the count stays at or below its floor. It gets the
-	// tool's combined output and exit code, and returns the verdict plus a
-	// human summary, printed as the `(…)` suffix on a pass and as the failure
-	// body in place of the tool's own output (`--verbose` still dumps that raw
-	// output).
+	// verdict decides pass/fail for a tool whose exit code does not
+	// (go-arch-lint reports, it does not judge: it exits 1 whenever it found
+	// anything, which is not the same as being over the floor). It sees the
+	// exit code too, so a gate counting findings out of the output still fails
+	// when the tool itself broke. Returns ok plus the detail shown after the
+	// ✓/✗ label, and supersedes extract; without it the exit code decides.
 	verdict func(output string, exitCode int) (bool, string)
+	hint    string
 }
 
 type gateResult struct {
@@ -119,11 +118,11 @@ func runCapture(g gate) gateResult {
 	detail := ""
 	if g.verdict != nil {
 		ok, detail = g.verdict(output, code)
+		if !ok && code == 0 {
+			code = 1
+		}
 	} else if ok && g.extract != nil {
 		detail = g.extract(output)
-	}
-	if !ok && code == 0 {
-		code = 1 // the tool passed but the verdict didn't
 	}
 	return gateResult{g.description, g.cmd, ok, code, output, detail, g.hint}
 }
