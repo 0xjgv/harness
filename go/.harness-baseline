@@ -1,5 +1,6 @@
 complexity.max_violations 0
-coverage.min 59
+coverage.min 60
 crap.max_violations 0
+mutation.min 80
 suppressions.lint_ignore 3
 suppressions.nolint 11

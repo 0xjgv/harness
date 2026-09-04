@@ -113,8 +113,14 @@ suppressions.nolint 11
   measurement joins against it.
 - **The write merges.** Every measured key is overwritten (a suppression kind
   that vanished is recorded as `0`, so the floor ratchets down); every
-  unrecognised key — `coverage.min`, `mutation.min`, anything hand-written — is
-  carried through untouched.
+  unrecognised key — anything hand-written — is carried through untouched.
+- **`mutation.min`** is the share of mutants gremlins killed,
+  `killed / (killed + survived)` rounded, measured over the concrete package
+  targets. It is the one floor the automatic pass does *not* measure: a
+  mutation run costs minutes, so `--update-baseline` carries the key through
+  untouched and only `--update-baseline --with-mutation` rewrites it. The gate
+  itself is scoped to the package directories of the changed `.go` files and
+  advisory unless `--enforce`, mirroring `crap`.
 - **All-or-nothing.** A metric that does not apply here (no `*_test.go`, so no
   CRAP) has its key *dropped* with a `⚠`, never carried forward from the
   shipped template's own numbers. A metric whose tool ran and failed aborts the
@@ -126,12 +132,33 @@ suppressions.nolint 11
   ↳ fix: make the measurement pass, then rerun `suppressions --update-baseline`
 ```
 
-- Go's table has **3** entries where python's `RATCHETED_KEYS` has 4:
+- Go's table has **3** automatic entries plus `mutation.min` behind
+  `--with-mutation`, where python's `RATCHETED_KEYS` has 4:
   `deadcode.max_findings` has no go equivalent (golangci-lint's `unused` linter
   covers it, and it has no count to floor).
 - Extending it: `harness.go` keeps a `var ratcheted = []suppressions.Measurer`
   table of `{Key, Measure}` pairs. A new floor is one entry plus a function
-  returning `suppressions.Measured` / `Unavailable` / `Failed`.
+  returning `suppressions.Measured` / `Unavailable` / `Failed`. A floor too
+  expensive for every refresh goes behind a flag instead: see
+  `baselineMeasurers()`, which appends the `mutation.min` measurer only under
+  `--with-mutation`.
+
+## Mutation testing, gremlins v0.5.0
+
+Two findings worth carrying into any repo that adopts this:
+
+- **Scope by package, not by `--diff`.** gremlins' own `--diff <ref>` keys its
+  diff on git's repo-root-relative paths but matches them against filenames
+  walked from the target directory, so with a concrete package target nothing
+  ever matches: every mutant comes back `SKIPPED`, the report says zero
+  mutants, and the gate goes green having tested nothing. The runner derives
+  the package directories of the changed `.go` files instead.
+- **Give mutants a generous timeout.** gremlins drops every mutant that
+  overruns its budget out of *both* score counts, so an adequate-looking
+  coefficient silently shrinks the sample and inflates the score. On a loaded
+  machine `--timeout-coefficient=10` scored 100% off 8 mutants where `=30`
+  scored 80% off 49, reproducibly. A floor is only worth recording if it
+  reproduces.
 
 ## Canonical anchors
 

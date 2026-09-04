@@ -200,4 +200,5 @@ func InitializeCrapScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^the output contains "([^"]+)"$`, w.outputContains)
 	sc.Step(`^the output does not contain "([^"]+)"$`, w.outputDoesNotContain)
 	initializeBaselineSteps(sc, w)
+	initializeMutationSteps(sc, w)
 }

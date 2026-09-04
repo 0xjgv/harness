@@ -38,7 +38,10 @@ const (
 	reportOnlyLimit = "1000000"
 	baselineFile    = ".harness-baseline"
 	updateBaseline  = "go run harness.go suppressions --update-baseline"
-	crapMaxDefault  = 30.0
+	// updateBaselineMutation also measures mutation.min, which the automatic
+	// pass leaves alone because a mutation run costs minutes.
+	updateBaselineMutation = updateBaseline + " --with-mutation"
+	crapMaxDefault         = 30.0
 )
 
 // ── Output ──────────────────────────────────────────────────────────
@@ -749,44 +752,295 @@ func cmdGherkinGuard() {
 	}
 }
 
-// mutationTarget is the package gremlins mutates. The template ships
-// `suppressions` as its sample library package — point this (or pass a path
-// argument) at your own source packages as the module grows.
-const mutationTarget = "./suppressions"
+// mutationTargets are the packages gremlins mutates when a run is not scoped
+// to a change set — `--all`, an explicit path argument, or the baseline
+// measurement. The template ships `suppressions` as its sample library
+// package; point this at your own source packages as the module grows.
+var mutationTargets = []string{"./suppressions"}
 
-// cmdMutation runs gremlins mutation testing. Advisory — not wired into ci.
+const (
+	gremlinsPkg = "github.com/go-gremlins/gremlins/cmd/gremlins@v0.5.0"
+	// mutationTimeout is generous on purpose. gremlins derives each mutant's
+	// budget from its own baseline test run and drops every mutant that
+	// overruns it out of *both* score counts, so a coefficient that is merely
+	// adequate silently shrinks the sample and inflates the score: on a loaded
+	// machine `=10` scored 100% off 8 mutants where `=30` scored 80% off 49,
+	// twice, with no timeouts. A floor is only worth recording if it reproduces.
+	mutationTimeout = "--timeout-coefficient=30"
+	// mutationReportGlob matches every per-target gremlins report `clean`
+	// removes and .gitignore keeps out of the tree.
+	mutationReportGlob = "gremlins-report*.json"
+)
+
+// mutationReport is the slice of gremlins' machine-readable report the gate
+// reads: counts, not percentages, so several scoped runs sum into one score
+// instead of averaging percentages.
 //
-// Two hard-won notes baked into this command:
-//   - gremlins derives each mutant's test timeout from the baseline test run.
-//     A cold build cache makes the first mutant compile blow that budget and
-//     every mutant reports TIMED OUT. Warming the cache with `go test` first,
-//     plus a generous --timeout-coefficient, makes results meaningful.
-//   - gremlins must be pointed at a concrete package. `./...` from this module
-//     gathers no coverage because the root file (harness.go) is build-ignored,
-//     so gremlins reports "No results". Target source packages explicitly.
-//
-// Output is printed unconditionally: an advisory report you cannot see is useless.
-func cmdMutation() {
-	target := mutationTarget
-	if args := filterFlags(os.Args[1:]); len(args) > 1 {
-		target = args[1]
+// gremlins leaves timed-out mutants out of both counts, so a machine loaded
+// enough to blow the mutant timeout shrinks the denominator instead of
+// scoring those mutants — one more reason this gate warns rather than blocks.
+type mutationReport struct {
+	Killed     int `json:"mutants_killed"`
+	Lived      int `json:"mutants_lived"`
+	NotCovered int `json:"mutants_not_covered"`
+}
+
+func (r mutationReport) add(other mutationReport) mutationReport {
+	return mutationReport{
+		Killed:     r.Killed + other.Killed,
+		Lived:      r.Lived + other.Lived,
+		NotCovered: r.NotCovered + other.NotCovered,
 	}
-	run("Warm test cache", []string{"go", "test", "-count=1", "./..."},
-		&runOpts{extract: extractTestSummary, noExit: true})
+}
 
-	fmt.Printf("  %s→%s gremlins unleash %s\n", dim, reset, target)
-	c := exec.Command("go", "run",
-		"github.com/go-gremlins/gremlins/cmd/gremlins@v0.5.0",
-		"unleash", "--timeout-coefficient=10", target)
-	c.Dir = root
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	if err := c.Run(); err != nil {
-		fmt.Printf("  %s⚠%s Mutation: gremlins exited non-zero (advisory — not blocking)\n", green, reset)
+// mutationReportPath names one target's report so several targets do not
+// overwrite each other's artifact: `./suppressions` → gremlins-report-suppressions.json.
+func mutationReportPath(target string) string {
+	name := strings.Trim(strings.ReplaceAll(strings.TrimPrefix(target, "./"), "/", "-"), ".")
+	if name == "" {
+		return "gremlins-report.json"
+	}
+	return "gremlins-report-" + name + ".json"
+}
+
+func readMutationReport(reportPath string) (mutationReport, error) {
+	var report mutationReport
+	if !filepath.IsAbs(reportPath) {
+		reportPath = filepath.Join(root, reportPath)
+	}
+	data, err := os.ReadFile(reportPath)
+	if err != nil {
+		return report, fmt.Errorf("cannot read gremlins report: %w", err)
+	}
+	if err := json.Unmarshal(data, &report); err != nil {
+		return report, fmt.Errorf("cannot parse gremlins report %s: %w", reportPath, err)
+	}
+	return report, nil
+}
+
+// mutationBaseRef resolves the single ref the change set is diffed against.
+// Separate from changedPathsFromBase, which may diff against two bases at
+// once and so has no single ref to name.
+func mutationBaseRef() string {
+	candidates := []string{flagValue("base", ""), os.Getenv("HARNESS_ARCH_BASE")}
+	if githubBase := os.Getenv("GITHUB_BASE_REF"); githubBase != "" {
+		candidates = append(candidates, "origin/"+githubBase)
+	}
+	candidates = append(candidates, "origin/HEAD", "origin/main", "main")
+	for _, candidate := range candidates {
+		if candidate != "" && len(gitLines("rev-parse", "--verify", candidate)) > 0 {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// changedGoFilesSince lists the .go files this branch changed against a base
+// ref — the change-set source for every stage that has one, because a
+// `git status` on a fresh CI checkout is empty and would score a green gate
+// that tested nothing.
+func changedGoFilesSince(base string) []string {
+	prefix := gitPrefix()
+	var files []string
+	for _, p := range gitLines("diff", "--name-only", "--diff-filter=d", base+"...HEAD", "--", ".") {
+		files = append(files, normalizeChangedPath(p, prefix))
+	}
+	return files
+}
+
+// mutationScope resolves the packages to mutate. An explicit path argument or
+// `--all` pins the concrete targets; otherwise the scope is the package
+// directories of the changed .go files. workingTree is false in ci, where the
+// uncommitted set must never be the source (see changedGoFilesSince).
+//
+// Scoping is package-granular, not line-granular: gremlins' own `--diff` is
+// unusable with a concrete package target. It keys the diff on git's
+// repo-root-relative paths (internal/diff/parse.go:30) but matches them
+// against filenames walked from the target directory
+// (internal/engine/engine.go:68 builds `os.DirFS(module root + calling dir)`),
+// so `go/suppressions/suppressions.go` never matches `suppressions.go`: every
+// mutant comes back SKIPPED and the run reports zero mutants — a green gate
+// that tested nothing.
+func mutationScope(workingTree bool) []string {
+	if args := filterFlags(os.Args[1:]); len(args) > 1 {
+		return []string{args[1]}
+	}
+	if hasFlag("all") {
+		return mutationTargets
+	}
+	if base := mutationBaseRef(); base != "" {
+		return suppressions.MutationPackages(changedGoFilesSince(base))
+	}
+	if workingTree {
+		return suppressions.MutationPackages(changedGoFiles())
+	}
+	return nil
+}
+
+// dirHasTestFiles reports whether a gremlins target's own package directory
+// holds a test. gremlins can only kill a mutant a test reaches, so an
+// untested package scores nothing and would only dilute the run.
+func dirHasTestFiles(target string) bool {
+	dir := filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(target, "./")))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), "_test.go") {
+			return true
+		}
+	}
+	return false
+}
+
+func withTestFiles(targets []string) []string {
+	var kept []string
+	for _, target := range targets {
+		if dirHasTestFiles(target) {
+			kept = append(kept, target)
+			continue
+		}
+		fmt.Printf("  %s⚠%s Mutation: %s has no *_test.go — skipped\n", green, reset, target)
+	}
+	return kept
+}
+
+// warmTestCache builds and runs the suite before gremlins does. gremlins
+// derives each mutant's test timeout from the baseline test run: a cold build
+// cache makes the first mutant's compile blow that budget and every mutant
+// reports TIMED OUT. mutationTimeout is the other half of the same fix.
+func warmTestCache(stream bool) {
+	if stream {
+		run("Warm test cache", []string{"go", "test", "-count=1", "./..."},
+			&runOpts{extract: extractTestSummary, noExit: true})
 		return
 	}
-	fmt.Printf("  %s✓%s Mutation (gremlins)\n", green, reset)
+	c := exec.Command("go", "test", "-count=1", "./...")
+	c.Dir = root
+	_, _ = c.CombinedOutput()
 }
+
+// gremlinsUnleash mutates one package and returns its report. gremlins takes
+// a single concrete package path — `./...` gathers no coverage from this
+// module because the root file (harness.go) is build-ignored — so several
+// targets mean several runs, aggregated by the caller.
+func gremlinsUnleash(target string, stream bool) (mutationReport, error) {
+	reportPath := mutationReportPath(target)
+	argv := []string{"go", "run", gremlinsPkg, "unleash", mutationTimeout, "-o", reportPath, target}
+
+	c := exec.Command(argv[0], argv[1:]...)
+	c.Dir = root
+	var captured bytes.Buffer
+	if stream {
+		fmt.Printf("  %s→ %s%s\n", dim, strings.Join(argv, " "), reset)
+		c.Stdout = os.Stdout
+		c.Stderr = os.Stderr
+	} else {
+		c.Stdout = &captured
+		c.Stderr = &captured
+	}
+	runErr := c.Run()
+
+	report, err := readMutationReport(reportPath)
+	if err == nil {
+		return report, nil
+	}
+	if runErr != nil {
+		if !stream && captured.Len() > 0 {
+			fmt.Print(captured.String())
+		}
+		return report, fmt.Errorf("gremlins exited %d", exitCode(runErr))
+	}
+	return report, err
+}
+
+// mutateTargets runs every target and sums the reports. A target that failed
+// is a warning, not a failure: mutation is advisory, and the packages that
+// did run still carry a score. ok=false only when none of them ran.
+func mutateTargets(targets []string, stream bool) (total mutationReport, ok bool) {
+	for _, target := range targets {
+		report, err := gremlinsUnleash(target, stream)
+		if err != nil {
+			fmt.Printf("  %s⚠%s Mutation: %s — %v (advisory — not blocking)\n", green, reset, target, err)
+			continue
+		}
+		total = total.add(report)
+		ok = true
+	}
+	return total, ok
+}
+
+// reportMutationScore compares a run's kill rate to the `mutation.min` floor.
+// Mirrors cmdCrap exactly: advisory `⚠` by default, `✗` + exit 1 under
+// --enforce, and report-only — even under --enforce — when no floor is
+// recorded, because an absent key means the repo has never been measured,
+// not that it must already be perfect.
+func reportMutationScore(report mutationReport, enforce bool) {
+	score, scored := suppressions.MutationScore(report.Killed, report.Lived)
+	if !scored {
+		fmt.Printf("  %s⚠%s Mutation: no mutant was killed or survived (%d not covered) — nothing to score\n",
+			green, reset, report.NotCovered)
+		return
+	}
+	floor, hasFloor := suppressions.BaselineFloor(root, "mutation.min")
+	if !hasFloor {
+		fmt.Printf("  %s⚠%s Mutation: %d%% mutants killed (report-only: no %s floor)\n",
+			green, reset, score, baselineFile)
+		fmt.Printf("  ↳ fix: run `%s` to record a floor\n", updateBaselineMutation)
+		return
+	}
+	if score >= floor {
+		fmt.Printf("  %s✓%s Mutation: %d%% mutants killed (baseline %d)\n", green, reset, score, floor)
+		return
+	}
+	glyph, color := advisoryGlyphAndColor(enforce)
+	suffix := " (advisory)"
+	if enforce {
+		suffix = ""
+	}
+	fmt.Printf("  %s%s%s Mutation: %d%% mutants killed (baseline %d)%s\n",
+		color, glyph, reset, score, floor, suffix)
+	fmt.Println("  ↳ fix: add tests that kill the surviving mutants gremlins listed")
+	if enforce {
+		os.Exit(1)
+	}
+}
+
+// runMutation is the mutation gate: gremlins over the packages the change set
+// touches, scored against `mutation.min`. Advisory unless --enforce, and
+// wired into ci that way — a kill rate is too jittery a number to block a
+// pipeline on, and too useful to hide.
+//
+// Output is printed unconditionally: an advisory report you cannot see is useless.
+func runMutation(workingTree bool) {
+	enforce := hasFlag("enforce")
+	// --report scores a report that already exists instead of spending
+	// minutes producing a new one — the way to re-check a finished run
+	// against a changed floor. An unreadable path fails hard rather than
+	// scoring as "nothing to score": a typo must not pass for a clean tree.
+	if reportPath := flagValue("report", ""); reportPath != "" {
+		report, err := readMutationReport(reportPath)
+		if err != nil {
+			fmt.Printf("  %s✗%s Mutation: %v\n", red, reset, err)
+			os.Exit(1)
+		}
+		reportMutationScore(report, enforce)
+		return
+	}
+
+	targets := withTestFiles(mutationScope(workingTree))
+	if len(targets) == 0 {
+		fmt.Printf("  %s⚠%s Mutation: no changed Go package with tests (skipped)\n", green, reset)
+		return
+	}
+	warmTestCache(true)
+	if total, ok := mutateTargets(targets, true); ok {
+		reportMutationScore(total, enforce)
+	}
+}
+
+func cmdMutation() { runMutation(true) }
 
 // funcMetric pairs a function's location with its cyclomatic complexity.
 // Coverage is computed at join time in cmdCrap from per-line hit counts.
@@ -808,11 +1062,12 @@ var lizardLocRe = regexp.MustCompile(`"([^"@]*)@(\d+)-(\d+)@([^"]+)"`)
 // per-function coverage is the fraction of in-range tracked lines that ran.
 // Joining on file+line range, not name, sidesteps Go's "(*Foo).Bar" vs "Bar"
 // receiver-name mismatch between cover output and lizard output.
-// crapGlyphAndColor pairs CRAP's advisory/enforce output glyph with the
-// matching ANSI color used throughout this runner (⚠ prints green, ✗ prints
-// red, by convention here). The enforce→glyph mapping itself lives in
+// advisoryGlyphAndColor pairs an advisory gate's advisory/enforce output
+// glyph with the matching ANSI color used throughout this runner (⚠ prints
+// green, ✗ prints red, by convention here). Shared by CRAP and mutation, the
+// two gates that warn by default. The enforce→glyph mapping itself lives in
 // crap.AdvisoryGlyph — pure, unit tested — so this stays a one-line wrapper.
-func crapGlyphAndColor(enforce bool) (glyph, color string) {
+func advisoryGlyphAndColor(enforce bool) (glyph, color string) {
 	glyph = crap.AdvisoryGlyph(enforce)
 	color = green
 	if enforce {
@@ -903,7 +1158,7 @@ func cmdCrap() {
 	if enforce {
 		suffix = ""
 	}
-	glyph, color := crapGlyphAndColor(enforce)
+	glyph, color := advisoryGlyphAndColor(enforce)
 
 	measurement := crapMeasure(maxCrap)
 	if measurement.problem != "" {
@@ -1273,8 +1528,9 @@ func cmdCi() {
 	gates = append(gates, acceptanceGatesOrWarn()...)
 	gates = append(gates, archGatesOrWarn()...)
 	allOk, _ := runGatesParallel(gates)
-	cmdTestCov() // after the batch
-	cmdCrap()    // advisory unless --enforce
+	cmdTestCov()       // after the batch
+	cmdCrap()          // advisory unless --enforce
+	runMutation(false) // advisory unless --enforce; change set from the base ref only
 	archConfigOk := checkArchConfigGuard(false, false, false)
 	gherkinOk := checkGherkinGuard(false, false, false)
 	suppressionsOk := suppressions.CheckBaseline(
@@ -1439,6 +1695,43 @@ func measuredCrapViolations() suppressions.Measurement {
 		return suppressions.Failed(measurement.problem)
 	}
 	return suppressions.Measured(len(measurement.offenders))
+}
+
+// baselineMeasurers is the set `suppressions --update-baseline` measures.
+// `mutation.min` joins it only under `--with-mutation`: a mutation run costs
+// minutes, so the automatic pass carries the key through untouched instead of
+// making every baseline refresh pay for it.
+func baselineMeasurers() []suppressions.Measurer {
+	if !hasFlag("with-mutation") {
+		return ratcheted
+	}
+	return append(append([]suppressions.Measurer{}, ratcheted...),
+		suppressions.Measurer{Key: "mutation.min", Measure: measuredMutationMin})
+}
+
+// measuredMutationMin is the kill rate over the concrete package targets —
+// never over a change set. A floor derived from whatever happened to change
+// is not comparable to the next run's score, and would flap on every branch.
+//
+// The consequence, worth knowing: a whole-tree floor compared against a
+// scoped run can warn when the changed package is weaker than the module
+// average. That is why the gate is advisory unless `--enforce`.
+func measuredMutationMin() suppressions.Measurement {
+	targets := withTestFiles(mutationTargets)
+	if len(targets) == 0 {
+		return suppressions.Unavailable("no package with *_test.go to mutate")
+	}
+	fmt.Printf("  %s→%s measuring mutation.min: gremlins on %s\n", dim, reset, strings.Join(targets, " "))
+	warmTestCache(verbose)
+	report, ok := mutateTargets(targets, verbose)
+	if !ok {
+		return suppressions.Failed("gremlins failed on every target package")
+	}
+	score, scored := suppressions.MutationScore(report.Killed, report.Lived)
+	if !scored {
+		return suppressions.Unavailable("gremlins killed no mutants and none survived")
+	}
+	return suppressions.Measured(score)
 }
 
 // hasTestFiles reports whether any *_test.go exists under root (vendor/ and
@@ -1641,7 +1934,12 @@ func cmdHooks() {
 
 func cmdClean() {
 	fmt.Printf("\n%s[clean]%s\n\n", blue, reset)
-	for _, name := range []string{"coverage.out"} {
+	names := []string{"coverage.out"}
+	matches, _ := filepath.Glob(filepath.Join(root, mutationReportGlob))
+	for _, match := range matches {
+		names = append(names, filepath.Base(match))
+	}
+	for _, name := range names {
 		p := filepath.Join(root, name)
 		if _, err := os.Stat(p); err == nil {
 			os.Remove(p)
@@ -1656,7 +1954,8 @@ func cmdSuppressions() {
 	findings := suppressions.ScanFindings(root)
 	results := suppressions.BucketByKind(findings)
 	if hasFlag("update-baseline") {
-		baseline, err := suppressions.WriteBaseline(root, results, ratcheted)
+		measurers := baselineMeasurers()
+		baseline, err := suppressions.WriteBaseline(root, results, measurers)
 		var unmeasured *suppressions.MeasurementError
 		if errors.As(err, &unmeasured) {
 			fmt.Printf("  %s✗%s %s not written — could not measure:\n", red, reset, baselineFile)
@@ -1673,7 +1972,7 @@ func cmdSuppressions() {
 			total += len(entries)
 		}
 		recorded := []string{fmt.Sprintf("suppressions %d", total)}
-		for _, m := range ratcheted {
+		for _, m := range measurers {
 			if value, ok := baseline[m.Key]; ok {
 				recorded = append(recorded, fmt.Sprintf("%s %d", m.Key, value))
 			}
@@ -1714,7 +2013,7 @@ var tasks = []task{
 	{"arch", cmdArch, "Architecture checks (go-arch-lint)"},
 	{"arch-config-guard", cmdArchConfigGuard, "Block unreviewed arch config changes"},
 	{"gherkin-guard", cmdGherkinGuard, "Block production source changes with no accompanying .feature scenario"},
-	{"mutation", cmdMutation, "Mutation testing (gremlins, advisory)"},
+	{"mutation", cmdMutation, "Mutation testing on changed packages (gremlins, advisory)"},
 	{"crap", cmdCrap, "CRAP complexity x coverage gate (advisory)"},
 	{"suppressions", cmdSuppressions, "Show or update suppression baseline"},
 	{"pre-commit", cmdPreCommit, "Staged checks + tests"},
