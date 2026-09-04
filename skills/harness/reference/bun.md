@@ -25,13 +25,15 @@ paraphrase (it drifts). Two sections:
   build lock), then warns (does not block) via `arch-config-guard`
   and `gherkin-guard`, checks Stop-hook wiring and `agents-md-drift`, and
   ratchets suppressions. Invariant: `ci` minus `check` == every gate that
-  needs the network or a build lock (`audit`, `coverage`, advisory `crap`).
+  needs the network or a build lock, or is too slow for an edit loop (`audit`,
+  `coverage`, advisory `crap`, advisory `mutation`).
   `ci` runs the read-only gates
   (`lint`, `typecheck`, `audit`, `complexity`, `deadcode`, `acceptance`,
   `arch`) **in parallel** — captured and printed in submission order, run to
-  completion so one pass surfaces every failure — then streams `coverage` and
-  the advisory `crap`; `ci` also runs `arch-config-guard` and `gherkin-guard`
-  in strict (blocking) mode.
+  completion so one pass surfaces every failure — then streams `coverage`, the
+  advisory `crap`, and the advisory `mutation` (scoped to the diff against the
+  resolved base ref, never the working tree, which is empty on a CI checkout);
+  `ci` also runs `arch-config-guard` and `gherkin-guard` in strict (blocking) mode.
   `pre-push` is the offline push gate: `lint` (biome
   covers format), `acceptance`, `arch`, and strict `arch-config-guard` + `gherkin-guard` over the whole pushed tree (the
   deterministic checks pre-commit and stop-hook skip). `deadcode` runs knip
@@ -47,12 +49,21 @@ paraphrase (it drifts). Two sections:
   a merge-based ratchet: `suppressions --update-baseline` re-measures `coverage.min`,
   `complexity.max_violations`, `crap.max_violations` and every `suppressions.<kind>`
   (a vanished kind is written as 0), drops a key it cannot measure in this repo
-  (with a warning), preserves keys it does not own (`mutation.min`), and writes
+  (with a warning), preserves keys it does not measure, and writes
   nothing if any measurement errors. `complexity` passes the floor to lizard as
-  `-i N`; `crap` compares its offender count to the floor. A missing file or key
-  makes both gates report-only: they pass — `crap` under `--enforce` too —
+  `-i N`; `crap` compares its offender count to the floor; `mutation` compares
+  its score to `mutation.min`. A missing file or key makes all three gates
+  report-only: they pass — `crap` and `mutation` under `--enforce` too —
   labelled `report-only: no .harness-baseline floor`, with a hint to run
-  `bun harness.ts suppressions --update-baseline`. `test`, `coverage`, `mutation`, and
+  `bun harness.ts suppressions --update-baseline`. `mutation.min` is the one
+  floor that pass does *not* measure — a Stryker run costs minutes, so it is
+  carried through untouched unless you add `--with-mutation` — so a repo that
+  copied this template must either delete the shipped `mutation.min` line or
+  re-measure it with `--with-mutation`, or it keeps the template's number. Its unit is
+  `round(100 * killed / (killed + survived))` over the statuses in Stryker's
+  JSON report (`Killed` + `Timeout` against `Survived`; mutants that never ran
+  are excluded from both sides, and Stryker's own `thresholds.break` is never
+  used because its denominator differs). `test`, `coverage`, `mutation`, and
   `crap` warn and skip when no Bun test files exist. `check` also warns on
   missing Stop hook wiring and arch config changes. Requires `uvx`
   on PATH for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,

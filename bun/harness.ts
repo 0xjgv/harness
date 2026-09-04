@@ -10,7 +10,7 @@
  *   bun harness.ts ci               # CI verification
  *   bun harness.ts acceptance       # cucumber scenarios
  *   bun harness.ts coverage --min=N # tests with coverage threshold
- *   bun harness.ts mutation         # Stryker mutation testing (advisory)
+ *   bun harness.ts mutation --all   # Stryker mutation score (advisory)
  *   bun harness.ts crap --max=N     # CRAP complexity x coverage (advisory)
  *   bun harness.ts arch             # dependency-cruiser arch checks
  *   bun harness.ts --verbose        # show all output
@@ -26,6 +26,10 @@ const KNIP = 'knip@5.88.1';
 const COMPLEXITY_MAX_ARGS = 8;
 const COMPLEXITY_MAX_CCN = 15;
 const CRAP_MAX_DEFAULT = 30;
+const STRYKER_BIN = './node_modules/.bin/stryker';
+// Matches `jsonReporter.fileName` in stryker.conf.json — set there explicitly so
+// the runner never has to guess at Stryker's default report location.
+const MUTATION_REPORT = 'reports/mutation/mutation.json';
 // `-i N` high enough that lizard never exits non-zero on warnings: used wherever
 // lizard is a measuring tape (report-only complexity, CRAP scoring, baseline
 // measurement) rather than a gate.
@@ -42,6 +46,9 @@ const BASELINE_FILE = '.harness-baseline';
 const SUPPRESSION_BASELINE_PREFIX = 'suppressions.';
 // Every gate that finds no floor points at the same command.
 const BASELINE_FLOOR_HINT = 'run `bun harness.ts suppressions --update-baseline` to record a floor';
+// …except `mutation.min`, which that pass deliberately does not measure.
+const MUTATION_FLOOR_HINT =
+  'run `bun harness.ts suppressions --update-baseline --with-mutation` to record a floor';
 const ARCH_CONFIGS = ['.dependency-cruiser.json'] as const;
 const ARCH_CONFIG_ALLOW_ENV = 'HARNESS_ALLOW_ARCH_CONFIG';
 const GHERKIN_ALLOW_ENV = 'HARNESS_ALLOW_NO_FEATURE';
@@ -602,7 +609,13 @@ async function checkSuppressionsBaseline(opts?: { noExit?: boolean }): Promise<b
 async function cmdSuppressions(): Promise<void> {
   const results = await scanSuppressions();
   if (process.argv.includes('--update-baseline')) {
-    const written = await writeBaseline(results, await measureRatcheted());
+    // `mutation.min` costs a full Stryker run, so it is opt-in: without
+    // --with-mutation the key is simply not measured, and writeBaseline carries
+    // whatever value the file already holds through untouched.
+    const metrics = process.argv.includes('--with-mutation')
+      ? [...RATCHETED_METRICS, MUTATION_METRIC]
+      : RATCHETED_METRICS;
+    const written = await writeBaseline(results, await measureRatcheted(metrics));
     if (!written.ok) {
       console.log(`  ${RED}✗${RESET} ${BASELINE_FILE} not written — could not measure:`);
       for (const [key, reason] of written.broken) console.log(`    ${key}: ${reason}`);
@@ -614,9 +627,9 @@ async function cmdSuppressions(): Promise<void> {
     const total = Object.values(results).reduce((sum, arr) => sum + arr.length, 0);
     const recorded = [
       `suppressions ${total}`,
-      ...RATCHETED_METRICS.filter(({ key }) => key in written.baseline).map(
-        ({ key }) => `${key} ${written.baseline[key]}`,
-      ),
+      ...metrics
+        .filter(({ key }) => key in written.baseline)
+        .map(({ key }) => `${key} ${written.baseline[key]}`),
     ].join(', ');
     console.log(`  ${GREEN}✓${RESET} ${BASELINE_FILE}: ${recorded}`);
     return;
@@ -1121,16 +1134,199 @@ async function cmdGherkinGuard(): Promise<void> {
   if (!ok) process.exit(1);
 }
 
-async function cmdMutation(): Promise<void> {
-  // StrykerJS mutation testing. Advisory — not wired into ci.
-  // No official Bun runner plugin exists; stryker.conf.json uses the universal
-  // 'command' runner which shells out to `bun test` and grades by exit code.
+// ── Mutation ────────────────────────────────────────────────────────
+
+export interface MutantTally {
+  killed: number;
+  survived: number;
+}
+
+/**
+ * Count killed against survived mutants in a StrykerJS JSON report.
+ *
+ * The report carries no mutation-score field, so the score is derived from the
+ * per-mutant statuses. `Timeout` counts as killed (the mutant broke the suite
+ * badly enough to hang it); `NoCoverage`, `Ignored`, `CompileError` and
+ * `RuntimeError` are excluded from *both* sides, because a mutant that never
+ * ran says nothing about the tests. null means the payload was not a report.
+ */
+export function tallyMutants(report: unknown): MutantTally | null {
+  const files = (report as { files?: Record<string, { mutants?: { status?: string }[] }> } | null)
+    ?.files;
+  if (files == null || typeof files !== 'object') return null;
+  let killed = 0;
+  let survived = 0;
+  for (const file of Object.values(files)) {
+    for (const mutant of file?.mutants ?? []) {
+      if (mutant.status === 'Killed' || mutant.status === 'Timeout') killed += 1;
+      else if (mutant.status === 'Survived') survived += 1;
+    }
+  }
+  return { killed, survived };
+}
+
+/** Percent of graded mutants killed, rounded — the unit `mutation.min` is in. */
+export function mutationScore(tally: MutantTally): number {
+  return Math.round((100 * tally.killed) / (tally.killed + tally.survived));
+}
+
+/** A file Stryker should mutate: application source, never a test. */
+export function isMutableSourceFile(path: string): boolean {
+  return matchesTsTarget(path, APP_SOURCES) && !isTestFile(path);
+}
+
+/**
+ * The source files to mutate: the uncommitted working set, or the diff against
+ * the resolved base ref. `ci` must use the base (`fromBase`) — the working set
+ * is empty on a CI checkout, and a green gate that mutated nothing is a lie.
+ */
+async function mutationScope(fromBase: boolean): Promise<string[]> {
+  if (!fromBase) return (await changedTsFiles()).filter(isMutableSourceFile);
+  const prefix = await gitPrefix();
+  return (await changedPathsFromBase())
+    .map((p) => normalizeChangedPath(p, prefix))
+    .filter(isMutableSourceFile);
+}
+
+interface MutationMeasurement {
+  tally?: MutantTally;
+  /** Why scoring did not happen. With `code` set the tool failed; without it, a benign skip. */
+  problem?: string;
+  detail?: string;
+  code?: number;
+}
+
+/**
+ * Run Stryker over `mutate` (the whole configured tree when undefined) and tally
+ * its JSON report.
+ *
+ * The report is deleted first: a run that dies half-way would otherwise leave the
+ * previous run's numbers behind to be scored as if they were fresh. Stryker's own
+ * `thresholds.break` is never used — its denominator counts mutants that never
+ * ran, which is not the score this baseline records.
+ */
+async function mutationMeasure(mutate?: string[]): Promise<MutationMeasurement> {
+  if (!(await pathExists(STRYKER_BIN))) {
+    return { problem: `${STRYKER_BIN} not found — run \`bun install\`; skipped` };
+  }
+  const { readFile, rm } = await import('node:fs/promises');
+  await rm(`${ROOT}/${MUTATION_REPORT}`, { force: true });
+
+  const cmd = [STRYKER_BIN, 'run', '--reporters', 'json,clear-text'];
+  if (mutate) cmd.push('--mutate', mutate.join(','));
+  const res = await runCapture({ description: 'Mutation (Stryker)', cmd });
+  if (VERBOSE) {
+    console.log(`${DIM}  → ${cmd.join(' ')}${RESET}`);
+    if (res.output.trim()) console.log(res.output);
+  }
+
+  const text = await readFile(`${ROOT}/${MUTATION_REPORT}`, 'utf8').catch(() => null);
+  if (text == null) {
+    return {
+      problem: `stryker wrote no ${MUTATION_REPORT} (exit ${res.exitCode})`,
+      detail: res.output.trim(),
+      code: res.exitCode || 1,
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { problem: `${MUTATION_REPORT} is not valid JSON`, code: 1 };
+  }
+  const tally = tallyMutants(parsed);
+  if (tally == null) return { problem: `${MUTATION_REPORT} has no files to score`, code: 1 };
+  if (tally.killed + tally.survived === 0) return { problem: 'stryker graded no mutants; skipped' };
+  return { tally };
+}
+
+/**
+ * Mutation score for the changed source files, against the `mutation.min` floor.
+ *
+ * Advisory by default (`--enforce` to exit non-zero), and deliberately so: the
+ * floor is measured whole-tree by `suppressions --update-baseline --with-mutation`,
+ * while this gate normally scores only the files a change touched. A weakly tested
+ * file can score well under the tree average with nothing having regressed, so a
+ * miss is a prompt to write a test, not a build break — the same contract as `crap`.
+ *
+ * StrykerJS has no official Bun test-runner plugin; `stryker.conf.json` uses the
+ * universal `command` runner, which shells out to `bun test` and grades each
+ * mutant by exit code. That means a full suite run per mutant — which is why the
+ * default scope is the changed files and `--all` is opt-in.
+ */
+async function cmdMutation(opts: { fromBase?: boolean } = {}): Promise<void> {
   if (!(await hasTests())) {
     warn(`Mutation: no ${TEST_DIR}/*.test.ts or *.spec.ts files; skipped`);
     return;
   }
-  await run('Mutation (Stryker)', ['./node_modules/.bin/stryker', 'run'], { noExit: true });
+  const enforce = process.argv.includes('--enforce');
+  const suffix = enforce ? '' : ' (advisory)';
+
+  let mutate: string[] | undefined;
+  if (!process.argv.includes('--all')) {
+    mutate = await mutationScope(opts.fromBase ?? false);
+    if (mutate.length === 0) {
+      warn('Mutation: no changed source files; skipped (use --all for the whole tree)');
+      return;
+    }
+  }
+
+  const measurement = await mutationMeasure(mutate);
+  if (measurement.tally == null) {
+    if (measurement.code == null) {
+      warn(`Mutation: ${measurement.problem}`);
+      return;
+    }
+    console.log(`  ${advisoryGlyph(enforce)} Mutation: ${measurement.problem}${suffix}`);
+    if (measurement.detail) console.log(measurement.detail);
+    if (enforce) process.exit(measurement.code);
+    return;
+  }
+
+  const { killed, survived } = measurement.tally;
+  const score = mutationScore(measurement.tally);
+  const detail = `${score}% killed, ${killed}/${killed + survived}`;
+  const floor = await baselineFloor('mutation.min');
+  if (floor === undefined) {
+    // Nothing recorded is not a floor of 0; it is a repo that has never been
+    // measured here. Report the score and pass — `--enforce` included — so
+    // retrofitting the harness into a legacy tree is green on day one.
+    warn(`Mutation: ${detail} (report-only: no ${BASELINE_FILE} floor)`);
+    console.log(`  ↳ fix: ${MUTATION_FLOOR_HINT}`);
+    return;
+  }
+  if (score >= floor) {
+    console.log(`  ${GREEN}✓${RESET} Mutation >= ${floor}% ${DIM}(${detail})${RESET}`);
+    return;
+  }
+  console.log(
+    `  ${advisoryGlyph(enforce)} Mutation >= ${floor}% ${DIM}(got ${detail})${RESET}${suffix}`,
+  );
+  if (enforce) process.exit(1);
 }
+
+async function measuredMutationMin(): Promise<Measurement> {
+  if (!(await hasTests())) return { unavailable: `no ${TEST_DIR}/*.test.ts or *.spec.ts files` };
+  // An uninstalled Stryker is a broken toolchain, not "the metric does not apply
+  // here": treating it as unavailable would silently *delete* a recorded floor.
+  if (!(await pathExists(STRYKER_BIN))) {
+    return { error: `${STRYKER_BIN} not found — run \`bun install\`` };
+  }
+  const measurement = await mutationMeasure();
+  if (measurement.tally == null) {
+    // `code` set is a tool failure; unset is a benign skip (no Stryker, no mutants).
+    if (measurement.code == null) return { unavailable: measurement.problem ?? 'not measurable' };
+    return { error: measurement.problem ?? 'stryker failed' };
+  }
+  return { value: mutationScore(measurement.tally) };
+}
+
+/**
+ * `mutation.min` is measured on demand only. A mutation run costs minutes on a
+ * real codebase, so `--update-baseline` carries the key through untouched unless
+ * `--with-mutation` asks for it — hence a separate metric, not a RATCHETED_METRICS entry.
+ */
+const MUTATION_METRIC: RatchetedMetric = { key: 'mutation.min', measure: measuredMutationMin };
 
 interface CrapFn {
   crap: number;
@@ -1144,12 +1340,12 @@ export function crapScore(ccn: number, cov: number): number {
 }
 
 /**
- * Glyph for a CRAP offender line. A passing gate (exit 0, the default
- * advisory mode) must never show the red ✗ — that's reserved for --enforce,
- * which actually exits non-zero on offenders. Pure so it's unit-testable
- * without shelling out to lizard.
+ * Glyph for an advisory gate's finding (CRAP offenders, a missed mutation floor).
+ * A passing gate (exit 0, the default advisory mode) must never show the red ✗ —
+ * that's reserved for --enforce, which actually exits non-zero. Pure so it's
+ * unit-testable without shelling out to lizard or Stryker.
  */
-export function crapOffenderGlyph(enforce: boolean): string {
+export function advisoryGlyph(enforce: boolean): string {
   return enforce ? `${RED}✗${RESET}` : `${GREEN}⚠${RESET}`;
 }
 
@@ -1304,7 +1500,7 @@ async function cmdCrap(): Promise<void> {
       warn(`CRAP: ${measurement.problem}`);
       return;
     }
-    console.log(`  ${crapOffenderGlyph(enforce)} CRAP: ${measurement.problem}${suffix}`);
+    console.log(`  ${advisoryGlyph(enforce)} CRAP: ${measurement.problem}${suffix}`);
     if (measurement.detail) console.log(measurement.detail);
     if (enforce) process.exit(measurement.code);
     return;
@@ -1337,7 +1533,7 @@ async function cmdCrap(): Promise<void> {
     console.log(`  ${GREEN}✓${RESET} ${summary}`);
     return;
   }
-  console.log(`  ${crapOffenderGlyph(enforce)} ${summary}${suffix}`);
+  console.log(`  ${advisoryGlyph(enforce)} ${summary}${suffix}`);
   printCrapOffenders(offenders);
   if (enforce) process.exit(1);
 }
@@ -1816,6 +2012,7 @@ async function cmdCi(): Promise<void> {
   const allOk = await runGatesParallel(gates);
   await cmdCoverage(); // self-skips; after the batch
   await cmdCrap(); // advisory unless --enforce
+  await cmdMutation({ fromBase: true }); // advisory unless --enforce; scoped to the base diff
   const archConfigOk = await checkArchConfigGuard();
   const gherkinOk = await checkGherkinGuard();
   const suppressionsOk = await checkSuppressionsBaseline({ noExit: true });
@@ -1874,7 +2071,7 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   audit: [cmdAudit, 'Audit dependencies for known vulnerabilities'],
   acceptance: [cmdAcceptance, 'Run acceptance scenarios (cucumber)'],
   coverage: [cmdCoverage, 'Tests with coverage threshold (--min=N)'],
-  mutation: [cmdMutation, 'Mutation testing (Stryker, advisory)'],
+  mutation: [() => cmdMutation(), 'Mutation score on changed sources (Stryker, advisory; --all)'],
   crap: [cmdCrap, 'CRAP complexity x coverage gate (advisory)'],
   suppressions: [cmdSuppressions, 'Show suppressions; --update-baseline re-measures every floor'],
   complexity: [

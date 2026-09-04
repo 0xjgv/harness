@@ -32,7 +32,7 @@ Every command above is also a `make` target — `make check`, `make ci`, `make p
 
 The complexity gate requires `uvx` on PATH — install via [uv](https://docs.astral.sh/uv/).
 
-CRAP is **advisory** but still runs in `ci`. Mutation testing is advisory and invoked explicitly.
+CRAP and mutation are **advisory** but still run in `ci` — mutation scoped to the diff against the base ref.
 
 ### Continuous integration
 
@@ -50,7 +50,7 @@ bun harness.ts check --verbose
 bun run acceptance                 # cucumber against tests/features/
 bun harness.ts deadcode            # knip (via bunx): unused files/exports/deps; config in knip.json
 bun run coverage --min=80          # tests with coverage, fails below threshold
-bun run mutation                   # Stryker mutation score on src/ (advisory)
+bun run mutation --all             # Stryker mutation score on src/ (advisory; default scope is changed files)
 bun run crap --max=30              # CRAP = CCN² × (1-cov)³ + CCN per function (advisory)
 bun harness.ts suppressions        # suppression breakdown; --update-baseline with human sign-off
 bun run arch                       # dependency-cruiser against .dependency-cruiser.json
@@ -99,7 +99,7 @@ Day-1 defaults are deliberately loose so adopting this template does not fail ex
 - `.harness-baseline` also ratchets suppression counts. New suppressions fail `check`; run `harness suppressions --update-baseline` only with human sign-off.
 - `harness test`, coverage, mutation, and CRAP warn and skip when no test files exist.
 - CRAP is advisory in `ci`; pass `--enforce` when you are ready to block on it.
-- Mutation is advisory — enable as a blocking gate once a baseline is established.
+- Mutation is advisory: it scores `killed / (killed + survived)` against `.harness-baseline` `mutation.min`, warns below it, and only `--enforce` exits non-zero. Record the floor with `harness suppressions --update-baseline --with-mutation` — the plain pass skips it, because a Stryker run costs minutes.
 - StrykerJS has no official Bun test-runner plugin; `stryker.conf.json` uses the universal `command` runner, which shells out to `bun test` and grades each mutant by exit code. It works everywhere but cannot do per-test coverage optimizations — expect a full test run per mutant.
 - `.dependency-cruiser.json` ships with one starter rule (`src/internal/` is not importable from outside it) plus a `no-circular` rule. Extend as the module graph grows.
 
