@@ -55,8 +55,8 @@ def _finding(path, row, code):
     }
 
 
-def _make_git_project(context):
-    context.tmp = Path(tempfile.mkdtemp(prefix="scoping-"))
+def _make_git_project(context, root=None):
+    context.tmp = root or Path(tempfile.mkdtemp(prefix="scoping-"))
     venv_bin = context.tmp / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
     stub = venv_bin / "ruff"
@@ -86,6 +86,43 @@ def step_clean_git_project(context):
 def step_git_project_with_one_change(context):
     _make_git_project(context)
     (context.tmp / "src" / "changed.py").write_text("CHANGED = 2\n")
+
+
+TEST_MODULE = (
+    "import unittest\n\n\n"
+    "class TestIt(unittest.TestCase):\n"
+    "    def test_it(self):\n"
+    "        self.assertTrue(True)\n"
+)
+
+
+def _make_git_project_with_tests(context):
+    """The lint-stub project plus a real unittest module for changed.py and
+    untouched.py — not for legacy.py, so a change to it maps to no test."""
+    context.tmp = Path(tempfile.mkdtemp(prefix="scoping-"))
+    tests = context.tmp / "tests"
+    tests.mkdir()
+    (tests / "__init__.py").write_text("")
+    (tests / "test_changed.py").write_text(TEST_MODULE)
+    (tests / "test_untouched.py").write_text(TEST_MODULE)
+    _make_git_project(context, root=context.tmp)
+
+
+@given("a git project with a test module per source file and no changes")
+def step_clean_git_project_with_tests(context):
+    _make_git_project_with_tests(context)
+
+
+@given("a git project with a test module per source file and one changed Python file")
+def step_git_project_with_tests_and_one_change(context):
+    _make_git_project_with_tests(context)
+    (context.tmp / "src" / "changed.py").write_text("CHANGED = 2\n")
+
+
+@given("a git project with a test module per source file and one changed untested Python file")
+def step_git_project_with_tests_and_untested_change(context):
+    _make_git_project_with_tests(context)
+    (context.tmp / "src" / "legacy.py").write_text(LEGACY + "# appended\n")
 
 
 @given("a legacy file with a comment appended to its last line")

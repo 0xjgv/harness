@@ -193,8 +193,12 @@ class TestNoTestBehavior(unittest.TestCase):
         self.assertIn("harness.py", command)
         self.assertIn("src/app.py", command)
 
-    def test_test_command_runs_unittest_when_tests_exist(self):
-        with temp_project(with_tests=True), mock.patch.object(harness, "run") as run_mock:
+    def test_test_command_runs_the_whole_suite_with_all(self):
+        with (
+            temp_project(with_tests=True),
+            mock.patch.object(harness, "ALL_FILES", True),
+            mock.patch.object(harness, "run") as run_mock,
+        ):
             harness.cmd_test()
             expected = [*harness._python(), *harness.TEST_COMMAND]
 
@@ -204,7 +208,7 @@ class TestNoTestBehavior(unittest.TestCase):
         """A pytest repo swaps TEST_COMMAND; both the test run and the coverage run
         follow, with no function body touched."""
         pytest_argv = ("-m", "pytest", "-q")
-        with temp_project(with_tests=True):
+        with temp_project(with_tests=True), mock.patch.object(harness, "ALL_FILES", True):
             with (
                 mock.patch.object(harness, "TEST_COMMAND", pytest_argv),
                 mock.patch.object(harness, "run") as run_mock,
@@ -818,12 +822,142 @@ class TestEmptyScopeSkipsRatherThanWideningToWholeTree(unittest.TestCase):
             self.assertTrue(harness.cmd_typecheck(no_exit=True))
         run_mock.assert_not_called()
 
+    def test_test_skips_without_running_the_whole_suite(self):
+        with (
+            temp_project(with_tests=True),
+            self._empty_scope() as output,
+            mock.patch.object(harness, "run") as run_mock,
+        ):
+            self.assertTrue(harness.cmd_test(no_exit=True))
+        run_mock.assert_not_called()
+        self.assertIn("Tests: no changed Python files", output.getvalue())
+
     def test_explicit_empty_file_list_also_skips(self):
         # pre-commit passes its staged set verbatim; an empty one must skip too,
         # not silently become a whole-tree run.
         with redirect_stdout(io.StringIO()):
             self.assertIsNone(harness._lint_gate([]))
             self.assertIsNone(harness._typecheck_gate([]))
+
+
+class TestScopedTests(unittest.TestCase):
+    """`check`/`pre-commit` run only the test modules that map to the changed files."""
+
+    @contextmanager
+    def _project(self, *test_files: str, init: bool = True):
+        with temp_project(with_tests=True) as root:
+            if init:
+                (root / "tests" / "__init__.py").write_text("", encoding="utf-8")
+            for name in test_files:
+                (root / "tests" / name).write_text("import unittest\n", encoding="utf-8")
+            with (
+                mock.patch.object(harness, "ALL_FILES", False),
+                mock.patch.object(harness, "run", return_value=True) as run_mock,
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                yield run_mock, output
+
+    def _scope(self, *files: str):
+        return mock.patch.object(harness, "_scoped_py_files", return_value=list(files))
+
+    def test_stems_are_the_module_name_and_the_folded_package_path(self):
+        self.assertEqual(harness._test_stems("src/core/pricing.py"), ["pricing", "core_pricing"])
+        self.assertEqual(harness._test_stems("src/core/__init__.py"), ["core"])
+        self.assertEqual(harness._test_stems("src/__init__.py"), ["src"])
+        self.assertEqual(harness._test_stems("harness.py"), ["harness"])
+
+    def test_source_maps_to_bare_folded_and_prefixed_test_files(self):
+        names = ("test_core_pricing.py", "test_pricing_rules.py", "test_other.py")
+        with self._project(*names):
+            (Path("src") / "core").mkdir()
+            tests, unmapped = harness._mapped_test_files(["src/core/pricing.py", "src/app.py"])
+
+        self.assertEqual(
+            tests,
+            ["tests/test_app.py", "tests/test_core_pricing.py", "tests/test_pricing_rules.py"],
+        )
+        self.assertEqual(unmapped, [])
+
+    def test_changed_test_module_runs_itself_and_orphan_source_is_reported(self):
+        with self._project("test_other.py"):
+            tests, unmapped = harness._mapped_test_files([
+                "tests/test_other.py",
+                "src/orphan.py",
+                "tests/__init__.py",
+                "README.md",
+            ])
+
+        self.assertEqual(tests, ["tests/test_other.py"])
+        self.assertEqual(unmapped, ["src/orphan.py"])
+
+    def test_scoped_run_names_only_the_mapped_modules(self):
+        with self._project("test_other.py") as (run_mock, _), self._scope("src/app.py"):
+            self.assertTrue(harness.cmd_test(no_exit=True))
+            prefix = harness._python()
+
+        run_mock.assert_called_once_with(
+            "Tests (1/2 test modules)",
+            [*prefix, "-m", "unittest", "-q", "tests.test_app"],
+            no_exit=True,
+        )
+
+    def test_explicit_file_list_is_honoured_verbatim(self):
+        # pre-commit hands over its staged set; a staged test module runs itself.
+        with self._project() as (run_mock, _):
+            harness.cmd_test(["tests/test_app.py"])
+
+        self.assertEqual(run_mock.call_args.args[1][-1], "tests.test_app")
+
+    def test_unmapped_source_warns_but_mapped_tests_still_run(self):
+        with (
+            self._project() as (run_mock, output),
+            self._scope("src/app.py", "src/orphan.py"),
+        ):
+            self.assertTrue(harness.cmd_test(no_exit=True))
+
+        self.assertIn("Tests: src/orphan.py maps to no tests/**/test_<mod>.py", output.getvalue())
+        self.assertEqual(run_mock.call_args.args[1][-1], "tests.test_app")
+
+    def test_only_unmapped_source_skips_without_widening(self):
+        with self._project() as (run_mock, output), self._scope("src/orphan.py"):
+            self.assertTrue(harness.cmd_test(no_exit=True))
+
+        run_mock.assert_not_called()
+        self.assertIn("no test module maps to the changed files", output.getvalue())
+        self.assertIn("skipped", output.getvalue())
+
+    def test_missing_tests_init_warns_and_runs_the_whole_suite(self):
+        with self._project(init=False) as (run_mock, output), self._scope("src/app.py"):
+            harness.cmd_test(no_exit=True)
+
+        self.assertIn("has no __init__.py", output.getvalue())
+        self.assertEqual(
+            run_mock.call_args.args[1][-len(harness.TEST_COMMAND) :], list(harness.TEST_COMMAND)
+        )
+
+    def test_a_subpackage_without_init_also_falls_back_to_the_whole_suite(self):
+        # `tests/__init__.py` alone is not enough: `tests.unit.test_app` needs one in
+        # every package on the way down, or the dotted name is an ImportError.
+        with self._project() as (run_mock, output), self._scope("src/app.py"):
+            (Path("tests") / "unit").mkdir()
+            (Path("tests") / "unit" / "test_app.py").write_text("import unittest\n")
+            harness.cmd_test(no_exit=True)
+
+        self.assertIn("has no __init__.py", output.getvalue())
+        self.assertEqual(
+            run_mock.call_args.args[1][-len(harness.TEST_COMMAND) :], list(harness.TEST_COMMAND)
+        )
+
+    def test_pytest_runner_takes_file_paths(self):
+        pytest_argv = ("-m", "pytest", "-q")
+        with (
+            self._project(init=False) as (run_mock, _),
+            self._scope("src/app.py"),
+            mock.patch.object(harness, "TEST_COMMAND", pytest_argv),
+        ):
+            harness.cmd_test(no_exit=True)
+
+        self.assertEqual(run_mock.call_args.args[1][-4:], [*pytest_argv, "tests/test_app.py"])
 
 
 class TestAllFilesWidensScopedGates(unittest.TestCase):

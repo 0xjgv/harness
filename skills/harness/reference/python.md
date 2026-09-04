@@ -324,6 +324,8 @@ Two mechanisms, and between them every gate is covered:
 - `fix`, `format`, `lint`, `typecheck` are **diff-scoped**, and scoped to
   changed *lines*, not whole files (see `python/CLAUDE.md` `## Scoping`). They
   skip with a warning on an empty scope and never widen to the whole tree.
+  `test` is diff-scoped too, at file level: in `check`/`pre-commit` it runs only
+  the test modules that map to the changed files.
 - `coverage`, `complexity`, `crap`, `deadcode`, `suppressions` are
   **count-ratcheted** and stay whole-tree — scoping a count makes it
   meaningless. Step 1 wrote each floor at the number the repo already has.
@@ -605,18 +607,33 @@ it is found on purpose rather than discovered by accident.
 
 ## Known limitations
 
-- **`test` is the one gate with no adoption ramp.** `check` runs `TEST_COMMAND`
-  whole and unratcheted: if the suite is red in the environment where `check`
-  runs, `check` is red, and no baseline or scoping rescues it. A repo whose
-  suite needs a database, a service, or an API key must have it present.
-  Measured on fusion: `LLM_API_KEY` unset → 55 collection errors → red `check`;
-  set to any string → 1042 passed → green. Set `TEST_COMMAND` to the invocation
-  that genuinely passes in that environment, and tell the human what it needs.
-  The same on doghouse, in numbers: with no database, **735 passed, 1 skipped,
-  2,980 errors**; with one, **3,711 passed, 2 failed**; with the two
-  network-dependent tests deselected, green. Note what the deselection *is* — a
-  deliberate, commented narrowing of `TEST_COMMAND` to what the environment can
-  run, not a weakened gate. Write the comment.
+- **`test` in `check`/`pre-commit` is scoped, but the environment still has to
+  work.** `check` and `pre-commit` run only the test modules that map to the
+  changed files: a changed `tests/**/test*.py` runs itself, and a changed source
+  module runs every `tests/**/test_<stem>.py` / `tests/**/test_<stem>_*.py` for
+  its bare module name and its package path folded with underscores
+  (`src/core/pricing.py` → `pricing`, `core_pricing`). A changed source file that
+  maps to no test is one ⚠ line, never a failure; an empty scope skips and never
+  widens. `--all` and `ci` (through `coverage`) run the whole suite. This is the
+  adoption ramp — day one in a large repo touches a handful of modules, not the
+  whole suite — but it is a *narrower* run, not a ratcheted one: whatever the
+  scoped modules need must still be present. A repo whose suite needs a database,
+  a service, or an API key must have it present. Measured on fusion: `LLM_API_KEY`
+  unset → 55 collection errors → red `check`; set to any string → 1042 passed →
+  green. Set `TEST_COMMAND` to the invocation that genuinely passes in that
+  environment, and tell the human what it needs. The same on doghouse, in
+  numbers: with no database, **735 passed, 1 skipped, 2,980 errors**; with one,
+  **3,711 passed, 2 failed**; with the two network-dependent tests deselected,
+  green. Note what the deselection *is* — a deliberate, commented narrowing of
+  `TEST_COMMAND` to what the environment can run, not a weakened gate. Write the
+  comment.
+- **Scoping needs an `__init__.py` in every test package.** The scoped run names
+  modules dotted (`python -m unittest -q tests.test_core_pricing`) because
+  `unittest discover -p` takes a single pattern and cannot express a set. A
+  missing `__init__.py` anywhere on the way to a mapped module — `tests/` itself
+  or a subpackage like `tests/unit/` — makes the dotted name an ImportError, so
+  the gate warns and runs the whole suite instead. A pytest `TEST_COMMAND` needs
+  nothing: it takes the file paths appended directly.
 - **`--update-baseline` runs the suite up to three times** (coverage, then CRAP
   re-runs it). On fusion's 75-second suite that is a four-minute step; on
   doghouse's 32-minute suite it is an hour and a half. Run it in the background.

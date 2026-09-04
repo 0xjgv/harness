@@ -45,7 +45,8 @@ TEST_DIR = "tests"
 # (`python <TEST_COMMAND>`) and to coverage (`coverage run <TEST_COMMAND>`) alike,
 # so both stay one edit apart. Defaults to stdlib unittest so a repo with no test
 # dependencies still runs. A pytest repo edits this one line and nothing else, to
-# the tuple ("-m", "pytest", "-q").
+# the tuple ("-m", "pytest", "-q") — with no test target, because the scoped run
+# in `check`/`pre-commit` appends the changed test files to it.
 TEST_COMMAND = ("-m", "unittest", "discover", "-s", TEST_DIR, "-q")
 LIZARD = "lizard"
 VULTURE = "vulture"
@@ -1343,15 +1344,128 @@ def cmd_typecheck(files: list[str] | None = None, *, no_exit: bool = False) -> b
     return run(gate.description, gate.cmd, no_exit=no_exit, hint=gate.hint, runner=gate.runner)
 
 
-def cmd_test(*, no_exit: bool = False) -> bool:
-    if _has_tests():
-        return run("Tests", [*_python(), *TEST_COMMAND], no_exit=no_exit)
+def _test_stems(path: str) -> list[str]:
+    """Candidate `test_<stem>` stems for a source module.
 
-    files = [str(path) for path in _iter_python_files(_quality_targets(include_tests=False))]
-    if not files:
+    `src/core/pricing.py` yields `pricing` and `core_pricing`: the bare module name
+    and the name with its package path folded in, the two schemes a test tree
+    commonly uses. `__init__.py` maps by its package name.
+    """
+    parts = list(Path(path).with_suffix("").parts)
+    if len(parts) > 1 and parts[-1] == "__init__":
+        parts.pop()
+    if len(parts) > 1 and parts[0] in APP_SOURCES:
+        parts.pop(0)
+    return list(dict.fromkeys([parts[-1], "_".join(parts)]))
+
+
+def _test_modules() -> list[str]:
+    """Every test module unittest discovery would collect, walked once per run."""
+    return sorted(str(path) for path in Path(TEST_DIR).rglob("test*.py"))
+
+
+def _is_test_module(path: str) -> bool:
+    """True for a file unittest discovery would collect: `tests/**/test*.py`."""
+    return path.startswith(f"{TEST_DIR}/") and Path(path).name.startswith("test")
+
+
+def _mapped_test_files(files: Iterable[str]) -> tuple[list[str], list[str]]:
+    """Test modules to run for the changed files, and the source files none maps to.
+
+    A changed test module runs itself. A changed source module runs every
+    `tests/**/test_<stem>.py` and `tests/**/test_<stem>_*.py` for its stems. Other
+    changed files under `tests/` (`__init__.py`, step definitions) map to nothing
+    and are not reported: they are not source.
+    """
+    index = _test_modules()
+    tests: dict[str, None] = {}
+    unmapped: list[str] = []
+    for path in files:
+        if _is_test_module(path):
+            tests.setdefault(path, None)
+            continue
+        if not _is_quality_python_file(path):
+            continue
+        names = {f"test_{stem}.py" for stem in _test_stems(path)}
+        prefixes = tuple(name.removesuffix(".py") + "_" for name in names)
+        matches = [
+            test
+            for test in index
+            if Path(test).name in names or Path(test).name.startswith(prefixes)
+        ]
+        if not matches:
+            unmapped.append(path)
+        for match in matches:
+            tests.setdefault(match, None)
+    return sorted(tests), unmapped
+
+
+def _is_importable(test: str) -> bool:
+    """True when every package directory on the way to `test` has an `__init__.py`.
+
+    `tests/unit/test_x.py` needs both `tests/__init__.py` and `tests/unit/__init__.py`;
+    a repo missing either has a tree `discover` walks but a dotted name cannot reach.
+    """
+    packages = Path(test).parts[:-1]
+    return all(
+        Path(*packages[: depth + 1], "__init__.py").is_file() for depth in range(len(packages))
+    )
+
+
+def _scoped_test_command(tests: list[str]) -> list[str] | None:
+    """Argv tail that runs only `tests`, or None when the runner cannot be scoped.
+
+    unittest takes dotted module names, which import only through the `__init__.py`
+    of every package on the path (`discover -p` takes a single pattern, so it cannot
+    scope either). Any other TEST_COMMAND (pytest) takes file paths.
+    """
+    if TEST_COMMAND[:2] != ("-m", "unittest"):
+        return [*TEST_COMMAND, *tests]
+    if not all(_is_importable(test) for test in tests):
+        return None
+    return ["-m", "unittest", "-q", *(t.removesuffix(".py").replace("/", ".") for t in tests)]
+
+
+def _whole_suite(*, no_exit: bool) -> bool:
+    return run("Tests", [*_python(), *TEST_COMMAND], no_exit=no_exit)
+
+
+def _syntax_check(*, no_exit: bool) -> bool:
+    """The stand-in gate for a repo with no tests: every source file must import-compile."""
+    sources = [str(path) for path in _iter_python_files(_quality_targets(include_tests=False))]
+    if not sources:
         warn("Syntax check: no Python files found; skipped")
         return True
-    return run("Syntax check", [*_python(), "-m", "py_compile", *files], no_exit=no_exit)
+    return run("Syntax check", [*_python(), "-m", "py_compile", *sources], no_exit=no_exit)
+
+
+def cmd_test(files: list[str] | None = None, *, no_exit: bool = False) -> bool:
+    """Run the test modules that map to the changed files; `--all` runs the whole suite.
+
+    An empty scope skips with a warning, never widens. A changed source file that
+    maps to no test gets one `⚠` line and is not a failure: the tests that do map
+    still run. `ci` runs the whole suite through `coverage` instead.
+    """
+    if not _has_tests():
+        return _syntax_check(no_exit=no_exit)
+
+    if files is None and ALL_FILES:
+        return _whole_suite(no_exit=no_exit)
+    targets = _resolve_targets(files, "Tests")
+    if targets is None:
+        return True
+    tests, unmapped = _mapped_test_files(targets)
+    for path in unmapped:
+        warn(f"Tests: {path} maps to no {TEST_DIR}/**/test_<mod>.py; not covered by this run")
+    if not tests:
+        warn("Tests: no test module maps to the changed files (use --all for the suite); skipped")
+        return True
+    scoped = _scoped_test_command(tests)
+    if scoped is None:
+        warn(f"Tests: {TEST_DIR}/ has no __init__.py to import by name; running the whole suite")
+        return _whole_suite(no_exit=no_exit)
+    label = f"Tests ({len(tests)}/{len(_test_modules())} test modules)"
+    return run(label, [*_python(), *scoped], no_exit=no_exit)
 
 
 def cmd_coverage() -> None:
@@ -2267,7 +2381,7 @@ def cmd_check() -> None:
 
 
 def cmd_pre_commit() -> None:
-    """Staged checks + tests if source files staged.
+    """Staged checks, then the tests that map to the staged files.
 
     The arch-config and gherkin-first guards run before the staged-files early
     return: both are staged-mode and cheap, and a commit that stages only a
@@ -2291,8 +2405,7 @@ def cmd_pre_commit() -> None:
     cmd_typecheck(files)
     _check_agents_md_drift()
 
-    if any(_is_quality_python_file(f) for f in files):
-        cmd_test()
+    cmd_test(files)
 
 
 def cmd_ci() -> None:
@@ -2503,7 +2616,7 @@ TASKS: dict[str, tuple[Callable[..., object], str]] = {
     "format": (cmd_format, "Format code with ruff"),
     "lint": (cmd_lint, "Lint code with ruff (read-only)"),
     "typecheck": (cmd_typecheck, "Type-check with basedpyright"),
-    "test": (cmd_test, "Run tests, or syntax check when no tests exist"),
+    "test": (cmd_test, "Run the tests mapping to changed files (--all for the suite)"),
     "check": (
         cmd_check,
         "Fix + format + typecheck on changed files (--all for the whole tree), test, every gate",

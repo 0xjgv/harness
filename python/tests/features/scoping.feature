@@ -1,5 +1,5 @@
 Feature: Scoped gates only ever touch what changed
-  fix/format/lint/typecheck resolve one git-derived file list — working tree +
+  fix/format/lint/typecheck/test resolve one git-derived file list — working tree +
   index + untracked + the diff against the base ref — and skip when it is empty.
   Adopting this harness into a large existing repo must not report that repo's
   pre-existing violations, and must never widen an empty scope to the whole tree.
@@ -55,3 +55,31 @@ Feature: Scoped gates only ever touch what changed
     Then the exit code is 0
     And the output contains "src/legacy.py"
     And the output does not contain "--output-format=json"
+
+  Scenario: A clean tree skips the test gate instead of running the whole suite
+    Given a git project with a test module per source file and no changes
+    When I run "harness test"
+    Then the exit code is 0
+    And the output contains "Tests: no changed Python files"
+    And the output contains "skipped"
+
+  Scenario: One changed source file runs only the test module that maps to it
+    Given a git project with a test module per source file and one changed Python file
+    When I run "harness test --verbose"
+    Then the exit code is 0
+    And the output contains "Tests (1/2 test modules)"
+    And the output contains "tests.test_changed"
+    And the output does not contain "tests.test_untouched"
+
+  Scenario: A changed source file with no test warns and passes
+    Given a git project with a test module per source file and one changed untested Python file
+    When I run "harness test"
+    Then the exit code is 0
+    And the output contains "src/legacy.py maps to no tests/**/test_<mod>.py"
+    And the output contains "skipped"
+
+  Scenario: --all runs the whole suite on purpose
+    Given a git project with a test module per source file and one changed Python file
+    When I run "harness test --all --verbose"
+    Then the exit code is 0
+    And the output contains "unittest discover"
