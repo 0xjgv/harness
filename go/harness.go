@@ -927,6 +927,10 @@ func warmTestCache(stream bool) {
 // targets mean several runs, aggregated by the caller.
 func gremlinsUnleash(target string, stream bool) (mutationReport, error) {
 	reportPath := mutationReportPath(target)
+	// Drop the previous run's report first: gremlins writes it only on
+	// success, so a leftover would be read back as this run's result and
+	// scored as fresh.
+	_ = os.Remove(filepath.Join(root, reportPath))
 	argv := []string{"go", "run", gremlinsPkg, "unleash", mutationTimeout, "-o", reportPath, target}
 
 	c := exec.Command(argv[0], argv[1:]...)
