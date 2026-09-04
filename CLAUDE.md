@@ -79,12 +79,15 @@ cd monorepo && make check           # dispatches check to every subproject copie
 | `stop-hook` | agent Stop hook | `post-edit` + complexity (+ deadcode where shipped); exits 2 with a stderr failure summary so Claude's Stop hook blocks and feeds the failure back to the agent | yes |
 
 Invariant every runner documents: `ci` minus `check` is only the network dependency
-audit, coverage, advisory CRAP, and advisory mutation (which runs after coverage and
+audit, coverage over the whole test suite (where `check` ran only the tests mapped to
+the change set), advisory CRAP, and advisory mutation (which runs after coverage and
 never fails `ci`; only the standalone `mutation --enforce` hard-fails) — plus, in Go
 and Rust only, the architecture boundary check itself (`arch`), which stays
 `ci`/`pre-push`-only there (Go's needs to fetch a module, Rust's takes cargo's build
 lock); Python and Bun's `arch` has neither constraint, so it runs inside `check` too —
-so a green `check` predicts a green `ci`.
+so a green `check` predicts a green `ci` for the gates it ran. `check` runs only the
+tests that map to the change set, so `check --all` (or `ci`) is the whole-suite run;
+`pre-push` has no test gate in any template.
 
 Other standalone subcommands every template exposes: `complexity`, `crap`, `acceptance`,
 `coverage` (Go also keeps `test-cov`), `mutation`, `arch`, `arch-config-guard`,
