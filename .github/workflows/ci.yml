@@ -64,7 +64,7 @@ jobs:
       - name: Install cargo tools
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit@0.22.1,cargo-llvm-cov@0.6.22,cargo-modules@0.26.0,cargo-mutants@27.0.0
+          tool: cargo-audit@0.22.1,cargo-llvm-cov@0.8.7,cargo-modules@0.26.0,cargo-mutants@27.0.0
 
       - name: Root repo-level gates
         run: make check
