@@ -148,9 +148,11 @@ statically checks that the four templates' command surfaces stay in sync: every
 runner-dispatched command appears in that template's Makefile
 `HARNESS_TARGETS`, every command a template's `CLAUDE.md` documents exists in
 its runner, every `bun run <x>` in `bun/CLAUDE.md` has a matching
-`bun/package.json` script, all four templates expose the same core 19
-commands, and any other cross-template command divergence is either present
-in all four or explicitly allowlisted with a reason in the script.
+`bun/package.json` script, all four templates expose the same core 20
+commands, any other cross-template command divergence is either present
+in all four or explicitly allowlisted with a reason in the script, and all
+four templates pin the same lizard release (`lizard@<ver>` in the bun/go/rust
+runners, `lizard==<ver>` in `python/pyproject.toml`).
 
 This repo root dogfoods the same Stop-hook shape: `.claude/settings.json` runs
 `make stop-hook`, and `.codex/hooks.json` runs the Codex JSON wrapper around

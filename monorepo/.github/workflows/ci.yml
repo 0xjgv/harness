@@ -9,6 +9,10 @@ on:
 # subproject. This template ships every toolchain wired so any mix of
 # subprojects works out of the box — trim the setup steps below to the
 # languages you actually use.
+#
+# Every toolchain and tool below is pinned to an exact version so a floating
+# upstream release cannot turn this gate red on its own. The single-language
+# templates pin the same tools in their own ci.yml; bump them together.
 jobs:
   ci:
     runs-on: ubuntu-latest
@@ -20,31 +24,35 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
+          version: "0.12.9"
+          python-version: "3.13.11"
           enable-cache: true
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.1"
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version: "1.24.0"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy, rustfmt, llvm-tools-preview
 
       - name: Install golangci-lint
         run: |
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
-            | sh -s -- -b "$(go env GOPATH)/bin"
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.13.2/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.13.2
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Install cargo tools
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit, cargo-llvm-cov, cargo-modules
+          tool: cargo-audit@0.22.1,cargo-llvm-cov@0.6.22,cargo-modules@0.26.0,cargo-mutants@27.0.0
 
       - name: Run CI gate
         run: make ci

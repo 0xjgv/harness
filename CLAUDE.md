@@ -30,7 +30,9 @@ The root `Makefile` manages repo-level dogfooding and skill deployment:
   command surfaces have drifted apart (`make parity`), and warn on protected arch
   config changes
 - `make parity` — fail if `python`/`bun`/`go`/`rust` harness command surfaces have
-  drifted apart (`scripts/parity-gate.sh`); a prerequisite of `make check`
+  drifted apart, or if the four templates pin different lizard versions
+  (`lizard@<ver>` in the bun/go/rust runners, `lizard==<ver>` in
+  `python/pyproject.toml`) (`scripts/parity-gate.sh`); a prerequisite of `make check`
 - `make sync-skills` — copy `skills/harness/*.md` → both deployed locations
 - `make agents-md-drift` — fail if root `AGENTS.md` differs from `CLAUDE.md`
 - `make sync-agents-md` — copy root `CLAUDE.md` → `AGENTS.md`

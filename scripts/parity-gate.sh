@@ -25,14 +25,21 @@
 #      c. bun only: every `bun run <cmd>` form documented in bun/CLAUDE.md
 #         has a matching bun/package.json "scripts" entry — this is the
 #         exact shape of the audit/BSM-audit bug above.
-#   2. Core command coverage: all four templates must expose the 19 command
+#   2. Core command coverage: all four templates must expose the 20 command
 #      names every template contract requires (check, pre-commit, ...).
 #      Non-negotiable — never allowlist-exempt.
-#   3. Cross-template surface parity: beyond the 19 core commands, every
+#   3. Cross-template surface parity: beyond the 20 core commands, every
 #      command any one template exposes must exist in all four, UNLESS the
 #      (template, command) pair is declared in the ALLOWLIST below. This is
 #      what makes e.g. "go/rust ship no deadcode command" a reviewable
 #      one-line decision instead of silent, undetected drift.
+#   4. Lizard pin parity: the complexity/CRAP/duplication gates in all four
+#      templates run the same lizard release. The pin is a literal in each
+#      runner (`lizard@<ver>` in bun/harness.ts, go/harness.go,
+#      rust/harness.rs) and a dev dependency in python/pyproject.toml
+#      (`lizard==<ver>`); every file must pin exactly one version and all
+#      four must agree, or the ratcheted floors stop reproducing across
+#      templates.
 #
 # WHAT THIS DELIBERATELY DOES NOT CHECK (see root task spec):
 #   - Runner *implementations* or line counts — different languages, only
@@ -57,7 +64,7 @@ hint() { printf "  ↳ fix: %s\n" "$1"; }
 # ── Allowlist: intentional cross-template command-surface divergence ───────
 # Format (one per line): <template>:<command>  # <reason>
 # Consulted by check 3 (cross-template surface parity) for commands OUTSIDE
-# the 19-item core list, and by check 1a for runner-vs-Makefile mismatches.
+# the 20-item core list, and by check 1a for runner-vs-Makefile mismatches.
 # Core commands may never be allowlisted here — they are non-negotiable.
 ALLOWLIST="
 bun:format      # biome's fix already formats + lints in one pass; no separate format step
@@ -142,6 +149,22 @@ bun_scripts() { # -> sorted unique bun/package.json "scripts" keys
 
 claude_invocations() { # $1=file $2=prefix -> commands invoked as "$2 <cmd>"
   grep -oE "${2} [a-zA-Z0-9_-]+" "$1" 2>/dev/null | awk '{print $NF}' | sort -u
+}
+
+lizard_pin_file() { # $1=template -> the file that pins lizard for it
+  case "$1" in
+    python) echo "python/pyproject.toml" ;;
+    bun) echo "bun/harness.ts" ;;
+    go) echo "go/harness.go" ;;
+    rust) echo "rust/harness.rs" ;;
+  esac
+}
+
+lizard_pins() { # $1=template -> distinct pinned lizard versions, one per line
+  # Matches the `uvx lizard@<ver>` literal (bun/go/rust runners) and the
+  # `lizard==<ver>` dev-dependency spec (python/pyproject.toml).
+  grep -oE 'lizard(@|==)[0-9][0-9A-Za-z.+-]*' "$(lizard_pin_file "$1")" 2>/dev/null \
+    | sed -E 's/^lizard(@|==)//' | sort -u
 }
 
 set_diff() { # $1=newline-list $2=newline-list -> lines in $1 not in $2
@@ -245,7 +268,7 @@ if [ "$EXTRACTION_OK" = 1 ]; then
   done
 fi
 
-# ── Check 3: cross-template surface parity beyond the core 19 ─────────────
+# ── Check 3: cross-template surface parity beyond the core 20 ─────────────
 UNION_COUNT=0
 ALLOWED_COUNT=0
 if [ "$EXTRACTION_OK" = 1 ]; then
@@ -271,10 +294,40 @@ if [ "$EXTRACTION_OK" = 1 ]; then
   done
 fi
 
+# ── Check 4: the lizard pin is identical across all four templates ────────
+# Every template's complexity, CRAP, and duplication gates shell out to the
+# same `uvx lizard@<ver>`; a floor in one template's .harness-baseline only
+# reproduces in another if they run the same lizard release.
+LIZARD_PIN=""
+LIZARD_REPORT=""
+for t in $TEMPLATES; do
+  pins=$(lizard_pins "$t")
+  pin_count=$(printf '%s\n' "$pins" | grep -c .)
+  if [ "$pin_count" -eq 0 ]; then
+    fail "could not extract a lizard pin from $(lizard_pin_file "$t") — expected a \`lizard@<ver>\` (runner) or \`lizard==<ver>\` (pyproject) literal"
+    hint "pin lizard in $(lizard_pin_file "$t"), or update lizard_pins() in scripts/parity-gate.sh if the pin moved"
+    continue
+  fi
+  if [ "$pin_count" -gt 1 ]; then
+    fail "$(lizard_pin_file "$t") pins lizard to more than one version: $(printf '%s' "$pins" | tr '\n' ' ')"
+    hint "use a single lizard version everywhere in $(lizard_pin_file "$t")"
+    continue
+  fi
+  LIZARD_REPORT="${LIZARD_REPORT}${t}=${pins} "
+  LIZARD_PIN="${LIZARD_PIN}${pins}
+"
+done
+LIZARD_DISTINCT=$(printf '%s' "$LIZARD_PIN" | sed '/^$/d' | sort -u | grep -c .)
+if [ "$LIZARD_DISTINCT" -gt 1 ]; then
+  fail "lizard pin differs across templates: ${LIZARD_REPORT% }"
+  hint "pin the same lizard version in bun/harness.ts, go/harness.go, rust/harness.rs (lizard@<ver>) and python/pyproject.toml (lizard==<ver>)"
+fi
+
 # ── Summary ─────────────────────────────────────────────────────────────
 if [ "$FAILED" -eq 0 ]; then
-  printf "  %s✓%s parity (python bun go rust · %d core commands · %d total · %d allowlisted exceptions)\n" \
-    "$GREEN" "$RESET" "$(printf '%s\n' $CORE_COMMANDS | wc -w | tr -d ' ')" "$UNION_COUNT" "$ALLOWED_COUNT"
+  printf "  %s✓%s parity (python bun go rust · %d core commands · %d total · %d allowlisted exceptions · lizard@%s)\n" \
+    "$GREEN" "$RESET" "$(printf '%s\n' $CORE_COMMANDS | wc -w | tr -d ' ')" "$UNION_COUNT" "$ALLOWED_COUNT" \
+    "$(printf '%s' "$LIZARD_PIN" | sed '/^$/d' | sort -u)"
   exit 0
 fi
 exit 1
