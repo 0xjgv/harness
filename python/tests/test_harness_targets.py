@@ -292,9 +292,13 @@ class TestStopHook(unittest.TestCase):
         ):
             harness.cmd_stop_hook()
 
-        # Mutating fix/format runs first and alone; the read-only complexity gate runs
-        # through the parallel batch, then the count-ratcheted dead-code check.
-        self.assertEqual(calls, ["post-edit", "batch:Complexity (lizard)", "deadcode"])
+        # Mutating fix/format runs first and alone; the read-only complexity and
+        # duplication gates run through the parallel batch (both are lizard runs, so
+        # they overlap), then the count-ratcheted dead-code check.
+        self.assertEqual(
+            calls,
+            ["post-edit", "batch:Complexity (lizard),Duplication (lizard)", "deadcode"],
+        )
 
     def test_stop_hook_exits_2_and_names_failed_gates_on_stderr(self):
         # Claude Code only treats exit code 2 as blocking, and only stderr is fed
@@ -432,8 +436,8 @@ class TestCmdCheckSummary(unittest.TestCase):
             mock.patch.object(harness, "cmd_typecheck", return_value=typecheck_ok),
             mock.patch.object(harness, "cmd_test", return_value=True),
             mock.patch.object(harness, "run_gates_parallel", return_value=(True, [])),
-            # Pin the parallel batch to exactly one gate (complexity) so the summary
-            # count is deterministic: `check` now tallies one result per gate.
+            # Pin the parallel batch to exactly two gates (complexity, duplication) so
+            # the summary count is deterministic: `check` tallies one result per gate.
             mock.patch.object(harness, "_acceptance_gates_or_warn", return_value=[]),
             mock.patch.object(harness, "_arch_gates_or_warn", return_value=[]),
             mock.patch.object(harness, "_check_stop_hooks_present"),
@@ -453,7 +457,7 @@ class TestCmdCheckSummary(unittest.TestCase):
                 harness.cmd_check()  # must not raise
 
         self.assertIn("OK", output.getvalue())
-        self.assertIn("11 passed", output.getvalue())
+        self.assertIn("12 passed", output.getvalue())
 
     def test_check_exits_1_and_prints_fail_summary_on_gate_failure(self):
         output = io.StringIO()
@@ -465,13 +469,13 @@ class TestCmdCheckSummary(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("FAIL", output.getvalue())
-        self.assertIn("10 passed, 1 failed", output.getvalue())
+        self.assertIn("11 passed, 1 failed", output.getvalue())
 
     def test_check_runs_complexity_acceptance_arch_as_parallel_batch(self):
         # check must run every offline, fast, no-build-lock gate — complexity,
-        # acceptance, and arch (import-linter: local dev dependency, offline, no
-        # build lock) all run through the same read-only parallel batch stop-hook
-        # uses. Dead code is count-ratcheted, so it runs outside the Gate batch.
+        # duplication, acceptance, and arch (import-linter: local dev dependency,
+        # offline, no build lock) all run through the same read-only parallel batch
+        # stop-hook uses. Dead code is count-ratcheted, so it runs outside the batch.
         captured_gates = []
 
         def record_batch(gates):
@@ -501,7 +505,7 @@ class TestCmdCheckSummary(unittest.TestCase):
 
         self.assertEqual(
             captured_gates,
-            [["Complexity (lizard)", "Arch (import-linter)"]],
+            [["Complexity (lizard)", "Duplication (lizard)", "Arch (import-linter)"]],
         )
 
 
@@ -1201,9 +1205,10 @@ class TestCheckSummaryCountsEveryGate(unittest.TestCase):
             with redirect_stdout(output), self.assertRaises(SystemExit):
                 harness.cmd_check()
 
-        # 3 of the 4 batch gates failed; the old code reported 1.
+        # 3 of the 5 batch gates failed (4 mocked + the real duplication gate); the
+        # old code reported 1.
         self.assertIn("3 failed", output.getvalue())
-        self.assertIn("11 passed", output.getvalue())
+        self.assertIn("12 passed", output.getvalue())
 
 
 class TestVerboseStillPrintsGlyphs(unittest.TestCase):

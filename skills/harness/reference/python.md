@@ -393,20 +393,34 @@ Two measured details:
 
 ---
 
-## `.harness-baseline` — five metrics, one writer
+## `.harness-baseline` — six metrics, one writer
 
 ```
 complexity.max_violations 0
 coverage.min 100
 crap.max_violations 0
 deadcode.max_findings 0
+duplication.max_blocks 8
 suppressions.noqa 8
 suppressions.pyright_ignore 2
 suppressions.type_ignore 4
 ```
 
-- **Five**, not four. `deadcode.max_findings` was added because vulture
+- **Six**, not four. `deadcode.max_findings` was added because vulture
   produced 1,583 findings on doghouse with no floor and no escape.
+  `duplication.max_blocks` was added because the complexity gate scores each
+  function alone and never sees the same block written twice.
+- **`duplication.max_blocks` is lizard's `-Eduplicate` block count** — a second
+  lizard invocation over the *same* targets as the complexity gate
+  (`src` + `tests`), run `-w -i 1000000` so lizard stays quiet and green while
+  the runner counts lines equal to `Duplicate block:` and judges them itself
+  (lizard's exit code tracks CCN warnings only, never duplicates). Change the
+  target set and the recorded floor stops reproducing. Overlapping near-
+  duplicates are reported as separate blocks, so the count can move by one on a
+  trivial edit — harmless for a ratchet, which only asks that it never grow.
+  The template ships `8`, all of them in `tests/` where repeated setup is the
+  readable choice; a fresh adopter's step 1 overwrites it, same as
+  `coverage.min`.
 - **The only writer is `suppressions --update-baseline`.** Nobody guesses that
   from the name — say it out loud when handing the repo over. The name is a
   known wart, deliberately unfixed: `suppressions` sits in the parity gate's
@@ -415,7 +429,8 @@ suppressions.type_ignore 4
 - **A missing `.harness-baseline` is report-only and passes** — verified for
   every metric, complexity included:
   `✓ Complexity (lizard, report-only: no .harness-baseline floor)`,
-  `⚠ Dead code (vulture): 177 finding(s), report-only (no .harness-baseline floor)`.
+  `⚠ Dead code (vulture): 177 finding(s), report-only (no .harness-baseline floor)`,
+  `✓ Duplication (lizard): 8 block(s), report-only (no .harness-baseline floor)`.
 - `coverage.min` is the floor. `[tool.coverage.report] fail_under` is **not**
   read — the harness always passes an explicit `--fail-under=<n>` on the CLI.
 - **`coverage.min 100` ships in the committed template baseline.** Greenfield
@@ -429,7 +444,9 @@ suppressions.type_ignore 4
 ## Measured transcripts
 
 Both from a fresh `git clone` of the real repo into scratch, following §1–§5 of
-this file verbatim. Both originals verified untouched before and after.
+this file verbatim. Both originals verified untouched before and after. Both
+predate `duplication.max_blocks`, so neither transcript shows that gate; a rerun
+today would add one `✓ Duplication (lizard): …` line and one baseline key.
 
 **fusion** — 62k lines, no `pyproject.toml`, ruleset via `ruff.toml`,
 `TEST_COMMAND = ("-m", "pytest", "-q")`, no `.importlinter`, no `.feature`

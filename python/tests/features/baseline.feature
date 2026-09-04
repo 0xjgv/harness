@@ -1,6 +1,6 @@
 Feature: The baseline is a ratchet, not a wall
   `.harness-baseline` records where the repo already is — coverage, complexity,
-  CRAP, dead code and suppressions — so adoption never starts on a red gate, and
+  duplication, CRAP, dead code and suppressions — so adoption never starts on a red gate, and
   each number may only move down. A metric with no recorded floor reports instead
   of blocking; a metric that could not be measured is never recorded at all.
 
@@ -16,6 +16,7 @@ Feature: The baseline is a ratchet, not a wall
     When I run "harness suppressions --update-baseline"
     Then the exit code is 0
     And the baseline file contains "complexity.max_violations"
+    And the baseline file contains "duplication.max_blocks"
     And the baseline file contains "deadcode.max_findings"
     But the baseline file does not contain "coverage.min"
     And the baseline file does not contain "crap.max_violations"
@@ -75,3 +76,21 @@ Feature: The baseline is a ratchet, not a wall
     When I run "harness complexity"
     Then the exit code is 1
     And the output contains "Complexity (lizard)"
+
+  Scenario: Duplication is report-only until a floor is recorded
+    Given a project with a duplicate block and no baseline
+    When I run "harness complexity"
+    Then the exit code is 0
+    And the output contains "1 block(s), report-only"
+
+  Scenario: The duplication floor tolerates exactly the recorded blocks
+    Given a project with a duplicate block and a baseline line "duplication.max_blocks 1"
+    When I run "harness complexity"
+    Then the exit code is 0
+    And the output contains "Duplication (lizard): 1 (baseline 1)"
+
+  Scenario: The duplication floor blocks a new duplicate block
+    Given a project with a duplicate block and a baseline line "duplication.max_blocks 0"
+    When I run "harness complexity"
+    Then the exit code is 1
+    And the output contains "1 block(s) > baseline 0"

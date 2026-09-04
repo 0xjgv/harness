@@ -35,6 +35,7 @@ def _as_measurement(value: harness.Measurement | int | None) -> harness.Measurem
 def measurements(
     coverage: harness.Measurement | int | None = None,
     complexity: harness.Measurement | int | None = None,
+    duplication: harness.Measurement | int | None = None,
     crap: harness.Measurement | int | None = None,
     deadcode: harness.Measurement | int | None = None,
 ):
@@ -43,6 +44,9 @@ def measurements(
         mock.patch.object(harness, "_measured_coverage", return_value=_as_measurement(coverage)),
         mock.patch.object(
             harness, "_measured_complexity_violations", return_value=_as_measurement(complexity)
+        ),
+        mock.patch.object(
+            harness, "_measured_duplicate_blocks", return_value=_as_measurement(duplication)
         ),
         mock.patch.object(
             harness, "_measured_crap_violations", return_value=_as_measurement(crap)
@@ -150,7 +154,10 @@ class TestBaseline(unittest.TestCase):
             (root / ".harness-baseline").write_text(
                 "custom.thing 7\ncoverage.min 40\n", encoding="utf-8"
             )
-            with cwd(root), measurements(coverage=88, complexity=3, crap=None, deadcode=12):
+            with (
+                cwd(root),
+                measurements(coverage=88, complexity=3, duplication=8, crap=None, deadcode=12),
+            ):
                 written = harness._write_baseline({"noqa": [["E501"]]})
                 content = (root / ".harness-baseline").read_text(encoding="utf-8")
 
@@ -158,6 +165,7 @@ class TestBaseline(unittest.TestCase):
         self.assertEqual(written["custom.thing"], 7)
         self.assertEqual(written["coverage.min"], 88)
         self.assertEqual(written["complexity.max_violations"], 3)
+        self.assertEqual(written["duplication.max_blocks"], 8)
         self.assertEqual(written["deadcode.max_findings"], 12)
         self.assertNotIn("crap.max_violations", written)
         self.assertIn("custom.thing 7", content)
@@ -348,6 +356,100 @@ class TestReportOnlyWithoutABaseline(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("1583", output.getvalue())
         self.assertIn("report-only", output.getvalue())
+
+
+class TestDuplicationRatchet(unittest.TestCase):
+    """lizard's exit code ignores `-Eduplicate`, so the block count is judged here."""
+
+    @staticmethod
+    def _result(baseline: str | None, measurement, report: str = "") -> harness.GateResult:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            if baseline is not None:
+                (root / ".harness-baseline").write_text(baseline, encoding="utf-8")
+            with (
+                cwd(root),
+                mock.patch.object(harness, "_run_duplication", return_value=(measurement, report)),
+            ):
+                gate = harness._duplication_gate()
+                assert gate.runner is not None
+                return gate.runner()
+
+    def test_passes_at_the_floor(self) -> None:
+        result = self._result("duplication.max_blocks 8\n", harness.Measurement(value=8))
+        self.assertTrue(result.ok)
+        self.assertIn("8 (baseline 8)", result.description)
+
+    def test_fails_when_one_new_block_appears(self) -> None:
+        report = "Duplicate block:\nsrc/a.py:1 ~ 17\nsrc/a.py:20 ~ 36\n"
+        result = self._result("duplication.max_blocks 8\n", harness.Measurement(value=9), report)
+        self.assertFalse(result.ok)
+        self.assertIn("9 block(s) > baseline 8", result.description)
+        self.assertEqual(result.stdout, report)
+        self.assertEqual(result.hint, harness.DUPLICATION_HINT)
+
+    def test_suggests_ratcheting_down_when_blocks_drop(self) -> None:
+        result = self._result("duplication.max_blocks 8\n", harness.Measurement(value=5))
+        self.assertTrue(result.ok)
+        self.assertIn("ratchet down", result.description)
+
+    def test_reports_and_passes_without_a_floor(self) -> None:
+        result = self._result("coverage.min 0\n", harness.Measurement(value=1583))
+        self.assertTrue(result.ok)
+        self.assertIn("1583 block(s), report-only", result.description)
+
+    def test_a_broken_lizard_fails_instead_of_reporting_zero(self) -> None:
+        result = self._result(None, harness.Measurement(error="lizard failed to run (exit 2)"))
+        self.assertFalse(result.ok)
+        self.assertIn("lizard failed to run (exit 2)", result.description)
+
+    def test_duplicate_block_count_counts_only_exact_headers(self) -> None:
+        report = (
+            "Duplicates\n===================================\n"
+            "Duplicate block:\n--------------------------\n"
+            "src/a.py:1 ~ 17\nsrc/a.py:20 ~ 36\n^^^^^^^^^^^^^^^^^^^^^^^^^^\n\n"
+            "Duplicate block:\n--------------------------\n"
+            "src/b.py:3 ~ 9\nsrc/c.py:3 ~ 9\n^^^^^^^^^^^^^^^^^^^^^^^^^^\n\n"
+            "  Duplicate block: (indented, not a header)\n"
+            "Total duplicate rate: 4.51%\n"
+        )
+        self.assertEqual(harness._duplicate_block_count(report), 2)
+
+    def test_duplication_argv_shares_the_complexity_targets_and_disarms_lizard(self) -> None:
+        # The recorded floor only reproduces against an identical target set, so pin
+        # the two argvs to each other rather than to a hand-written list.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            with cwd(root):
+                argv = harness._duplication_argv()
+                complexity_argv = harness._complexity_argv(harness.REPORT_ONLY_LIMIT)
+                targets = harness._app_targets(include_tests=True)
+
+        # Everything before the trailing flags (4 here, 8 for complexity) is the
+        # resolved lizard command plus the targets, and must match exactly.
+        self.assertEqual(argv[:-4], complexity_argv[:-8])
+        self.assertEqual(
+            argv[-len(targets) - 4 :], [*targets, "-Eduplicate", "-w", "-i", "1000000"]
+        )
+
+    def test_measured_duplicate_blocks_errors_when_lizard_fails(self) -> None:
+        failed = subprocess.CompletedProcess([], 2, "", "lizard: error")
+        with (
+            mock.patch.object(harness, "_app_targets", return_value=["src"]),
+            mock.patch.object(harness.subprocess, "run", return_value=failed),
+        ):
+            measured = harness._measured_duplicate_blocks()
+
+        self.assertEqual(measured.error, "lizard failed to run (exit 2)")
+
+    def test_measured_duplicate_blocks_is_unavailable_without_app_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, cwd(Path(tmp)):
+            measured = harness._measured_duplicate_blocks()
+
+        self.assertIsNone(measured.value)
+        self.assertEqual(measured.unavailable, "no app sources")
 
 
 class TestDeadcodeRatchet(unittest.TestCase):

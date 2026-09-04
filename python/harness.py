@@ -601,6 +601,33 @@ def _measured_complexity_violations() -> Measurement:
     return Measurement(value=count)
 
 
+def _duplicate_block_count(stdout: str) -> int:
+    """Count the `Duplicate block:` headers in lizard's `-Eduplicate` report."""
+    return sum(1 for line in stdout.splitlines() if line == "Duplicate block:")
+
+
+def _run_duplication() -> tuple[Measurement, str]:
+    """Run lizard's duplicate finder once; the block count and the report it printed.
+
+    Overlapping near-duplicates are reported as separate blocks, so the count can
+    move by one on a trivial edit — fine for a ratchet, which only asks that the
+    number never grow. Stable across repeated runs on an unchanged tree.
+    """
+    if not _app_targets(include_tests=True):
+        return Measurement(unavailable="no app sources"), ""
+    res = subprocess.run(_duplication_argv(), capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+        return Measurement(error=f"lizard failed to run (exit {res.returncode})"), (
+            res.stdout + res.stderr
+        )
+    return Measurement(value=_duplicate_block_count(res.stdout)), res.stdout
+
+
+def _measured_duplicate_blocks() -> Measurement:
+    """Count of duplicate blocks lizard reports over the complexity gate's targets."""
+    return _run_duplication()[0]
+
+
 def _measured_crap_violations() -> Measurement:
     """Count of functions above the default CRAP threshold."""
     if not _has_tests():
@@ -640,6 +667,7 @@ def _measured_deadcode_findings() -> Measurement:
 RATCHETED_KEYS = (
     "coverage.min",
     "complexity.max_violations",
+    "duplication.max_blocks",
     "crap.max_violations",
     "deadcode.max_findings",
 )
@@ -656,6 +684,7 @@ def _measure_ratcheted() -> dict[str, Measurement]:
     for key, measure in (
         ("coverage.min", _measured_coverage),
         ("complexity.max_violations", _measured_complexity_violations),
+        ("duplication.max_blocks", _measured_duplicate_blocks),
         ("crap.max_violations", _measured_crap_violations),
         ("deadcode.max_findings", _measured_deadcode_findings),
     ):
@@ -1960,9 +1989,64 @@ def _complexity_gate() -> Gate:
     )
 
 
+def _duplication_argv() -> list[str]:
+    """lizard argv for the duplicate-block report over the complexity gate's targets.
+
+    A separate lizard run on purpose: `-Eduplicate` composes with the CCN flags, but
+    lizard's exit code still tracks CCN warnings only, so the block count has to be
+    judged here. `-w -i N` keeps that run silent and green; the target set must stay
+    identical to `_complexity_argv`'s, or the recorded floor stops reproducing.
+    """
+    return [
+        *_tool(LIZARD, read_only=True),
+        *_app_targets(include_tests=True),
+        "-Eduplicate",
+        "-w",
+        "-i",
+        str(REPORT_ONLY_LIMIT),
+    ]
+
+
+DUPLICATION_LABEL = "Duplication (lizard)"
+DUPLICATION_HINT = "extract the repeated block into one helper; do not raise the floor"
+
+
+def _duplication_gate() -> Gate:
+    """Count-ratcheted duplicate-block gate: blocks may never exceed the committed floor.
+
+    Count-based like dead code, but a `Gate` with its own `runner` so it rides the
+    same parallel batch as complexity — the verdict is computed from lizard's report,
+    not its exit code. Without a recorded floor it is report-only: a legacy tree
+    carries duplicates by the hundred, and blocking on that is the day-one red that
+    gets the harness deleted instead of adopted.
+    """
+    floor = _baseline_floor("duplication.max_blocks")
+    argv = _duplication_argv()
+
+    def runner() -> GateResult:
+        measured, report = _run_duplication()
+        if measured.error:
+            return GateResult(f"{DUPLICATION_LABEL}: {measured.error}", argv, 1, report, "")
+        if measured.value is None:
+            label = f"{measured.unavailable}; skipped"
+            return GateResult(f"{DUPLICATION_LABEL}: {label}", argv, 0, "", "")
+        blocks = measured.value
+        if floor is None:
+            label = f"{blocks} block(s), report-only (no {BASELINE_FILE} floor)"
+            return GateResult(f"{DUPLICATION_LABEL}: {label}", argv, 0, "", "")
+        if blocks <= floor:
+            suffix = " — run `harness suppressions --update-baseline` to ratchet down"
+            label = f"{blocks} (baseline {floor}){suffix if blocks < floor else ''}"
+            return GateResult(f"{DUPLICATION_LABEL}: {label}", argv, 0, "", "")
+        label = f"{blocks} block(s) > baseline {floor}"
+        return GateResult(f"{DUPLICATION_LABEL}: {label}", argv, 1, report, "", DUPLICATION_HINT)
+
+    return Gate(DUPLICATION_LABEL, argv, DUPLICATION_HINT, runner)
+
+
 def cmd_complexity() -> None:
-    gate = _complexity_gate()
-    run(gate.description, gate.cmd)
+    all_ok, _failed = run_gates_parallel([_complexity_gate(), _duplication_gate()])
+    _exit_if_failed(all_ok)
 
 
 def _deadcode_argv() -> list[str]:
@@ -2053,7 +2137,7 @@ def cmd_stop_hook() -> None:
     cmd_post_edit()  # mutating — sequential, first
     _check_arch_config_guard(warn_only=True)
     _check_gherkin_guard(warn_only=True)
-    all_ok, failed = run_gates_parallel([_complexity_gate()])  # read-only batch
+    all_ok, failed = run_gates_parallel([_complexity_gate(), _duplication_gate()])  # read-only
     if not _check_deadcode(no_exit=True):  # count-ratcheted, so outside the Gate batch
         all_ok = False
         failed.append(DEADCODE_LABEL)
@@ -2243,7 +2327,12 @@ def cmd_check() -> None:
         cmd_typecheck(no_exit=True),
         cmd_test(no_exit=True),
     ]
-    batch = [_complexity_gate(), *_acceptance_gates_or_warn(), *_arch_gates_or_warn()]
+    batch = [
+        _complexity_gate(),
+        _duplication_gate(),
+        *_acceptance_gates_or_warn(),
+        *_arch_gates_or_warn(),
+    ]
     _batch_ok, batch_failed = run_gates_parallel(batch)
     # One entry per gate, not one for the whole batch: collapsing the batch into a
     # single boolean makes the summary under-report by (failures - 1).
@@ -2312,6 +2401,7 @@ def cmd_ci() -> None:
         _typecheck_gate(),
         _audit_gate_or_warn(),
         _complexity_gate(),
+        _duplication_gate(),
         *_acceptance_gates_or_warn(),
         *_arch_gates_or_warn(),
     ])
