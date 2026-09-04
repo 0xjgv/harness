@@ -22,8 +22,16 @@ Two mechanisms, split by whether a finding has a natural count:
 
 | Finding kind | Mechanism | Commands | Scope |
 |---|---|---|---|
-| No natural count (lint diagnostic, format diff, type error) | **diff-scoped** — git-derived file list, skip with a warning when empty, never widen to whole tree | `fix`, `format`, `lint`, `typecheck` | changed set; `--all` overrides, `--base=<ref>` picks the base |
-| Natural count (coverage %, functions over CCN, CRAP offenders, suppressions) | **baseline floor starting where the repo already is** | `coverage`, `complexity`, `crap`, `suppressions` | whole tree — scoping a count makes it meaningless |
+| No natural count (lint diagnostic, format diff, type error, which tests to run) | **diff-scoped** — git-derived file list, skip with a warning when empty, never widen to whole tree | `fix`, `format`, `lint`, `typecheck`, `test` (in `check`/`pre-commit`) | changed set; `--all` overrides, `--base=<ref>` picks the base |
+| Natural count (coverage %, mutants killed, functions over CCN, duplicate blocks, CRAP offenders, arch violations, deadcode findings, suppressions) | **baseline floor starting where the repo already is** | `coverage`, `mutation`, `complexity`, `crap`, `arch`, `deadcode`, `suppressions` | whole tree — scoping a count makes it meaningless (mutation excepted: scoped, because a run costs minutes) |
+
+The change set depends on the stage: local stages (`check`, `pre-commit`,
+`post-edit`) use the uncommitted set (`git status --porcelain`); anything with
+a resolved base ref (`--base=<ref>`, `HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`,
+then the `origin/HEAD` → `origin/main` → `main` fallbacks) uses
+`git diff --name-only <base>...HEAD`. `ci`, `pre-push`, and `--all` run the
+whole tree. The `git status` helper must never feed `ci`: there it yields an
+empty set and a green gate that tested nothing.
 
 Audit consequences:
 
@@ -101,10 +109,10 @@ Default classification:
 | `stop-hook` command + Claude/Codex Stop wiring | Required |
 | Quiet runner output contract | Required |
 | Read-only `ci` and `pre-push` | Required |
-| Diff-scoped `fix`/`format`/`lint`/`typecheck`, skipping on empty scope | Required |
+| Diff-scoped `fix`/`format`/`lint`/`typecheck`/`test`, skipping on empty scope | Required |
 | `--all` and `--base=<ref>` scope overrides | Required |
-| Five baseline floors in `.harness-baseline` (`coverage.min`, `complexity.max_violations`, `crap.max_violations`, `deadcode.max_findings`, `suppressions.*`) | Required |
-| `suppressions --update-baseline` as the sole writer of all five | Required |
+| Seven baseline floor families in `.harness-baseline` (`coverage.min`, `mutation.min`, `complexity.max_violations`, `duplication.max_blocks`, `crap.max_violations`, `arch.max_violations`, `deadcode.max_findings`, `suppressions.*`); a missing key is report-only | Required |
+| `suppressions --update-baseline` as the sole writer of all of them (`mutation.min` only under `--with-mutation`) | Required |
 | AGENTS.md/CLAUDE.md full-content parity | Required |
 | `agents-md-drift` and `sync-agents-md` | Required |
 | Deadcode gate for Python/Bun | Required |
@@ -114,7 +122,7 @@ Default classification:
 | Architecture gate | Strongly recommended |
 | CRAP advisory gate in `ci` | Required |
 | Property-based tests under normal `test` | Strongly recommended |
-| Mutation command | Contextual |
+| `mutation` command, scoped, advisory in `ci` after coverage | Strongly recommended |
 | `arch-config-guard` | Required |
 | `gherkin-guard` (mechanical Gherkin-first enforcement) | Required |
 | Stop hook exits 2 with a stderr failure summary on failure | Required |
@@ -136,13 +144,13 @@ The repo must expose these commands through its chosen runner:
 | `setup-hooks` | Installs or refreshes pre-commit, pre-push, and Claude/Codex Stop hook wiring. |
 | `suppressions` | Shows suppression counts; `--update-baseline` is the only writer and needs human sign-off. |
 | `coverage` | Enforces the `.harness-baseline` `coverage.min` floor unless overridden. |
-| `complexity` | Enforces lizard thresholds: CCN<=15, args<=8, length<=100. |
+| `complexity` | Enforces lizard thresholds: CCN<=15, args<=8, length<=100, against `complexity.max_violations`; a second lizard run with `-Eduplicate` counts duplicate blocks against `duplication.max_blocks`. Both report-only when the key is missing. |
 | `crap` | Advisory by default (prints `⚠`, not `✗`); `--enforce` hard-fails. Runs in `ci`, not `stop-hook`. |
 | `acceptance` | Runs Gherkin acceptance tests when present. |
-| `arch` | Runs the architecture boundary check when configured. Also runs in `check` when the tool is offline and takes no build lock (python/bun); stays `ci`/`pre-push`-only when it needs the network or a build lock (go/rust). |
+| `arch` | Runs the architecture boundary check when configured and counts its violations against `arch.max_violations` (report-only when the key is missing; warns and skips when no arch config exists). Also runs in `check` when the tool is offline and takes no build lock (python/bun); stays `ci`/`pre-push`-only when it needs the network or a build lock (go/rust). |
 | `arch-config-guard` | Warns or blocks protected arch config changes; strict mode allows `HARNESS_ALLOW_ARCH_CONFIG=1` after review. |
 | `gherkin-guard` | Warns (in `check`/`stop-hook`) or blocks (in `pre-commit`/`pre-push`/`ci`) a changed production-source file with no accompanying `.feature` change; strict mode allows `HARNESS_ALLOW_NO_FEATURE=1` after review. Skips silently when the repo has no `.feature` files anywhere. |
-| `mutation` | Available as an explicit command; advisory and not wired into `ci`. |
+| `mutation` | Scoped to the changed source files (`--all` for the whole tree); prints the integer % of mutants killed and compares it to `mutation.min`. Advisory: prints `⚠` on a miss; only `--enforce` hard-fails. Runs in `ci` after coverage, advisory there too. Warns and skips on an empty scope or a missing tool. |
 | `agents-md-drift` | Fails if `AGENTS.md` differs from `CLAUDE.md`. |
 | `sync-agents-md` | Writes `AGENTS.md <- CLAUDE.md`. |
 | `deadcode` | Python/Bun only as a standalone command; Go/Rust cover dead code through lint gates. Runs in `check` + `ci` + `stop-hook` where present. |
@@ -163,8 +171,12 @@ Must:
 - Run fix/format before read-only checks.
 - Run lint or equivalent quality checks.
 - Run typecheck or compiler checks.
-- Run tests. If the language template supports no-test fallback, preserve that
-  fallback behavior.
+- Run tests, scoped: the changed test files plus the tests that map to the
+  changed source modules (mapping per language reference). An empty scope
+  warns and skips; a changed source file with no mapped test gets one `⚠`
+  line per file, never a failure, and the mapped tests still run; `--all`
+  runs the whole suite. If the language template supports no-test fallback,
+  preserve that fallback behavior.
 - Run every other gate that is offline, fast, and takes no build lock:
   complexity, acceptance (self-skip with a warning if no `.feature` files
   exist), the deadcode gate where the language ships one, and a
@@ -203,8 +215,8 @@ Must:
 - Be installed as `.git/hooks/pre-commit` or through the repo's configured
   git hooks path.
 - Run on staged source files where practical.
-- Fix/format, typecheck, test when source changed, and check suppressions and
-  AGENTS/CLAUDE drift.
+- Fix/format, typecheck, the scoped test run (same mapping rule as `check`,
+  over the staged set), and check suppressions and AGENTS/CLAUDE drift.
 - Re-stage (`git add`) the files it fixed, so the commit records the fixed
   content. Note the trade-off: for a partially staged file, this also stages
   its remaining unstaged hunks — the same trade-off `lint-staged` makes.
@@ -247,8 +259,10 @@ Must:
 - Include lint, typecheck where separate, audit, complexity, acceptance, arch,
   and deadcode for Python/Bun.
 - Run `arch-config-guard` in strict mode.
-- Then run tests/coverage and advisory CRAP.
-- Check suppressions against `.harness-baseline`.
+- Then run the whole test suite under coverage, advisory CRAP, and advisory
+  `mutation` over the base-ref diff (`git diff --name-only <base>...HEAD`,
+  never `git status`). A mutation miss prints `⚠` and never fails `ci`.
+- Check every `.harness-baseline` floor.
 
 Language notes:
 
@@ -270,6 +284,8 @@ Gap examples:
   short summary line.
 - Runs format/fix: move mutation to `check`; keep `ci` read-only.
 - Does not run CRAP: add advisory `crap` after coverage.
+- Skips mutation, or fails `ci` on a mutation miss: add advisory `mutation`
+  after coverage; only the standalone command with `--enforce` may fail.
 
 ### `post-edit`
 
@@ -325,34 +341,62 @@ Gap examples:
 
 ### Baseline floors (`.harness-baseline`)
 
-The baseline is **not** suppression-only. It records five metric families,
-each a floor that starts where the repo already is:
+The baseline is **not** suppression-only. It records seven metric families
+(eight keys), each a floor that starts where the repo already is. The key
+names are identical in all four languages:
 
 ```
+arch.max_violations 0
 complexity.max_violations 0
 coverage.min 100
 crap.max_violations 0
 deadcode.max_findings 0
+duplication.max_blocks 0
+mutation.min 78          # only present after --with-mutation
 suppressions.noqa 8
 suppressions.pyright_ignore 2
 suppressions.type_ignore 4
 ```
 
+| Key | Direction | Measures |
+|---|---|---|
+| `complexity.max_violations` | down | lizard warnings over CCN 15 / args 8 / length 100 |
+| `duplication.max_blocks` | down | lizard `-Eduplicate` duplicate blocks |
+| `crap.max_violations` | down | functions over the CRAP threshold |
+| `arch.max_violations` | down | boundary violations reported by the arch tool |
+| `mutation.min` | up | integer % of mutants killed on the last scoped run |
+| `coverage.min` | up | coverage percent |
+| `deadcode.max_findings` | down | python/bun deadcode findings |
+| `suppressions.<kind>` | down | per-kind suppression counts (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`) |
+
 Must:
 
 - Count suppressions for the language (`# noqa`, `// @ts-ignore`,
   `//nolint`, `#[allow]`, etc.).
-- Fail `check`/`ci` when any of the five grows above `.harness-baseline`.
-- **Re-measure** all five on update, so a metric that improved ratchets down;
-  preserve unrecognised keys untouched.
-- Make the update **all-or-nothing**: a metric that cannot be measured aborts
-  the write and is named; a metric that does not apply has its key *removed*
-  (absence on disk means report-only, which is what stops the template's own
-  `coverage.min 100` from being inherited).
+- Fail `check`/`ci` when any floor is crossed — except `mutation.min`, which
+  is advisory everywhere but the standalone command with `--enforce`.
+- Treat a **missing key** as report-only for that one gate: it passes with a
+  `report-only: no .harness-baseline floor` label and a hint to run the
+  update. A missing file is the same for every gate. A missing baseline must
+  never fail a gate.
+- **Re-measure** every key on update, so a metric that improved ratchets
+  down; preserve unrecognised keys untouched. `mutation.min` is the one
+  exception: the automatic pass carries its existing value through untouched
+  and measures it only under `--with-mutation` (a mutation run costs
+  minutes).
+- Make the update **all-or-nothing**: a metric that errors aborts the write
+  and is named; a metric that cannot be measured (no arch config, no tests,
+  no deadcode tool) has its key *dropped* with a warning (absence on disk
+  means report-only, which is what stops the template's own
+  `coverage.min 100` from being inherited). Suppression kinds ratcheted to
+  zero are recorded as `0`, not dropped.
+- Score `mutation.min` as `round(100 * killed / (killed + survived))`,
+  killed = caught + timeout, survived = ran and not detected; unviable,
+  compile-error, skipped, and not-covered mutants count in neither term;
+  `killed + survived == 0` is unavailable, i.e. report-only. Never use the
+  mutation tool's own threshold flag — denominators differ per tool.
 - Let only `suppressions --update-baseline` write the baseline. Confirm no
   other code path writes it — an automatic write destroys the ratchet.
-- Treat a **missing** `.harness-baseline` as report-only and passing, with a
-  hint to run the update. A missing baseline must never fail a gate.
 
 Fix suggestions:
 
@@ -360,7 +404,7 @@ Fix suggestions:
   human sign-off — never by hand-writing target numbers.
 - Add the baseline check to `check`, `pre-commit`, and `ci`.
 - Record the naming wart in the report: `suppressions --update-baseline`
-  writes all five families. The name is misleading and deliberately unfixed
+  writes all seven families. The name is misleading and deliberately unfixed
   (`suppressions` is in the parity gate's non-allowlistable core command
   list, so a `baseline` command would have to land in all four templates).
   An adopter will not guess it — name it explicitly in the handover.
@@ -406,6 +450,27 @@ Fix suggestions:
 - Do not fail default `ci` solely because advisory CRAP offenders exist unless
   the repo intentionally enables enforcement.
 
+### Mutation
+
+Must:
+
+- Scope to the changed source files: the uncommitted set locally, the
+  base-ref diff in `ci`; `--all` widens to the whole tree. Warn and skip on
+  an empty scope or when the tool is not installed.
+- Print the integer % killed and compare it to `mutation.min`; advisory by
+  default (`⚠` on a miss), hard-fail only with `--enforce`.
+- Run in `ci` after coverage, advisory. Not in `check`, `pre-push`, or
+  `stop-hook`.
+- Be written to `.harness-baseline` only by
+  `suppressions --update-baseline --with-mutation`.
+
+Fix suggestions:
+
+- Add `mutation` as a standalone command and call it from `ci` after coverage.
+- Compute the score in the runner from the tool's report; do not pass the
+  tool a threshold flag.
+- Gitignore the tool's output directory and wipe it in `clean`.
+
 ### Complexity
 
 Must:
@@ -417,11 +482,17 @@ Must:
 - Run in `check`, `ci`, and `stop-hook`.
 - Stay whole-tree, and gate on `complexity.max_violations` from
   `.harness-baseline` rather than on zero.
+- Run lizard a second time with `-Eduplicate` over the same target set and
+  gate the `Duplicate block:` count on `duplication.max_blocks`. Lizard's
+  exit code ignores duplicates, so the runner compares the count itself.
 
 Fix suggestions:
 
 - Add the `complexity` command and call it from both `ci` and `stop-hook`.
 - Capture successful lizard output; print details only on failure.
+- Missing duplication gate: add the `-Eduplicate` invocation with the same
+  targets as the CCN run; a different target set makes the floor
+  irreproducible.
 
 ### Deadcode
 
@@ -476,16 +547,27 @@ Fix suggestions:
 Must:
 
 - Run the repo's architecture boundary check when configured.
+- Count the violations it reports and gate on `arch.max_violations` from
+  `.harness-baseline`; report-only when the key is missing; warn and skip
+  when no arch config exists.
 - Be included in `ci` and `pre-push`.
 - Keep the architecture config under `arch-config-guard`.
 - Warn in `check`/`stop-hook` and fail `pre-commit`/`pre-push`/`ci` unless
   `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+- In a brownfield repo, **derive the contract from the real package tree and
+  baseline the violations — never delete or loosen the arch config to get a
+  green first run.** Deleting the config is a "Required" defect in the
+  adoption, not a shortcut.
 
 Fix suggestions:
 
 - Add `arch` as a standalone command.
 - Add `arch-config-guard` as a standalone command and wire it into the runner
   stages.
+- Arch config was deleted or gutted during adoption: restore it, write the
+  layers the package tree actually has, run
+  `suppressions --update-baseline`, and let `arch.max_violations` hold the
+  count until `/ratchet` or a human moves it.
 - If no architecture tool exists, mark as contextual and recommend one only
   when module boundaries matter.
 
@@ -627,9 +709,15 @@ that step 2 is green:
 
 1. `<runner> suppressions --update-baseline` — snapshot every metric as it is
    today. This is the only writer of `.harness-baseline`, and it is
-   all-or-nothing: it aborts and names the metric it could not measure.
+   all-or-nothing: it aborts and names the metric that errored, and drops
+   (with a warning) a key it cannot measure. `mutation.min` is not in the
+   automatic set; add `--with-mutation` when the repo has a mutation tool
+   and the minutes to spare, or leave it report-only for now.
 2. `<runner> check` — must be green: the scoped gates see only the diff and
-   every counted metric sits exactly at its just-written floor.
+   every counted metric sits exactly at its just-written floor. Expect `⚠`
+   lines from the scoped `test` gate for changed source files with no
+   mapped test — those are the first `/ratchet` characterization targets,
+   not failures.
 3. **The human commits the adoption.** Not the agent — the behavior contract
    forbids it. Until the adoption diff is committed, every later `check`
    re-scopes over it, and "green" means green over the harness's own
@@ -667,12 +755,18 @@ gate warns and skips with no `uv.lock`.
 7. Inspect git hook installation and hook path handling.
 8. Inspect Claude/Codex hook JSON.
 9. Inspect AGENTS.md/CLAUDE.md content and drift tooling.
-10. Inspect `.harness-baseline`: all five metric families present, single
-    writer, missing-file case report-only.
-11. Inspect scoping: do `fix`/`format`/`lint`/`typecheck` resolve a
+10. Inspect `.harness-baseline`: the seven metric families present under
+    their fixed key names (`mutation.min` may be absent until
+    `--with-mutation` has run), single writer, missing-file and missing-key
+    cases report-only.
+11. Inspect scoping: do `fix`/`format`/`lint`/`typecheck`/`test` resolve a
     git-derived file list, skip on an empty scope, and honour `--all` /
-    `--base=<ref>`? A whole-tree fallback is a Required defect.
-12. Inspect PBT, acceptance, arch, CRAP, complexity, and deadcode coverage.
+    `--base=<ref>`? Does `test` warn per changed source file with no mapped
+    test and still run the mapped ones? A whole-tree fallback is a Required
+    defect; so is a `git status` change set inside `ci`.
+12. Inspect PBT, acceptance, arch (config present, violations baselined, not
+    deleted), CRAP, complexity + duplication, mutation, and deadcode
+    coverage.
 13. Produce the report below with actionable fixes.
 
 Do not edit during the audit unless the user asked for fixes. If asked to fix,
@@ -720,11 +814,12 @@ Target: complete harness adoption
 
 | Gate | Status | Evidence | Fix |
 |---|---|---|---|
-| diff scoping (fix/format/lint/typecheck) | pass/fail/missing | <evidence> | <action> |
-| baseline floors (4 families, single writer) | pass/fail/missing/skipped | <evidence> | <action> |
+| diff scoping (fix/format/lint/typecheck/test) | pass/fail/missing | <evidence> | <action> |
+| baseline floors (7 families, single writer) | pass/fail/missing/skipped | <evidence> | <action> |
 | suppressions | pass/fail/missing/skipped | <evidence> | <action> |
 | coverage | pass/fail/missing/skipped | <evidence> | <action> |
-| complexity | pass/fail/missing/skipped | <evidence> | <action> |
+| mutation | pass/fail/missing/skipped | <evidence> | <action> |
+| complexity + duplication | pass/fail/missing/skipped | <evidence> | <action> |
 | deadcode | pass/fail/missing/skipped | <evidence> | <action> |
 | CRAP | pass/fail/missing/skipped | <evidence> | <action> |
 | PBT | pass/fail/missing/skipped | <evidence> | <action> |

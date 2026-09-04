@@ -88,16 +88,17 @@ Behavior contract: [behavior-contract.md](reference/behavior-contract.md).
 
 | Stage | When | What | Fixes? |
 |---|---|---|---|
-| `check` | After edits | fix + format + typecheck + test, plus every other gate that is offline, fast, and takes no build lock (complexity + acceptance + deadcode where shipped + a lockfile check in python/bun + `go mod tidy -diff` in go + — python/bun only — the architecture boundary check `arch` itself); warns via `arch-config-guard` + `gherkin-guard`; checks agents-md drift; suppression ratchet | yes |
+| `check` | After edits | fix + format + typecheck + test (scoped to the tests that map to changed modules; `--all` for the whole suite), plus every other gate that is offline, fast, and takes no build lock (complexity + acceptance + deadcode where shipped + a lockfile check in python/bun + `go mod tidy -diff` in go + — python/bun only — the architecture boundary check `arch` itself); warns via `arch-config-guard` + `gherkin-guard`; checks agents-md drift; suppression ratchet | yes |
 | `pre-commit` | Git pre-commit hook | same, staged files only, then re-stages (`git add`) the files it fixed | yes |
 | `pre-push` | Before push | read-only push gate: lint + format check + acceptance + arch over the whole tree, in parallel; strict `arch-config-guard` + `gherkin-guard` | no |
-| `ci` | CI pipeline | read-only gates (lint + typecheck + dep audit + complexity + deadcode + acceptance + arch) **run in parallel**, captured and printed in submission order; then tests/coverage + crap (advisory); strict `arch-config-guard` + `gherkin-guard` | no |
+| `ci` | CI pipeline | read-only gates (lint + typecheck + dep audit + complexity + deadcode + acceptance + arch) **run in parallel**, captured and printed in submission order; then the whole test suite under coverage + crap (advisory) + mutation (advisory, scoped to the base-ref diff); strict `arch-config-guard` + `gherkin-guard` | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
 | `post-edit` | Stop hook helper | format if source files changed | yes |
 | `stop-hook` | Agent Stop hook | post-edit + complexity + deadcode (python/bun); **exits 2 with a stderr failure summary on failure** | yes |
 
 Invariant every runner documents: `ci` minus `check` is only the network
-dependency audit, coverage, and advisory CRAP — plus, in go and rust only,
+dependency audit, coverage (which runs the whole suite where `check` ran the
+scoped subset), advisory CRAP, and advisory mutation — plus, in go and rust only,
 the architecture boundary check itself (`arch`), which stays
 `ci`/`pre-push`-only there (go's needs to fetch a module, rust's takes
 cargo's build lock); python and bun's `arch` has neither constraint, so it
@@ -127,24 +128,54 @@ or `py_compile` over quality targets when no `tests/test*.py` files exist. Bun
 `test`, `coverage`, `mutation`, and
 `crap` warn and skip when no Bun test files exist. `complexity` runs
 `uvx lizard@1.22.2` (CCN≤15, args≤8, length≤100) — all 4 templates, so
-`uvx` must be on PATH. `crap` is **advisory by default** (warns with a
-green `⚠`, not a red `✗`; pass `--enforce` to hard-fail) and runs in `ci`.
+`uvx` must be on PATH; the same invocation with `-Eduplicate` counts duplicate
+blocks. `crap` is **advisory by default** (warns with a green `⚠`, not a red
+`✗`; pass `--enforce` to hard-fail) and runs in `ci`. `mutation` is scoped to
+the changed source files (`--all` for the whole tree), prints the percentage
+of mutants killed, and is advisory in the same way: it runs in `ci` after
+coverage and prints `⚠` on a miss, never fails `ci`, and only the standalone
+command with `--enforce` hard-fails against `mutation.min`. `test` in
+`check`/`pre-commit` runs only the tests that map to changed modules (rule
+under "Progressive adoption" below); `ci`, `pre-push`, and `--all` run the
+whole suite.
 
-`.harness-baseline` ratchets **five** metric families, not one: `coverage.min`
-(the coverage floor unless `--min=N` is passed), `complexity.max_violations`,
-`crap.max_violations`, `deadcode.max_findings` (python/bun), and
-`suppressions.*` (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`). Growth in
-any of them fails `check`/`ci`. The only writer for all five is
-`suppressions --update-baseline`, which requires human sign-off — a naming wart
-(`suppressions` is in the parity gate's non-allowlistable core command list, so
-renaming it is a four-template change), deliberately deferred. Say the command
-out loud when handing a repo over; nobody guesses it from the name. A
-**missing** `.harness-baseline` is report-only and passes, per metric.
+`.harness-baseline` ratchets **seven** metric families (eight keys), not one.
+The key names are fixed across all four languages:
 
-`--update-baseline` is **all-or-nothing**: a metric that cannot be measured
-aborts the whole write and is named in the error, so nothing is half-written; a
-metric that does not apply has its key *removed*, which is what stops the
-template's own `coverage.min 100` from being inherited by an adopting repo.
+| Family | Key | Direction | Meaning |
+|---|---|---|---|
+| complexity | `complexity.max_violations` | down | lizard warnings over CCN 15 / args 8 / length 100 |
+| complexity | `duplication.max_blocks` | down | lizard `-Eduplicate` duplicate blocks |
+| crap | `crap.max_violations` | down | functions over the CRAP threshold |
+| arch | `arch.max_violations` | down | boundary violations reported by the arch tool |
+| mutation | `mutation.min` | up | integer % of mutants killed on the last scoped run |
+| coverage | `coverage.min` | up | coverage floor unless `--min=N` is passed |
+| deadcode | `deadcode.max_findings` | down | python/bun only |
+| suppressions | `suppressions.<kind>` | down | per-kind counts (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`) |
+
+Growth past a floor fails `check`/`ci` (mutation excepted: advisory unless
+`--enforce`). A **missing** file or a **missing key** makes that one gate
+report-only: it passes with a `report-only: no .harness-baseline floor` label
+and a hint to run the update. The only writer for all of them is
+`suppressions --update-baseline`, which requires human sign-off — a naming
+wart (`suppressions` is in the parity gate's non-allowlistable core command
+list, so renaming it is a four-template change), deliberately deferred. Say
+the command out loud when handing a repo over; nobody guesses it from the
+name.
+
+`--update-baseline` is **all-or-nothing**: a metric that errors aborts the
+whole write and is named in the error, so nothing is half-written; a metric
+that cannot be measured (no arch config, no tests, no deadcode tool) has its
+key *dropped* with a warning, which is what stops the template's own
+`coverage.min 100` from being inherited by an adopting repo. Unknown keys are
+preserved. `mutation.min` is the one exception to "re-measure everything": a
+mutation run costs minutes, so the automatic pass carries the existing value
+through untouched and writes it only under `--update-baseline
+--with-mutation`. The score is the same in all four languages:
+`round(100 * killed / (killed + survived))`, killed = caught + timeout,
+survived = ran and not detected; unviable, compile-error, skipped, and
+not-covered mutants count in neither term, and `killed + survived == 0` is
+"unavailable", i.e. report-only.
 
 Property-based tests run inside the normal `test` step — no extra script.
 Each template carries the language's PBT dev-dep (hypothesis / fast-check /
@@ -204,10 +235,34 @@ two mechanisms split by whether a finding has a natural count:
   subcommands, not flags, so it does not catch this — it is a deliberate
   boundary while python is the reference implementation, and a divergence to
   close during the port.
-- **Findings with a natural count** — coverage percent, functions over the
-  complexity threshold, CRAP offenders, suppression counts — get a **floor
-  that starts where the repo already is**, recorded in `.harness-baseline`.
-  These stay whole-tree on purpose: scoping a count makes it meaningless.
+- **Which tests to run** is scoped the same way. In `check` and
+  `pre-commit`, `test` runs only the changed test files plus the tests that
+  map to changed source modules (per-language mapping in the language
+  reference, e.g. `src/**/<mod>.py` → `tests/**/test_<mod>.py`). The
+  change set comes from the stage: local stages (`check`, `pre-commit`,
+  `post-edit`) use the uncommitted set (`git status --porcelain`); anything
+  with a resolved base ref (`--base=<ref>`, `HARNESS_ARCH_BASE`,
+  `GITHUB_BASE_REF`, then the `origin/HEAD` → `origin/main` → `main`
+  fallbacks) uses `git diff --name-only <base>...HEAD`. An empty scope warns
+  and skips, never widens. A changed source file that maps to no test gets
+  one `⚠` line per file, never a failure, and the tests that do map still
+  run. `ci`, `pre-push`, and `--all` always run the whole suite. The
+  `git status` helper must never feed `ci`: there it yields an empty set and
+  a green gate that tested nothing.
+- **Findings with a natural count** — coverage percent, mutants killed,
+  functions over the complexity threshold, duplicate blocks, CRAP offenders,
+  arch boundary violations, deadcode findings, suppression counts — get a
+  **floor that starts where the repo already is**, recorded in
+  `.harness-baseline` under the keys in the table above. These stay
+  whole-tree on purpose (mutation excepted, which is scoped because a run
+  costs minutes): scoping a count makes it meaningless.
+- **Architecture is adopted by baselining, never by deleting.** When the
+  repo has module boundaries, derive the arch contract from the real package
+  tree (the layers that exist, top down), keep the config, and let
+  `suppressions --update-baseline` record today's violation count as
+  `arch.max_violations`. Deleting or loosening the arch config to get a green
+  first run throws away the only structural signal the harness has; a repo
+  with genuinely no boundaries gets no config, and the gate warns and skips.
 
 Consequence: first run is identical for greenfield and brownfield —
 `suppressions --update-baseline`, then `check`, then `setup-hooks` — and
@@ -282,17 +337,23 @@ Layer 1:
    [settings-json.md](reference/settings-json.md)). Force a failure and confirm
    the Claude Stop-hook command exits 2 with a failure summary on stderr — a
    non-2 exit is silently swallowed and the agent never sees it.
-6. Suppression growth above `.harness-baseline` fails; `suppressions --update-baseline` updates it.
-7. `arch-config-guard` warns in `check`/`stop-hook` and fails
+6. Growth past any `.harness-baseline` floor fails (mutation: warns);
+   `suppressions --update-baseline` re-measures every key except
+   `mutation.min`, which needs `--with-mutation`; a missing key is
+   report-only.
+7. `check` with one changed source file runs only its mapped tests and
+   prints a `⚠` per changed source file with no mapped test; `check --all`
+   and `ci` run the whole suite.
+8. `arch-config-guard` warns in `check`/`stop-hook` and fails
    `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set.
-8. `gherkin-guard` warns in `check`/`stop-hook` and fails
+9. `gherkin-guard` warns in `check`/`stop-hook` and fails
    `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_NO_FEATURE=1` is set, and
    skips silently when the repo has no `.feature` files anywhere.
-9. Runner imports nothing outside stdlib/runtime.
+10. Runner imports nothing outside stdlib/runtime.
 
 Layer 2 (only if wired):
 
-10. `AGENTS.md` and `CLAUDE.md` include the same full behavior contract text.
-11. Commit/push ownership and task-sizing rules are present as instructions;
+11. `AGENTS.md` and `CLAUDE.md` include the same full behavior contract text.
+12. Commit/push ownership and task-sizing rules are present as instructions;
     Gherkin-first and arch-config review are present as instructions **and**
     enforced by `gherkin-guard`/`arch-config-guard`.

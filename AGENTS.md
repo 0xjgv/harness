@@ -126,6 +126,28 @@ templates copied inside it as subprojects (`cp -r python/ api`), not edited stan
   `HARNESS_ALLOW_ARCH_CONFIG=1` / `HARNESS_ALLOW_NO_FEATURE=1` is set after
   review. Full design: `skills/harness/reference/behavior-contract.md`.
 
+**Brownfield adoption: the harness gates the change, not the codebase.** Findings with
+no natural count (lint, format, type errors, and which tests to run) are diff-scoped:
+local stages (`check`, `pre-commit`, `post-edit`) scope to the uncommitted set, anything
+with a resolved base ref (`--base=<ref>`, `HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`) to
+`git diff --name-only <base>...HEAD`; an empty scope warns and skips, never widens;
+`test` warns once per changed source file with no mapped test; `ci`, `pre-push`, and
+`--all` run the whole tree. Findings with a natural count get a floor in
+`.harness-baseline` that starts where the repo already is — seven families under fixed
+key names: `complexity.max_violations`, `duplication.max_blocks`,
+`crap.max_violations`, `arch.max_violations`, `mutation.min`, `coverage.min`,
+`deadcode.max_findings`, `suppressions.*` — written only by
+`suppressions --update-baseline` (all-or-nothing; drops an unmeasurable key with a
+warning; `mutation.min` only under `--with-mutation`), report-only while a key is
+missing, and raised only via the `ratchet` skill. `mutation` is advisory in `ci` after
+coverage and hard-fails only standalone with `--enforce`. Arch is adopted by deriving a
+contract from the real package tree and baselining its violations, never by deleting
+the config. `python/harness.py` is the reference implementation (it also has
+`--whole-file`, line- to file-level, which stays Python-only); `bun`, `go`, and `rust`
+gain the same flags and floors as each language's unit lands. A scoped gate that widens
+to the whole tree on an empty scope is a defect, not a stricter variant. Audit
+procedure: `skills/harness/reference/adoption-checklist.md`.
+
 **`AGENTS.md`/`CLAUDE.md` are byte-identical within each template**, enforced by that
 template's own `agents-md-drift` harness command and fixed by `sync-agents-md`
 (`CLAUDE.md` is the source; `AGENTS.md` is derived). Claude Code reads `CLAUDE.md`,
