@@ -52,7 +52,8 @@ paraphrase (it drifts). Two sections:
   + `<base>...HEAD`, base from `--base=<ref>`/`HARNESS_ARCH_BASE`/
   `GITHUB_BASE_REF`/fallback refs). An empty change set warns and skips instead
   of widening; a changed source no test imports warns once and never fails.
-  `--all`, `ci` (through coverage), and `pre-push` run the whole suite. `check` also warns on
+  `--all` and `ci` (through coverage) run the whole suite; `pre-push` has no
+  test gate, so `--all` is the local way to run everything. `check` also warns on
   missing Stop hook wiring and arch config changes. Requires `uvx`
   on PATH for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
   length≤100).

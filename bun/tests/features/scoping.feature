@@ -22,11 +22,17 @@ Feature: The test gate scopes to the change set
     And the output contains "Tests (changed)"
     And the output contains "1 passed"
 
+  Scenario: An unresolvable --base fails instead of narrowing the scope
+    Given a committed project with one source edited
+    When I run "harness test --base=nope/typo"
+    Then the exit code is 1
+    And the output contains "does not resolve"
+
   Scenario: A source no test reaches warns without failing
     Given a committed project with an untested source added
     When I run "harness test"
     Then the exit code is 0
-    And the output contains "no test imports src/orphan.ts"
+    And the output contains "no test reaches src/orphan.ts"
 
   Scenario: --all runs the whole suite
     Given a committed project with a test for each source

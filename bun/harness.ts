@@ -879,7 +879,18 @@ const RELATIVE_IMPORT_RE = /(?:from|import)\s*\(?\s*['"](\.[^'"]*)['"]/g;
  * run, where the working tree is clean, still sees the branch's own commits.
  */
 async function changedScopeFiles(): Promise<string[]> {
-  return (await changedPathsForGuard()).filter(isProjectTsFile);
+  const paths = (await changedPathsForGuard()).filter(isProjectTsFile);
+  // A file deleted in the working tree still shows up in `<base>...HEAD`; it has
+  // nothing left to test, and passing it on would warn about a file that is gone.
+  const existing: string[] = [];
+  for (const path of paths) {
+    if (await pathExists(path)) existing.push(path);
+  }
+  return existing;
+}
+
+async function refResolves(ref: string): Promise<boolean> {
+  return (await gitLines(['rev-parse', '--verify', ref])).length > 0;
 }
 
 /** Every project .ts file (src/**, harness.ts, tests/**), relative to `base`. */
@@ -989,12 +1000,13 @@ async function supportsChangedFlag(): Promise<boolean> {
 /**
  * Tests scoped to the change set — the ramp that keeps `check` proportional to the edit.
  *
- * `--all` runs the whole suite, and so do `ci` (through coverage) and `pre-push`, which
- * never call this. An empty change set warns and skips: a scoped gate never widens to the
- * whole tree. A changed source no test reaches warns once and never fails; the tests that
- * do reach the change still run. `bun test --changed[=<base>]` covers the same union of
- * working tree and base diff over bun's own import graph, so it is preferred where the
- * runtime advertises it; the mapped file list is the fallback for builds without it.
+ * `--all` runs the whole suite, and so does `ci` through coverage (`pre-push` has no test
+ * gate at all). An empty change set warns and skips: a scoped gate never widens to the
+ * whole tree. `bun test --changed[=<base>]` covers the same union of working tree and base
+ * diff over bun's own resolver, so it selects the tests wherever the runtime advertises it;
+ * the mapped file list is the fallback for builds without it. The import map only decides
+ * the per-file warnings there — it reads relative specifiers, so a path alias resolves to
+ * nothing, which must never be the reason a test does not run.
  */
 async function runTests(opts: { noExit?: boolean } = {}): Promise<RunResult> {
   if (!(await hasTests())) {
@@ -1004,26 +1016,30 @@ async function runTests(opts: { noExit?: boolean } = {}): Promise<RunResult> {
   const runOpts = { extract: extractTestSummary, noExit: opts.noExit };
   if (ALL_FILES) return await run('Tests', ['bun', 'test'], runOpts);
 
+  if (BASE_OVERRIDE !== '' && !(await refResolves(BASE_OVERRIDE))) {
+    console.log(`  ${RED}✗${RESET} Tests: --base=${BASE_OVERRIDE} does not resolve`);
+    if (opts.noExit !== true) process.exit(1);
+    return { ok: false, output: '' };
+  }
   const changed = await changedScopeFiles();
   if (changed.length === 0) {
     warn('Tests: no changed TypeScript files; skipped (--all runs the whole suite)');
     return { ok: true, output: '' };
   }
   const { tests, unmapped } = await mapChangedToTests(changed);
-  for (const path of unmapped) warn(`Tests: no test imports ${path}; add one`);
-  if (tests.length === 0) {
-    warn('Tests: no test covers the change; skipped (--all runs the whole suite)');
-    return { ok: true, output: '' };
+  for (const path of unmapped) {
+    warn(`Tests: no test reaches ${path} through relative imports; add one`);
   }
 
   const cmd = ['bun', 'test', '--pass-with-no-tests'];
   if (await supportsChangedFlag()) {
     const [base] = await diffBases();
-    const resolved =
-      base !== undefined && (await gitLines(['rev-parse', '--verify', base])).length > 0;
-    cmd.push(resolved ? `--changed=${base}` : '--changed');
-  } else {
+    cmd.push(base !== undefined && (await refResolves(base)) ? `--changed=${base}` : '--changed');
+  } else if (tests.length > 0) {
     cmd.push(...tests);
+  } else {
+    warn('Tests: no test covers the change; skipped (--all runs the whole suite)');
+    return { ok: true, output: '' };
   }
   return await run('Tests (changed)', cmd, runOpts);
 }
