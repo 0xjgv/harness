@@ -1129,26 +1129,28 @@ fn parse_orphan_count(stdout: &str) -> Option<u32> {
 /// Architectural violations as one number: `orphan_count + cycle_flag`.
 ///
 /// cargo-modules 0.26.0 exposes no JSON and no aggregate count — `dependencies
-/// --acyclic` is pass/fail and `orphans` only adds `--deny` — so the count is
-/// *defined* here, and this definition is what the `arch.max_violations` floor
-/// ratchets:
+/// --acyclic` is pass/fail and `orphans` reports one block per file — so the
+/// count is *defined* here, and this definition is what the `arch.max_violations`
+/// floor ratchets:
 ///
 /// * `cycle_flag` is 1 when `ARCH_CYCLES_CMD` exits non-zero. A cycle exists but
 ///   the tool never says how many, so the whole condition counts once.
-/// * `orphan_count` is the `N orphans found:` header. When that line is missing
-///   and the command still failed, the run counts as 1 rather than 0: an output
-///   format change then degrades to "something is wrong" instead of a silently
-///   green gate.
+/// * `orphan_count` is the `N orphans found:` header, via `parse_orphan_count`.
+///   A run that printed no header at all measured nothing; `ArchScan::analyzed`
+///   catches that before this arithmetic is ever consulted.
+///
+/// Both conditions share one budget: a floor recorded from N orphans also
+/// tolerates a cycle introduced later. That follows from there being one
+/// `arch.max_violations` key, and is stated in CLAUDE.md so it is a known
+/// trade-off rather than a surprise.
 ///
 /// The dot graph is deliberately not parsed — it renders the module tree, not the
 /// violations, and reconstructing cycles from it would put a graph algorithm in a
 /// task runner that must stay dependency-free.
 ///
 /// Pure so the arithmetic is unit-tested without invoking cargo.
-fn arch_violation_count(cycles_ok: bool, orphans_ok: bool, orphans_stdout: &str) -> u32 {
-    let cycle_flag = u32::from(!cycles_ok);
-    let orphans = parse_orphan_count(orphans_stdout).unwrap_or_else(|| u32::from(!orphans_ok));
-    cycle_flag + orphans
+fn arch_violation_count(cycles_ok: bool, orphan_count: u32) -> u32 {
+    u32::from(!cycles_ok) + orphan_count
 }
 
 /// Both cargo-modules passes, reduced to what the gate and the baseline need.
@@ -1169,9 +1171,10 @@ struct ArchScan {
 fn arch_scan() -> ArchScan {
     let cycles = run_capture(&Gate::new("Arch: no module cycles", ARCH_CYCLES_CMD));
     let orphans = run_capture(&Gate::new("Arch: no orphan files", ARCH_ORPHANS_CMD));
+    let orphan_count = parse_orphan_count(&orphans.output);
     ArchScan {
-        count: arch_violation_count(cycles.ok, orphans.ok, &orphans.output),
-        analyzed: parse_orphan_count(&orphans.output).is_some(),
+        count: arch_violation_count(cycles.ok, orphan_count.unwrap_or(0)),
+        analyzed: orphan_count.is_some(),
         output: [&cycles, &orphans]
             .into_iter()
             .filter(|pass| !pass.ok)
@@ -2282,7 +2285,7 @@ fn cmd_ci() {
     // acceptance, and arch all invoke cargo, which takes an exclusive lock on
     // target/ per invocation, so they run sequentially below instead of
     // queuing behind each other under the illusion of concurrency — see
-    // run_gates_sequential.
+    // run_gates_sequential, and `arch_check` right after it.
     let parallel_ok = run_gates_parallel(&[format_check_gate(), complexity_gate()]);
 
     let mut cargo_gates = vec![lint_gate()];
@@ -2334,7 +2337,8 @@ fn cmd_ci() {
 ///
 /// Format check is the only gate here that doesn't shell out to cargo, so it
 /// runs on its own; clippy, acceptance, and arch all take cargo's exclusive
-/// target/ lock and run sequentially instead — see `run_gates_sequential`.
+/// target/ lock and run one at a time instead — see `run_gates_sequential`, and
+/// `arch_check`, which runs right after it for the reason noted there.
 fn cmd_pre_push() {
     println!("\n{BLUE}[pre-push]{RESET}\n");
     let arch_config_ok = check_arch_config_guard(false, false, true);
@@ -2344,9 +2348,6 @@ fn cmd_pre_push() {
     let mut cargo_gates = vec![lint_gate()];
     cargo_gates.extend(acceptance_gates_or_warn());
     let cargo_ok = run_gates_sequential(&cargo_gates);
-    // Arch runs after the batch, not inside it: it is two cargo-modules passes
-    // summed into one count and compared to a floor, which no single-command
-    // Gate can express. It still takes cargo's build lock, so it stays here.
     let arch_ok = arch_check(true);
 
     if !format_ok || !cargo_ok || !arch_ok || !arch_config_ok || !gherkin_ok {
@@ -2714,20 +2715,12 @@ mod tests {
     #[test]
     fn arch_count_is_orphans_plus_one_per_cycle_condition() {
         // Clean tree.
-        assert_eq!(arch_violation_count(true, true, "No orphans found."), 0);
+        assert_eq!(arch_violation_count(true, 0), 0);
         // A cycle counts once: cargo-modules never says how many there are.
-        assert_eq!(arch_violation_count(false, true, "No orphans found."), 1);
-        // Orphans come from the header, and both conditions add up.
-        assert_eq!(arch_violation_count(true, false, ORPHANS_HEADER), 2);
-        assert_eq!(arch_violation_count(false, false, ORPHANS_HEADER), 3);
-    }
-
-    #[test]
-    fn arch_count_falls_back_to_one_when_the_orphan_output_is_unparseable() {
-        // A tool failure that prints no count must not read as zero violations.
-        assert_eq!(arch_violation_count(true, false, "Error: no projects"), 1);
-        // ...but an unparseable success is still zero — nothing was reported.
-        assert_eq!(arch_violation_count(true, true, "Error: no projects"), 0);
+        assert_eq!(arch_violation_count(false, 0), 1);
+        // Both conditions share the one budget.
+        assert_eq!(arch_violation_count(true, 2), 2);
+        assert_eq!(arch_violation_count(false, 2), 3);
     }
 
     #[test]
