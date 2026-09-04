@@ -80,8 +80,22 @@ Codex Stop command:
 - Runner: `~/Code/harness-templates/rust/harness.rs` (entry: `src/main.rs`)
 - Cargo alias: `~/Code/harness-templates/rust/.cargo/`
 - Tooling: rustfmt, clippy (pedantic + `unsafe_code = "forbid"`),
-  `cargo test`, cargo-audit, lizard (complexity, via `uvx`),
+  `cargo test`, cargo-audit (audit), lizard (complexity, via `uvx`),
   cargo-llvm-cov (coverage), cucumber (acceptance), cargo-mutants
   (mutation), proptest (property-based tests, see `mod property_tests`
   in `harness.rs`), cargo-modules (arch)
 - Protected arch config: `arch.toml` (`cargo harness arch-config-guard`)
+- Pins: `rust-toolchain.toml` pins rustc (`channel = "1.98.0"` plus the
+  `clippy` / `rustfmt` / `llvm-tools-preview` components); the cargo
+  subcommands are pinned as `CARGO_*_VERSION` constants in `harness.rs` —
+  `cargo-audit 0.22.1`, `cargo-llvm-cov 0.8.7`, `cargo-modules 0.26.0`,
+  `cargo-mutants 27.0.0` (lizard is pinned separately, as the literal
+  `lizard@1.22.2` in the complexity and CRAP commands). CI installs exactly those
+  (`dtolnay/rust-toolchain@1.98.0`, `taiki-e/install-action@v2` with
+  `tool: cargo-audit@0.22.1,cargo-llvm-cov@0.8.7,cargo-modules@0.26.0,cargo-mutants@27.0.0`).
+  The runner reads `cargo <sub> --version` and prints a `⚠` when the local
+  install differs — it never fails on a version, because an adopter runs
+  whatever they already have; a *missing* tool keeps its existing `⊘` skip
+  (or, for `audit` under `ci`, its hard failure). When porting into an
+  existing repo, bump these constants to the versions that repo already
+  uses rather than forcing an install.

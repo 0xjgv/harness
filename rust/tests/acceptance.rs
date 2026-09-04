@@ -108,6 +108,28 @@ fn artifact_missing(world: &mut CrateWorld) {
     world.make_tmp();
 }
 
+/// Put a fake `cargo` first on PATH so the version the runner sees is controlled.
+/// `cargo <sub> --version` prints the given version; every other invocation is a
+/// silent success, which is enough for the mutation gate to run to completion.
+#[given(expr = "a cargo shim reporting cargo-mutants version {string}")]
+fn cargo_shim(world: &mut CrateWorld, version: String) {
+    let dir = tempdir();
+    world.tmp = Some(dir.clone());
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).expect("create shim bin/");
+    let shim = bin.join("cargo");
+    fs::write(
+        &shim,
+        format!("#!/bin/sh\nif [ \"$2\" = \"--version\" ]; then\n  echo \"cargo-$1 {version}\"\nfi\nexit 0\n"),
+    )
+    .expect("write cargo shim");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod cargo shim");
+    }
+}
+
 #[when(expr = "I run {string}")]
 fn i_run(world: &mut CrateWorld, cmd: String) {
     // Drop leading "harness" — the rest is forwarded to the binary.
@@ -116,11 +138,14 @@ fn i_run(world: &mut CrateWorld, cmd: String) {
         argv.remove(0);
     }
     let tmp = world.tmp.as_ref().expect("tmp dir not initialised");
-    let output = Command::new(HARNESS_BIN)
-        .args(&argv)
-        .current_dir(tmp)
-        .output()
-        .expect("spawn harness binary");
+    let mut command = Command::new(HARNESS_BIN);
+    command.args(&argv).current_dir(tmp);
+    let shim = tmp.join("bin");
+    if shim.is_dir() {
+        let path = std::env::var("PATH").unwrap_or_default();
+        command.env("PATH", format!("{}:{path}", shim.display()));
+    }
+    let output = command.output().expect("spawn harness binary");
     world.exit_code = output.status.code();
     world.output = format!(
         "{}{}",

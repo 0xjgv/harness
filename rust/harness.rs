@@ -35,6 +35,14 @@ const ARCH_CONFIG: &str = "arch.toml";
 const ARCH_CONFIG_ALLOW_ENV: &str = "HARNESS_ALLOW_ARCH_CONFIG";
 const GHERKIN_ALLOW_ENV: &str = "HARNESS_ALLOW_NO_FEATURE";
 
+// Pinned cargo subcommand versions. CI installs exactly these
+// (.github/workflows/ci.yml, taiki-e/install-action); a local install that
+// differs only warns, so an adopter is never blocked by a tool version.
+const CARGO_AUDIT_VERSION: &str = "0.22.1";
+const CARGO_LLVM_COV_VERSION: &str = "0.8.7";
+const CARGO_MODULES_VERSION: &str = "0.26.0";
+const CARGO_MUTANTS_VERSION: &str = "27.0.0";
+
 // ── Runner ──────────────────────────────────────────────────────────
 
 struct RunResult {
@@ -716,14 +724,7 @@ fn cmd_audit() {
 /// non-blocking skip. Strict callers run with `no_exit` so a vuln folds into the batch
 /// result instead of short-circuiting the rest of ci.
 fn cmd_audit_inner(strict: bool) -> bool {
-    let installed = Command::new("cargo")
-        .args(["audit", "--version"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .status()
-        .is_ok_and(|s| s.success());
-
-    if installed {
+    if tool_installed("audit", CARGO_AUDIT_VERSION) {
         let result = run(
             "Dep audit",
             &["cargo", "audit"],
@@ -827,7 +828,7 @@ fn has_feature_files(dir: &Path) -> bool {
 fn cmd_coverage() {
     let min_pct = coverage_min_default();
 
-    if !tool_installed("llvm-cov") {
+    if !tool_installed("llvm-cov", CARGO_LLVM_COV_VERSION) {
         println!("  {DIM}\u{2298} Coverage skipped (install: cargo install cargo-llvm-cov){RESET}");
         return;
     }
@@ -903,7 +904,7 @@ fn llvm_tools_env() -> Vec<(String, String)> {
 /// catches them. It is slow and noisy by nature, so it stays an explicit
 /// opt-in rather than a blocking gate. Absent → warn + skip.
 fn cmd_mutation() {
-    if !tool_installed("mutants") {
+    if !tool_installed("mutants", CARGO_MUTANTS_VERSION) {
         println!("  {DIM}\u{2298} Mutation skipped (install: cargo install cargo-mutants){RESET}");
         return;
     }
@@ -926,7 +927,7 @@ fn arch_gates_or_warn() -> Vec<Gate> {
         println!("  {GREEN}\u{26a0}{RESET} Arch: no arch.toml \u{2014} skipped");
         return Vec::new();
     }
-    if !tool_installed("modules") {
+    if !tool_installed("modules", CARGO_MODULES_VERSION) {
         println!("  {DIM}\u{2298} Arch skipped (install: cargo install cargo-modules){RESET}");
         return Vec::new();
     }
@@ -1271,7 +1272,7 @@ fn cmd_crap() {
     let max_crap: f64 = arg_value("--max").and_then(|v| v.parse::<f64>().ok()).unwrap_or(30.0);
     let enforce = arg_flag("--enforce");
 
-    if !tool_installed("llvm-cov") {
+    if !tool_installed("llvm-cov", CARGO_LLVM_COV_VERSION) {
         println!("  {DIM}\u{2298} CRAP skipped (install: cargo install cargo-llvm-cov){RESET}");
         return;
     }
@@ -1509,15 +1510,56 @@ fn parse_lizard_csv_row(row: &str) -> Option<(u32, String, u32, u32, String)> {
     Some((ccn, name, start, end, path))
 }
 
-/// True when `cargo <subcommand> --version` succeeds (the subcommand is installed).
-fn tool_installed(subcommand: &str) -> bool {
-    Command::new("cargo")
+/// Version reported by `cargo <subcommand> --version`, or `None` when the
+/// subcommand is not installed. `Some("")` means installed but unparseable.
+fn tool_version(subcommand: &str) -> Option<String> {
+    let out = Command::new("cargo")
         .args([subcommand, "--version"])
         .current_dir(root())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(parse_tool_version(
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    ))
+}
+
+/// Every cargo tool prints `<name> <version> [build metadata]` on its first line, so
+/// the version is the first token starting with a digit (`cargo-audit-audit 0.22.1`
+/// -> `0.22.1`); trailing build metadata is ignored. Falls back to stderr for tools
+/// that report there, and to `""` when nothing is parseable — an unrecognised format
+/// stays silent rather than warning about a version it did not read.
+fn parse_tool_version(stdout: &str, stderr: &str) -> String {
+    let text = if stdout.trim().is_empty() { stderr } else { stdout };
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| {
+            line.split_whitespace()
+                .map(|token| token.trim_start_matches('v'))
+                .find(|token| token.starts_with(|c: char| c.is_ascii_digit()))
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// True when `cargo <subcommand> --version` succeeds (the subcommand is installed).
+/// A version other than `pinned` warns and never fails: adopters run whatever they
+/// have, while CI installs the pin, so a drifting local tool stays visible but
+/// non-blocking. A missing tool keeps its existing skip/fail handling at the caller.
+fn tool_installed(subcommand: &str, pinned: &str) -> bool {
+    let Some(found) = tool_version(subcommand) else { return false };
+    if !found.is_empty() && found != pinned {
+        println!(
+            "  {GREEN}\u{26a0}{RESET} cargo-{subcommand} {found} != pinned {pinned} \
+             (install: cargo install cargo-{subcommand} --version {pinned})"
+        );
+    }
+    true
 }
 
 /// Return the value of a `--name=value` CLI argument, if present.
@@ -1738,7 +1780,9 @@ fn cmd_ci() {
     // Only run it when llvm-cov is absent, so ci still exercises the suite
     // either way (cmd_coverage's own run already surfaces test failures —
     // see its `run()` calls, which are not `no_exit`).
-    let tests_ok = if tool_installed("llvm-cov") {
+    // `tool_version` rather than `tool_installed`: this is a routing decision, and
+    // cmd_coverage/cmd_crap below already report a version drift for llvm-cov.
+    let tests_ok = if tool_version("llvm-cov").is_some() {
         true
     } else {
         run("Tests", &["cargo", "test"], Some(&RunOpts { no_exit: true, ..RunOpts::default() })).ok
@@ -2045,6 +2089,33 @@ mod tests {
     #[test]
     fn parse_lizard_csv_row_skips_malformed_rows() {
         assert_eq!(parse_lizard_csv_row("not,csv"), None);
+    }
+
+    #[test]
+    fn parse_tool_version_takes_first_numeric_token_of_first_line() {
+        assert_eq!(parse_tool_version("cargo-audit-audit 0.22.1\n", ""), "0.22.1");
+        assert_eq!(parse_tool_version("cargo-modules 0.26.0\n", ""), "0.26.0");
+        assert_eq!(parse_tool_version("cargo-mutants 27.0.0\nextra\n", ""), "27.0.0");
+    }
+
+    #[test]
+    fn parse_tool_version_ignores_build_metadata_and_v_prefix() {
+        assert_eq!(parse_tool_version("cargo-foo v1.2.3 (abc1234 2026-01-01)\n", ""), "1.2.3");
+    }
+
+    #[test]
+    fn parse_tool_version_empty_when_no_numeric_token() {
+        assert_eq!(parse_tool_version("cargo-foo unknown\n", ""), "");
+    }
+
+    #[test]
+    fn parse_tool_version_falls_back_to_stderr() {
+        assert_eq!(parse_tool_version("  \n", "cargo-llvm-cov 0.8.7\n"), "0.8.7");
+    }
+
+    #[test]
+    fn parse_tool_version_empty_when_unparseable() {
+        assert_eq!(parse_tool_version("", ""), "");
     }
 
     #[test]

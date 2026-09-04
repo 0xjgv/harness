@@ -16,11 +16,15 @@ subcommands. Each gate detects whether its tool is installed and warns + skips
 when it is absent, so the template works out of the box and degrades cleanly:
 
 ```bash
-cargo install cargo-llvm-cov         # coverage + CRAP (LCOV producer)
-cargo install cargo-mutants          # mutation (advisory)
-cargo install cargo-modules          # arch
-cargo install cargo-audit            # dep audit
+cargo install cargo-llvm-cov --version 0.8.7   # coverage + CRAP (LCOV producer)
+cargo install cargo-mutants  --version 27.0.0  # mutation (advisory)
+cargo install cargo-modules  --version 0.26.0  # arch
+cargo install cargo-audit    --version 0.22.1  # dep audit
 ```
+
+These are the versions CI installs and the ones pinned as `CARGO_*_VERSION`
+constants in `harness.rs`; another version only prints a `⚠` and never changes
+an exit code. `rust-toolchain.toml` pins rustc the same way for rustup users.
 
 The complexity and CRAP gates additionally require `uvx` on `PATH` — they shell
 out to `uvx lizard@1.22.2` for the cyclomatic-complexity scan. Install via

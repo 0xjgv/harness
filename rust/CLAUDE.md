@@ -9,18 +9,19 @@
 - Complexity: `cargo harness complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over src + tests
 - Deadcode: no separate target — rust's `dead_code` lint is on by default and `ci`'s strict clippy (`-D warnings`) denies unused functions, fields, and variants; unused dependencies surface via `cargo`'s own warnings (or `cargo-machete`).
 - CRAP (advisory): `cargo harness crap --max=30` — complexity × coverage gate (joins lizard --csv with `target/llvm-cov/lcov.info`). Add `--enforce` to exit 1 on offenders (default exits 0 with warning).
-- Audit: `cargo harness audit` — audit dependencies for known vulnerabilities (via cargo-audit)
+- Audit: `cargo harness audit` — audit dependencies for known vulnerabilities (via cargo-audit@0.22.1)
 - Acceptance: `cargo harness acceptance` — run cucumber against `tests/features/`. Not a separate gate in `check`: the `acceptance` test is a Cargo `[[test]]` target (`tests/acceptance.rs`, `harness = false`), so plain `cargo test` already executes it as part of `check`'s "Tests" step — unlike python/bun/go, whose acceptance runner is a standalone script their default test command does not invoke automatically, so those templates need `check` to call it separately.
-- Coverage: `cargo harness coverage --min=0` — cargo-llvm-cov line coverage with threshold; default comes from `.harness-baseline` `coverage.min`; a non-integer `--min=` value prints an error and exits 1
-- Mutation (advisory): `cargo harness mutation` — cargo-mutants kill-rate on the crate
+- Coverage: `cargo harness coverage --min=0` — cargo-llvm-cov@0.8.7 line coverage with threshold; default comes from `.harness-baseline` `coverage.min`; a non-integer `--min=` value prints an error and exits 1
+- Mutation (advisory): `cargo harness mutation` — cargo-mutants@27.0.0 kill-rate on the crate
 - Suppressions: `cargo harness suppressions` — full suppression breakdown; `--update-baseline` requires human sign-off and updates `.harness-baseline`
-- Arch: `cargo harness arch` — cargo-modules checks against `arch.toml`
+- Arch: `cargo harness arch` — cargo-modules@0.26.0 checks against `arch.toml`
 - Arch config guard: `cargo harness arch-config-guard` — blocks unreviewed `arch.toml` changes in pre-commit/pre-push/CI; use `HARNESS_ALLOW_ARCH_CONFIG=1` after review. Base ref for the diff: `HARNESS_ARCH_BASE` env, else `GITHUB_BASE_REF` (only set on `pull_request` events), else the first of `origin/HEAD`/`origin/main`/`main` that resolves — so a direct push to `main` (no PR event) still gets checked; silently skipped if none of those resolve.
 - Gherkin guard: `cargo harness gherkin-guard` — mechanizes the Gherkin-first rule below. Blocks when a changed "production source" file (a `.rs` file under `src/`, excluding `tests/` and excluding `harness.rs` itself) has no matching changed `.feature` file, in pre-commit (staged)/pre-push (incl. pre-push stdin refs)/CI; warns only in `check`/`stop-hook`. Use `HARNESS_ALLOW_NO_FEATURE=1` after review to override. Skips entirely (silent pass) when the template has no `.feature` files anywhere yet — retrofitting into a repo without an acceptance suite must never block.
 - Agents drift: `cargo harness agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `cargo harness sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
 - Setup: `cargo harness setup-hooks` installs git pre-commit + pre-push hooks (path resolved via `git rev-parse`, worktree-safe) and verifies the Claude/Codex Stop wiring (the runner is std-only — it checks rather than rewrites JSON that carries other hooks; copy the template's `.claude`/`.codex` if it warns)
 - Stop hook: auto-formats/fixes changed files, then runs complexity (`stop-hook`). On failure it exits **2** and writes a short `Stop hook failed: <gate names>` summary to stderr — Claude Code treats exit 2 as blocking and feeds stderr back to the model (any other exit code is silently swallowed); Codex's wrapper already turns any non-zero exit into a block.
+- Pinned tooling: `rust-toolchain.toml` pins rustc (rustup only); the cargo tool versions above are `CARGO_*_VERSION` constants in `harness.rs` and are exactly what CI installs (`taiki-e/install-action`). A local install on another version prints a `⚠` and changes no exit code. A *missing* tool keeps its existing handling: `⊘` skip for coverage/CRAP/mutation/arch and for `audit` outside `ci`, a hard failure for `audit` inside `ci`.
 
 ## Definition of done
 
