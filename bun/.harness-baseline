@@ -1,6 +1,8 @@
+complexity.max_violations 0
+coverage.min 2
+crap.max_violations 0
 suppressions.biome-ignore 2
 suppressions.eslint-disable 3
 suppressions.ts-expect-error 1
 suppressions.ts-ignore 3
 suppressions.ts-nocheck 1
-coverage.min 0

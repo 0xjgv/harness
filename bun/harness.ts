@@ -24,6 +24,19 @@ const TEST_DIR = 'tests';
 const LIZARD = 'lizard@1.22.2';
 const KNIP = 'knip@5.88.1';
 const COMPLEXITY_MAX_ARGS = 8;
+const COMPLEXITY_MAX_CCN = 15;
+const CRAP_MAX_DEFAULT = 30;
+// `-i N` high enough that lizard never exits non-zero on warnings: used wherever
+// lizard is a measuring tape (report-only complexity, CRAP scoring, baseline
+// measurement) rather than a gate.
+const REPORT_ONLY_LIMIT = 1_000_000;
+const COVERAGE_CMD = [
+  'bun',
+  'test',
+  '--coverage',
+  '--coverage-reporter=lcov',
+  '--coverage-dir=coverage',
+] as const;
 const ROOT = import.meta.dir;
 const BASELINE_FILE = '.harness-baseline';
 const SUPPRESSION_BASELINE_PREFIX = 'suppressions.';
@@ -285,6 +298,13 @@ const TS_DIRECTIVE_PATTERNS: { kind: string; pattern: RegExp }[] = [
 const ESLINT_PATTERN =
   /(?:\/\/|\/\*)\s*eslint-disable(?:-line|-next-line)?(?::\s*([^*\n]+?))?(?:\s*\*\/|\s*$)/;
 const BIOME_PATTERN = /\/\/\s*biome-ignore\s+([a-zA-Z0-9_/-]+)/;
+// Every kind the scanner can report — the baseline writer records each one, so a
+// kind that vanished from the tree ratchets to 0 instead of lingering at its old count.
+const SUPPRESSION_KINDS = [
+  ...TS_DIRECTIVE_PATTERNS.map((d) => d.kind),
+  'eslint-disable',
+  'biome-ignore',
+];
 
 export function parseLineForSuppressions(line: string): SuppressionMatch[] {
   const out: SuppressionMatch[] = [];
@@ -423,15 +443,83 @@ export async function coverageMinDefault(base = ROOT): Promise<number> {
   return baseline?.['coverage.min'] ?? 0;
 }
 
-async function writeBaseline(results: Record<string, string[][]>): Promise<void> {
-  const { writeFile } = await import('node:fs/promises');
-  const existing = (await readBaseline()) ?? {};
-  const counts = suppressionCounts(results);
-  const lines = Object.keys(counts)
+/**
+ * The committed floor for a ratcheted metric, or undefined when there is none.
+ *
+ * undefined means "never measured here" — no `.harness-baseline` at all, or a file
+ * that does not carry this key. Every gate reading a floor must then run
+ * report-only: retrofitting the harness into an existing repo has to be green on
+ * day one, and a floor of 0 inferred from a missing number is not a floor, it is
+ * a demand that the repo already be perfect.
+ */
+export async function baselineFloor(key: string, base = ROOT): Promise<number | undefined> {
+  const baseline = await readBaseline(base);
+  return baseline?.[key];
+}
+
+/**
+ * A metric's value, or the reason there isn't one. Three states, deliberately not
+ * collapsed into `number | undefined`:
+ *   - `value` — measured, including a legitimate 0.
+ *   - `unavailable` — the metric does not apply to this repo (no tests, no app
+ *     sources). The baseline key is dropped, and the gate goes report-only.
+ *   - `error` — the measuring tool ran and failed. `--update-baseline` aborts and
+ *     writes nothing: a floor recorded from a broken run is worse than no floor,
+ *     because every downstream gate trusts it.
+ */
+export type Measurement = { value: number } | { unavailable: string } | { error: string };
+
+/** One ratcheted `.harness-baseline` key and how `--update-baseline` measures it. */
+export interface RatchetedMetric {
+  key: string;
+  measure: () => Promise<Measurement>;
+}
+
+export type BaselineWrite =
+  | { ok: true; baseline: Record<string, number> }
+  | { ok: false; broken: [string, string][] };
+
+/**
+ * Merge measured floors over the existing baseline; unknown keys are preserved.
+ *
+ * Every key the harness measures is rewritten (so a metric that improved ratchets
+ * down); every key it does not recognise is carried through untouched
+ * (`mutation.min` is one — a mutation run costs minutes, never the automatic pass).
+ *
+ * A metric that does not apply here has its key *removed*, never carried forward:
+ * the shipped template's own numbers must not survive into an adopting repo's
+ * first baseline. A metric that could not be measured aborts the whole write and
+ * nothing is written — see `Measurement`.
+ */
+export async function writeBaseline(
+  results: Record<string, string[][]>,
+  measurements: Record<string, Measurement>,
+  base = ROOT,
+): Promise<BaselineWrite> {
+  const broken: [string, string][] = [];
+  for (const [key, measured] of Object.entries(measurements)) {
+    if ('error' in measured) broken.push([key, measured.error]);
+  }
+  if (broken.length > 0) return { ok: false, broken };
+
+  const baseline = (await readBaseline(base)) ?? {};
+  for (const kind of SUPPRESSION_KINDS) baseline[`${SUPPRESSION_BASELINE_PREFIX}${kind}`] = 0;
+  Object.assign(baseline, suppressionCounts(results));
+  for (const [key, measured] of Object.entries(measurements)) {
+    if ('value' in measured) {
+      baseline[key] = measured.value;
+    } else if ('unavailable' in measured && key in baseline) {
+      delete baseline[key];
+      warn(`${key}: dropped — ${measured.unavailable}`);
+    }
+  }
+
+  const lines = Object.keys(baseline)
     .sort()
-    .map((key) => `${key} ${counts[key]}`);
-  lines.push(`coverage.min ${existing['coverage.min'] ?? 0}`);
-  await writeFile(`${ROOT}/${BASELINE_FILE}`, `${lines.join('\n')}\n`);
+    .map((key) => `${key} ${baseline[key]}`);
+  const { writeFile } = await import('node:fs/promises');
+  await writeFile(`${base}/${BASELINE_FILE}`, `${lines.join('\n')}\n`);
+  return { ok: true, baseline };
 }
 
 function printSuppressionsBreakdown(results: Record<string, string[][]>): void {
@@ -512,9 +600,23 @@ async function checkSuppressionsBaseline(opts?: { noExit?: boolean }): Promise<b
 async function cmdSuppressions(): Promise<void> {
   const results = await scanSuppressions();
   if (process.argv.includes('--update-baseline')) {
-    await writeBaseline(results);
+    const written = await writeBaseline(results, await measureRatcheted());
+    if (!written.ok) {
+      console.log(`  ${RED}✗${RESET} ${BASELINE_FILE} not written — could not measure:`);
+      for (const [key, reason] of written.broken) console.log(`    ${key}: ${reason}`);
+      console.log(
+        '  ↳ fix: make the measurement pass, then rerun `bun harness.ts suppressions --update-baseline`',
+      );
+      process.exit(1);
+    }
     const total = Object.values(results).reduce((sum, arr) => sum + arr.length, 0);
-    console.log(`  ${GREEN}✓${RESET} ${BASELINE_FILE}: suppressions baseline set to ${total}`);
+    const recorded = [
+      `suppressions ${total}`,
+      ...RATCHETED_METRICS.filter(({ key }) => key in written.baseline).map(
+        ({ key }) => `${key} ${written.baseline[key]}`,
+      ),
+    ].join(', ');
+    console.log(`  ${GREEN}✓${RESET} ${BASELINE_FILE}: ${recorded}`);
     return;
   }
   printSuppressionsBreakdown(results);
@@ -629,31 +731,53 @@ async function cmdCoverage(): Promise<void> {
   // compute the line-coverage percentage ourselves, mirroring python's --min=N.
   const minPct = await coverageMinDefault();
 
-  await run(
-    'Coverage (run)',
-    ['bun', 'test', '--coverage', '--coverage-reporter=lcov', '--coverage-dir=coverage'],
-    { extract: extractTestSummary },
-  );
+  await run('Coverage (run)', [...COVERAGE_CMD], { extract: extractTestSummary });
 
-  const { readFile } = await import('node:fs/promises');
-  const lcov = await readFile(`${ROOT}/coverage/lcov.info`, 'utf8').catch(() => null);
+  const lcov = await readLcov();
   if (lcov == null) {
     console.log(`  ${RED}✗${RESET} Coverage: coverage/lcov.info not found`);
     process.exit(1);
   }
-  let found = 0;
-  let hit = 0;
-  for (const line of lcov.split('\n')) {
-    if (line.startsWith('LF:')) found += Number(line.slice(3));
-    else if (line.startsWith('LH:')) hit += Number(line.slice(3));
-  }
-  const pct = found === 0 ? 100 : (hit / found) * 100;
+  const pct = lcovLinePercent(lcov);
   if (pct >= minPct) {
     console.log(`  ${GREEN}✓${RESET} Coverage >= ${minPct}% ${DIM}(${pct.toFixed(1)}%)${RESET}`);
   } else {
     console.log(`  ${RED}✗${RESET} Coverage >= ${minPct}% ${DIM}(got ${pct.toFixed(1)}%)${RESET}`);
     process.exit(1);
   }
+}
+
+async function readLcov(): Promise<string | null> {
+  const { readFile } = await import('node:fs/promises');
+  return readFile(`${ROOT}/coverage/lcov.info`, 'utf8').catch(() => null);
+}
+
+/** Line coverage percent over every LCOV record; 100 when the report covers no lines. */
+function lcovLinePercent(lcov: string): number {
+  let found = 0;
+  let hit = 0;
+  for (const line of lcov.split('\n')) {
+    if (line.startsWith('LF:')) found += Number(line.slice(3));
+    else if (line.startsWith('LH:')) hit += Number(line.slice(3));
+  }
+  return found === 0 ? 100 : (hit / found) * 100;
+}
+
+async function measuredCoverage(): Promise<Measurement> {
+  if (!(await hasTests())) return { unavailable: `no ${TEST_DIR}/*.test.ts or *.spec.ts files` };
+  if (!(await artifactIsFresh('coverage/lcov.info', await qualityTargets()))) {
+    // The test run's exit code is load-bearing: a suite whose every module fails
+    // to import still produces a coverage number (a very low one), and recording
+    // that as the floor bakes a broken run into the ratchet.
+    const { exitCode } = await runCapture({
+      description: 'Coverage (run)',
+      cmd: [...COVERAGE_CMD],
+    });
+    if (exitCode !== 0) return { error: `the test run under coverage failed (exit ${exitCode})` };
+  }
+  const lcov = await readLcov();
+  if (lcov == null) return { error: 'coverage/lcov.info not found after coverage run' };
+  return { value: Math.floor(lcovLinePercent(lcov)) };
 }
 
 // Shared by acceptanceGatesOrWarn (warns when absent) and the gherkin-first
@@ -1074,38 +1198,35 @@ async function artifactIsFresh(path: string, roots: string[]): Promise<boolean> 
   return true;
 }
 
-async function cmdCrap(): Promise<void> {
-  // CRAP = ccn^2 * (1-cov)^3 + ccn per function. Advisory — lizard + LCOV.
-  if (!(await hasTests())) {
-    warn('CRAP: no tests; skipped');
-    return;
-  }
+interface CrapMeasurement {
+  offenders: CrapFn[];
+  /** Why scoring did not happen. With `code` set the tool failed; without it, a benign skip. */
+  problem?: string;
+  detail?: string;
+  code?: number;
+}
 
-  const maxArg = process.argv.find((a) => a.startsWith('--max='));
-  const maxCrap = maxArg ? Number(maxArg.split('=', 2)[1]) : 30;
-  const enforce = process.argv.includes('--enforce');
-
+/** Score every function's CRAP against `maxCrap`, refreshing coverage if stale. */
+async function crapMeasure(maxCrap: number): Promise<CrapMeasurement> {
   if (!(await artifactIsFresh('coverage/lcov.info', await qualityTargets()))) {
     await cmdCoverage();
   }
 
-  const { readFile } = await import('node:fs/promises');
-  const lcov = await readFile(`${ROOT}/coverage/lcov.info`, 'utf8').catch(() => null);
+  const lcov = await readLcov();
   if (lcov == null) {
-    warn('CRAP: coverage/lcov.info not found after coverage run');
-    return;
+    return { offenders: [], problem: 'coverage/lcov.info not found after coverage run' };
   }
 
   // Parse LCOV into { file: { lineNumber: hits } }.
   const covMap = parseLcov(lcov);
   const targets = await appTargets();
-  if (targets.length === 0) {
-    warn('CRAP: no app sources; skipped');
-    return;
-  }
+  if (targets.length === 0) return { offenders: [], problem: 'no app sources; skipped' };
 
   // lizard --csv columns: nloc,ccn,token,param,length,location,file,name,sig,start,end
-  const lz = Bun.spawn(['uvx', LIZARD, ...targets, '--csv'], {
+  // `-i` high: here lizard is a measuring tape, not a gate. At its default
+  // (`-i 0`, CCN 15) it exits 1 on any complex function, and CRAP would report
+  // "lizard failed to run" for exactly the repos that need scoring most.
+  const lz = Bun.spawn(['uvx', LIZARD, ...targets, '--csv', '-i', String(REPORT_ONLY_LIMIT)], {
     cwd: ROOT,
     stdout: 'pipe',
     stderr: 'pipe',
@@ -1118,13 +1239,12 @@ async function cmdCrap(): Promise<void> {
   if (lzCode !== 0) {
     // Lizard could not run (uvx missing, network failure, lizard crash).
     // Reporting "all functions below max" here would be a silent false-pass.
-    console.log(
-      `  ${crapOffenderGlyph(enforce)} CRAP: lizard failed to run (exit ${lzCode})` +
-        `${enforce ? '' : ' (advisory)'}`,
-    );
-    if (lzErr.trim()) console.log(lzErr.trim());
-    if (enforce) process.exit(lzCode);
-    return;
+    return {
+      offenders: [],
+      problem: `lizard failed to run (exit ${lzCode})`,
+      detail: lzErr.trim(),
+      code: lzCode,
+    };
   }
 
   // lizard --csv: column 1 is CCN; the quoted location field encodes
@@ -1160,16 +1280,51 @@ async function cmdCrap(): Promise<void> {
       offenders.push({ crap, ccn, cov, loc: location });
     }
   }
+  offenders.sort((a, b) => b.crap - a.crap);
+  return { offenders };
+}
 
+async function cmdCrap(): Promise<void> {
+  // CRAP = ccn^2 * (1-cov)^3 + ccn per function. Advisory — lizard + LCOV.
+  if (!(await hasTests())) {
+    warn('CRAP: no tests; skipped');
+    return;
+  }
+
+  const maxArg = process.argv.find((a) => a.startsWith('--max='));
+  const maxCrap = maxArg ? Number(maxArg.split('=', 2)[1]) : CRAP_MAX_DEFAULT;
+  const enforce = process.argv.includes('--enforce');
+  const suffix = enforce ? '' : ' (advisory)';
+
+  const measurement = await crapMeasure(maxCrap);
+  if (measurement.problem) {
+    if (measurement.code == null) {
+      warn(`CRAP: ${measurement.problem}`);
+      return;
+    }
+    console.log(`  ${crapOffenderGlyph(enforce)} CRAP: ${measurement.problem}${suffix}`);
+    if (measurement.detail) console.log(measurement.detail);
+    if (enforce) process.exit(measurement.code);
+    return;
+  }
+
+  const { offenders } = measurement;
   if (offenders.length === 0) {
     console.log(`  ${GREEN}✓${RESET} CRAP: all functions below ${maxCrap}`);
     return;
   }
-  offenders.sort((a, b) => b.crap - a.crap);
-  const suffix = enforce ? '' : ' (advisory)';
-  console.log(
-    `  ${crapOffenderGlyph(enforce)} CRAP: ${offenders.length} function(s) exceed ${maxCrap}${suffix}`,
-  );
+
+  // The baseline is a count floor: a repo adopting the harness starts wherever it
+  // already is, and that number may only come down. No floor recorded means no
+  // tolerance — safe here, unlike complexity, because CRAP is advisory: with no
+  // baseline it warns and still exits 0.
+  const floor = (await baselineFloor('crap.max_violations')) ?? 0;
+  const summary = `CRAP: ${offenders.length} function(s) exceed ${maxCrap} (baseline ${floor})`;
+  if (offenders.length <= floor) {
+    console.log(`  ${GREEN}✓${RESET} ${summary}`);
+    return;
+  }
+  console.log(`  ${crapOffenderGlyph(enforce)} ${summary}${suffix}`);
   for (const o of offenders.slice(0, 20)) {
     console.log(
       `    CRAP=${o.crap.toFixed(1).padStart(6)}  CCN=${String(o.ccn).padStart(3)}  ` +
@@ -1179,35 +1334,132 @@ async function cmdCrap(): Promise<void> {
   if (enforce) process.exit(1);
 }
 
-async function complexityGatesOrWarn(): Promise<Gate[]> {
+async function measuredCrapViolations(): Promise<Measurement> {
+  if (!(await hasTests())) return { unavailable: `no ${TEST_DIR}/*.test.ts or *.spec.ts files` };
+  const measurement = await crapMeasure(CRAP_MAX_DEFAULT);
+  if (measurement.problem) {
+    // `code` set is a tool failure; unset is a benign skip (no app sources).
+    if (measurement.code == null) return { unavailable: measurement.problem };
+    return { error: measurement.problem };
+  }
+  return { value: measurement.offenders.length };
+}
+
+/**
+ * lizard argv at this template's thresholds, tolerating `maxViolations` warnings.
+ * lizard's own `-i N` is the count ratchet: it exits 0 while the number of
+ * flagged functions stays at or below N, so lizard does the counting.
+ */
+function complexityArgv(targets: string[], maxViolations: number): string[] {
+  return [
+    'uvx',
+    LIZARD,
+    ...targets,
+    '-C',
+    String(COMPLEXITY_MAX_CCN),
+    '-a',
+    String(COMPLEXITY_MAX_ARGS),
+    '-L',
+    '100',
+    '-i',
+    String(maxViolations),
+  ];
+}
+
+/** Read the `Warning cnt` column out of lizard's final summary row. */
+export function lizardWarningCount(stdout: string): number | null {
+  const lines = stdout.split('\n');
+  const header = lines.findIndex((line) => line.startsWith('Total nloc'));
+  if (header < 0) return null;
+  for (const row of lines.slice(header + 1)) {
+    const fields = row.trim().split(/\s+/);
+    if (fields.length < 6 || /^-+$/.test(row.trim())) continue;
+    const count = Number(fields[5]);
+    return Number.isInteger(count) ? count : null;
+  }
+  return null;
+}
+
+async function measuredComplexityViolations(): Promise<Measurement> {
   const targets = await appTargets({ includeTests: true });
+  if (targets.length === 0) return { unavailable: 'no app sources' };
+  // `-i` high enough that lizard exits 0 and still prints the summary row.
+  const res = await runCapture({
+    description: 'Complexity',
+    cmd: complexityArgv(targets, REPORT_ONLY_LIMIT),
+  });
+  if (!res.ok) return { error: `lizard failed to run (exit ${res.exitCode})` };
+  const count = lizardWarningCount(res.output);
+  if (count == null) return { error: 'lizard printed no summary row to count warnings from' };
+  return { value: count };
+}
+
+/**
+ * The lizard gate at the committed floor, or report-only when there is none.
+ * With no floor recorded, `-i 0` would demand a legacy tree already be perfect —
+ * exactly the day-one red that stops the harness being adopted. Measure instead.
+ */
+export async function complexityGatesOrWarn(base = ROOT): Promise<Gate[]> {
+  const targets = await appTargets({ includeTests: true, base });
   if (targets.length === 0) {
     warn('Complexity: no app sources; skipped');
     return [];
   }
+  const floor = await baselineFloor('complexity.max_violations', base);
+  if (floor === undefined) {
+    const hint = 'run `bun harness.ts suppressions --update-baseline` to record a floor';
+    return [
+      {
+        description: `Complexity (lizard, report-only: no ${BASELINE_FILE} floor)`,
+        cmd: complexityArgv(targets, REPORT_ONLY_LIMIT),
+        extract: () => hint,
+        hint,
+      },
+    ];
+  }
   return [
     {
-      description: 'Complexity (lizard)',
-      cmd: [
-        'uvx',
-        LIZARD,
-        ...targets,
-        '-C',
-        '15',
-        '-a',
-        String(COMPLEXITY_MAX_ARGS),
-        '-L',
-        '100',
-        '-i',
-        '0',
-      ],
-      hint: 'extract helpers or flatten branches until CCN <= 15; do not raise the threshold',
+      description: floor ? `Complexity (lizard, baseline ${floor})` : 'Complexity (lizard)',
+      cmd: complexityArgv(targets, floor),
+      hint: `extract helpers or flatten branches until CCN <= ${COMPLEXITY_MAX_CCN}; do not raise the threshold`,
     },
   ];
 }
 
+/**
+ * Every key `--update-baseline` rewrites, in measurement order. Later gates
+ * append here; a key absent from this table is carried through the file
+ * untouched (see writeBaseline).
+ */
+export const RATCHETED_METRICS: RatchetedMetric[] = [
+  { key: 'coverage.min', measure: measuredCoverage },
+  { key: 'complexity.max_violations', measure: measuredComplexityViolations },
+  { key: 'crap.max_violations', measure: measuredCrapViolations },
+];
+
+/**
+ * Measure every ratcheted metric, stopping at the first one that failed.
+ * Sequential and short-circuiting on purpose: a broken tool usually breaks the
+ * metrics after it too (CRAP re-runs the coverage suite), so the first failure
+ * is the one worth reporting, and the later ones would only be noise.
+ */
+export async function measureRatcheted(
+  metrics: readonly RatchetedMetric[] = RATCHETED_METRICS,
+): Promise<Record<string, Measurement>> {
+  const measured: Record<string, Measurement> = {};
+  for (const { key, measure } of metrics) {
+    const measurement = await measure();
+    measured[key] = measurement;
+    if ('error' in measurement) break;
+  }
+  return measured;
+}
+
 async function cmdComplexity(): Promise<void> {
-  for (const gate of await complexityGatesOrWarn()) await run(gate.description, gate.cmd);
+  // `extract` carries the report-only gate's hint onto its passing line; the
+  // parallel batches get it for free through runCapture, this path does not.
+  for (const gate of await complexityGatesOrWarn())
+    await run(gate.description, gate.cmd, { extract: gate.extract });
 }
 
 function deadcodeGate(): Gate {
@@ -1607,8 +1859,11 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   coverage: [cmdCoverage, 'Tests with coverage threshold (--min=N)'],
   mutation: [cmdMutation, 'Mutation testing (Stryker, advisory)'],
   crap: [cmdCrap, 'CRAP complexity x coverage gate (advisory)'],
-  suppressions: [cmdSuppressions, 'Show or update suppression baseline'],
-  complexity: [cmdComplexity, 'Cyclomatic complexity gate (lizard, CCN 15, args 8)'],
+  suppressions: [cmdSuppressions, 'Show suppressions; --update-baseline re-measures every floor'],
+  complexity: [
+    cmdComplexity,
+    'Cyclomatic complexity gate (lizard, CCN 15, args 8; violations ratcheted by .harness-baseline)',
+  ],
   deadcode: [cmdDeadcode, 'Detect unused files/exports/deps (knip, via bunx)'],
   arch: [cmdArch, 'Architecture checks (dependency-cruiser)'],
   'arch-config-guard': [cmdArchConfigGuard, 'Block unreviewed arch config changes'],

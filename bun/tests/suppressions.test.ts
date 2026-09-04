@@ -1,14 +1,22 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  baselineFloor,
+  complexityGatesOrWarn,
   coverageMinDefault,
+  lizardWarningCount,
+  type Measurement,
+  measureRatcheted,
   parseLineForSuppressions,
   parseMinArg,
+  RATCHETED_METRICS,
+  type RatchetedMetric,
   readBaseline,
   scanSuppressionFindings,
   scanSuppressions,
+  writeBaseline,
 } from '../harness';
 
 describe('parseLineForSuppressions', () => {
@@ -145,6 +153,187 @@ describe('baseline helpers', () => {
     } finally {
       process.argv = originalArgv;
     }
+  });
+});
+
+describe('writeBaseline merge semantics', () => {
+  const roots: string[] = [];
+
+  afterAll(() => {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  });
+
+  // Every test must pass an explicit base: the default is the template root, and
+  // one forgotten argument would rewrite the shipped `.harness-baseline`.
+  function project(existing?: string): string {
+    const root = mkdtempSync(join(tmpdir(), 'bun-write-baseline-'));
+    roots.push(root);
+    if (existing !== undefined) writeFileSync(join(root, '.harness-baseline'), existing);
+    return root;
+  }
+
+  function read(root: string): string {
+    return readFileSync(join(root, '.harness-baseline'), 'utf8');
+  }
+
+  test('measured floors are written and unknown keys are preserved', async () => {
+    const root = project('mutation.min 63\ncoverage.min 40\n');
+    const written = await writeBaseline(
+      { 'ts-ignore': [[]] },
+      { 'coverage.min': { value: 72 }, 'complexity.max_violations': { value: 3 } },
+      root,
+    );
+
+    expect(written.ok).toBe(true);
+    expect(await readBaseline(root)).toMatchObject({
+      'mutation.min': 63,
+      'coverage.min': 72,
+      'complexity.max_violations': 3,
+      'suppressions.ts-ignore': 1,
+    });
+  });
+
+  test('a kind that vanished from the tree ratchets to 0, not to its old count', async () => {
+    const root = project('suppressions.ts-ignore 5\nsuppressions.biome-ignore 2\n');
+    await writeBaseline({ 'ts-ignore': [[]] }, {}, root);
+
+    expect(await readBaseline(root)).toMatchObject({
+      'suppressions.ts-ignore': 1,
+      'suppressions.biome-ignore': 0,
+    });
+  });
+
+  test('an unavailable metric drops its key instead of carrying the shipped number', async () => {
+    const root = project('coverage.min 100\n');
+    const written = await writeBaseline({}, { 'coverage.min': { unavailable: 'no tests' } }, root);
+
+    expect(written.ok).toBe(true);
+    expect(read(root)).not.toContain('coverage.min');
+  });
+
+  test('an errored metric writes nothing at all', async () => {
+    const root = project('coverage.min 40\n');
+    const written = await writeBaseline(
+      { 'ts-ignore': [[]] },
+      { 'coverage.min': { error: 'the test run under coverage failed (exit 1)' } },
+      root,
+    );
+
+    expect(written).toEqual({
+      ok: false,
+      broken: [['coverage.min', 'the test run under coverage failed (exit 1)']],
+    });
+    expect(read(root)).toBe('coverage.min 40\n');
+  });
+
+  test('lines are sorted so the file is diff-stable', async () => {
+    const root = project();
+    await writeBaseline(
+      {},
+      { 'crap.max_violations': { value: 2 }, 'coverage.min': { value: 1 } },
+      root,
+    );
+
+    const keys = read(root)
+      .trim()
+      .split('\n')
+      .map((line) => line.split(' ')[0]);
+    expect(keys).toEqual([...keys].sort());
+  });
+});
+
+describe('measureRatcheted', () => {
+  const metric = (key: string, measurement: Measurement): RatchetedMetric => ({
+    key,
+    measure: () => Promise.resolve(measurement),
+  });
+
+  test('stops at the first error so the later noise is not reported', async () => {
+    const measured = await measureRatcheted([
+      metric('coverage.min', { value: 70 }),
+      metric('complexity.max_violations', { error: 'lizard failed to run (exit 2)' }),
+      metric('crap.max_violations', { value: 0 }),
+    ]);
+
+    expect(Object.keys(measured)).toEqual(['coverage.min', 'complexity.max_violations']);
+  });
+
+  test('an unavailable metric does not stop the ones after it', async () => {
+    const measured = await measureRatcheted([
+      metric('coverage.min', { unavailable: 'no tests' }),
+      metric('crap.max_violations', { value: 4 }),
+    ]);
+
+    expect(measured['crap.max_violations']).toEqual({ value: 4 });
+  });
+
+  test('the shipped table covers exactly the keys this template ratchets', () => {
+    expect(RATCHETED_METRICS.map((m) => m.key)).toEqual([
+      'coverage.min',
+      'complexity.max_violations',
+      'crap.max_violations',
+    ]);
+  });
+});
+
+describe('complexity floor', () => {
+  const roots: string[] = [];
+
+  afterAll(() => {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  });
+
+  function project(existing?: string): string {
+    const root = mkdtempSync(join(tmpdir(), 'bun-complexity-'));
+    roots.push(root);
+    mkdirSync(join(root, 'src'));
+    writeFileSync(join(root, 'src', 'index.ts'), 'export const x = 1;\n');
+    if (existing !== undefined) writeFileSync(join(root, '.harness-baseline'), existing);
+    return root;
+  }
+
+  test('no floor recorded means report-only, not -i 0', async () => {
+    const root = project();
+    const [gate] = await complexityGatesOrWarn(root);
+
+    expect(gate?.description).toContain('report-only: no .harness-baseline floor');
+    expect(gate?.cmd.at(-1)).toBe('1000000');
+    expect(gate?.extract?.('')).toContain('suppressions --update-baseline');
+    expect(await baselineFloor('complexity.max_violations', root)).toBeUndefined();
+  });
+
+  test('a recorded floor is handed to lizard as -i N', async () => {
+    const root = project('complexity.max_violations 4\n');
+    const [gate] = await complexityGatesOrWarn(root);
+
+    expect(gate?.description).toBe('Complexity (lizard, baseline 4)');
+    expect(gate?.cmd.slice(-2)).toEqual(['-i', '4']);
+    expect(await baselineFloor('complexity.max_violations', root)).toBe(4);
+  });
+
+  test('a floor of 0 is a real floor, not a missing one', async () => {
+    const root = project('complexity.max_violations 0\n');
+    const [gate] = await complexityGatesOrWarn(root);
+
+    expect(gate?.description).toBe('Complexity (lizard)');
+    expect(gate?.cmd.slice(-2)).toEqual(['-i', '0']);
+  });
+});
+
+describe('lizardWarningCount', () => {
+  const summary = [
+    '='.repeat(10),
+    'Total nloc   Avg.NLOC  AvgCCN  Avg.token   Fun Cnt  Warning cnt   Fun Rt   nloc Rt',
+    '--------------------------------------------------------------------------------',
+    '      1200       12.0     3.2      100.0        99            7     0.07      0.12',
+  ].join('\n');
+
+  test('reads the Warning cnt column out of the summary row', () => {
+    expect(lizardWarningCount(summary)).toBe(7);
+  });
+
+  test('no summary row is null, never a silent 0', () => {
+    expect(lizardWarningCount('lizard: command not found')).toBeNull();
   });
 });
 

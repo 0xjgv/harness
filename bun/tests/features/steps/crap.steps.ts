@@ -44,11 +44,12 @@ DA:11,0
 end_of_record
 `;
 
-async function makeTmp(): Promise<string> {
+/** An isolated project (src/stub.ts + one test + a copy of harness.ts) for the baseline steps too. */
+export async function makeTmp(source = STUB_TS): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'crap-'));
   await mkdir(join(dir, 'src'));
   await mkdir(join(dir, 'tests'));
-  await writeFile(join(dir, 'src', 'stub.ts'), STUB_TS);
+  await writeFile(join(dir, 'src', 'stub.ts'), source);
   await writeFile(
     join(dir, 'tests', 'stub.test.ts'),
     "import { test, expect } from 'bun:test';\nimport { stub } from '../src/stub';\ntest('stub', () => expect(stub(0)).toBe(0));\n",
