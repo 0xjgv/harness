@@ -43,7 +43,18 @@ paraphrase (it drifts). Two sections:
   `check`/`stop-hook`, and skips silently when the repo has no `.feature`
   files anywhere.
   `crap` is advisory (warns by default, `--enforce` to hard-fail; joins
-  lizard `--csv` with `target/llvm-cov/lcov.info`). Suppressions are ratcheted
+  lizard `--csv` with `target/llvm-cov/lcov.info`). `check` and `pre-commit`
+  scope `test` to the changed modules — `src/foo/bar.rs` → the libtest filter
+  `foo::bar`, `src/main.rs` and `src/bin/*.rs` → `--bins`, `tests/<name>.rs` →
+  `--test <name>`, any `.feature` → `--test acceptance`, `harness.rs` →
+  `--bins` + `--test acceptance`. Filters never run bare (that would forward
+  them to the `harness = false` acceptance target): they run under `--lib`, or
+  `--bins` in a crate with no lib target. The change set is the staged files in
+  `pre-commit`, else `<base>...HEAD` when `--base=<ref>` / `HARNESS_ARCH_BASE` /
+  `GITHUB_BASE_REF` resolves, else the uncommitted files. An empty scope warns
+  and skips (it never widens); a changed source with no `#[cfg(test)]` block
+  warns once and never fails; a `--base=<ref>` git cannot resolve fails the
+  gate instead of degrading to a scope that would test nothing. `--all` and `ci` run the whole suite. Suppressions are ratcheted
   by `.harness-baseline`; `coverage.min` in the same file is the default coverage floor. Requires `uvx` on PATH
   for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
   length≤100).

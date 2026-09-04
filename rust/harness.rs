@@ -645,21 +645,28 @@ fn parse_porcelain_line(line: &str) -> Option<&str> {
 /// subtree belongs to a sibling template (or another crate in a monorepo)
 /// and must be dropped rather than normalized — normalizing it would strip
 /// nothing and let it pass the extension filter unchanged.
-fn parse_changed_rs_files(porcelain: &str, prefix: &str) -> Vec<String> {
+fn parse_changed_paths(porcelain: &str, prefix: &str) -> Vec<String> {
     porcelain
         .lines()
         .filter_map(parse_porcelain_line)
         .filter(|p| prefix.is_empty() || p.starts_with(&format!("{prefix}/")))
         .map(|p| normalize_changed_path(p, prefix))
-        .filter(|f| Path::new(f).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rs")))
         .collect()
 }
 
-fn changed_rs_files() -> Vec<String> {
-    // `-- .` scopes the porcelain output to this template's subtree, same
-    // idiom the arch-config-guard helpers below already use — without it, a
-    // sibling template's change (or another crate in a monorepo) reads as
-    // "this template changed" and triggers a repo-wide reformat.
+fn parse_changed_rs_files(porcelain: &str, prefix: &str) -> Vec<String> {
+    parse_changed_paths(porcelain, prefix).into_iter().filter(|f| is_rs(f)).collect()
+}
+
+fn is_rs(path: &str) -> bool {
+    Path::new(path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+}
+
+/// `git status --porcelain` for this template's subtree. `-- .` scopes the
+/// output, same idiom the arch-config-guard helpers below already use —
+/// without it, a sibling template's change (or another crate in a monorepo)
+/// reads as "this template changed" and triggers a repo-wide reformat.
+fn git_status_porcelain() -> String {
     let output = Command::new("git")
         .args(["status", "--porcelain", "--", "."])
         .current_dir(root())
@@ -667,11 +674,239 @@ fn changed_rs_files() -> Vec<String> {
         .stderr(Stdio::piped())
         .output();
 
-    let Ok(output) = output else {
+    output.map_or_else(|_| String::new(), |o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+fn changed_rs_files() -> Vec<String> {
+    parse_changed_rs_files(&git_status_porcelain(), &git_prefix())
+}
+
+// ── Test scoping ────────────────────────────────────────────────────
+
+/// Base ref for the scoped test gate: `--base=<ref>`, else `HARNESS_ARCH_BASE`,
+/// else `origin/$GITHUB_BASE_REF`; the first one git resolves wins.
+///
+/// Deliberately without the `origin/HEAD`/`origin/main`/`main` fallback the
+/// arch and gherkin guards use: those ask "did this branch touch a protected
+/// file", the test gate asks "what did I just edit". Falling back would make
+/// every local `check` re-run the whole branch's tests.
+fn test_base_ref() -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(base) = arg_value("--base")
+        && !base.is_empty()
+    {
+        candidates.push(base);
+    }
+    if let Ok(base) = env::var("HARNESS_ARCH_BASE")
+        && !base.is_empty()
+    {
+        candidates.push(base);
+    }
+    if let Ok(github_base) = env::var("GITHUB_BASE_REF")
+        && !github_base.is_empty()
+    {
+        candidates.push(format!("origin/{github_base}"));
+    }
+    candidates.into_iter().find(|base| !git_lines(&["rev-parse", "--verify", base]).is_empty())
+}
+
+/// The change set the scoped test gate maps from, template-relative and with
+/// deletions excluded.
+///
+/// `staged` (pre-commit) wins outright: that stage is contractually about what
+/// is being committed, so a `HARNESS_ARCH_BASE` left in the environment must
+/// not silently replace it. Otherwise a resolved base ref diffs
+/// `<base>...HEAD`, and failing that the local uncommitted set — never the
+/// whole tree, which would green a gate that tested nothing.
+fn test_scope_paths(staged: bool) -> Vec<String> {
+    if staged {
+        return git_lines(&["diff", "--cached", "--name-only", "--diff-filter=d", "--relative"]);
+    }
+    if let Some(base) = test_base_ref() {
+        let range = format!("{base}...HEAD");
+        return git_lines(&["diff", "--name-only", "--diff-filter=d", "--relative", &range]);
+    }
+    parse_changed_paths(&git_status_porcelain(), &git_prefix())
+}
+
+/// What `cargo test` must run to cover one changed file.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TestTarget {
+    /// The whole lib target (or, in a crate without one, every bin).
+    Lib,
+    /// A libtest name filter.
+    LibFilter(String),
+    /// Every `[[bin]]` target's unit tests.
+    Bins,
+    /// One integration target, `tests/<name>.rs`.
+    Integration(String),
+}
+
+/// True when a source file carries its own `#[cfg(test)]` block.
+fn has_unit_tests(path: &str) -> bool {
+    fs::read_to_string(root().join(path)).is_ok_and(|text| text.contains("#[cfg(test)]"))
+}
+
+/// Map a changed file to the test targets that cover it.
+///
+/// `src/lib.rs` → the whole lib target; `src/foo/bar.rs` → the libtest filter
+/// `foo::bar`; `src/foo/mod.rs` → `foo`; `src/main.rs` and `src/bin/*.rs` →
+/// `--bins`; `tests/<name>.rs` → `--test <name>`; any `.feature` file → the
+/// cucumber target, which is what executes it; the runner itself → `--bins`
+/// plus that same cucumber target, since the scenarios drive its binary.
+///
+/// A `src` module with no `#[cfg(test)]` block maps to nothing — its filter
+/// would match no test and libtest exits 0 on an empty match, so the caller
+/// warns about the file instead of printing a green tick for nothing.
+///
+/// Two conventions are assumed, both true of this template: an integration
+/// target is named after its file stem (`[[test]] name` can rename it), and
+/// the cucumber target is called `acceptance`. `has_tests` is lazy so the
+/// mapping stays a pure function of the path in every other case.
+fn test_targets_for(path: &str, has_tests: impl FnOnce() -> bool) -> Vec<TestTarget> {
+    if path.ends_with(".feature") {
+        return vec![TestTarget::Integration("acceptance".to_string())];
+    }
+    if path == "harness.rs" {
+        return vec![TestTarget::Bins, TestTarget::Integration("acceptance".to_string())];
+    }
+    if let Some(rest) = path.strip_prefix("tests/") {
+        let name = rest.strip_suffix(".rs").unwrap_or(rest);
+        // A nested helper (tests/common/mod.rs) belongs to whichever target
+        // includes it, which cargo does not tell us — warn rather than guess.
+        if name.contains('/') || !is_rs(rest) {
+            return Vec::new();
+        }
+        return vec![TestTarget::Integration(name.to_string())];
+    }
+    let Some(rest) = path.strip_prefix("src/") else {
         return Vec::new();
     };
+    if !is_rs(rest) {
+        return Vec::new();
+    }
+    if rest == "lib.rs" {
+        return vec![TestTarget::Lib];
+    }
+    // `src/bin/*.rs` are separate bin targets, not lib modules: filtering on
+    // `bin::name` would match nothing and pass.
+    if rest == "main.rs" || rest.starts_with("bin/") {
+        return vec![TestTarget::Bins];
+    }
+    if !has_tests() {
+        return Vec::new();
+    }
+    let stem = rest.strip_suffix(".rs").unwrap_or(rest);
+    let module = stem.strip_suffix("/mod").unwrap_or(stem);
+    vec![TestTarget::LibFilter(module.replace('/', "::"))]
+}
 
-    parse_changed_rs_files(&String::from_utf8_lossy(&output.stdout), &git_prefix())
+/// Turn mapped targets into cargo argv lists, one per invocation.
+///
+/// Filters never run bare: `cargo test -- <filter>` forwards the filter to
+/// `tests/acceptance.rs` too, which is `harness = false` and does not accept
+/// libtest arguments. They run under `--lib`, or under `--bins` in a crate
+/// with no lib target (`cargo test --lib` there is a hard error). Several
+/// filters after `--` are OR'd by libtest, so one run covers every changed
+/// module.
+fn scoped_test_commands(targets: &BTreeSet<TestTarget>, has_lib: bool) -> Vec<Vec<String>> {
+    let cargo_test = |args: &[&str]| {
+        let mut cmd = vec!["cargo".to_string(), "test".to_string()];
+        cmd.extend(args.iter().map(|a| (*a).to_string()));
+        cmd
+    };
+    let host = if has_lib { "--lib" } else { "--bins" };
+    let filters: Vec<&str> = targets
+        .iter()
+        .filter_map(|t| match t {
+            TestTarget::LibFilter(f) => Some(f.as_str()),
+            _ => None,
+        })
+        .collect();
+    let whole_host =
+        targets.contains(&TestTarget::Lib) || (!has_lib && targets.contains(&TestTarget::Bins));
+
+    let mut cmds: Vec<Vec<String>> = Vec::new();
+    if whole_host {
+        cmds.push(cargo_test(&[host]));
+    } else if !filters.is_empty() {
+        let mut args = vec![host, "--"];
+        args.extend(filters);
+        cmds.push(cargo_test(&args));
+    }
+    if has_lib && targets.contains(&TestTarget::Bins) {
+        cmds.push(cargo_test(&["--bins"]));
+    }
+    for target in targets {
+        if let TestTarget::Integration(name) = target {
+            cmds.push(cargo_test(&["--test", name]));
+        }
+    }
+    cmds
+}
+
+/// Run the test gate scoped to the changed modules (`check`, `pre-commit`).
+///
+/// `--all` runs the whole suite, as `ci` does. An empty change set warns and
+/// skips instead of widening: a scoped gate that falls back to the whole tree
+/// stops being a scope. A changed source that maps to no test warns once and
+/// never fails — the tests that do map still run.
+fn run_scoped_tests(staged: bool, no_exit: bool) -> Vec<RunResult> {
+    let opts = || RunOpts { extract: Some(extract_test_summary), no_exit, ..RunOpts::default() };
+    if arg_flag("--all") {
+        return vec![run("Tests (incl. acceptance)", &["cargo", "test"], Some(&opts()))];
+    }
+
+    // An explicitly requested base that git cannot resolve (an unfetched ref
+    // on a shallow checkout, a typo) must be loud: falling through to the
+    // uncommitted set would print a green gate that tested nothing.
+    if let Some(base) = arg_value("--base")
+        && git_lines(&["rev-parse", "--verify", &base]).is_empty()
+    {
+        println!("  {RED}\u{2717}{RESET} Tests: --base={base} does not resolve");
+        println!("  \u{21b3} fix: fetch that ref, or pass one this checkout has");
+        if !no_exit {
+            std::process::exit(1);
+        }
+        return vec![RunResult { ok: false, output: String::new() }];
+    }
+
+    let changed: Vec<String> = test_scope_paths(staged)
+        .into_iter()
+        .filter(|p| is_rs(p) || p.ends_with(".feature"))
+        .collect();
+    if changed.is_empty() {
+        println!(
+            "  {GREEN}\u{26a0}{RESET} Tests: no changed Rust or .feature files \u{2014} skipped \
+             (use --all for the whole suite)"
+        );
+        return vec![RunResult { ok: true, output: String::new() }];
+    }
+
+    let mut targets: BTreeSet<TestTarget> = BTreeSet::new();
+    let mut unmapped: Vec<&String> = Vec::new();
+    for path in &changed {
+        let mapped = test_targets_for(path, || has_unit_tests(path));
+        if mapped.is_empty() {
+            unmapped.push(path);
+        } else {
+            targets.extend(mapped);
+        }
+    }
+    for path in unmapped {
+        println!("  {GREEN}\u{26a0}{RESET} Tests: no test maps to {path}");
+    }
+
+    let cmds = scoped_test_commands(&targets, root().join("src").join("lib.rs").exists());
+    if cmds.is_empty() {
+        return vec![RunResult { ok: true, output: String::new() }];
+    }
+    cmds.iter()
+        .map(|cmd| {
+            let argv: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            run(&format!("Tests ({})", cmd[2..].join(" ")), &argv, Some(&opts()))
+        })
+        .collect()
 }
 
 // ── Commands ────────────────────────────────────────────────────────
@@ -1620,23 +1855,15 @@ fn cmd_check() {
             Some(&RunOpts { no_exit: true, ..RunOpts::default() }),
         ),
         run("Format", &["cargo", "fmt"], Some(&RunOpts { no_exit: true, ..RunOpts::default() })),
-        run(
-            // `[[test]]` targets (Cargo.toml) always run under plain `cargo
-            // test`, including the `acceptance` binary (harness = false,
-            // tests/acceptance.rs) — so this one line already exercises the
-            // Gherkin/cucumber scenarios too. No separate acceptance gate
-            // here: see the `ci` minus `check` invariant documented in
-            // CLAUDE.md.
-            "Tests (incl. acceptance)",
-            &["cargo", "test"],
-            Some(&RunOpts {
-                extract: Some(extract_test_summary),
-                no_exit: true,
-                ..RunOpts::default()
-            }),
-        ),
-        check_agents_md_drift(true),
     ];
+    // Tests are scoped to the changed modules (`--all` for the whole suite).
+    // `[[test]]` targets (Cargo.toml) run under plain `cargo test`, including
+    // the `acceptance` binary (harness = false, tests/acceptance.rs) — so a
+    // changed `.feature` (or `harness.rs`) still exercises the Gherkin
+    // scenarios here, and `--all` always does. No separate acceptance gate:
+    // see the `ci` minus `check` invariant documented in CLAUDE.md.
+    results.extend(run_scoped_tests(false, true));
+    results.push(check_agents_md_drift(true));
 
     let complexity_failed = run_gates_parallel_detailed(&[complexity_gate()]);
     results.push(RunResult { ok: complexity_failed.is_empty(), output: String::new() });
@@ -1681,7 +1908,8 @@ fn cmd_pre_commit() {
     cmd_fix();
     restage_fixed_files(&files);
     check_agents_md_drift(false);
-    cmd_test();
+    // Staged files only: the tests that map to what is about to be committed.
+    run_scoped_tests(true, false);
 }
 
 /// Paths from `files` that still exist under `base` — the cheap, testable
@@ -2381,6 +2609,141 @@ mod tests {
     #[test]
     fn crap_status_glyph_enforce_uses_red_cross_glyph() {
         assert_eq!(crap_status_glyph(true), (RED, "\u{2717}", ""));
+    }
+
+    // ── Test scoping ─────────────────────────────────────────────────────
+
+    fn targets(path: &str, has_tests: bool) -> Vec<TestTarget> {
+        test_targets_for(path, || has_tests)
+    }
+
+    fn cargo_test(args: &[&str]) -> Vec<String> {
+        let mut cmd = vec!["cargo".to_string(), "test".to_string()];
+        cmd.extend(args.iter().map(|a| (*a).to_string()));
+        cmd
+    }
+
+    #[test]
+    fn lib_root_maps_to_the_whole_lib_target() {
+        assert_eq!(targets("src/lib.rs", false), vec![TestTarget::Lib]);
+    }
+
+    #[test]
+    fn nested_module_maps_to_a_libtest_filter() {
+        assert_eq!(
+            targets("src/foo/bar.rs", true),
+            vec![TestTarget::LibFilter("foo::bar".to_string())]
+        );
+    }
+
+    #[test]
+    fn mod_rs_maps_to_its_parent_module() {
+        assert_eq!(targets("src/foo/mod.rs", true), vec![TestTarget::LibFilter("foo".to_string())]);
+    }
+
+    #[test]
+    fn module_without_unit_tests_maps_to_nothing() {
+        assert!(targets("src/foo/bar.rs", false).is_empty());
+    }
+
+    #[test]
+    fn bin_sources_map_to_the_bin_targets_not_a_lib_filter() {
+        assert_eq!(targets("src/main.rs", true), vec![TestTarget::Bins]);
+        assert_eq!(targets("src/bin/extra.rs", true), vec![TestTarget::Bins]);
+    }
+
+    #[test]
+    fn integration_test_maps_to_its_own_target() {
+        assert_eq!(
+            targets("tests/smoke.rs", false),
+            vec![TestTarget::Integration("smoke".to_string())]
+        );
+    }
+
+    #[test]
+    fn nested_test_helper_maps_to_nothing() {
+        assert!(targets("tests/common/mod.rs", true).is_empty());
+    }
+
+    #[test]
+    fn feature_file_maps_to_the_cucumber_target() {
+        assert_eq!(
+            targets("tests/features/smoke.feature", false),
+            vec![TestTarget::Integration("acceptance".to_string())]
+        );
+    }
+
+    #[test]
+    fn runner_maps_to_the_bins_and_the_cucumber_target() {
+        assert_eq!(
+            targets("harness.rs", true),
+            vec![TestTarget::Bins, TestTarget::Integration("acceptance".to_string())]
+        );
+    }
+
+    #[test]
+    fn unrelated_path_maps_to_nothing() {
+        assert!(targets("build.rs", true).is_empty());
+        assert!(targets("Cargo.toml", true).is_empty());
+    }
+
+    #[test]
+    fn filters_run_under_lib_and_are_ord_stable() {
+        let targets: BTreeSet<TestTarget> = [
+            TestTarget::LibFilter("foo::bar".to_string()),
+            TestTarget::LibFilter("baz".to_string()),
+        ]
+        .into();
+        assert_eq!(
+            scoped_test_commands(&targets, true),
+            vec![cargo_test(&["--lib", "--", "baz", "foo::bar"])]
+        );
+    }
+
+    #[test]
+    fn filters_run_under_bins_when_the_crate_has_no_lib() {
+        let targets: BTreeSet<TestTarget> = [TestTarget::LibFilter("foo".to_string())].into();
+        assert_eq!(
+            scoped_test_commands(&targets, false),
+            vec![cargo_test(&["--bins", "--", "foo"])]
+        );
+    }
+
+    #[test]
+    fn whole_lib_subsumes_filters() {
+        let targets: BTreeSet<TestTarget> =
+            [TestTarget::Lib, TestTarget::LibFilter("foo".to_string())].into();
+        assert_eq!(scoped_test_commands(&targets, true), vec![cargo_test(&["--lib"])]);
+    }
+
+    #[test]
+    fn whole_bins_subsumes_filters_without_a_lib() {
+        let targets: BTreeSet<TestTarget> =
+            [TestTarget::Bins, TestTarget::LibFilter("foo".to_string())].into();
+        assert_eq!(scoped_test_commands(&targets, false), vec![cargo_test(&["--bins"])]);
+    }
+
+    #[test]
+    fn integration_targets_get_their_own_invocations() {
+        let targets: BTreeSet<TestTarget> = [
+            TestTarget::Bins,
+            TestTarget::Integration("acceptance".to_string()),
+            TestTarget::Integration("smoke".to_string()),
+        ]
+        .into();
+        assert_eq!(
+            scoped_test_commands(&targets, true),
+            vec![
+                cargo_test(&["--bins"]),
+                cargo_test(&["--test", "acceptance"]),
+                cargo_test(&["--test", "smoke"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_targets_means_no_invocations() {
+        assert!(scoped_test_commands(&BTreeSet::new(), true).is_empty());
     }
 }
 
