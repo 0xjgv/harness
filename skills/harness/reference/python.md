@@ -184,10 +184,13 @@ Read the real package tree and write the contract it already implies:
    what already imports what (a `web`/`api`/`cli` entry point on top, a
    `models`/`domain`/`core` package at the bottom). Leave `exhaustive` off on a
    first pass; it turns every undeclared subpackage into its own violation.
-3. Run `<prefix> arch`. It prints the count and passes, because with no
-   `arch.max_violations` key the gate is **report-only**.
-4. Record where the repo is: `<prefix> suppressions --update-baseline`. The
-   count becomes the floor, and the next new violation is the one that fails.
+3. Run `<prefix> arch`. It prints the count and **passes**: `.harness-baseline`
+   is DO-NOT-COPY (§1), so there is no `arch.max_violations` key yet and the
+   gate is report-only.
+4. §5 step 1 records where the repo is. `suppressions --update-baseline` writes
+   the count as `arch.max_violations`, and the next *new* violation is the one
+   that fails. Nothing extra to run here — just do not skip that step, or the
+   contract you derived stays advisory forever.
 
 A contract written this way is red on day one by dozens of chains — that is the
 point of the floor. Never bend the contract to reach zero; a `layers` list
