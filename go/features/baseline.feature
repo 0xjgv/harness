@@ -1,9 +1,9 @@
 Feature: Ratcheted floors in .harness-baseline
   A repo adopting the harness starts wherever it already is. Without a
-  recorded floor the complexity gate measures and reports; with one it
-  blocks any growth past it. `suppressions --update-baseline` records the
-  floors it can measure, drops the ones it cannot, and never disturbs a
-  key it does not own.
+  recorded floor the complexity and duplication gates measure and report;
+  with one they block any growth past it. `suppressions --update-baseline`
+  records the floors it can measure, drops the ones it cannot, and never
+  disturbs a key it does not own.
 
   Scenario: Complexity is report-only when no floor is recorded
     Given a function above the complexity threshold
@@ -24,6 +24,34 @@ Feature: Ratcheted floors in .harness-baseline
     When I run "harness complexity"
     Then the exit code is 1
     And the output contains "do not raise the threshold"
+
+  Scenario: Duplication is report-only when no floor is recorded
+    Given a duplicated block of code
+    When I run "harness complexity"
+    Then the exit code is 0
+    And the output contains "Duplication (lizard, report-only: no .harness-baseline floor)"
+    And the output contains "run `go run harness.go suppressions --update-baseline` to record a floor"
+
+  Scenario: Duplication passes at the recorded floor
+    Given a duplicated block of code
+    And a .harness-baseline carrying "duplication.max_blocks 1"
+    When I run "harness complexity"
+    Then the exit code is 0
+    And the output contains "Duplication (lizard, baseline 1)"
+
+  Scenario: Duplication fails above the recorded floor
+    Given a duplicated block of code
+    And a .harness-baseline carrying "duplication.max_blocks 0"
+    When I run "harness complexity"
+    Then the exit code is 1
+    And the output contains "1 duplicate block(s)"
+    And the output contains "extract the duplicated code into one function"
+
+  Scenario: Updating the baseline records the duplicate-block floor
+    Given a duplicated block of code
+    When I run "harness suppressions --update-baseline"
+    Then the exit code is 0
+    And the .harness-baseline file contains "duplication.max_blocks 1"
 
   Scenario: Updating the baseline records measured floors and preserves unknown keys
     Given a function above the complexity threshold

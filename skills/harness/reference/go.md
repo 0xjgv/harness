@@ -42,7 +42,8 @@ paraphrase (it drifts). Two sections:
   review); it only warns in `check`/`stop-hook`, and skips silently when the
   repo has no `.feature` files anywhere. `crap` is
   advisory (warns by default, `--enforce` to hard-fail). Suppressions,
-  complexity, and CRAP are ratcheted by `.harness-baseline` (see below);
+  complexity, duplication, and CRAP are ratcheted by `.harness-baseline` (see
+  below);
   `coverage.min` in the same file is the default coverage floor. Requires `uvx` on
   PATH for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
   length≤100 — replaces the old gocyclo gate).
@@ -83,6 +84,7 @@ Codex Stop command:
 complexity.max_violations 0
 coverage.min 59
 crap.max_violations 0
+duplication.max_blocks 0
 suppressions.lint_ignore 3
 suppressions.nolint 11
 ```
@@ -102,6 +104,16 @@ suppressions.nolint 11
   the counting, and exits 0 while the number of flagged functions stays at or
   below the floor. The writer reads the count back out of the `Warning cnt`
   column of lizard's summary row.
+- **`duplication.max_blocks`** counts the `Duplicate block:` headers of a
+  second lizard run, `-Eduplicate` over the same target set and exclusions as
+  the complexity gate (the floor only reproduces against an identical target
+  set). It has to be a separate invocation: `-Eduplicate` composes with the
+  complexity thresholds but never reaches lizard's exit code, which stays
+  driven by CCN warnings alone — so the run passes `-i 1000000` and the runner
+  does the comparing. Lizard only reports a block once it spans 70+ unified
+  tokens, and overlapping near-duplicates are reported separately, so the count
+  jitters by one on a trivial edit; fine for a ratchet, not for an absolute
+  number. Report-only under the same rule as complexity.
 - **`crap.max_violations`** is compared in the runner, and is report-only under
   the same rule — including under `--enforce`, because an absent key means the
   repo has never been measured, not that it must be perfect. (Python's
@@ -126,9 +138,11 @@ suppressions.nolint 11
   ↳ fix: make the measurement pass, then rerun `suppressions --update-baseline`
 ```
 
-- Go's table has **3** entries where python's `RATCHETED_KEYS` has 4:
+- Go's table has **4** entries where python's `RATCHETED_KEYS` has 4, but not
+  the same four:
   `deadcode.max_findings` has no go equivalent (golangci-lint's `unused` linter
-  covers it, and it has no count to floor).
+  covers it, and it has no count to floor), and `duplication.max_blocks` is
+  go's own.
 - Extending it: `harness.go` keeps a `var ratcheted = []suppressions.Measurer`
   table of `{Key, Measure}` pairs. A new floor is one entry plus a function
   returning `suppressions.Measured` / `Unavailable` / `Failed`.

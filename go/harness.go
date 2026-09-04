@@ -82,7 +82,13 @@ type gate struct {
 	description string
 	cmd         []string
 	extract     func(output string) string
-	hint        string
+	// verdict decides pass/fail for a tool whose exit code does not (lizard's
+	// duplicate detector reports, it does not judge). It sees the exit code
+	// too, so a gate counting findings out of the output still fails when the
+	// tool itself broke. Returns ok plus the detail shown after the ✓/✗ label,
+	// and supersedes extract; without it the exit code decides.
+	verdict func(output string, exitCode int) (bool, string)
+	hint    string
 }
 
 type gateResult struct {
@@ -102,15 +108,19 @@ func runCapture(g gate) gateResult {
 	c.Dir = root
 	out, err := c.CombinedOutput()
 	output := string(out)
-	ok := err == nil
-	detail := ""
 	code := 0
-	if ok {
-		if g.extract != nil {
-			detail = g.extract(output)
-		}
-	} else {
+	if err != nil {
 		code = exitCode(err)
+	}
+	ok := code == 0
+	detail := ""
+	if g.verdict != nil {
+		ok, detail = g.verdict(output, code)
+		if !ok && code == 0 {
+			code = 1
+		}
+	} else if ok && g.extract != nil {
+		detail = g.extract(output)
 	}
 	return gateResult{g.description, g.cmd, ok, code, output, detail, g.hint}
 }
@@ -124,15 +134,15 @@ func printGateResult(r gateResult, noExit bool) bool {
 			fmt.Print(r.output)
 		}
 	}
+	suffix := ""
+	if r.detail != "" {
+		suffix = fmt.Sprintf(" %s(%s)%s", dim, r.detail, reset)
+	}
 	if r.ok {
-		suffix := ""
-		if r.detail != "" {
-			suffix = fmt.Sprintf(" %s(%s)%s", dim, r.detail, reset)
-		}
 		fmt.Printf("  %s✓%s %s%s\n", green, reset, r.description, suffix)
 		return true
 	}
-	fmt.Printf("  %s✗%s %s\n", red, reset, r.description)
+	fmt.Printf("  %s✗%s %s%s\n", red, reset, r.description, suffix)
 	if !verbose && r.output != "" {
 		fmt.Print(r.output)
 	}
@@ -398,7 +408,7 @@ func cmdStopHook() {
 	cmdPostEdit() // mutating — sequential, first
 	checkArchConfigGuard(true, false, false)
 	checkGherkinGuard(true, false, false)
-	allOk, failed := runGatesParallel([]gate{complexityGate()}) // read-only batch
+	allOk, failed := runGatesParallel([]gate{complexityGate(), duplicationGate()}) // read-only batch
 	if !allOk {
 		fmt.Fprintf(os.Stderr, "stop-hook: failed gate(s): %s\n", strings.Join(failed, ", "))
 		os.Exit(2)
@@ -1165,7 +1175,7 @@ func cmdCheck() {
 	// stays ci/pre-push-only. Folded into `results` gate-by-gate (not as one
 	// combined entry) so the N passed/M failed summary below reflects each
 	// gate individually.
-	checkGates := []gate{complexityGate(), modTidyGate()}
+	checkGates := []gate{complexityGate(), duplicationGate(), modTidyGate()}
 	checkGates = append(checkGates, acceptanceGatesOrWarn()...)
 	_, failedCheckGates := runGatesParallel(checkGates)
 	failedCheckGateSet := make(map[string]bool, len(failedCheckGates))
@@ -1269,7 +1279,7 @@ func cmdCi() {
 	fmt.Printf("\n%s[ci]%s\n\n", blue, reset)
 	// Read-only gates run as a parallel batch (captured, printed in submission
 	// order, run to completion). Coverage is captured and CRAP is advisory — after.
-	gates := []gate{lintGate(nil), auditGate(), complexityGate(), modTidyGate()}
+	gates := []gate{lintGate(nil), auditGate(), complexityGate(), duplicationGate(), modTidyGate()}
 	gates = append(gates, acceptanceGatesOrWarn()...)
 	gates = append(gates, archGatesOrWarn()...)
 	allOk, _ := runGatesParallel(gates)
@@ -1352,8 +1362,74 @@ func complexityGate() gate {
 }
 
 func cmdComplexity() {
-	g := complexityGate()
-	run(g.description, g.cmd, &runOpts{hint: g.hint})
+	if ok, _ := runGatesParallel([]gate{complexityGate(), duplicationGate()}); !ok {
+		os.Exit(1)
+	}
+}
+
+// duplicationArgv is lizard's copy-paste detector over the same target set and
+// the same exclusions as complexityArgv — the floor only reproduces against an
+// identical target set. A separate invocation because `-Eduplicate` composes
+// with the complexity thresholds but does not reach lizard's exit code: it
+// stays driven by CCN warnings alone, so `-i reportOnlyLimit` keeps this run
+// green and duplicationGate does the comparing.
+func duplicationArgv() []string {
+	return []string{
+		"uvx", lizard, "-l", "go", ".", "-Eduplicate", "-w", "-i", reportOnlyLimit,
+		"-x", "*_test.go", "-x", "./harness.go",
+	}
+}
+
+// duplicateBlockCount counts the `Duplicate block:` headers lizard prints, one
+// per group of copy-pasted code. Lizard only reports a block once it spans 70+
+// unified tokens, so this counts real duplication, not incidental repetition.
+func duplicateBlockCount(stdout string) int {
+	count := 0
+	for line := range strings.SplitSeq(stdout, "\n") {
+		if strings.TrimRight(line, "\r") == "Duplicate block:" {
+			count++
+		}
+	}
+	return count
+}
+
+// duplicationGate is the copy-paste gate at the committed floor, or
+// report-only when there is none — same rule as complexityGate: a floor of 0
+// inferred from an absent number is not a floor, it is a demand that the repo
+// already be perfect. Overlapping near-duplicates are reported separately, so
+// the count can jitter by one on a trivial edit; that is fine for a ratchet.
+func duplicationGate() gate {
+	floor, ok := suppressions.BaselineFloor(root, "duplication.max_blocks")
+	if !ok {
+		// The call to action rides on the ✓ line, not in `hint`: a report-only
+		// gate passes by construction, and printGateResult only shows a hint on
+		// failure — where the failure would be lizard itself breaking, not a
+		// missing floor.
+		return gate{
+			description: fmt.Sprintf("Duplication (lizard, report-only: no %s floor)", baselineFile),
+			cmd:         duplicationArgv(),
+			extract: func(output string) string {
+				return fmt.Sprintf("%s; run `%s` to record a floor",
+					duplicationDetail(duplicateBlockCount(output)), updateBaseline)
+			},
+		}
+	}
+	return gate{
+		description: fmt.Sprintf("Duplication (lizard, baseline %d)", floor),
+		cmd:         duplicationArgv(),
+		verdict: func(output string, exitCode int) (bool, string) {
+			if exitCode != 0 {
+				return false, fmt.Sprintf("lizard exited %d", exitCode)
+			}
+			count := duplicateBlockCount(output)
+			return count <= floor, duplicationDetail(count)
+		},
+		hint: "extract the duplicated code into one function; do not raise the floor",
+	}
+}
+
+func duplicationDetail(count int) string {
+	return fmt.Sprintf("%d duplicate block(s)", count)
 }
 
 // lizardWarningCount reads the `Warning cnt` column out of lizard's final
@@ -1385,6 +1461,7 @@ var ratcheted = []suppressions.Measurer{
 	{Key: "coverage.min", Measure: measuredCoverageMin},
 	{Key: "complexity.max_violations", Measure: measuredComplexityViolations},
 	{Key: "crap.max_violations", Measure: measuredCrapViolations},
+	{Key: "duplication.max_blocks", Measure: measuredDuplicationBlocks},
 }
 
 // measuredCoverageMin is total coverage floored to an integer — the floor the
@@ -1427,6 +1504,19 @@ func measuredComplexityViolations() suppressions.Measurement {
 		return suppressions.Failed("lizard printed no summary row to count warnings from")
 	}
 	return suppressions.Measured(count)
+}
+
+// measuredDuplicationBlocks counts the copy-pasted blocks lizard reports over
+// the complexity gate's target set.
+func measuredDuplicationBlocks() suppressions.Measurement {
+	argv := duplicationArgv()
+	c := exec.Command(argv[0], argv[1:]...)
+	c.Dir = root
+	out, err := c.Output()
+	if err != nil {
+		return suppressions.Failed(fmt.Sprintf("lizard failed to run (exit %d)", exitCode(err)))
+	}
+	return suppressions.Measured(duplicateBlockCount(string(out)))
 }
 
 // measuredCrapViolations counts the functions above the default CRAP threshold.
@@ -1709,7 +1799,7 @@ var tasks = []task{
 	{"test-cov", cmdTestCov, "Run tests with race detector and coverage"},
 	{"coverage", cmdTestCov, "Run tests with race detector and coverage"},
 	{"audit", cmdAudit, "Audit dependencies for known vulnerabilities"},
-	{"complexity", cmdComplexity, "Cyclomatic complexity gate (lizard, CCN 15, args 8)"},
+	{"complexity", cmdComplexity, "Cyclomatic complexity + duplication gates (lizard, CCN 15, args 8)"},
 	{"acceptance", cmdAcceptance, "Run acceptance scenarios (godog)"},
 	{"arch", cmdArch, "Architecture checks (go-arch-lint)"},
 	{"arch-config-guard", cmdArchConfigGuard, "Block unreviewed arch config changes"},
