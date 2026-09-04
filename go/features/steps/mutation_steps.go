@@ -42,9 +42,22 @@ func (w *crapWorld) gremlinsReport(killed, lived int) error {
 	return os.WriteFile(filepath.Join(w.tmp, "gremlins-report.json"), []byte(body), 0o600)
 }
 
+// notAReport is valid JSON with none of gremlins' fields — the `--report=`
+// typo that must fail rather than decode to all-zeros and score as a run that
+// killed nothing.
+const notAReport = `{"coverage": 91.1, "note": "not a gremlins report"}` + "\n"
+
+func (w *crapWorld) notAGremlinsReport() error {
+	if err := w.ensureTmp(); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(w.tmp, "not-a-report.json"), []byte(notAReport), 0o600)
+}
+
 // initializeMutationSteps registers the mutation-gate steps against the same
 // per-scenario world as the CRAP and baseline steps, so all three feature
 // files share one set of `I run` / `exit code` / `output contains` definitions.
 func initializeMutationSteps(sc *godog.ScenarioContext, w *crapWorld) {
 	sc.Step(`^a gremlins report with (\d+) killed and (\d+) surviving mutants$`, w.gremlinsReport)
+	sc.Step(`^a JSON file that is not a gremlins report$`, w.notAGremlinsReport)
 }

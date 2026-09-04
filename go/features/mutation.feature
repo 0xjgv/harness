@@ -46,6 +46,18 @@ Feature: Scoped mutation testing against a mutation.min floor
     Then the exit code is 1
     And the output contains "cannot read gremlins report"
 
+  Scenario: A path argument that is not a package directory fails
+    Given a gremlins report with 3 killed and 1 surviving mutants
+    When I run "harness mutation ./no-such-package --enforce"
+    Then the exit code is 1
+    And the output contains "is not a package directory"
+
+  Scenario: A JSON file that is not a gremlins report is rejected
+    Given a JSON file that is not a gremlins report
+    When I run "harness mutation --report=not-a-report.json"
+    Then the exit code is 1
+    And the output contains "is not a gremlins report"
+
   Scenario: Updating the baseline leaves mutation.min alone without --with-mutation
     Given a function above the complexity threshold
     And a .harness-baseline carrying "mutation.min 40"

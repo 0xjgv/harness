@@ -803,6 +803,10 @@ func mutationReportPath(target string) string {
 	return "gremlins-report-" + name + ".json"
 }
 
+// readMutationReport decodes gremlins' `-o` report. A file that is valid JSON
+// but carries none of gremlins' fields is rejected rather than decoded to
+// all-zeros and scored as a run that killed nothing: `--report=` aimed at the
+// wrong file must not pass for a clean tree.
 func readMutationReport(reportPath string) (mutationReport, error) {
 	var report mutationReport
 	if !filepath.IsAbs(reportPath) {
@@ -811,6 +815,15 @@ func readMutationReport(reportPath string) (mutationReport, error) {
 	data, err := os.ReadFile(reportPath)
 	if err != nil {
 		return report, fmt.Errorf("cannot read gremlins report: %w", err)
+	}
+	var probe struct {
+		Total *int `json:"mutants_total"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return report, fmt.Errorf("cannot parse gremlins report %s: %w", reportPath, err)
+	}
+	if probe.Total == nil {
+		return report, fmt.Errorf("%s is not a gremlins report: no mutants_total field", reportPath)
 	}
 	if err := json.Unmarshal(data, &report); err != nil {
 		return report, fmt.Errorf("cannot parse gremlins report %s: %w", reportPath, err)
@@ -868,42 +881,53 @@ func mutationScope(workingTree bool) []string {
 	if hasFlag("all") {
 		return mutationTargets
 	}
+	var changed []string
 	if base := mutationBaseRef(); base != "" {
-		return suppressions.MutationPackages(changedGoFilesSince(base))
+		changed = changedGoFilesSince(base)
 	}
+	// A local run unions the branch diff with the uncommitted set: a base ref
+	// almost always resolves, so treating the two as alternatives would leave
+	// the developer who just edited a file — and has not committed it — with an
+	// empty scope on the very change the gate exists to score.
 	if workingTree {
-		return suppressions.MutationPackages(changedGoFiles())
+		changed = append(changed, changedGoFiles()...)
 	}
-	return nil
+	return suppressions.MutationPackages(changed)
 }
 
 // dirHasTestFiles reports whether a gremlins target's own package directory
 // holds a test. gremlins can only kill a mutant a test reaches, so an
-// untested package scores nothing and would only dilute the run.
-func dirHasTestFiles(target string) bool {
+// untested package scores nothing and would only dilute the run. A directory
+// that cannot be read is an error, never "no tests": a mistyped path argument
+// must not skip its way to a green gate.
+func dirHasTestFiles(target string) (bool, error) {
 	dir := filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(target, "./")))
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return false
+		return false, err
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() && strings.HasSuffix(entry.Name(), "_test.go") {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
-func withTestFiles(targets []string) []string {
+func withTestFiles(targets []string) ([]string, error) {
 	var kept []string
 	for _, target := range targets {
-		if dirHasTestFiles(target) {
+		hasTests, err := dirHasTestFiles(target)
+		if err != nil {
+			return nil, fmt.Errorf("%s is not a package directory: %w", target, err)
+		}
+		if hasTests {
 			kept = append(kept, target)
 			continue
 		}
 		fmt.Printf("  %s⚠%s Mutation: %s has no *_test.go — skipped\n", green, reset, target)
 	}
-	return kept
+	return kept, nil
 }
 
 // warmTestCache builds and runs the suite before gremlins does. gremlins
@@ -944,35 +968,37 @@ func gremlinsUnleash(target string, stream bool) (mutationReport, error) {
 		c.Stdout = &captured
 		c.Stderr = &captured
 	}
-	runErr := c.Run()
-
-	report, err := readMutationReport(reportPath)
-	if err == nil {
-		return report, nil
-	}
-	if runErr != nil {
+	// A non-zero exit fails the target whatever it left on disk. gremlins exits
+	// non-zero both for a real failure and for its own efficacy/coverage
+	// thresholds, and a run it aborted part-way may still have written a
+	// report — scoring that would be a floor comparison against a partial run,
+	// which is worse than no comparison at all.
+	if err := c.Run(); err != nil {
 		if !stream && captured.Len() > 0 {
 			fmt.Print(captured.String())
 		}
-		return report, fmt.Errorf("gremlins exited %d", exitCode(runErr))
+		return mutationReport{}, fmt.Errorf("gremlins exited %d", exitCode(err))
 	}
-	return report, err
+	return readMutationReport(reportPath)
 }
 
 // mutateTargets runs every target and sums the reports. A target that failed
-// is a warning, not a failure: mutation is advisory, and the packages that
-// did run still carry a score. ok=false only when none of them ran.
-func mutateTargets(targets []string, stream bool) (total mutationReport, ok bool) {
+// is a warning by default — mutation is advisory, and the packages that did
+// run still carry a score — but it is counted, because a score summed over
+// only the targets that survived is not the score the floor was measured
+// against, and `--enforce` must not pass on it.
+func mutateTargets(targets []string, stream bool) (total mutationReport, ran, failed int) {
 	for _, target := range targets {
 		report, err := gremlinsUnleash(target, stream)
 		if err != nil {
 			fmt.Printf("  %s⚠%s Mutation: %s — %v (advisory — not blocking)\n", green, reset, target, err)
+			failed++
 			continue
 		}
 		total = total.add(report)
-		ok = true
+		ran++
 	}
-	return total, ok
+	return total, ran, failed
 }
 
 // reportMutationScore compares a run's kill rate to the `mutation.min` floor.
@@ -1033,14 +1059,24 @@ func runMutation(workingTree bool) {
 		return
 	}
 
-	targets := withTestFiles(mutationScope(workingTree))
+	targets, err := withTestFiles(mutationScope(workingTree))
+	if err != nil {
+		fmt.Printf("  %s✗%s Mutation: %v\n", red, reset, err)
+		os.Exit(1)
+	}
 	if len(targets) == 0 {
 		fmt.Printf("  %s⚠%s Mutation: no changed Go package with tests (skipped)\n", green, reset)
 		return
 	}
 	warmTestCache(true)
-	if total, ok := mutateTargets(targets, true); ok {
+	total, ran, failed := mutateTargets(targets, true)
+	if ran > 0 {
 		reportMutationScore(total, enforce)
+	}
+	// Nothing scored, or scored over an incomplete set: advisory by default,
+	// but a gate asked to enforce must not pass because the tool broke.
+	if failed > 0 && enforce {
+		os.Exit(1)
 	}
 }
 
@@ -1721,15 +1757,18 @@ func baselineMeasurers() []suppressions.Measurer {
 // scoped run can warn when the changed package is weaker than the module
 // average. That is why the gate is advisory unless `--enforce`.
 func measuredMutationMin() suppressions.Measurement {
-	targets := withTestFiles(mutationTargets)
+	targets, err := withTestFiles(mutationTargets)
+	if err != nil {
+		return suppressions.Failed(err.Error())
+	}
 	if len(targets) == 0 {
 		return suppressions.Unavailable("no package with *_test.go to mutate")
 	}
 	fmt.Printf("  %s→%s measuring mutation.min: gremlins on %s\n", dim, reset, strings.Join(targets, " "))
 	warmTestCache(verbose)
-	report, ok := mutateTargets(targets, verbose)
-	if !ok {
-		return suppressions.Failed("gremlins failed on every target package")
+	report, _, failed := mutateTargets(targets, verbose)
+	if failed > 0 {
+		return suppressions.Failed(fmt.Sprintf("gremlins failed on %d target package(s)", failed))
 	}
 	score, scored := suppressions.MutationScore(report.Killed, report.Lived)
 	if !scored {
