@@ -10,7 +10,10 @@ as `bun harness.ts arch-config-guard`.
 Arch (dependency-cruiser) qualifies — it's a local devDependency, runs offline, and
 takes no build lock — so it joins the read-only parallel batch here too. `ci` adds
 only: the dependency audit (network), coverage, and CRAP (advisory). If you add a new
-offline, no-build-lock gate to `ci`, add it to `check` too.
+offline, no-build-lock gate to `ci`, add it to `check` too. The one scoped exception is
+the test gate: `check`/`pre-commit` run the tests that reach the change, `ci` runs the
+whole suite through coverage, so a green `check` predicts a green `ci` only for the tests
+the change reaches — `bun harness.ts test --all` closes that gap locally.
 
 - After edits: `bun run check` — lockfile sync (`bun install --frozen-lockfile`), fix, format, typecheck, test (scoped to the change set), complexity, deadcode, acceptance, arch (all four run as a read-only parallel batch after the fix step), hook-drift + arch-config-guard (warn) + gherkin-guard (warn) + suppression ratchet
 - Pre-commit: `bun run pre-commit` — the arch-config guard and the gherkin-guard run first, staged-mode, before checking whether any TypeScript files are staged, so a commit that stages only an arch config edit (or any other non-TypeScript file) still gets blocked. Only then: staged files (auto via git hook) get fixed, then re-staged so the commit records the fixed content, not the pre-fix blob. Caveat: for a partially staged file, `git add` also stages its unstaged hunks (same trade-off lint-staged makes).

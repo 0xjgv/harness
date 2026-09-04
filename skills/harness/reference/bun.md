@@ -18,14 +18,16 @@ paraphrase (it drifts). Two sections:
   `sync-agents-md` (keeps `AGENTS.md` byte-identical to `CLAUDE.md`;
   `check` + `pre-commit` fail on drift). `check` runs a lockfile check
   (`bun install --frozen-lockfile`), fix + format, typecheck, and test
-  (warns/skips when no tests exist), then — as a read-only parallel batch —
+  (scoped to the change set), then — as a read-only parallel batch —
   complexity, deadcode, acceptance (self-skips with a warning when no
   `.feature` files exist), and `arch` (dependency-cruiser qualifies for
   `check`'s batch: it's a local devDependency, runs offline, and takes no
   build lock), then warns (does not block) via `arch-config-guard`
   and `gherkin-guard`, checks Stop-hook wiring and `agents-md-drift`, and
   ratchets suppressions. Invariant: `ci` minus `check` == every gate that
-  needs the network or a build lock (`audit`, `coverage`, advisory `crap`).
+  needs the network or a build lock (`audit`, `coverage`, advisory `crap`) —
+  plus the tests outside the change set, which `ci` reaches through coverage
+  and `check` deliberately skips (`--all` runs them locally).
   `ci` runs the read-only gates
   (`lint`, `typecheck`, `audit`, `complexity`, `deadcode`, `acceptance`,
   `arch`) **in parallel** — captured and printed in submission order, run to

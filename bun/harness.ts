@@ -1027,9 +1027,11 @@ async function runTests(opts: { noExit?: boolean } = {}): Promise<RunResult> {
     return { ok: true, output: '' };
   }
   const { tests, unmapped } = await mapChangedToTests(changed);
-  for (const path of unmapped) {
+  // Quiet by default: a wide change would otherwise print one line per file.
+  for (const path of unmapped.slice(0, 5)) {
     warn(`Tests: no test reaches ${path} through relative imports; add one`);
   }
+  if (unmapped.length > 5) warn(`Tests: ${unmapped.length - 5} more source(s) no test reaches`);
 
   const cmd = ['bun', 'test', '--pass-with-no-tests'];
   if (await supportsChangedFlag()) {
