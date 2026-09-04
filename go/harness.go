@@ -572,7 +572,7 @@ func archCheck(output string) (int, []string, string) {
 			lines = append(lines, fmt.Sprintf("%s (%s:%d)", w.Text, filepath.Base(w.File), w.Line))
 		}
 		return 0, lines, fmt.Sprintf(
-			"go-arch-lint skipped the boundary check: %d problem(s) in %s",
+			"go-arch-lint skipped the boundary check: %d problem(s) in %s — fix them and rerun; this is not a clean tree",
 			len(payload.ExecutionWarnings), archConfig)
 	}
 	count := len(payload.ArchWarningsDeps) + len(payload.ArchWarningsNotMatched) +
