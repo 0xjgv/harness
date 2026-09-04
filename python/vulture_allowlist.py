@@ -7,3 +7,9 @@ framework callbacks, serialization hooks. When vulture flags such a name, add it
 here (for example `handler.on_event` or `_.middleware`) so the gate stays green
 without scattering suppressions through the source. Empty by default.
 """
+
+from src.adapters import formatting
+
+# render_receipt is the adapters layer's public entrypoint (what a CLI or web
+# handler would call); only tests and step defs invoke it today.
+_ = formatting.render_receipt

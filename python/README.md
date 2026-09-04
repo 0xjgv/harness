@@ -46,7 +46,7 @@ uv run harness check --verbose
 uv run harness acceptance            # behave against tests/features/
 uv run harness deadcode              # vulture over src/ only (--min-confidence 60); allowlist in vulture_allowlist.py
 uv run harness coverage --min=80     # tests with coverage, fails below threshold
-uv run harness mutation              # mutmut kill-rate on src/ (advisory; see note below)
+uv run harness mutation              # mutation testing (advisory; not configured by default — see note below)
 uv run harness crap --max=30         # CRAP = CCN² × (1-cov)³ + CCN per function (advisory)
 uv run harness suppressions          # suppression breakdown; --update-baseline with human sign-off
 uv run harness arch                  # import-linter against .importlinter
@@ -93,10 +93,9 @@ Day-1 defaults are deliberately loose so adopting this template does not fail ex
 - `coverage --min=0` — explicit flags win; otherwise the default comes from `.harness-baseline` `coverage.min`.
 - `.harness-baseline` also ratchets suppression counts. New suppressions fail `check`; run `harness suppressions --update-baseline` only with human sign-off.
 - `harness test` uses `unittest`; when no `tests/test*.py` files exist, it runs `py_compile` over `src/` and `harness.py`.
-- Coverage, mutation, and CRAP warn and skip when no unit tests exist.
+- Coverage and CRAP warn and skip when no unit tests exist.
 - CRAP is advisory in `ci`; pass `--enforce` when you are ready to block on it.
-- Mutation is advisory — enable as a blocking gate once a baseline is established.
-- `mutmut 3.x` isolates `src/` into a `mutants/` subdir. If your tests import top-level modules (e.g., `from harness import ...`), add `[tool.mutmut]` config or a `conftest.py` path shim so the isolated test run can resolve them.
+- Mutation is not configured by default: `harness mutation` warns and exits 0. Add a mutation-testing tool (e.g. mutmut) to `[dependency-groups] dev` and wire it into `cmd_mutation` to enable it as an advisory (or later blocking) gate.
 - `.importlinter` ships with one starter rule (`tests` cannot import `src.internal`). Extend as the module graph grows.
 
 ## Starting from This Template

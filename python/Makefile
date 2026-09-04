@@ -7,8 +7,8 @@ HARNESS := uv run harness
 
 HARNESS_TARGETS := \
 	fix format lint typecheck test coverage acceptance mutation \
-	crap complexity deadcode arch arch-config-guard audit check post-edit stop-hook \
-	pre-commit pre-push ci setup-hooks agents-md-drift sync-agents-md clean
+	crap complexity deadcode arch arch-config-guard gherkin-guard audit check post-edit stop-hook \
+	pre-commit pre-push ci setup-hooks agents-md-drift sync-agents-md suppressions clean
 
 .DEFAULT_GOAL := check
 .PHONY: deps bootstrap $(HARNESS_TARGETS)

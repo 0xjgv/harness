@@ -96,6 +96,19 @@ func parseCoverBlock(line string) (path string, startLine, endLine, hits int, ok
 	return line[:colon], startLine, endLine, h, true
 }
 
+// AdvisoryGlyph returns the status glyph CRAP's offender report should
+// print: "✗" only when enforce is true (the run actually exits 1 on
+// offenders), "⚠" otherwise (advisory — offenders are reported but the run
+// still exits 0). Reserves the red/blocking glyph for the mode that
+// actually fails the build; advisory mode must not print a glyph it then
+// ignores.
+func AdvisoryGlyph(enforce bool) string {
+	if enforce {
+		return "✗"
+	}
+	return "⚠"
+}
+
 // parseLineNumber extracts the line number from a "line.col" token.
 func parseLineNumber(token string) (int, bool) {
 	dot := strings.Index(token, ".")

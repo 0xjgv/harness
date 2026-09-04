@@ -13,21 +13,37 @@ paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
   quality subcommands `complexity`, `deadcode`, `acceptance`, `coverage`,
-  `mutation`, `crap`, `arch`, `arch-config-guard`, `suppressions`, and the drift pair `agents-md-drift` /
+  `mutation`, `crap`, `arch`, `arch-config-guard`, `gherkin-guard`,
+  `suppressions`, and the drift pair `agents-md-drift` /
   `sync-agents-md` (keeps `AGENTS.md` byte-identical to `CLAUDE.md`;
-  `check` + `pre-commit` fail on drift). `ci` runs the read-only gates
+  `check` + `pre-commit` fail on drift). `check` runs a lockfile check
+  (`bun install --frozen-lockfile`), fix + format, typecheck, and test
+  (warns/skips when no tests exist), then — as a read-only parallel batch —
+  complexity, deadcode, acceptance (self-skips with a warning when no
+  `.feature` files exist), and `arch` (dependency-cruiser qualifies for
+  `check`'s batch: it's a local devDependency, runs offline, and takes no
+  build lock), then warns (does not block) via `arch-config-guard`
+  and `gherkin-guard`, checks Stop-hook wiring and `agents-md-drift`, and
+  ratchets suppressions. Invariant: `ci` minus `check` == every gate that
+  needs the network or a build lock (`audit`, `coverage`, advisory `crap`).
+  `ci` runs the read-only gates
   (`lint`, `typecheck`, `audit`, `complexity`, `deadcode`, `acceptance`,
   `arch`) **in parallel** — captured and printed in submission order, run to
   completion so one pass surfaces every failure — then streams `coverage` and
-  the advisory `crap`; `ci` also runs `arch-config-guard` in strict mode.
+  the advisory `crap`; `ci` also runs `arch-config-guard` and `gherkin-guard`
+  in strict (blocking) mode.
   `pre-push` is the offline push gate: `lint` (biome
-  covers format), `acceptance`, `arch`, and strict `arch-config-guard` over the whole pushed tree (the
+  covers format), `acceptance`, `arch`, and strict `arch-config-guard` + `gherkin-guard` over the whole pushed tree (the
   deterministic checks pre-commit and stop-hook skip). `deadcode` runs knip
   (pinned, fetched on demand via `bunx` — no devDep) to flag unused files,
   exports, and dependencies; `knip.json` declares the cucumber step files as
-  entries and ignores the tool devDeps invoked as binaries. It runs in `ci`
-  and `stop-hook`. `crap` is advisory (warns by default, `--enforce` to
-  hard-fail) but runs in `ci`, not `stop-hook`. Suppressions are ratcheted by
+  entries and ignores the tool devDeps invoked as binaries. It runs in `check`,
+  `ci`, and `stop-hook`. `gherkin-guard` blocks a changed `src/` file with no
+  changed `.feature` in `pre-commit`/`pre-push`/`ci`
+  (`HARNESS_ALLOW_NO_FEATURE=1` overrides after review); it only warns in
+  `check`/`stop-hook`, and skips silently when the repo has no `.feature`
+  files anywhere. `crap` is advisory (warns by default, `--enforce` to
+  hard-fail) but runs in `ci`, not `stop-hook` or `check`. Suppressions are ratcheted by
   `.harness-baseline`; `coverage.min` in the same file is the default coverage floor. `test`, `coverage`, `mutation`, and
   `crap` warn and skip when no Bun test files exist. `check` also warns on
   missing Stop hook wiring and arch config changes. Requires `uvx`

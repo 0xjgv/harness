@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -169,9 +170,12 @@ func run(description string, cmd []string, opts *runOpts) runResult {
 // failure; the caller exits non-zero afterward. Results are collected into an
 // index-stable slice and printed in submission order (not as they finish) so a
 // parallel run reads the same every time — matching the monorepo Makefile's dump.
-func runGatesParallel(gates []gate) bool {
+// runGatesParallel returns whether every gate passed and, for any that
+// didn't, their descriptions — the caller decides how loudly to surface
+// the failure (e.g. stop-hook echoes them to stderr for Claude to see).
+func runGatesParallel(gates []gate) (bool, []string) {
 	if len(gates) == 0 {
-		return true
+		return true, nil
 	}
 	results := make([]gateResult, len(gates))
 	var wg sync.WaitGroup
@@ -185,12 +189,14 @@ func runGatesParallel(gates []gate) bool {
 	wg.Wait()
 
 	allOk := true
+	var failed []string
 	for _, r := range results {
 		if !printGateResult(r, true) {
 			allOk = false
+			failed = append(failed, r.description)
 		}
 	}
-	return allOk
+	return allOk, failed
 }
 
 func exitCode(err error) int {
@@ -266,21 +272,24 @@ func hasNonTestFiles(files []string) bool {
 	return false
 }
 
+// changedGoFiles returns .go files with uncommitted changes in this
+// template's subtree. `git status --porcelain` prints repo-root-relative
+// paths regardless of cwd, so the `-- .` pathspec scopes it to the current
+// template and PorcelainChangedGoPath rejects anything git still reports
+// outside that subtree (defense in depth) as well as deletions and renames'
+// old-side paths.
 func changedGoFiles() []string {
-	c := exec.Command("git", "status", "--porcelain")
+	c := exec.Command("git", "status", "--porcelain", "--", ".")
 	c.Dir = root
 	out, err := c.Output()
 	if err != nil {
 		return nil
 	}
 
+	prefix := gitPrefix()
 	var files []string
 	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		if len(line) < 4 {
-			continue
-		}
-		f := line[3:]
-		if strings.HasSuffix(f, ".go") {
+		if f, ok := suppressions.PorcelainChangedGoPath(line, prefix); ok {
 			files = append(files, f)
 		}
 	}
@@ -343,6 +352,17 @@ func auditGate() gate {
 	}
 }
 
+// modTidyGate fails when go.mod/go.sum don't match what `go mod tidy` would
+// produce — a direct import marked `// indirect` (or vice versa) silently
+// bit-rots the require list otherwise. `-diff` reports without mutating.
+func modTidyGate() gate {
+	return gate{
+		description: "go.mod tidy",
+		cmd:         []string{"go", "mod", "tidy", "-diff"},
+		hint:        "run `go mod tidy`",
+	}
+}
+
 func cmdAudit() {
 	g := auditGate()
 	run(g.description, g.cmd, nil)
@@ -355,13 +375,20 @@ func cmdPostEdit() {
 	run("Fix & format", []string{"golangci-lint", "run", "--fix", "./..."}, &runOpts{noExit: true})
 }
 
+// cmdStopHook exits 2 (not 1) on failure: Claude Code treats a Stop hook's
+// exit code 2 as blocking and feeds its stderr back to the model, but any
+// other non-zero exit is a non-blocking error the model never sees. Codex
+// doesn't care about the exit code itself — codex-stop-hook.sh maps any
+// non-zero exit to {"decision":"block"} — so this only changes Claude's path.
 func cmdStopHook() {
 	fmt.Println("\n=== Stop Hook Checks ===\n")
 	cmdPostEdit() // mutating — sequential, first
 	checkArchConfigGuard(true, false, false)
-	allOk := runGatesParallel([]gate{complexityGate()}) // read-only batch
+	checkGherkinGuard(true, false, false)
+	allOk, failed := runGatesParallel([]gate{complexityGate()}) // read-only batch
 	if !allOk {
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "stop-hook: failed gate(s): %s\n", strings.Join(failed, ", "))
+		os.Exit(2)
 	}
 }
 
@@ -397,7 +424,11 @@ func hasFlag(name string) bool {
 func coverageMinDefault() int {
 	raw := flagValue("min", "")
 	if raw != "" {
-		value, _ := strconv.Atoi(raw)
+		value, err := strconv.Atoi(raw)
+		if err != nil {
+			fmt.Printf("  %s✗%s Coverage: invalid --min=%q (must be an integer)\n", red, reset, raw)
+			os.Exit(1)
+		}
 		return value
 	}
 	if baseline, ok := suppressions.ReadBaseline(root); ok {
@@ -495,14 +526,21 @@ func gitPrefix() string {
 	return strings.Trim(strings.TrimPrefix(filepath.ToSlash(lines[0]), "./"), "/")
 }
 
+// normalizeChangedPath delegates to the pure, unit-tested implementation in
+// suppressions — harness.go carries `//go:build ignore` and is not part of
+// any testable package.
 func normalizeChangedPath(path, prefix string) string {
-	normalized := strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(path)), "./")
-	if prefix != "" && strings.HasPrefix(normalized, prefix+"/") {
-		return strings.TrimPrefix(normalized, prefix+"/")
-	}
-	return normalized
+	return suppressions.NormalizeChangedPath(path, prefix)
 }
 
+// changedPathsFromBase resolves the base ref to diff against for the arch
+// config guard. HARNESS_ARCH_BASE (explicit override) and GITHUB_BASE_REF
+// (set by GitHub Actions, but only on `pull_request` events) take priority.
+// Neither is set on a direct `push` to main, which would otherwise leave a
+// same-branch push blind to an arch config change — so absent both, fall
+// back to the first of origin/HEAD, origin/main, main that resolves. On main
+// itself the `base...HEAD` triple-dot diff is empty (merge-base(main,main)
+// == HEAD), so this adds no false positives.
 func changedPathsFromBase() []string {
 	var bases []string
 	if base := os.Getenv("HARNESS_ARCH_BASE"); base != "" {
@@ -510,6 +548,14 @@ func changedPathsFromBase() []string {
 	}
 	if githubBase := os.Getenv("GITHUB_BASE_REF"); githubBase != "" {
 		bases = append(bases, "origin/"+githubBase)
+	}
+	if len(bases) == 0 {
+		for _, candidate := range []string{"origin/HEAD", "origin/main", "main"} {
+			if len(gitLines("rev-parse", "--verify", candidate)) > 0 {
+				bases = append(bases, candidate)
+				break
+			}
+		}
 	}
 	var paths []string
 	for _, base := range bases {
@@ -550,7 +596,14 @@ func changedPathsFromPrePushStdin() []string {
 	return paths
 }
 
-func changedArchConfigs(staged, includePrePushStdin bool) []string {
+// changedPaths gathers every changed path in this template's subtree: the
+// working tree diff, staged diff, untracked files, and the diff against the
+// resolved base branch (all three skipped when staged is true — only the
+// staged diff applies), plus, when requested, refs read from pre-push's
+// stdin. Shared by the arch config guard and the Gherkin-first guard so
+// both git-diff invocations, base-ref resolution, and pre-push stdin
+// parsing have exactly one implementation.
+func changedPaths(staged, includePrePushStdin bool) []string {
 	var paths []string
 	if staged {
 		paths = append(paths, gitLines("diff", "--cached", "--name-only", "--diff-filter=d", "--", ".")...)
@@ -563,13 +616,15 @@ func changedArchConfigs(staged, includePrePushStdin bool) []string {
 	if includePrePushStdin {
 		paths = append(paths, changedPathsFromPrePushStdin()...)
 	}
+	return paths
+}
 
+func changedArchConfigs(staged, includePrePushStdin bool) []string {
 	seen := map[string]bool{}
 	prefix := gitPrefix()
-	for _, p := range paths {
-		normalized := normalizeChangedPath(p, prefix)
-		if normalized == archConfig {
-			seen[normalized] = true
+	for _, p := range changedPaths(staged, includePrePushStdin) {
+		if normalizeChangedPath(p, prefix) == archConfig {
+			seen[archConfig] = true
 		}
 	}
 	var changed []string
@@ -603,6 +658,80 @@ func checkArchConfigGuard(warnOnly, staged, includePrePushStdin bool) bool {
 
 func cmdArchConfigGuard() {
 	if !checkArchConfigGuard(hasFlag("warn"), hasFlag("staged"), false) {
+		os.Exit(1)
+	}
+}
+
+// ── Gherkin-first guard ─────────────────────────────────────────────
+
+const gherkinGuardAllowEnv = "HARNESS_ALLOW_NO_FEATURE"
+
+// hasAnyFeatureFiles reports whether the template contains at least one
+// `.feature` file anywhere under root.
+func hasAnyFeatureFiles() bool {
+	found := false
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found {
+			return nil
+		}
+		if !d.IsDir() && strings.HasSuffix(path, ".feature") {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+// checkGherkinGuard mechanizes the "write a .feature before changing
+// user-visible behavior" rule, mirroring checkArchConfigGuard's shape
+// exactly: gather the same changed-path set (changedPaths, shared with the
+// arch config guard), classify it, print a single ✓/⚠/✗ line, and return
+// whether the caller should proceed. "Production source" = a changed
+// non-test .go file outside features/, excluding harness.go itself (see
+// suppressions.IsGherkinGuardProductionPath). Silently passes (no output at
+// all) when the template has no .feature files anywhere yet — retrofitting
+// the harness into a repo with no acceptance suite must never block.
+func checkGherkinGuard(warnOnly, staged, includePrePushStdin bool) bool {
+	prefix := gitPrefix()
+	var productionPaths []string
+	hasFeatureChange := false
+	for _, p := range changedPaths(staged, includePrePushStdin) {
+		normalized := normalizeChangedPath(p, prefix)
+		if suppressions.IsGherkinGuardProductionPath(normalized) {
+			productionPaths = append(productionPaths, normalized)
+		}
+		if strings.HasSuffix(normalized, ".feature") {
+			hasFeatureChange = true
+		}
+	}
+	hasProductionChange := len(productionPaths) > 0
+	override := os.Getenv(gherkinGuardAllowEnv) == "1"
+	joined := strings.Join(productionPaths, ", ")
+
+	switch suppressions.EvaluateGherkinGuard(hasAnyFeatureFiles(), hasProductionChange, hasFeatureChange, override) {
+	case suppressions.GherkinGuardSkip:
+		return true
+	case suppressions.GherkinGuardTrigger:
+		if warnOnly {
+			fmt.Printf("  %s⚠%s Gherkin-first: production source changed with no .feature: %s\n", green, reset, joined)
+			fmt.Printf("  ↳ fix: add a scenario under features/, or set %s=1 after review\n", gherkinGuardAllowEnv)
+			return true
+		}
+		fmt.Printf("  %s✗%s Gherkin-first: production source changed with no .feature: %s\n", red, reset, joined)
+		fmt.Printf("  ↳ fix: add a scenario under features/, or set %s=1 after review\n", gherkinGuardAllowEnv)
+		return false
+	default: // GherkinGuardPass
+		if override && hasProductionChange && !hasFeatureChange {
+			fmt.Printf("  %s⚠%s Gherkin-first override: %s\n", green, reset, joined)
+		} else {
+			fmt.Printf("  %s✓%s Gherkin-first\n", green, reset)
+		}
+		return true
+	}
+}
+
+func cmdGherkinGuard() {
+	if !checkGherkinGuard(hasFlag("warn"), hasFlag("staged"), false) {
 		os.Exit(1)
 	}
 }
@@ -666,6 +795,19 @@ var lizardLocRe = regexp.MustCompile(`"([^"@]*)@(\d+)-(\d+)@([^"]+)"`)
 // per-function coverage is the fraction of in-range tracked lines that ran.
 // Joining on file+line range, not name, sidesteps Go's "(*Foo).Bar" vs "Bar"
 // receiver-name mismatch between cover output and lizard output.
+// crapGlyphAndColor pairs CRAP's advisory/enforce output glyph with the
+// matching ANSI color used throughout this runner (⚠ prints green, ✗ prints
+// red, by convention here). The enforce→glyph mapping itself lives in
+// crap.AdvisoryGlyph — pure, unit tested — so this stays a one-line wrapper.
+func crapGlyphAndColor(enforce bool) (glyph, color string) {
+	glyph = crap.AdvisoryGlyph(enforce)
+	color = green
+	if enforce {
+		color = red
+	}
+	return glyph, color
+}
+
 func cmdCrap() {
 	maxCrap, _ := strconv.ParseFloat(flagValue("max", "30"), 64)
 	enforce := hasFlag("enforce")
@@ -700,7 +842,8 @@ func cmdCrap() {
 		if !enforce {
 			suffix = " (advisory)"
 		}
-		fmt.Printf("  %s✗%s CRAP: lizard failed to run%s\n", red, reset, suffix)
+		glyph, color := crapGlyphAndColor(enforce)
+		fmt.Printf("  %s%s%s CRAP: lizard failed to run%s\n", color, glyph, reset, suffix)
 		if enforce {
 			os.Exit(1)
 		}
@@ -730,7 +873,8 @@ func cmdCrap() {
 	if enforce {
 		suffix = ""
 	}
-	fmt.Printf("  %s✗%s CRAP: %d function(s) exceed %.0f%s\n", red, reset, len(offenders), maxCrap, suffix)
+	glyph, color := crapGlyphAndColor(enforce)
+	fmt.Printf("  %s%s%s CRAP: %d function(s) exceed %.0f%s\n", color, glyph, reset, len(offenders), maxCrap, suffix)
 	limit := min(len(offenders), 20)
 	for _, o := range offenders[:limit] {
 		m := o.metric
@@ -955,8 +1099,28 @@ func cmdCheck() {
 		run("Tests", []string{"go", "test", "./..."}, &runOpts{extract: extractTestSummary, noExit: true}),
 	}
 
+	// Read-only parallel batch, after the mutating fix step above. Invariant:
+	// `check` runs every gate that is offline, fast, and takes no build lock —
+	// lint is already covered by Fix & format's own --fix exit code, but arch
+	// (go-arch-lint) does NOT qualify: `go run github.com/fe3dback/go-arch-lint@…`
+	// fetches a module, which hits the network on a cold module cache, so it
+	// stays ci/pre-push-only. Folded into `results` gate-by-gate (not as one
+	// combined entry) so the N passed/M failed summary below reflects each
+	// gate individually.
+	checkGates := []gate{complexityGate(), modTidyGate()}
+	checkGates = append(checkGates, acceptanceGatesOrWarn()...)
+	_, failedCheckGates := runGatesParallel(checkGates)
+	failedCheckGateSet := make(map[string]bool, len(failedCheckGates))
+	for _, d := range failedCheckGates {
+		failedCheckGateSet[d] = true
+	}
+	for _, g := range checkGates {
+		results = append(results, runResult{ok: !failedCheckGateSet[g.description]})
+	}
+
 	checkStopHooksPresent()
 	checkArchConfigGuard(true, false, false)
+	checkGherkinGuard(true, false, false)
 	results = append(results, checkAgentsMdDrift(true))
 	results = append(results, runResult{
 		ok: suppressions.CheckBaseline(
@@ -987,20 +1151,29 @@ func cmdCheck() {
 	fmt.Printf("%sOK%s %d passed %s(%.1fs)%s\n", green, reset, passed, dim, elapsed, reset)
 }
 
+// cmdPreCommit runs the arch-config and gherkin-first guards before the
+// staged-files early return: both are staged-mode and cheap, and a commit
+// that stages only a non-Go file (an arch config edit alone, a .md, a
+// lockfile) must not bypass them.
 func cmdPreCommit() {
+	fmt.Printf("\n%s[pre-commit]%s\n\n", blue, reset)
+
+	if !checkArchConfigGuard(false, true, false) {
+		os.Exit(1)
+	}
+	if !checkGherkinGuard(false, true, false) {
+		os.Exit(1)
+	}
+
 	files := stagedGoFiles()
 	if len(files) == 0 {
 		fmt.Println("No staged Go files — skipping checks")
 		return
 	}
 
-	fmt.Printf("\n%s[pre-commit]%s\n\n", blue, reset)
-
-	if !checkArchConfigGuard(false, true, false) {
-		os.Exit(1)
-	}
 	pkgs := stagedPackages(files)
 	cmdFix(pkgs)
+	restageFixedFiles(files)
 	checkAgentsMdDrift(false)
 
 	if hasNonTestFiles(files) {
@@ -1008,17 +1181,44 @@ func cmdPreCommit() {
 	}
 }
 
+// restageFixedFiles re-adds staged files after cmdFix rewrites the working
+// tree, so the commit records the fixed blob instead of the pre-fix one.
+// Files cmdFix deleted (rare — a fix that removes a file outright) are left
+// out; `git add` on a missing path fails and there is nothing to re-stage.
+// Note: if a file was only partially staged, `git add` also stages its
+// remaining unstaged hunks — there is no way to re-stage just the fixed
+// hunk without the file's other pending edits.
+func restageFixedFiles(files []string) {
+	var existing []string
+	for _, f := range files {
+		if _, err := os.Stat(filepath.Join(root, f)); err == nil {
+			existing = append(existing, f)
+		}
+	}
+	if len(existing) == 0 {
+		return
+	}
+	c := exec.Command("git", append([]string{"add", "--"}, existing...)...)
+	c.Dir = root
+	if err := c.Run(); err != nil {
+		fmt.Printf("  %s✗%s Re-stage fixed files: %v\n", red, reset, err)
+		os.Exit(1)
+	}
+	fmt.Printf("  %s✓%s Re-staged %d fixed file(s)\n", green, reset, len(existing))
+}
+
 func cmdCi() {
 	fmt.Printf("\n%s[ci]%s\n\n", blue, reset)
 	// Read-only gates run as a parallel batch (captured, printed in submission
 	// order, run to completion). Coverage is captured and CRAP is advisory — after.
-	gates := []gate{lintGate(nil), auditGate(), complexityGate()}
+	gates := []gate{lintGate(nil), auditGate(), complexityGate(), modTidyGate()}
 	gates = append(gates, acceptanceGatesOrWarn()...)
 	gates = append(gates, archGatesOrWarn()...)
-	allOk := runGatesParallel(gates)
+	allOk, _ := runGatesParallel(gates)
 	cmdTestCov() // after the batch
 	cmdCrap()    // advisory unless --enforce
 	archConfigOk := checkArchConfigGuard(false, false, false)
+	gherkinOk := checkGherkinGuard(false, false, false)
 	suppressionsOk := suppressions.CheckBaseline(
 		root,
 		suppressions.ScanFindings(root),
@@ -1026,7 +1226,7 @@ func cmdCi() {
 		"go run harness.go suppressions --update-baseline",
 		true,
 	)
-	if !allOk || !archConfigOk || !suppressionsOk {
+	if !allOk || !archConfigOk || !gherkinOk || !suppressionsOk {
 		os.Exit(1)
 	}
 }
@@ -1040,10 +1240,12 @@ func cmdCi() {
 func cmdPrePush() {
 	fmt.Printf("\n%s[pre-push]%s\n\n", blue, reset)
 	archConfigOk := checkArchConfigGuard(false, false, true)
+	gherkinOk := checkGherkinGuard(false, false, true)
 	gates := []gate{lintGate(nil)}
 	gates = append(gates, acceptanceGatesOrWarn()...)
 	gates = append(gates, archGatesOrWarn()...)
-	if !runGatesParallel(gates) || !archConfigOk {
+	ok, _ := runGatesParallel(gates)
+	if !ok || !archConfigOk || !gherkinOk {
 		os.Exit(1)
 	}
 }
@@ -1076,7 +1278,7 @@ func cmdComplexity() {
 // the exit code into the block/continue JSON Codex expects).
 const (
 	claudeSettingsSchema = "https://json.schemastore.org/claude-code-settings.json"
-	claudeStopCommand    = "cd $CLAUDE_PROJECT_DIR && go run harness.go stop-hook"
+	claudeStopCommand    = "cd $CLAUDE_PROJECT_DIR && go run harness.go stop-hook || exit 2"
 	codexStopCommand     = `cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh go run harness.go stop-hook`
 )
 
@@ -1162,8 +1364,14 @@ func cloneMap(m map[string]any) map[string]any {
 // installStopHook injects/refreshes the Stop hook in a settings file, preserving
 // every other hook. Idempotent: an existing stop-hook handler (current or legacy)
 // is replaced in place and duplicates are dropped, so re-running never accumulates
-// entries. (encoding/json sorts object keys, so the file is rewritten in a stable
-// order — cosmetic, and identical on every subsequent run.)
+// entries. SetEscapeHTML(false) keeps "&&" in hook commands from being written out
+// as "&&", matching the committed template's literal "&&" byte-for-byte.
+// Residual: encoding/json still sorts every object's keys alphabetically — that is
+// inherent to Marshal/Encoder.Encode, not specific to MarshalIndent, and not fixable
+// here without hand-rolling a JSON writer. A committed file whose keys aren't already
+// alphabetical (e.g. this repo's "type" before "command") gets reordered on first
+// run. That reordering is stable and idempotent — identical on every subsequent
+// run — just not byte-identical to the hand-written committed file on first run.
 func installStopHook(rel string, hook map[string]any, claudeSettings bool) {
 	path := filepath.Join(root, filepath.FromSlash(rel))
 	data := map[string]any{}
@@ -1211,8 +1419,11 @@ func installStopHook(rel string, hook map[string]any, claudeSettings bool) {
 	}
 	hooks["Stop"] = stopGroups
 
-	out, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(data); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: marshal failed: %v\n", rel, err)
 		os.Exit(1)
 	}
@@ -1220,7 +1431,8 @@ func installStopHook(rel string, hook map[string]any, claudeSettings bool) {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
-	if err := os.WriteFile(path, append(out, '\n'), 0o644); err != nil {
+	// Encoder.Encode already appends a trailing newline.
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
@@ -1294,6 +1506,7 @@ var tasks = []task{
 	{"acceptance", cmdAcceptance, "Run acceptance scenarios (godog)"},
 	{"arch", cmdArch, "Architecture checks (go-arch-lint)"},
 	{"arch-config-guard", cmdArchConfigGuard, "Block unreviewed arch config changes"},
+	{"gherkin-guard", cmdGherkinGuard, "Block production source changes with no accompanying .feature scenario"},
 	{"mutation", cmdMutation, "Mutation testing (gremlins, advisory)"},
 	{"crap", cmdCrap, "CRAP complexity x coverage gate (advisory)"},
 	{"suppressions", cmdSuppressions, "Show or update suppression baseline"},

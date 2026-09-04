@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd $CLAUDE_PROJECT_DIR && cargo harness stop-hook"
+            "command": "cd $CLAUDE_PROJECT_DIR && cargo harness stop-hook || exit 2"
           }
         ]
       }

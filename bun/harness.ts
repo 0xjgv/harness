@@ -29,6 +29,7 @@ const BASELINE_FILE = '.harness-baseline';
 const SUPPRESSION_BASELINE_PREFIX = 'suppressions.';
 const ARCH_CONFIGS = ['.dependency-cruiser.json'] as const;
 const ARCH_CONFIG_ALLOW_ENV = 'HARNESS_ALLOW_ARCH_CONFIG';
+const GHERKIN_ALLOW_ENV = 'HARNESS_ALLOW_NO_FEATURE';
 
 // ── Hook wiring (installed by `setup-hooks`) ────────────────────────
 // Claude reads .claude/settings.json and runs the harness directly; Codex reads
@@ -36,7 +37,7 @@ const ARCH_CONFIG_ALLOW_ENV = 'HARNESS_ALLOW_ARCH_CONFIG';
 // the exit code into the block/continue JSON Codex expects). Keep both in sync
 // with the committed template files so re-running the installer is a no-op.
 const CLAUDE_SETTINGS_SCHEMA = 'https://json.schemastore.org/claude-code-settings.json';
-const CLAUDE_STOP_COMMAND = 'cd $CLAUDE_PROJECT_DIR && bun harness.ts stop-hook';
+const CLAUDE_STOP_COMMAND = 'cd $CLAUDE_PROJECT_DIR && bun harness.ts stop-hook || exit 2';
 const CODEX_STOP_COMMAND =
   'cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh bun harness.ts stop-hook';
 const CLAUDE_STOP_HOOK = { type: 'command', command: CLAUDE_STOP_COMMAND };
@@ -233,13 +234,18 @@ async function run(
  * buffered, deterministic dump.
  */
 export async function runGatesParallel(gates: Gate[]): Promise<boolean> {
-  if (gates.length === 0) return true;
+  return (await runGatesParallelDetailed(gates)).ok;
+}
+
+/** Same as runGatesParallel, plus which gates failed — stop-hook needs the names for its stderr summary. */
+async function runGatesParallelDetailed(gates: Gate[]): Promise<{ ok: boolean; failed: string[] }> {
+  if (gates.length === 0) return { ok: true, failed: [] };
   const results = await Promise.all(gates.map((gate) => runCapture(gate)));
-  let allOk = true;
+  const failed: string[] = [];
   for (const result of results) {
-    if (!printGateResult(result, { noExit: true })) allOk = false;
+    if (!printGateResult(result, { noExit: true })) failed.push(result.description);
   }
-  return allOk;
+  return { ok: failed.length === 0, failed };
 }
 
 // ── Extractors ──────────────────────────────────────────────────────
@@ -267,7 +273,7 @@ export interface SuppressionMatch {
   rules: string[];
 }
 
-interface SuppressionFinding extends SuppressionMatch {
+export interface SuppressionFinding extends SuppressionMatch {
   location: string;
 }
 
@@ -302,12 +308,16 @@ export function parseLineForSuppressions(line: string): SuppressionMatch[] {
   return out;
 }
 
-async function scanSuppressionFindings(roots?: string[]): Promise<SuppressionFinding[]> {
+export async function scanSuppressionFindings(roots?: string[]): Promise<SuppressionFinding[]> {
   const { readdir, readFile, stat } = await import('node:fs/promises');
-  const { isAbsolute, join } = await import('node:path');
+  const { isAbsolute, join, relative } = await import('node:path');
   const actualRoots = roots ?? (await qualityTargets());
   const findings: SuppressionFinding[] = [];
 
+  // Locations are always reported relative to ROOT (the template root), never
+  // absolute and never as the raw (possibly relative-to-cwd) input path — both the
+  // single-file branch and the directory-walk branch route through the same
+  // relative(ROOT, full) so the suppression report never mixes formats.
   async function scanPath(rawPath: string): Promise<void> {
     const full = isAbsolute(rawPath) ? rawPath : join(ROOT, rawPath);
     const info = await stat(full).catch(() => null);
@@ -316,9 +326,10 @@ async function scanSuppressionFindings(roots?: string[]): Promise<SuppressionFin
       if (!full.endsWith('.ts')) return;
       const text = await readFile(full, 'utf8').catch(() => null);
       if (text == null) return;
+      const location = relative(ROOT, full);
       for (const [index, line] of text.split('\n').entries()) {
         for (const m of parseLineForSuppressions(line)) {
-          findings.push({ ...m, location: `${rawPath}:${index + 1}` });
+          findings.push({ ...m, location: `${location}:${index + 1}` });
         }
       }
       return;
@@ -333,9 +344,10 @@ async function scanSuppressionFindings(roots?: string[]): Promise<SuppressionFin
       } else if (e.isFile() && e.name.endsWith('.ts')) {
         const text = await readFile(child, 'utf8').catch(() => null);
         if (text == null) continue;
+        const location = relative(ROOT, child);
         for (const [index, line] of text.split('\n').entries()) {
           for (const m of parseLineForSuppressions(line)) {
-            findings.push({ ...m, location: `${child}:${index + 1}` });
+            findings.push({ ...m, location: `${location}:${index + 1}` });
           }
         }
       }
@@ -383,9 +395,30 @@ export async function readBaseline(base = ROOT): Promise<Record<string, number> 
   return baseline;
 }
 
+export type MinArgResult =
+  | { present: false }
+  | { present: true; ok: true; value: number }
+  | { present: true; ok: false; raw: string };
+
+/** Parse `--min=N` out of argv. Pure — kept separate so the invalid-value path is testable. */
+export function parseMinArg(argv: string[]): MinArgResult {
+  const minArg = argv.find((a) => a.startsWith('--min='));
+  if (!minArg) return { present: false };
+  const raw = minArg.split('=', 2)[1];
+  const value = Number(raw);
+  if (Number.isInteger(value)) return { present: true, ok: true, value };
+  return { present: true, ok: false, raw };
+}
+
 export async function coverageMinDefault(base = ROOT): Promise<number> {
-  const minArg = process.argv.find((a) => a.startsWith('--min='));
-  if (minArg) return Number(minArg.split('=', 2)[1]);
+  const parsed = parseMinArg(process.argv);
+  if (parsed.present) {
+    if (!parsed.ok) {
+      console.log(`  ${RED}✗${RESET} Coverage: --min=${parsed.raw} is not an integer`);
+      process.exit(1);
+    }
+    return parsed.value;
+  }
   const baseline = await readBaseline(base);
   return baseline?.['coverage.min'] ?? 0;
 }
@@ -508,18 +541,25 @@ async function stagedTsFiles(): Promise<string[]> {
 }
 
 async function changedTsFiles(): Promise<string[]> {
-  const proc = Bun.spawn(['git', 'status', '--porcelain'], {
+  // `git status --porcelain` always prints repo-root-relative paths, regardless of
+  // cwd — `-- .` scopes results to this template's subtree, and gitPrefix()/
+  // normalizeChangedPath() convert those repo-root-relative paths back to paths
+  // relative to ROOT (needed whenever the template isn't the git root, e.g. this
+  // monorepo-style checkout).
+  const proc = Bun.spawn(['git', 'status', '--porcelain', '--', '.'], {
     cwd: ROOT,
     stdout: 'pipe',
     stderr: 'pipe',
   });
   const stdout = await new Response(proc.stdout).text();
   await proc.exited;
+  const prefix = await gitPrefix();
   return stdout
     .trim()
     .split('\n')
     .filter((line) => line.length > 3 && !line.slice(0, 2).includes('D'))
     .map(porcelainPath)
+    .map((f) => normalizeChangedPath(f, prefix))
     .filter((f) => isProjectTsFile(f));
 }
 
@@ -616,17 +656,21 @@ async function cmdCoverage(): Promise<void> {
   }
 }
 
+// Shared by acceptanceGatesOrWarn (warns when absent) and the gherkin-first
+// guard (skips silently when absent) — both need to know whether the
+// template has adopted an acceptance suite at all.
+async function hasAnyFeatureFiles(base = ROOT): Promise<boolean> {
+  const { existsSync } = await import('node:fs');
+  const featuresDir = `${base}/${TEST_DIR}/features`;
+  if (!existsSync(featuresDir)) return false;
+  const glob = new Bun.Glob('**/*.feature');
+  const matches = await Array.fromAsync(glob.scan({ cwd: featuresDir, onlyFiles: true }));
+  return matches.length > 0;
+}
+
 async function acceptanceGatesOrWarn(): Promise<Gate[]> {
   // Build the cucumber-js gate, or warn + return [] when there are no scenarios.
-  const { existsSync } = await import('node:fs');
-  const featuresDir = `${ROOT}/${TEST_DIR}/features`;
-  let hasFeature = false;
-  if (existsSync(featuresDir)) {
-    const glob = new Bun.Glob('**/*.feature');
-    const matches = await Array.fromAsync(glob.scan({ cwd: featuresDir, onlyFiles: true }));
-    hasFeature = matches.length > 0;
-  }
-  if (!hasFeature) {
+  if (!(await hasAnyFeatureFiles())) {
     console.log(
       `  ${GREEN}⚠${RESET} Acceptance: no .feature files in ${TEST_DIR}/features/ ` +
         '(add one to enable this gate)',
@@ -698,7 +742,7 @@ async function gitPrefix(): Promise<string> {
   return (prefix ?? '').replace(/^\.\//, '').replace(/\\/g, '/').replace(/\/$/, '');
 }
 
-function normalizeChangedPath(path: string, prefix: string): string {
+export function normalizeChangedPath(path: string, prefix: string): string {
   const normalized = path.trim().replace(/^\.\//, '').replace(/\\/g, '/');
   if (prefix !== '' && normalized.startsWith(`${prefix}/`)) {
     return normalized.slice(prefix.length + 1);
@@ -706,10 +750,33 @@ function normalizeChangedPath(path: string, prefix: string): string {
   return normalized;
 }
 
+// GITHUB_BASE_REF is only set for pull_request events; a direct push to main (or
+// any branch push trigger) has neither env var set, so without a fallback the
+// arch-config guard silently skips the diff-from-base check entirely on push.
+const ARCH_BASE_FALLBACK_REFS = ['origin/HEAD', 'origin/main', 'main'] as const;
+
+/** First ref that resolves, in priority order — or undefined if none do. Pure
+ * apart from the injected verify() so the ordering is unit-testable. */
+export async function resolveFallbackArchBase(
+  verify: (ref: string) => Promise<boolean>,
+): Promise<string | undefined> {
+  for (const ref of ARCH_BASE_FALLBACK_REFS) {
+    if (await verify(ref)) return ref;
+  }
+  return undefined;
+}
+
 async function changedPathsFromBase(): Promise<string[]> {
   const bases: string[] = [];
   if (process.env.HARNESS_ARCH_BASE) bases.push(process.env.HARNESS_ARCH_BASE);
   if (process.env.GITHUB_BASE_REF) bases.push(`origin/${process.env.GITHUB_BASE_REF}`);
+
+  if (bases.length === 0) {
+    const fallback = await resolveFallbackArchBase(
+      async (ref) => (await gitLines(['rev-parse', '--verify', ref])).length > 0,
+    );
+    if (fallback) bases.push(fallback);
+  }
 
   const paths: string[] = [];
   for (const base of bases) {
@@ -761,7 +828,13 @@ async function changedPathsFromPrePushStdin(): Promise<string[]> {
   return paths;
 }
 
-async function changedArchConfigs(
+/**
+ * Gather changed/staged/untracked paths (normalized to template-relative),
+ * deduplicated. Shared plumbing for every changed-path guard — callers apply
+ * their own filter (arch-config-guard filters to ARCH_CONFIGS, gherkin-guard
+ * filters to production sources / .feature files).
+ */
+async function changedPathsForGuard(
   opts: { staged?: boolean; includePrePushStdin?: boolean } = {},
 ): Promise<string[]> {
   const paths: string[] = [];
@@ -779,11 +852,16 @@ async function changedArchConfigs(
   }
   if (opts.includePrePushStdin) paths.push(...(await changedPathsFromPrePushStdin()));
 
-  const protectedPaths = new Set<string>(ARCH_CONFIGS);
   const prefix = await gitPrefix();
-  return Array.from(
-    new Set(paths.map((p) => normalizeChangedPath(p, prefix)).filter((p) => protectedPaths.has(p))),
-  ).sort();
+  return Array.from(new Set(paths.map((p) => normalizeChangedPath(p, prefix))));
+}
+
+async function changedArchConfigs(
+  opts: { staged?: boolean; includePrePushStdin?: boolean } = {},
+): Promise<string[]> {
+  const protectedPaths = new Set<string>(ARCH_CONFIGS);
+  const paths = await changedPathsForGuard(opts);
+  return paths.filter((p) => protectedPaths.has(p)).sort();
 }
 
 async function checkArchConfigGuard(
@@ -822,6 +900,101 @@ async function cmdArchConfigGuard(): Promise<void> {
   if (!ok) process.exit(1);
 }
 
+// ── Gherkin-first guard ─────────────────────────────────────────────
+// Mechanizes the "write a .feature before changing user-visible behavior"
+// rule from the behavior contract. "Production source" is deliberately
+// scoped to APP_SOURCES (src/), excluding TEST_DIR — not the runner itself,
+// not tests — so the trigger is predictable: it fires only on the kind of
+// change the behavior contract is actually about.
+
+export function isProductionSourcePath(path: string): boolean {
+  const underAppSource = APP_SOURCES.some((src) => path === src || path.startsWith(`${src}/`));
+  if (!underAppSource) return false;
+  return !(path === TEST_DIR || path.startsWith(`${TEST_DIR}/`));
+}
+
+export interface GherkinGuardInput {
+  changedPaths: string[];
+  hasFeatureFiles: boolean;
+  overrideEnv?: string;
+}
+
+export interface GherkinGuardDecision {
+  /** No .feature files anywhere in the template — guard is inactive, pass silently. */
+  skip: boolean;
+  /** Production source changed with no matching .feature change. */
+  trigger: boolean;
+  /** trigger is true, but HARNESS_ALLOW_NO_FEATURE=1 overrides it. */
+  override: boolean;
+  changedProductionSources: string[];
+}
+
+/** Pure decision logic — no git, no fs — so it's unit-testable directly. */
+export function evaluateGherkinGuard(input: GherkinGuardInput): GherkinGuardDecision {
+  if (!input.hasFeatureFiles) {
+    return { skip: true, trigger: false, override: false, changedProductionSources: [] };
+  }
+  const changedProductionSources = input.changedPaths.filter(isProductionSourcePath);
+  const changedFeature = input.changedPaths.some((p) => p.endsWith('.feature'));
+  const trigger = changedProductionSources.length > 0 && !changedFeature;
+  const override = trigger && input.overrideEnv === '1';
+  return { skip: false, trigger, override, changedProductionSources };
+}
+
+async function checkGherkinGuard(
+  opts: { warnOnly?: boolean; staged?: boolean; includePrePushStdin?: boolean } = {},
+): Promise<boolean> {
+  const hasFeatureFiles = await hasAnyFeatureFiles();
+  const changedPaths = hasFeatureFiles
+    ? await changedPathsForGuard({
+        staged: opts.staged,
+        includePrePushStdin: opts.includePrePushStdin,
+      })
+    : [];
+  const decision = evaluateGherkinGuard({
+    changedPaths,
+    hasFeatureFiles,
+    overrideEnv: process.env[GHERKIN_ALLOW_ENV],
+  });
+
+  // Retrofitting into a repo with no acceptance suite must never block — pass
+  // with no output at all rather than warn every run about a rule that
+  // doesn't apply yet.
+  if (decision.skip) return true;
+
+  if (!decision.trigger) {
+    console.log(`  ${GREEN}✓${RESET} Gherkin-first`);
+    return true;
+  }
+
+  const joined = decision.changedProductionSources.join(', ');
+  if (decision.override) {
+    console.log(`  ${GREEN}⚠${RESET} Gherkin-first override: ${joined}`);
+    return true;
+  }
+  const hint = `add a scenario under ${TEST_DIR}/features/, or set ${GHERKIN_ALLOW_ENV}=1 after review`;
+  if (opts.warnOnly) {
+    console.log(
+      `  ${GREEN}⚠${RESET} Gherkin-first: production source changed with no .feature: ${joined}`,
+    );
+    console.log(`  ↳ fix: ${hint}`);
+    return true;
+  }
+  console.log(
+    `  ${RED}✗${RESET} Gherkin-first: production source changed with no .feature: ${joined}`,
+  );
+  console.log(`  ↳ fix: ${hint}`);
+  return false;
+}
+
+async function cmdGherkinGuard(): Promise<void> {
+  const ok = await checkGherkinGuard({
+    warnOnly: process.argv.includes('--warn'),
+    staged: process.argv.includes('--staged'),
+  });
+  if (!ok) process.exit(1);
+}
+
 async function cmdMutation(): Promise<void> {
   // StrykerJS mutation testing. Advisory — not wired into ci.
   // No official Bun runner plugin exists; stryker.conf.json uses the universal
@@ -842,6 +1015,16 @@ interface CrapFn {
 
 export function crapScore(ccn: number, cov: number): number {
   return ccn * ccn * (1 - cov) ** 3 + ccn;
+}
+
+/**
+ * Glyph for a CRAP offender line. A passing gate (exit 0, the default
+ * advisory mode) must never show the red ✗ — that's reserved for --enforce,
+ * which actually exits non-zero on offenders. Pure so it's unit-testable
+ * without shelling out to lizard.
+ */
+export function crapOffenderGlyph(enforce: boolean): string {
+  return enforce ? `${RED}✗${RESET}` : `${GREEN}⚠${RESET}`;
 }
 
 export function parseLcov(text: string): Record<string, Record<number, number>> {
@@ -936,7 +1119,7 @@ async function cmdCrap(): Promise<void> {
     // Lizard could not run (uvx missing, network failure, lizard crash).
     // Reporting "all functions below max" here would be a silent false-pass.
     console.log(
-      `  ${RED}✗${RESET} CRAP: lizard failed to run (exit ${lzCode})` +
+      `  ${crapOffenderGlyph(enforce)} CRAP: lizard failed to run (exit ${lzCode})` +
         `${enforce ? '' : ' (advisory)'}`,
     );
     if (lzErr.trim()) console.log(lzErr.trim());
@@ -984,7 +1167,9 @@ async function cmdCrap(): Promise<void> {
   }
   offenders.sort((a, b) => b.crap - a.crap);
   const suffix = enforce ? '' : ' (advisory)';
-  console.log(`  ${RED}✗${RESET} CRAP: ${offenders.length} function(s) exceed ${maxCrap}${suffix}`);
+  console.log(
+    `  ${crapOffenderGlyph(enforce)} CRAP: ${offenders.length} function(s) exceed ${maxCrap}${suffix}`,
+  );
   for (const o of offenders.slice(0, 20)) {
     console.log(
       `    CRAP=${o.crap.toFixed(1).padStart(6)}  CCN=${String(o.ccn).padStart(3)}  ` +
@@ -1053,9 +1238,20 @@ async function cmdStopHook(): Promise<void> {
   console.log('\n=== Stop Hook Checks ===\n');
   await cmdPostEdit(); // mutating — sequential, first
   await checkArchConfigGuard({ warnOnly: true });
+  await checkGherkinGuard({ warnOnly: true });
   // read-only batch: complexity + dead code
-  const allOk = await runGatesParallel([...(await complexityGatesOrWarn()), deadcodeGate()]);
-  if (!allOk) process.exit(1);
+  const { ok, failed } = await runGatesParallelDetailed([
+    ...(await complexityGatesOrWarn()),
+    deadcodeGate(),
+  ]);
+  if (!ok) {
+    // Claude Code only treats a Stop hook as blocking on exit 2, and only reads
+    // the failure back from stderr; any other non-zero exit is silently ignored
+    // by the model. Codex's wrapper (.codex/hooks/codex-stop-hook.sh) turns any
+    // non-zero exit into a block regardless, so this is safe for both agents.
+    console.error(`stop-hook failed: ${failed.join(', ')}`);
+    process.exit(2);
+  }
 }
 
 // ── Stages ──────────────────────────────────────────────────────────
@@ -1257,8 +1453,23 @@ async function cmdCheck(): Promise<void> {
     results.push({ ok: true, output: '' });
   }
 
+  // Read-only offline gates, after the mutating fix step above. Folded into
+  // `results` as one entry so the summary count stays accurate. Invariant (see
+  // CLAUDE.md): `check` runs every gate that is offline, fast, and takes no
+  // build lock — arch (dependency-cruiser) qualifies (local devDependency,
+  // offline, no build lock), so it joins the batch too; only the network
+  // audit, coverage, and CRAP stay `ci`-only.
+  const offlineGates: Gate[] = [
+    ...(await complexityGatesOrWarn()),
+    deadcodeGate(),
+    ...(await acceptanceGatesOrWarn()),
+    ...(await archGatesOrWarn()),
+  ];
+  results.push({ ok: await runGatesParallel(offlineGates), output: '' });
+
   await checkStopHooksPresent();
   await checkArchConfigGuard({ warnOnly: true });
+  await checkGherkinGuard({ warnOnly: true });
   results.push(await checkAgentsMdDrift(true));
   results.push({ ok: await checkSuppressionsBaseline({ noExit: true }), output: '' });
 
@@ -1277,16 +1488,41 @@ async function cmdCheck(): Promise<void> {
   }
 }
 
+async function restageFixedFiles(files: string[]): Promise<void> {
+  // cmdFix rewrites the working tree; without this the commit still records the
+  // pre-fix INDEX blob. Only re-add files that still exist (cmdFix never deletes,
+  // but stay defensive). Caveat documented in CLAUDE.md: for a partially staged
+  // file, `git add` also stages its unstaged hunks — same trade-off lint-staged makes.
+  const { existsSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const existing = files.filter((f) => existsSync(join(ROOT, f)));
+  if (existing.length === 0) return;
+  const proc = Bun.spawn(['git', 'add', '--', ...existing], {
+    cwd: ROOT,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  await proc.exited;
+  console.log(`  ${GREEN}✓${RESET} Re-staged ${existing.length} fixed file(s)`);
+}
+
+// The arch-config and gherkin-first guards run before the staged-files early
+// return: both are staged-mode and cheap, and a commit that stages only a
+// non-source file (an arch config edit alone, a `.md`, a lockfile) must not
+// bypass them.
 async function cmdPreCommit(): Promise<void> {
+  console.log(`\n${BLUE}[pre-commit]${RESET}\n`);
+  if (!(await checkArchConfigGuard({ staged: true }))) process.exit(1);
+  if (!(await checkGherkinGuard({ staged: true }))) process.exit(1);
+
   const files = await stagedTsFiles();
   if (files.length === 0) {
     console.log('No staged TypeScript files — skipping checks');
     return;
   }
 
-  console.log(`\n${BLUE}[pre-commit]${RESET}\n`);
-  if (!(await checkArchConfigGuard({ staged: true }))) process.exit(1);
   await cmdFix(files);
+  await restageFixedFiles(files);
   await cmdTypecheck();
   await checkAgentsMdDrift();
 
@@ -1312,8 +1548,9 @@ async function cmdCi(): Promise<void> {
   await cmdCoverage(); // self-skips; after the batch
   await cmdCrap(); // advisory unless --enforce
   const archConfigOk = await checkArchConfigGuard();
+  const gherkinOk = await checkGherkinGuard();
   const suppressionsOk = await checkSuppressionsBaseline({ noExit: true });
-  if (!allOk || !archConfigOk || !suppressionsOk) process.exit(1);
+  if (!allOk || !archConfigOk || !gherkinOk || !suppressionsOk) process.exit(1);
 }
 
 async function cmdPrePush(): Promise<void> {
@@ -1325,12 +1562,13 @@ async function cmdPrePush(): Promise<void> {
   // Network (audit) and advisory (coverage/CRAP) gates stay in ci.
   console.log(`\n${BLUE}[pre-push]${RESET}\n`);
   const archConfigOk = await checkArchConfigGuard({ includePrePushStdin: true });
+  const gherkinOk = await checkGherkinGuard({ includePrePushStdin: true });
   const gates: Gate[] = [
     lintGate(),
     ...(await acceptanceGatesOrWarn()),
     ...(await archGatesOrWarn()),
   ];
-  if (!(await runGatesParallel(gates)) || !archConfigOk) process.exit(1);
+  if (!(await runGatesParallel(gates)) || !archConfigOk || !gherkinOk) process.exit(1);
 }
 
 async function cmdHooks(): Promise<void> {
@@ -1374,6 +1612,10 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   deadcode: [cmdDeadcode, 'Detect unused files/exports/deps (knip, via bunx)'],
   arch: [cmdArch, 'Architecture checks (dependency-cruiser)'],
   'arch-config-guard': [cmdArchConfigGuard, 'Block unreviewed arch config changes'],
+  'gherkin-guard': [
+    cmdGherkinGuard,
+    'Block production-source changes with no matching .feature (skips if no .feature files exist)',
+  ],
   check: [cmdCheck, 'Full pre-flight: lockfile + fix + typecheck + tests'],
   'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
   'pre-push': [cmdPrePush, 'Read-only push gate: lint, acceptance, arch'],

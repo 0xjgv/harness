@@ -10,8 +10,10 @@ import {
   isProjectTsFile,
   isQualityTsFile,
   isTestFile,
+  normalizeChangedPath,
   porcelainPath,
   qualityTargets,
+  resolveFallbackArchBase,
   runGatesParallel,
 } from '../harness';
 
@@ -83,6 +85,42 @@ describe('target helpers', () => {
   test('porcelain path keeps rename target', () => {
     expect(porcelainPath(' M src/index.ts')).toBe('src/index.ts');
     expect(porcelainPath('R  old.ts -> harness.ts')).toBe('harness.ts');
+  });
+
+  test('FIX 1: repo-root-relative path normalizes to project-relative and is recognized', () => {
+    // git status --porcelain always returns repo-root-relative paths (e.g.
+    // "bun/src/foo.ts" when the git root is one level up from this template).
+    // normalizeChangedPath() strips the gitPrefix() ("bun") so isProjectTsFile
+    // sees the same "src/..." shape it expects when run from the template root.
+    const normalized = normalizeChangedPath('bun/src/foo.ts', 'bun');
+    expect(normalized).toBe('src/foo.ts');
+    expect(isProjectTsFile(normalized)).toBe(true);
+  });
+
+  test('FIX 1: a sibling template path is rejected after normalization', () => {
+    // A change in a sibling template (e.g. python/x.ts) does not share this
+    // template's prefix, so it is left untouched and correctly rejected.
+    const normalized = normalizeChangedPath('python/x.ts', 'bun');
+    expect(normalized).toBe('python/x.ts');
+    expect(isProjectTsFile(normalized)).toBe(false);
+  });
+});
+
+describe('resolveFallbackArchBase (FIX 6)', () => {
+  test('picks the first resolvable ref in priority order', async () => {
+    const calls: string[] = [];
+    const verify = async (ref: string) => {
+      calls.push(ref);
+      return ref === 'origin/main';
+    };
+    expect(await resolveFallbackArchBase(verify)).toBe('origin/main');
+    // origin/HEAD was tried and failed before origin/main resolved; main was
+    // never reached because the search stops at the first hit.
+    expect(calls).toEqual(['origin/HEAD', 'origin/main']);
+  });
+
+  test('returns undefined when no fallback ref resolves', async () => {
+    expect(await resolveFallbackArchBase(async () => false)).toBeUndefined();
   });
 });
 

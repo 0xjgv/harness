@@ -28,6 +28,24 @@ func TestScore(t *testing.T) {
 	}
 }
 
+func TestAdvisoryGlyph(t *testing.T) {
+	tests := []struct {
+		name    string
+		enforce bool
+		want    string
+	}{
+		{"advisory mode warns, does not block", false, "⚠"},
+		{"enforce mode blocks", true, "✗"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := AdvisoryGlyph(tt.enforce); got != tt.want {
+				t.Errorf("AdvisoryGlyph(%v) = %q, want %q", tt.enforce, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseCoverProfile(t *testing.T) {
 	input := "mode: count\n" +
 		"src/foo.go:1.1,3.2 2 5\n" +

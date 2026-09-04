@@ -2,10 +2,10 @@
 
 ## Commands
 
-- After edits: `go run harness.go check` — fix, format, lint, test, suppression ratchet
-- Pre-commit: `go run harness.go pre-commit` — staged files only (auto via git hook)
+- After edits: `go run harness.go check` — fix, format, lint (via `--fix`), test, complexity, `go mod tidy -diff`, acceptance (self-skips with a warning when no `.feature` files exist), arch config guard (warn), Gherkin-first guard (warn), agents-md drift, suppression ratchet. **Invariant: `check` runs every gate that is offline, fast, and takes no build lock.** `ci` adds: the dependency audit (network, govulncheck), coverage, CRAP (advisory) — and, uniquely in this template, the `arch` gate: `go run github.com/fe3dback/go-arch-lint@…` fetches a module, which hits the network on a cold module cache, so it stays `ci`/`pre-push`-only rather than running in the edit-triggered `check` loop.
+- Pre-commit: `go run harness.go pre-commit` — staged files only (auto via git hook). Fix/format rewrite the working tree, then the fixed files are re-staged (`git add`) so the commit records the fixed content. Caveat: if a file is only partially staged, `git add` also stages its unstaged hunks.
 - Pre-push: `go run harness.go pre-push` — read-only push gate over the whole tree: lint (golangci-lint covers format), acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
-- CI: `go run harness.go ci` — read-only gates (lint, audit, complexity, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then test-cov (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
+- CI: `go run harness.go ci` — read-only gates (lint, audit, complexity, `go mod tidy -diff`, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then test-cov (streams) + crap, then arch config guard and Gherkin-first guard, both blocking. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
 - Complexity: `go run harness.go complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over the module
 - Deadcode: no separate target — golangci-lint's `unused` linter (run by `lint`/`ci`) already flags unreachable functions, vars, and types, and `go mod tidy` prunes unused dependencies. (`x/tools/cmd/deadcode` needs a `main` package; this template is a library.)
 - Audit: `go run harness.go audit` — audit dependencies for known vulnerabilities (via govulncheck)
@@ -16,15 +16,16 @@
 - Suppressions: `go run harness.go suppressions` — full suppression breakdown; `--update-baseline` requires human sign-off and updates `.harness-baseline`
 - Arch: `go run harness.go arch` — go-arch-lint against `.go-arch-lint.yml`
 - Arch config guard: `go run harness.go arch-config-guard` — blocks unreviewed `.go-arch-lint.yml` changes in pre-commit/pre-push/CI; use `HARNESS_ALLOW_ARCH_CONFIG=1` after review
+- Gherkin-first guard: `go run harness.go gherkin-guard` — mechanizes the Gherkin-first rule below. Triggers when at least one changed "production source" file (a non-test `.go` file outside `features/`, excluding `harness.go` itself) has no changed path ending in `.feature`. Silently passes (no output) when the template has no `.feature` files anywhere yet — retrofitting the harness into a repo with no acceptance suite must never block. Modes mirror the arch config guard exactly: `--warn`; `--staged`; env override `HARNESS_ALLOW_NO_FEATURE=1`. WARN in `check`/`stop-hook`; BLOCK in `pre-commit` (staged), `pre-push` (+ pre-push stdin refs), and `ci`.
 - Agents drift: `go run harness.go agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `go run harness.go sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
 - Setup: `go run harness.go setup-hooks` installs git pre-commit + pre-push hooks (path resolved via `git rev-parse`, worktree-safe) and idempotently installs the Claude/Codex Stop wiring
-- Stop hook: auto-formats/fixes changed files, then runs complexity (`stop-hook`)
+- Stop hook: auto-formats/fixes changed files, then runs complexity (`stop-hook`). On failure it exits **2** and prints a short failure summary to stderr — Claude Code treats a Stop hook's exit code 2 as blocking and feeds stderr back to the model; any other non-zero exit is silently swallowed. `check`/`ci`/`pre-commit`/`pre-push` keep exiting 1 on failure. Codex's wrapper (`codex-stop-hook.sh`) maps any non-zero exit to a block decision, so it is unaffected by the exit-code change.
 
 ## Definition of done
 
 - `go run harness.go check` passes clean — never stop with check failing.
-- User-visible behavior change → a `.feature` scenario exists and acceptance passes.
+- User-visible behavior change → a `.feature` scenario exists and acceptance passes. Mechanically enforced by the Gherkin-first guard (`gherkin-guard`): `check`/`stop-hook` warn, and `pre-commit`/`pre-push`/`ci` fail unless a `.feature` changed alongside the production source, or `HARNESS_ALLOW_NO_FEATURE=1` is set after review.
 - No new suppressions: additions above `.harness-baseline` fail check; suppress only with the human's sign-off, stating why.
 - Arch config changes are integration-blocked: `check`/`stop-hook` warn, and `pre-commit`/`pre-push`/`ci` fail unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 - `pre-push`/`ci` are the human's gates: leave the tree in a state where they would pass, but do not commit or push yourself.
@@ -46,6 +47,7 @@
 
 <important if="the task changes user-visible behavior">
 - Workflow: write or extend a `.feature` scenario under `features/` → get human approval → write step definitions under `features/steps/` → write implementation.
+- Mechanically enforced: `go run harness.go gherkin-guard` blocks a changed production `.go` file (outside `features/`, excluding `harness.go` itself) with no changed `.feature` alongside it — see Commands.
 - If the behavior is law-like (formula, parser, codec, round-trip, invariant), also write a rapid property test, not just examples — see `crap/properties_test.go` for the pattern.
 - Refactors, typo fixes, dependency bumps, and internal cleanup are NOT user-visible behavior changes. You MAY proceed without a new `.feature`, but you MUST state in your first response that the change is non-behavioral and why.
 - If it is unclear whether a task changes user-visible behavior, ASK before editing source.

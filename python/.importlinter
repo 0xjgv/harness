@@ -2,10 +2,12 @@
 root_packages =
     src
 
-[importlinter:contract:no-internal-leak]
-name = Example: src.internal is not imported from other src modules (placeholder)
-type = forbidden
-source_modules =
+[importlinter:contract:layers]
+name = src package layers
+type = layers
+containers =
     src
-forbidden_modules =
-    src.internal
+layers =
+    adapters
+    core
+exhaustive = true

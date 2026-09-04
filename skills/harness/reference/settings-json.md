@@ -37,11 +37,27 @@ Every template ships this shape. Only the command differs per language.
 
 | Template | Stop-hook command |
 |---|---|
-| Python | `cd $CLAUDE_PROJECT_DIR && uv run harness stop-hook` |
-| Bun | `cd $CLAUDE_PROJECT_DIR && bun harness.ts stop-hook` |
-| Go | `cd $CLAUDE_PROJECT_DIR && go run harness.go stop-hook` |
-| Rust | `cd $CLAUDE_PROJECT_DIR && cargo harness stop-hook` |
-| Monorepo | `cd $CLAUDE_PROJECT_DIR && make stop-hook` |
+| Python | `cd $CLAUDE_PROJECT_DIR && uv run harness stop-hook \|\| exit 2` |
+| Bun | `cd $CLAUDE_PROJECT_DIR && bun harness.ts stop-hook \|\| exit 2` |
+| Go | `cd $CLAUDE_PROJECT_DIR && go run harness.go stop-hook \|\| exit 2` |
+| Rust | `cd $CLAUDE_PROJECT_DIR && cargo harness stop-hook \|\| exit 2` |
+| Monorepo | `cd $CLAUDE_PROJECT_DIR && make stop-hook \|\| exit 2` |
+
+Every Claude Stop-hook command ends in `|| exit 2`. Claude Code only treats a
+Stop hook's exit code **2** as blocking — it feeds the hook's stderr back to
+the model so the agent must address the failure before stopping. Any other
+non-zero exit is a non-blocking error the model never sees, so a runner that
+fails with exit 1 (or anything but 2) stops silently. Each runner's
+`stop-hook` subcommand already exits 2 on failure internally, but that exit
+code does not always survive the wrapper Claude actually invokes: `go run`
+collapses a child process's exit code and prints `exit status N` to stderr,
+then exits 1 itself, no matter what code the compiled program returned. `||
+exit 2` re-asserts the blocking exit code after the wrapper, at the shell
+level, regardless of what the underlying runner/toolchain does to the code in
+between. For runners where propagation already works (Python, Bun, Rust,
+`make`) the suffix is a no-op on the success and failure paths alike — it
+costs nothing and keeps all templates identical, which also makes the
+contract robust if a toolchain's exit-code propagation changes later.
 
 ## Codex Stop hook
 
