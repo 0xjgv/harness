@@ -27,8 +27,8 @@ paraphrase (it drifts). Two sections:
   ratchets suppressions. Invariant: `ci` minus `check` == every gate that
   needs the network or a build lock (`audit`, `coverage`, advisory `crap`).
   `ci` runs the read-only gates
-  (`lint`, `typecheck`, `audit`, `complexity`, `deadcode`, `acceptance`,
-  `arch`) **in parallel** — captured and printed in submission order, run to
+  (`lint`, `typecheck`, `audit`, `complexity` (CCN + duplicate blocks),
+  `deadcode`, `acceptance`, `arch`) **in parallel** — captured and printed in submission order, run to
   completion so one pass surfaces every failure — then streams `coverage` and
   the advisory `crap`; `ci` also runs `arch-config-guard` and `gherkin-guard`
   in strict (blocking) mode.

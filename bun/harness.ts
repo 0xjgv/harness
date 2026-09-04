@@ -168,13 +168,15 @@ export interface Gate {
    * Decide pass/fail from the output instead of the exit code, for a tool that
    * reports a count but always exits 0 (lizard's `-Eduplicate`). Consulted only
    * on a clean exit: a crashed tool prints no findings, and reading that as
-   * "zero findings" would be a silent false-pass.
+   * "zero findings" would be a silent false-pass. Takes precedence over
+   * `extract`, which is not consulted when a verdict is present — a gate wanting
+   * a summary on its passing line returns it as the verdict's `detail`.
    */
   verdict?: (output: string) => { ok: boolean; detail?: string };
   hint?: string;
 }
 
-interface GateResult {
+export interface GateResult {
   description: string;
   cmd: string[];
   ok: boolean;
@@ -185,7 +187,7 @@ interface GateResult {
 }
 
 /** Run a command with output captured (no printing, no exit): the unit the batch runs. */
-async function runCapture(gate: Gate): Promise<GateResult> {
+export async function runCapture(gate: Gate): Promise<GateResult> {
   const proc = Bun.spawn(gate.cmd, { cwd: ROOT, stdout: 'pipe', stderr: 'pipe' });
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -1407,18 +1409,36 @@ export function lizardWarningCount(stdout: string): number | null {
   return null;
 }
 
-async function measuredComplexityViolations(): Promise<Measurement> {
+/**
+ * Run lizard over the gate's own targets and turn its report into a Measurement.
+ *
+ * `count` returning null is an `error`, never a 0: lizard printing no countable
+ * report means the run is unusable, and a floor recorded from an unusable run is
+ * worse than no floor at all — every downstream gate trusts it.
+ */
+async function measuredLizard(
+  description: string,
+  argv: (targets: string[]) => string[],
+  count: (output: string) => number | null,
+  missing: string,
+): Promise<Measurement> {
   const targets = await appTargets({ includeTests: true });
   if (targets.length === 0) return { unavailable: 'no app sources' };
-  // `-i` high enough that lizard exits 0 and still prints the summary row.
-  const res = await runCapture({
-    description: 'Complexity',
-    cmd: complexityArgv(targets, REPORT_ONLY_LIMIT),
-  });
+  const res = await runCapture({ description, cmd: argv(targets) });
   if (!res.ok) return { error: `lizard failed to run (exit ${res.exitCode})` };
-  const count = lizardWarningCount(res.output);
-  if (count == null) return { error: 'lizard printed no summary row to count warnings from' };
-  return { value: count };
+  const value = count(res.output);
+  if (value == null) return { error: missing };
+  return { value };
+}
+
+async function measuredComplexityViolations(): Promise<Measurement> {
+  // `-i` high enough that lizard exits 0 and still prints the summary row.
+  return measuredLizard(
+    'Complexity',
+    (targets) => complexityArgv(targets, REPORT_ONLY_LIMIT),
+    lizardWarningCount,
+    'lizard printed no summary row to count warnings from',
+  );
 }
 
 /**
@@ -1446,13 +1466,12 @@ export function duplicateBlockCount(stdout: string): number | null {
 }
 
 async function measuredDuplicateBlocks(): Promise<Measurement> {
-  const targets = await appTargets({ includeTests: true });
-  if (targets.length === 0) return { unavailable: 'no app sources' };
-  const res = await runCapture({ description: 'Duplication', cmd: duplicationArgv(targets) });
-  if (!res.ok) return { error: `lizard failed to run (exit ${res.exitCode})` };
-  const count = duplicateBlockCount(res.output);
-  if (count == null) return { error: 'lizard printed no duplicate report to count blocks from' };
-  return { value: count };
+  return measuredLizard(
+    'Duplication',
+    duplicationArgv,
+    duplicateBlockCount,
+    'lizard printed no duplicate report to count blocks from',
+  );
 }
 
 /**
@@ -1472,11 +1491,15 @@ function duplicationGate(targets: string[], floor: number | undefined): Gate {
         : `Duplicate blocks (lizard, baseline ${floor})`,
     cmd: duplicationArgv(targets),
     verdict: (output) => {
+      // Report-only passes whatever it finds — a garbled report included. A
+      // repo with no recorded floor must not go red on day one, which is the
+      // whole point of the branch, and `--update-baseline` errors on the same
+      // output anyway, so the missing report is never recorded as a clean 0.
       const count = duplicateBlockCount(output);
-      if (count == null) return { ok: false, detail: 'no duplicate report to count blocks from' };
-      const blocks = `${count} block(s)`;
-      if (floor === undefined) return { ok: true, detail: `${blocks}; ${BASELINE_FLOOR_HINT}` };
-      return { ok: count <= floor, detail: blocks };
+      const detail =
+        count == null ? 'no duplicate report to count blocks from' : `${count} block(s)`;
+      if (floor === undefined) return { ok: true, detail: `${detail}; ${BASELINE_FLOOR_HINT}` };
+      return { ok: count != null && count <= floor, detail };
     },
     hint: 'extract the repeated block into a shared helper; do not raise the floor',
   };
@@ -1525,8 +1548,8 @@ export const RATCHETED_METRICS: RatchetedMetric[] = [
   { key: 'coverage.min', measure: measuredCoverage },
   { key: 'complexity.max_violations', measure: measuredComplexityViolations },
   { key: 'duplication.max_blocks', measure: measuredDuplicateBlocks },
-  // Last: CRAP re-runs the whole coverage suite, and measureRatcheted stops at
-  // the first error, so the cheap measurements go first.
+  // CRAP last: it re-runs the coverage suite a second time, and measureRatcheted
+  // stops at the first error, so put it after the metrics that cannot pay for it.
   { key: 'crap.max_violations', measure: measuredCrapViolations },
 ];
 

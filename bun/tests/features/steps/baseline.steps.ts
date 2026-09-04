@@ -30,10 +30,14 @@ const DUPLICATED_BODY = [
   '}',
   '',
 ].join('\n');
-const DUPLICATED_TS = ['alpha', 'beta']
+const DUPLICATED_TS = `${['alpha', 'beta']
   .map((name) => `export function ${name}(a: number, b: number, c: number): number {\n`)
   .map((signature) => signature + DUPLICATED_BODY)
-  .join('\n');
+  .join('\n')}
+// makeTmp's test file imports \`stub\`; keep it resolvable so a later scenario can
+// chain a type-checking command onto this fixture.
+export const stub = (n: number): number => n;
+`;
 
 async function writeBaselineLine(tmp: string, line: string): Promise<void> {
   await writeFile(join(tmp, BASELINE), `${line}\n`);

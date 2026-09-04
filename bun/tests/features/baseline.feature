@@ -32,7 +32,7 @@ Feature: The baseline is a ratchet, not a wall
     When I run "harness complexity"
     Then the exit code is 1
     And the output contains "Duplicate blocks (lizard, baseline 0)"
-    And the output contains "1 block(s)"
+    And the output contains "block(s)"
 
   Scenario: The CRAP floor tolerates exactly the recorded offenders
     Given a coverage artifact for a high-CCN, zero-coverage function

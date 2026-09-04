@@ -15,6 +15,7 @@ import {
   RATCHETED_METRICS,
   type RatchetedMetric,
   readBaseline,
+  runCapture,
   scanSuppressionFindings,
   scanSuppressions,
   writeBaseline,
@@ -310,7 +311,9 @@ describe('lizard floors', () => {
     const root = mkdtempSync(join(tmpdir(), 'bun-complexity-'));
     roots.push(root);
     mkdirSync(join(root, 'src'));
+    mkdirSync(join(root, 'tests'));
     writeFileSync(join(root, 'src', 'index.ts'), 'export const x = 1;\n');
+    writeFileSync(join(root, 'tests', 'x.test.ts'), 'export const y = 1;\n');
     if (existing !== undefined) writeFileSync(join(root, '.harness-baseline'), existing);
     return root;
   }
@@ -342,16 +345,16 @@ describe('lizard floors', () => {
     expect(gate?.cmd.slice(-2)).toEqual(['-i', '0']);
   });
 
-  // The floor only reproduces against the same target set the complexity gate uses.
+  // The floor only reproduces against the same target set the complexity gate
+  // uses, so compare the two lists instead of hardcoding one of them.
   test('the duplicate-block gate scans the same targets as the complexity gate', async () => {
     const root = project();
     const [complexity, duplication] = await complexityGatesOrWarn(root);
+    const targets = (complexity?.cmd ?? []).slice(2, complexity?.cmd.indexOf('-C'));
 
-    expect(complexity?.cmd.slice(0, 3)).toEqual(['uvx', 'lizard@1.22.2', 'src']);
-    expect(duplication?.cmd).toEqual([
-      'uvx',
-      'lizard@1.22.2',
-      'src',
+    expect(targets).toEqual(['src', 'tests']);
+    expect(duplication?.cmd.slice(2, 2 + targets.length)).toEqual(targets);
+    expect(duplication?.cmd.slice(2 + targets.length)).toEqual([
       '-Eduplicate',
       '-w',
       '-i',
@@ -389,6 +392,39 @@ describe('lizard floors', () => {
     const [, gate] = await complexityGatesOrWarn(root);
 
     expect(gate?.verdict?.('uvx: command not found')?.ok).toBe(false);
+  });
+
+  // Report-only means report-only: a garbled run cannot turn day one red either.
+  test('a missing report is still report-only when no floor is recorded', async () => {
+    const root = project();
+    const [, gate] = await complexityGatesOrWarn(root);
+
+    expect(gate?.verdict?.('uvx: command not found')?.ok).toBe(true);
+  });
+
+  // The guard that makes `verdict` safe: a crashed tool prints no findings, and
+  // scoring that as "zero findings" is the false-pass the whole design avoids.
+  test('a verdict is not consulted when the command exited non-zero', async () => {
+    const result = await runCapture({
+      description: 'crashes',
+      cmd: ['sh', '-c', 'exit 3'],
+      verdict: () => ({ ok: true, detail: 'looks clean to me' }),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(3);
+  });
+
+  test('a failing verdict on a clean exit still exits non-zero', async () => {
+    const result = await runCapture({
+      description: 'passes, reports trouble',
+      cmd: ['sh', '-c', 'exit 0'],
+      verdict: () => ({ ok: false, detail: '3 block(s)' }),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(result.detail).toBe('3 block(s)');
   });
 });
 
