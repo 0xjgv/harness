@@ -1,3 +1,4 @@
+arch.max_violations 0
 complexity.max_violations 0
 coverage.min 100
 crap.max_violations 0

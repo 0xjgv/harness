@@ -637,11 +637,71 @@ def _measured_deadcode_findings() -> Measurement:
     return _run_deadcode()[0]
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_ARCH_CHAIN_RE = re.compile(r"^-\s")
+
+
+def _broken_contracts_section(lines: list[str]) -> list[str]:
+    """The lines import-linter printed under its `Broken contracts` banner.
+
+    Blank lines and the `----` underlines are dropped so the section reads as the
+    failure detail; the `- importer -> imported (l.N)` chain lines are kept verbatim.
+    Matched on the stripped line, because the banner is a centred heading and a
+    trailing space in it would otherwise hide every violation under it.
+    """
+    banner = next((i for i, line in enumerate(lines) if line.strip() == "Broken contracts"), None)
+    if banner is None:
+        return []
+    body = lines[banner + 1 :]
+    return [line for line in body if line.strip() and set(line.strip()) != {"-"}]
+
+
+def _import_linter_broken_count(output: str) -> int:
+    """Number of illegal import chains import-linter reported.
+
+    import-linter 2.x has no machine-readable output, so this counts the lines
+    matching `^-\\s` after the `Broken contracts` banner: every renderer (layers,
+    independence, forbidden, exhaustive) prints exactly one such line per illegal
+    chain and indents continuations by two spaces. Two imports of the same module
+    are one chain (`(l.1, l.2)`), so the count is module pairs, not statements.
+    """
+    lines = [_ANSI_RE.sub("", line) for line in output.splitlines()]
+    return sum(1 for line in _broken_contracts_section(lines) if _ARCH_CHAIN_RE.match(line))
+
+
+def _run_arch() -> tuple[Measurement, list[str]]:
+    """Run import-linter once, returning its violation count and the broken section.
+
+    The exit code is deliberately ignored: import-linter exits 1 both for broken
+    contracts (a number, ratcheted) and for a bad config (a tool failure). What
+    separates them is the `Contracts: N kept, M broken.` summary, printed only when
+    the analysis ran; without it the run is an error, never a zero.
+    """
+    if not Path(".importlinter").exists():
+        return Measurement(unavailable="no .importlinter"), []
+    res = subprocess.run(
+        _tool("lint-imports", read_only=True), capture_output=True, text=True, check=False
+    )
+    output = res.stdout + res.stderr
+    lines = [_ANSI_RE.sub("", line) for line in output.splitlines()]
+    if not any(line.strip().startswith("Contracts:") for line in lines):
+        detail = [line for line in lines if line.strip()]
+        reason = f": {detail[-1]}" if detail else ""
+        return Measurement(error=f"lint-imports failed to run (exit {res.returncode}){reason}"), []
+    return Measurement(value=_import_linter_broken_count(output)), _broken_contracts_section(lines)
+
+
+def _measured_arch_violations() -> Measurement:
+    """Count of illegal import chains against `.importlinter`."""
+    return _run_arch()[0]
+
+
 RATCHETED_KEYS = (
     "coverage.min",
     "complexity.max_violations",
     "crap.max_violations",
     "deadcode.max_findings",
+    "arch.max_violations",
 )
 
 
@@ -658,6 +718,7 @@ def _measure_ratcheted() -> dict[str, Measurement]:
         ("complexity.max_violations", _measured_complexity_violations),
         ("crap.max_violations", _measured_crap_violations),
         ("deadcode.max_findings", _measured_deadcode_findings),
+        ("arch.max_violations", _measured_arch_violations),
     ):
         measured[key] = measure()
         if measured[key].error:
@@ -1410,18 +1471,54 @@ def cmd_mutation() -> None:
     warn("Mutation testing not configured — add mutmut to your dev dependencies to enable")
 
 
-def _arch_gates_or_warn() -> list[Gate]:
-    """Build the import-linter gate, or warn + return [] when no .importlinter exists."""
-    if not Path(".importlinter").exists():
-        warn("Arch: no .importlinter — skipped")
-        return []
-    return [Gate("Arch (import-linter)", _tool("lint-imports", read_only=True))]
+ARCH_LABEL = "Arch (import-linter)"
+ARCH_HINT = "restore the layering; editing .importlinter is a design decision for the human"
+
+
+def _check_arch(*, no_exit: bool = False) -> bool:
+    """Count-ratcheted arch gate: illegal import chains may never exceed the floor.
+
+    import-linter is pass/fail with no threshold flag, so like dead code this sits
+    outside the `Gate` batch and prints its own line. Without a recorded floor it is
+    report-only: a real layers contract written over a legacy tree breaks in dozens
+    of places on day one, and the point of the floor is to stop the 41st, not to
+    demand the first 40 be fixed before the harness is allowed in.
+    """
+    measured, section = _run_arch()
+    if measured.error:
+        print(f"  {RED}✗{RESET} {ARCH_LABEL}: {measured.error}")
+        if not no_exit:
+            sys.exit(1)
+        return False
+    if measured.value is None:
+        warn(f"Arch: {measured.unavailable} — skipped")
+        return True
+
+    violations = measured.value
+    floor = _baseline_floor("arch.max_violations")
+    if floor is None:
+        warn(f"{ARCH_LABEL}: {violations} violation(s), report-only (no {BASELINE_FILE} floor)")
+        return True
+    if violations <= floor:
+        suffix = " — run `harness suppressions --update-baseline` to ratchet down"
+        print(
+            f"  {GREEN}✓{RESET} {ARCH_LABEL}: {violations} "
+            f"(baseline {floor}){suffix if violations < floor else ''}"
+        )
+        return True
+
+    print(f"  {RED}✗{RESET} {ARCH_LABEL}: {violations} violation(s) > baseline {floor}")
+    for line in section[:40]:
+        print(f"    {line}")
+    print(f"  ↳ fix: {ARCH_HINT}")
+    if not no_exit:
+        sys.exit(1)
+    return False
 
 
 def cmd_arch() -> None:
-    """Run import-linter against .importlinter."""
-    for gate in _arch_gates_or_warn():
-        run(gate.description, gate.cmd)
+    """Run import-linter against .importlinter, ratcheted by `arch.max_violations`."""
+    _check_arch()
 
 
 def _git_lines(args: list[str]) -> list[str]:
@@ -2224,8 +2321,8 @@ def cmd_check() -> None:
     Invariant: `check` runs every gate that is offline, fast, and takes no build
     lock — `ci` adds only the network dependency audit, coverage, and CRAP
     (advisory). Arch (import-linter) qualifies here: it is a local dev dependency,
-    runs offline, and takes no build lock, so it joins the read-only parallel batch
-    below alongside complexity and acceptance, so a green `check`
+    runs offline, and takes no build lock, so it runs after the read-only parallel
+    batch below alongside dead code (both count-ratcheted), so a green `check`
     predicts a green `ci`. Accumulates every step's pass/fail instead of failing
     fast, so one run surfaces every problem — matching the bun/go/rust harnesses'
     `check` behavior — and ends with an `OK`/`FAIL` summary line.
@@ -2243,13 +2340,14 @@ def cmd_check() -> None:
         cmd_typecheck(no_exit=True),
         cmd_test(no_exit=True),
     ]
-    batch = [_complexity_gate(), *_acceptance_gates_or_warn(), *_arch_gates_or_warn()]
+    batch = [_complexity_gate(), *_acceptance_gates_or_warn()]
     _batch_ok, batch_failed = run_gates_parallel(batch)
     # One entry per gate, not one for the whole batch: collapsing the batch into a
     # single boolean makes the summary under-report by (failures - 1).
     results.extend([False] * len(batch_failed))
     results.extend([True] * (len(batch) - len(batch_failed)))
     results.append(_check_deadcode(no_exit=True))  # count-ratcheted; outside the Gate batch
+    results.append(_check_arch(no_exit=True))  # count-ratcheted; outside the Gate batch
     _check_stop_hooks_present()
     results.append(_check_arch_config_guard(warn_only=True))
     results.append(_check_gherkin_guard(warn_only=True))
@@ -2299,10 +2397,10 @@ def cmd_ci() -> None:
     """Run full read-only verification.
 
     Read-only gates run as a parallel batch (lint, format check, typecheck, audit,
-    complexity, acceptance, arch) — captured and printed in submission order, run to
+    complexity, acceptance) — captured and printed in submission order, run to
     completion so one pass surfaces every failure. The count-ratcheted gates run after
-    it, sequentially: dead code, then coverage (captured) and CRAP (advisory unless
-    --enforce).
+    it, sequentially: dead code and arch, then coverage (captured) and CRAP (advisory
+    unless --enforce).
     """
     print("\n=== CI Checks ===\n")
     base_ok = _check_base_ref(no_exit=True)
@@ -2313,11 +2411,11 @@ def cmd_ci() -> None:
         _audit_gate_or_warn(),
         _complexity_gate(),
         *_acceptance_gates_or_warn(),
-        *_arch_gates_or_warn(),
     ])
     all_ok, _failed = run_gates_parallel(gates)
     all_ok = all_ok and base_ok
     all_ok = _check_deadcode(no_exit=True) and all_ok  # count-ratcheted; outside the batch
+    all_ok = _check_arch(no_exit=True) and all_ok  # count-ratcheted; outside the batch
     cmd_coverage()  # self-skips; sequential, after the batch
     cmd_crap()  # reads .coverage/coverage.xml; advisory unless --enforce
     all_ok = _check_arch_config_guard() and all_ok
@@ -2343,10 +2441,10 @@ def cmd_pre_push() -> None:
         _lint_gate(),
         _format_check_gate(),
         *_acceptance_gates_or_warn(),
-        *_arch_gates_or_warn(),
     ])
     gates_ok, _failed = run_gates_parallel(gates)
-    _exit_if_failed(gates_ok and base_ok and arch_config_ok and gherkin_ok)
+    arch_ok = _check_arch(no_exit=True)  # count-ratcheted; outside the Gate batch
+    _exit_if_failed(gates_ok and arch_ok and base_ok and arch_config_ok and gherkin_ok)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -2519,7 +2617,7 @@ TASKS: dict[str, tuple[Callable[..., object], str]] = {
     "suppressions": (cmd_suppressions, "Show or update suppression baseline"),
     "complexity": (cmd_complexity, "Cyclomatic complexity gate (lizard, CCN 15, args 8)"),
     "deadcode": (cmd_deadcode, "Detect unused (dead) code with vulture (app sources only)"),
-    "arch": (cmd_arch, "Architecture checks (import-linter)"),
+    "arch": (cmd_arch, "Architecture checks (import-linter, ratcheted by the baseline)"),
     "arch-config-guard": (cmd_arch_config_guard, "Block unreviewed arch config changes"),
     "gherkin-guard": (
         cmd_gherkin_guard,

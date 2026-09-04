@@ -37,6 +37,7 @@ def measurements(
     complexity: harness.Measurement | int | None = None,
     crap: harness.Measurement | int | None = None,
     deadcode: harness.Measurement | int | None = None,
+    arch: harness.Measurement | int | None = None,
 ):
     """Stub every ratcheted measurement. `None` means "does not apply here"."""
     with (
@@ -49,6 +50,9 @@ def measurements(
         ),
         mock.patch.object(
             harness, "_measured_deadcode_findings", return_value=_as_measurement(deadcode)
+        ),
+        mock.patch.object(
+            harness, "_measured_arch_violations", return_value=_as_measurement(arch)
         ),
     ):
         yield
@@ -150,7 +154,10 @@ class TestBaseline(unittest.TestCase):
             (root / ".harness-baseline").write_text(
                 "custom.thing 7\ncoverage.min 40\n", encoding="utf-8"
             )
-            with cwd(root), measurements(coverage=88, complexity=3, crap=None, deadcode=12):
+            with (
+                cwd(root),
+                measurements(coverage=88, complexity=3, crap=None, deadcode=12, arch=2),
+            ):
                 written = harness._write_baseline({"noqa": [["E501"]]})
                 content = (root / ".harness-baseline").read_text(encoding="utf-8")
 
@@ -159,6 +166,7 @@ class TestBaseline(unittest.TestCase):
         self.assertEqual(written["coverage.min"], 88)
         self.assertEqual(written["complexity.max_violations"], 3)
         self.assertEqual(written["deadcode.max_findings"], 12)
+        self.assertEqual(written["arch.max_violations"], 2)
         self.assertNotIn("crap.max_violations", written)
         self.assertIn("custom.thing 7", content)
 
@@ -432,6 +440,146 @@ class TestDeadcodeRatchet(unittest.TestCase):
 
         self.assertIsNone(measured.value)
         self.assertIn("exit 2", measured.error)
+
+
+# Trimmed to the shape the parser has to survive: the banner, a per-contract heading
+# with its `---` underline, the human sentence, and one `- chain` line per violation.
+BROKEN_OUTPUT = """\
+Contracts: 0 kept, 1 broken.
+
+
+----------------
+Broken contracts
+----------------
+
+src package layers
+------------------
+
+src.core is not allowed to import src.adapters:
+
+- src.core.scratch -> src.adapters.formatting (l.1)
+- src.core.other -> src.adapters.formatting (l.2, l.7)
+"""
+
+KEPT_OUTPUT = """\
+---------
+Contracts
+---------
+
+src package layers KEPT
+
+Contracts: 1 kept, 0 broken.
+"""
+
+
+class TestArchCount(unittest.TestCase):
+    """import-linter has no machine-readable output, so the parser is the contract."""
+
+    def test_counts_one_violation_per_chain_line(self) -> None:
+        self.assertEqual(harness._import_linter_broken_count(BROKEN_OUTPUT), 2)
+
+    def test_a_kept_contract_counts_zero(self) -> None:
+        self.assertEqual(harness._import_linter_broken_count(KEPT_OUTPUT), 0)
+
+    def test_ansi_colour_does_not_hide_the_banner_or_the_chains(self) -> None:
+        coloured = BROKEN_OUTPUT.replace(
+            "Broken contracts", "\x1b[1mBroken contracts\x1b[0m"
+        ).replace("- src.core.scratch", "\x1b[31m- src.core.scratch")
+        self.assertEqual(harness._import_linter_broken_count(coloured), 2)
+
+    def test_a_dash_before_the_banner_is_not_a_violation(self) -> None:
+        # The `---------` rules and any `- ` line in the kept section sit above the
+        # banner; counting from the top would report violations for a clean tree.
+        self.assertEqual(harness._import_linter_broken_count("- decoy\n" + KEPT_OUTPUT), 0)
+
+
+class TestArchGate(unittest.TestCase):
+    """`arch` compares the chain count to `arch.max_violations`, like dead code."""
+
+    @staticmethod
+    def _check(baseline: str | None, measurement, lines=()) -> tuple[bool, str]:
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            if baseline is not None:
+                (root / ".harness-baseline").write_text(baseline, encoding="utf-8")
+            with (
+                cwd(root),
+                mock.patch.object(harness, "_run_arch", return_value=(measurement, list(lines))),
+                redirect_stdout(output),
+            ):
+                ok = harness._check_arch(no_exit=True)
+        return ok, output.getvalue()
+
+    def test_is_report_only_without_a_floor(self) -> None:
+        # The adoption promise: a real layers contract over a legacy tree breaks in
+        # dozens of places on day one and must still be green.
+        ok, out = self._check(None, harness.Measurement(value=41))
+        self.assertTrue(ok)
+        self.assertIn("report-only", out)
+        self.assertIn("41", out)
+
+    def test_passes_at_the_floor(self) -> None:
+        ok, out = self._check("arch.max_violations 41\n", harness.Measurement(value=41))
+        self.assertTrue(ok)
+        self.assertIn("41 (baseline 41)", out)
+
+    def test_fails_when_one_new_violation_appears(self) -> None:
+        ok, out = self._check(
+            "arch.max_violations 41\n",
+            harness.Measurement(value=42),
+            ["- src.core.scratch -> src.adapters.formatting (l.1)"],
+        )
+        self.assertFalse(ok)
+        self.assertIn("42 violation(s) > baseline 41", out)
+        self.assertIn("src.core.scratch", out)
+
+    def test_suggests_ratcheting_down_when_violations_drop(self) -> None:
+        ok, out = self._check("arch.max_violations 10\n", harness.Measurement(value=4))
+        self.assertTrue(ok)
+        self.assertIn("--update-baseline", out)
+
+    def test_skips_without_an_importlinter_config(self) -> None:
+        ok, out = self._check(
+            "arch.max_violations 0\n", harness.Measurement(unavailable="no .importlinter")
+        )
+        self.assertTrue(ok)
+        self.assertIn("no .importlinter", out)
+
+    def test_a_broken_lint_imports_fails_instead_of_reporting_zero(self) -> None:
+        ok, out = self._check(
+            "arch.max_violations 0\n",
+            harness.Measurement(error="lint-imports failed to run (exit 1): bad config"),
+        )
+        self.assertFalse(ok)
+        self.assertIn("lint-imports failed to run", out)
+
+    def test_a_run_without_a_contracts_summary_is_an_error(self) -> None:
+        # import-linter exits 1 for broken contracts *and* for a bad config. Only the
+        # `Contracts:` summary separates a real count from a run that never analysed.
+        completed = subprocess.CompletedProcess(
+            [], returncode=1, stdout="", stderr="ModuleNotFoundError: no root package\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".importlinter").write_text("[importlinter]\n", encoding="utf-8")
+            with cwd(root), mock.patch.object(harness.subprocess, "run", return_value=completed):
+                measured, _ = harness._run_arch()
+
+        self.assertIsNone(measured.value)
+        self.assertIn("exit 1", measured.error)
+        self.assertIn("no root package", measured.error)
+
+    def test_a_broken_contract_is_a_count_not_an_error(self) -> None:
+        completed = subprocess.CompletedProcess([], returncode=1, stdout=BROKEN_OUTPUT, stderr="")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".importlinter").write_text("[importlinter]\n", encoding="utf-8")
+            with cwd(root), mock.patch.object(harness.subprocess, "run", return_value=completed):
+                measured, lines = harness._run_arch()
+
+        self.assertEqual(measured.value, 2)
+        self.assertIn("- src.core.scratch -> src.adapters.formatting (l.1)", lines)
 
 
 if __name__ == "__main__":

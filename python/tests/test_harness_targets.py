@@ -435,13 +435,13 @@ class TestCmdCheckSummary(unittest.TestCase):
             # Pin the parallel batch to exactly one gate (complexity) so the summary
             # count is deterministic: `check` now tallies one result per gate.
             mock.patch.object(harness, "_acceptance_gates_or_warn", return_value=[]),
-            mock.patch.object(harness, "_arch_gates_or_warn", return_value=[]),
             mock.patch.object(harness, "_check_stop_hooks_present"),
             mock.patch.object(harness, "_check_arch_config_guard", return_value=True),
             mock.patch.object(harness, "_check_gherkin_guard", return_value=True),
             mock.patch.object(harness, "_check_agents_md_drift", return_value=True),
             mock.patch.object(harness, "_check_suppressions_baseline", return_value=True),
             mock.patch.object(harness, "_check_deadcode", return_value=True),
+            mock.patch.object(harness, "_check_arch", return_value=True),
         ]
 
     def test_check_prints_ok_summary_when_everything_passes(self):
@@ -453,7 +453,7 @@ class TestCmdCheckSummary(unittest.TestCase):
                 harness.cmd_check()  # must not raise
 
         self.assertIn("OK", output.getvalue())
-        self.assertIn("11 passed", output.getvalue())
+        self.assertIn("12 passed", output.getvalue())
 
     def test_check_exits_1_and_prints_fail_summary_on_gate_failure(self):
         output = io.StringIO()
@@ -465,13 +465,13 @@ class TestCmdCheckSummary(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("FAIL", output.getvalue())
-        self.assertIn("10 passed, 1 failed", output.getvalue())
+        self.assertIn("11 passed, 1 failed", output.getvalue())
 
-    def test_check_runs_complexity_acceptance_arch_as_parallel_batch(self):
-        # check must run every offline, fast, no-build-lock gate — complexity,
-        # acceptance, and arch (import-linter: local dev dependency, offline, no
-        # build lock) all run through the same read-only parallel batch stop-hook
-        # uses. Dead code is count-ratcheted, so it runs outside the Gate batch.
+    def test_check_runs_complexity_and_acceptance_as_parallel_batch(self):
+        # check must run every offline, fast, no-build-lock gate. Complexity and
+        # acceptance go through the read-only parallel batch stop-hook uses;
+        # dead code and arch are count-ratcheted (a number against a baseline
+        # floor, not an exit code), so they run outside the Gate batch.
         captured_gates = []
 
         def record_batch(gates):
@@ -485,15 +485,10 @@ class TestCmdCheckSummary(unittest.TestCase):
                 mock.patch.object(harness, "run_gates_parallel", side_effect=record_batch)
             )
             stack.enter_context(
-                mock.patch.object(harness, "_acceptance_gates_or_warn", return_value=[])
-            )
-            stack.enter_context(
                 mock.patch.object(
                     harness,
-                    "_arch_gates_or_warn",
-                    return_value=[
-                        harness.Gate("Arch (import-linter)", ["uv", "run", "lint-imports"])
-                    ],
+                    "_acceptance_gates_or_warn",
+                    return_value=[harness.Gate("Acceptance (behave)", ["behave"])],
                 )
             )
             with redirect_stdout(io.StringIO()):
@@ -501,8 +496,23 @@ class TestCmdCheckSummary(unittest.TestCase):
 
         self.assertEqual(
             captured_gates,
-            [["Complexity (lizard)", "Arch (import-linter)"]],
+            [["Complexity (lizard)", "Acceptance (behave)"]],
         )
+
+    def test_check_runs_arch_outside_the_batch(self):
+        # Arch (import-linter: local dev dependency, offline, no build lock) still
+        # runs in check — it just reports a count against `arch.max_violations`
+        # instead of an exit code, so it cannot ride in the Gate batch.
+        with contextlib.ExitStack() as stack:
+            for patcher in self._patch_check_steps():
+                stack.enter_context(patcher)
+            check_arch = stack.enter_context(
+                mock.patch.object(harness, "_check_arch", return_value=True)
+            )
+            with redirect_stdout(io.StringIO()):
+                harness.cmd_check()
+
+        check_arch.assert_called_once_with(no_exit=True)
 
 
 class TestGherkinGuardDecision(unittest.TestCase):
@@ -1184,7 +1194,7 @@ class TestCheckSummaryCountsEveryGate(unittest.TestCase):
                 mock.patch.object(harness, "cmd_test", return_value=True),
                 mock.patch.object(harness, "_complexity_gate", return_value=batch[0]),
                 mock.patch.object(harness, "_acceptance_gates_or_warn", return_value=batch[1:]),
-                mock.patch.object(harness, "_arch_gates_or_warn", return_value=[]),
+                mock.patch.object(harness, "_check_arch", return_value=True),
                 mock.patch.object(
                     harness,
                     "run_gates_parallel",
@@ -1203,7 +1213,7 @@ class TestCheckSummaryCountsEveryGate(unittest.TestCase):
 
         # 3 of the 4 batch gates failed; the old code reported 1.
         self.assertIn("3 failed", output.getvalue())
-        self.assertIn("11 passed", output.getvalue())
+        self.assertIn("12 passed", output.getvalue())
 
 
 class TestVerboseStillPrintsGlyphs(unittest.TestCase):

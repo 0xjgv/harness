@@ -174,12 +174,31 @@ The template's current list is `S404 S603 S607 S405 S314`. Adding the two
 missing codes turned that gate green. Diff the two lists; do not assume an
 existing entry is current.
 
-**`.importlinter`**: do not copy it. Its `layers = adapters / core` contract
-names the template's worked example. If the repo has a real layering, write it;
-otherwise **delete the file** — `_arch_gates_or_warn()` prints
-`⚠ Arch: no .importlinter — skipped` and passes. Measured on both repos.
-(fusion has no `__init__.py` anywhere, so import-linter has no root package to
-point at; deleting is the only correct answer there.)
+**`.importlinter`**: do not copy it — **derive it**. Its `layers = adapters /
+core` contract names the template's worked example, not the adopter's tree.
+Read the real package tree and write the contract it already implies:
+
+1. `root_packages` = the repo's top-level import package(s) — the directories
+   with an `__init__.py` that the code imports by name.
+2. `layers` = that package's own top-level subpackages, ordered high to low by
+   what already imports what (a `web`/`api`/`cli` entry point on top, a
+   `models`/`domain`/`core` package at the bottom). Leave `exhaustive` off on a
+   first pass; it turns every undeclared subpackage into its own violation.
+3. Run `<prefix> arch`. It prints the count and passes, because with no
+   `arch.max_violations` key the gate is **report-only**.
+4. Record where the repo is: `<prefix> suppressions --update-baseline`. The
+   count becomes the floor, and the next new violation is the one that fails.
+
+A contract written this way is red on day one by dozens of chains — that is the
+point of the floor. Never bend the contract to reach zero; a `layers` list
+edited to match the mess documents nothing, and `arch-config-guard` exists
+precisely to stop that edit passing unreviewed.
+
+**Delete the file only when no contract exists to write** — a flat package with
+no subpackages, or no import package at all. Then `arch` prints
+`⚠ Arch: no .importlinter — skipped` and passes. Measured: fusion has no
+`__init__.py` anywhere, so import-linter has no root package to point at, and
+deleting is the only correct answer there.
 
 **`Makefile`** is not verbatim: it hardcodes `HARNESS := uv run harness`. In a
 pip repo that resolves to whatever `harness` is first on `PATH` — measured on
@@ -393,9 +412,10 @@ Two measured details:
 
 ---
 
-## `.harness-baseline` — five metrics, one writer
+## `.harness-baseline` — six metrics, one writer
 
 ```
+arch.max_violations 0
 complexity.max_violations 0
 coverage.min 100
 crap.max_violations 0
@@ -405,8 +425,11 @@ suppressions.pyright_ignore 2
 suppressions.type_ignore 4
 ```
 
-- **Five**, not four. `deadcode.max_findings` was added because vulture
-  produced 1,583 findings on doghouse with no floor and no escape.
+- **Six**, not four. `deadcode.max_findings` was added because vulture produced
+  1,583 findings on doghouse with no floor and no escape; `arch.max_violations`
+  because a layering contract derived from a real tree (§3) is broken in dozens
+  of places the day it is written, and a pass/fail `arch` gate leaves an adopter
+  the single choice of deleting the contract.
 - **The only writer is `suppressions --update-baseline`.** Nobody guesses that
   from the name — say it out loud when handing the repo over. The name is a
   known wart, deliberately unfixed: `suppressions` sits in the parity gate's
@@ -415,7 +438,8 @@ suppressions.type_ignore 4
 - **A missing `.harness-baseline` is report-only and passes** — verified for
   every metric, complexity included:
   `✓ Complexity (lizard, report-only: no .harness-baseline floor)`,
-  `⚠ Dead code (vulture): 177 finding(s), report-only (no .harness-baseline floor)`.
+  `⚠ Dead code (vulture): 177 finding(s), report-only (no .harness-baseline floor)`,
+  `⚠ Arch (import-linter): 41 violation(s), report-only (no .harness-baseline floor)`.
 - `coverage.min` is the floor. `[tool.coverage.report] fail_under` is **not**
   read — the harness always passes an explicit `--fail-under=<n>` on the CLI.
 - **`coverage.min 100` ships in the committed template baseline.** Greenfield
