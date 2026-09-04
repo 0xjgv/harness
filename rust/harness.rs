@@ -32,6 +32,16 @@ const RESET: &str = "\x1b[0m";
 const BASELINE_FILE: &str = ".harness-baseline";
 const SUPPRESSION_BASELINE_PREFIX: &str = "suppressions.";
 const ARCH_CONFIG: &str = "arch.toml";
+/// lizard thresholds this template gates on. Shared by the gate and the
+/// `--update-baseline` measurement so a recorded floor reproduces exactly.
+const COMPLEXITY_MAX_CCN: u32 = 15;
+const COMPLEXITY_MAX_ARGS: u32 = 8;
+const COMPLEXITY_MAX_LENGTH: u32 = 100;
+/// `-i N` high enough that lizard never fails on count: how a gate is turned into
+/// a measuring tape, both when measuring a floor and when there is no floor yet.
+const REPORT_ONLY_LIMIT: u32 = 1_000_000;
+/// The CRAP threshold `crap` defaults to, and the one its floor is measured at.
+const CRAP_MAX_DEFAULT: f64 = 30.0;
 const ARCH_CONFIG_ALLOW_ENV: &str = "HARNESS_ALLOW_ARCH_CONFIG";
 const GHERKIN_ALLOW_ENV: &str = "HARNESS_ALLOW_NO_FEATURE";
 
@@ -143,36 +153,49 @@ fn run(description: &str, cmd: &[&str], opts: Option<&RunOpts>) -> RunResult {
 
 /// A read-only gate's label + command, shared by the standalone cmd_* and the batch.
 struct Gate {
-    description: &'static str,
+    /// Owned, not `&'static str`: a ratcheted gate names its floor in its own
+    /// label (`Complexity (lizard, baseline 3)`), which is only known at runtime.
+    description: String,
     cmd: Vec<String>,
     extract: Option<fn(&str) -> Option<String>>,
-    hint: Option<&'static str>,
+    hint: Option<String>,
+    /// True when the gate has no recorded floor and therefore cannot fail. Its
+    /// hint then prints on the passing line too — "record a floor" is the whole
+    /// point of the message, and a gate that never fails would never show it.
+    report_only: bool,
 }
 
 impl Gate {
-    fn new(description: &'static str, cmd: &[&str]) -> Self {
+    fn new(description: impl Into<String>, cmd: &[&str]) -> Self {
         Self {
-            description,
+            description: description.into(),
             cmd: cmd.iter().map(|&s| s.to_string()).collect(),
             extract: None,
             hint: None,
+            report_only: false,
         }
     }
 
-    const fn with_hint(mut self, hint: &'static str) -> Self {
-        self.hint = Some(hint);
+    fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    const fn report_only(mut self) -> Self {
+        self.report_only = true;
         self
     }
 }
 
 struct GateResult {
-    description: &'static str,
+    description: String,
     cmd: Vec<String>,
     ok: bool,
     exit_code: i32,
     output: String,
     detail: Option<String>,
-    hint: Option<&'static str>,
+    hint: Option<String>,
+    report_only: bool,
 }
 
 /// Run a gate's command with output captured (no printing, no exit): the
@@ -196,23 +219,25 @@ fn run_capture(gate: &Gate) -> GateResult {
             let ok = output.status.success();
             let detail = if ok { gate.extract.and_then(|f| f(&combined)) } else { None };
             GateResult {
-                description: gate.description,
+                description: gate.description.clone(),
                 cmd: gate.cmd.clone(),
                 ok,
                 exit_code: output.status.code().unwrap_or(1),
                 output: combined,
                 detail,
-                hint: gate.hint,
+                hint: gate.hint.clone(),
+                report_only: gate.report_only,
             }
         }
         Err(e) => GateResult {
-            description: gate.description,
+            description: gate.description.clone(),
             cmd: gate.cmd.clone(),
             ok: false,
             exit_code: 1,
             output: format!("Failed to execute {program}: {e}"),
             detail: None,
-            hint: gate.hint,
+            hint: gate.hint.clone(),
+            report_only: gate.report_only,
         },
     }
 }
@@ -229,13 +254,16 @@ fn print_gate_result(result: &GateResult, no_exit: bool) -> bool {
         let suffix =
             result.detail.as_ref().map_or_else(String::new, |d| format!(" {DIM}({d}){RESET}"));
         println!("  {GREEN}\u{2713}{RESET} {}{suffix}", result.description);
+        if let Some(hint) = result.report_only.then_some(result.hint.as_ref()).flatten() {
+            println!("  ↳ fix: {hint}");
+        }
         return true;
     }
     println!("  {RED}\u{2717}{RESET} {}", result.description);
     if !is_verbose() && !result.output.is_empty() {
         print!("{}", result.output);
     }
-    if let Some(hint) = result.hint {
+    if let Some(hint) = &result.hint {
         println!("  ↳ fix: {hint}");
     }
     if !no_exit {
@@ -255,7 +283,7 @@ fn print_gate_result(result: &GateResult, no_exit: bool) -> bool {
 /// the descriptions of any that failed — empty means every gate passed.
 /// Split out from `run_gates_parallel` so `cmd_stop_hook` can name failed
 /// gates in its stderr summary without duplicating the execution/printing.
-fn run_gates_parallel_detailed(gates: &[Gate]) -> Vec<&'static str> {
+fn run_gates_parallel_detailed(gates: &[Gate]) -> Vec<String> {
     if gates.is_empty() {
         return Vec::new();
     }
@@ -271,7 +299,7 @@ fn run_gates_parallel_detailed(gates: &[Gate]) -> Vec<&'static str> {
     let mut failed = Vec::new();
     for result in &results {
         if !print_gate_result(result, true) {
-            failed.push(result.description);
+            failed.push(result.description.clone());
         }
     }
     failed
@@ -431,7 +459,7 @@ fn default_suppression_roots() -> Vec<PathBuf> {
     vec![root().join("src"), root().join("tests"), root().join("harness.rs")]
 }
 
-fn suppression_counts(results: &SuppressionCounts) -> BTreeMap<String, u32> {
+fn suppression_counts(results: &SuppressionCounts) -> BaselineMap {
     results
         .iter()
         .map(|(kind, entries)| {
@@ -443,8 +471,18 @@ fn suppression_counts(results: &SuppressionCounts) -> BTreeMap<String, u32> {
         .collect()
 }
 
-fn parse_baseline_str(text: &str) -> BTreeMap<String, u32> {
-    let mut values = BTreeMap::new();
+/// The ratcheted floors `.harness-baseline` carries, keyed by metric name.
+type BaselineMap = BTreeMap<String, u32>;
+
+/// How one ratcheted metric is measured. Named so `RATCHETED_KEYS` stays readable.
+type MeasureFn = fn() -> Measurement;
+
+/// A merged baseline plus the "dropped this key" warnings, or the metrics that
+/// failed to measure as (key, reason) pairs.
+type MergeOutcome = Result<(BaselineMap, Vec<String>), Vec<(String, String)>>;
+
+fn parse_baseline_str(text: &str) -> BaselineMap {
+    let mut values = BaselineMap::new();
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -460,7 +498,7 @@ fn parse_baseline_str(text: &str) -> BTreeMap<String, u32> {
     values
 }
 
-fn read_baseline() -> Option<BTreeMap<String, u32>> {
+fn read_baseline() -> Option<BaselineMap> {
     let text = fs::read_to_string(root().join(BASELINE_FILE)).ok()?;
     Some(parse_baseline_str(&text))
 }
@@ -486,13 +524,159 @@ fn coverage_min_default() -> u32 {
     read_baseline().and_then(|b| b.get("coverage.min").copied()).unwrap_or(0)
 }
 
+/// The committed floor for a ratcheted metric, or `None` when there is none.
+///
+/// `None` means "never measured here" — no `.harness-baseline` at all, or a file
+/// that does not carry this key. A gate reading a floor then runs report-only:
+/// retrofitting the harness into an existing repo has to be green on day one, and
+/// a floor of 0 inferred from a missing number is not a floor, it is a demand that
+/// the repo already be perfect.
+fn baseline_floor(key: &str) -> Option<u32> {
+    read_baseline()?.get(key).copied()
+}
+
+/// A metric's value, or the reason there isn't one.
+///
+/// Three states, deliberately not collapsed into `Option<u32>`:
+///   * `Value` — measured, including a legitimate 0.
+///   * `Unavailable` — the metric does not apply to this repo (no sources, tool not
+///     installed). The baseline key is dropped, and the gate goes report-only.
+///   * `Error` — the measuring tool ran and failed. `--update-baseline` aborts and
+///     writes nothing: a floor recorded from a broken run is worse than no floor,
+///     because every downstream gate trusts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Measurement {
+    Value(u32),
+    Unavailable(String),
+    Error(String),
+}
+
+/// Every metric `suppressions --update-baseline` measures, paired with how to
+/// measure it. Add a line here to ratchet a new metric: the writer, the
+/// abort-on-error rule and the drop-when-unavailable rule are all generic over
+/// this table.
+///
+/// `coverage.min` is measured first so the instrumented run it needs is the one
+/// CRAP then reuses. `mutation.min` is deliberately absent: it is carried through
+/// untouched (see `merge_baseline`), because measuring it costs a mutation run the
+/// automatic pass must not silently pay for.
+const RATCHETED_KEYS: &[(&str, MeasureFn)] = &[
+    ("coverage.min", measured_coverage_min),
+    ("complexity.max_violations", measured_complexity_violations),
+    ("crap.max_violations", measured_crap_violations),
+];
+
+/// Measure every ratcheted metric, stopping at the first one that failed.
+///
+/// Sequential and short-circuiting on purpose: a broken tool usually breaks the
+/// metrics after it too (CRAP re-runs the coverage suite), so the first failure is
+/// the one worth reporting and the later ones would only be noise.
+fn measure_ratcheted() -> Vec<(&'static str, Measurement)> {
+    let mut measured = Vec::with_capacity(RATCHETED_KEYS.len());
+    for (key, measure) in RATCHETED_KEYS {
+        let value = measure();
+        let failed = matches!(value, Measurement::Error(_));
+        measured.push((*key, value));
+        if failed {
+            break;
+        }
+    }
+    measured
+}
+
+/// Merge measured floors over the existing baseline; unknown keys are preserved.
+///
+/// Every key the harness measures is rewritten (so a metric that improved ratchets
+/// down); every key it does not recognise — `coverage.min`, `mutation.min`, a key a
+/// newer harness wrote — is carried through untouched.
+///
+/// A metric that does not apply here has its key *removed*, never carried forward:
+/// the shipped template's own numbers must not survive into an adopting repo's
+/// first baseline. A metric that could not be measured aborts the whole write, so
+/// this returns `Err` before building anything — see `Measurement`.
+///
+/// Pure on purpose: `write_baseline` owns the I/O and the printing, this owns the
+/// merge rules, and the rules are unit-tested without touching the filesystem.
+fn merge_baseline(
+    existing: &BaselineMap,
+    suppressions: &BaselineMap,
+    measurements: &[(&str, Measurement)],
+) -> MergeOutcome {
+    let broken: Vec<(String, String)> = measurements
+        .iter()
+        .filter_map(|(key, measurement)| match measurement {
+            Measurement::Error(reason) => Some(((*key).to_string(), reason.clone())),
+            Measurement::Value(_) | Measurement::Unavailable(_) => None,
+        })
+        .collect();
+    if !broken.is_empty() {
+        return Err(broken);
+    }
+
+    let mut merged = existing.clone();
+    // Seed every known suppression kind at 0 before applying the scan: a kind that
+    // ratcheted to zero stops appearing in the scan entirely, and without the seed
+    // its stale count would survive as an unrecognised key, tolerating suppressions
+    // that are already gone.
+    for (kind, _) in SUPPRESSION_PREFIXES {
+        merged.insert(format!("{SUPPRESSION_BASELINE_PREFIX}{kind}"), 0);
+    }
+    for (key, count) in suppressions {
+        merged.insert(key.clone(), *count);
+    }
+
+    let mut dropped = Vec::new();
+    for (key, measurement) in measurements {
+        match measurement {
+            Measurement::Value(value) => {
+                merged.insert((*key).to_string(), *value);
+            }
+            Measurement::Unavailable(reason) => {
+                if merged.remove(*key).is_some() {
+                    dropped.push(format!("{key}: dropped — {reason}"));
+                }
+            }
+            Measurement::Error(_) => return Err(broken),
+        }
+    }
+    Ok((merged, dropped))
+}
+
+/// Render a baseline map as the `key value` lines the file stores, sorted.
+fn serialize_baseline(baseline: &BaselineMap) -> String {
+    let lines: Vec<String> = baseline.iter().map(|(key, value)| format!("{key} {value}")).collect();
+    if lines.is_empty() { String::new() } else { format!("{}\n", lines.join("\n")) }
+}
+
+/// Measure, merge and write `.harness-baseline`.
+///
+/// All-or-nothing: when any ratcheted metric fails to measure, nothing is written
+/// and the process exits 1. The write is the last statement for exactly that
+/// reason — an abort can never leave a half-updated floor behind.
 fn write_baseline(results: &SuppressionCounts) -> std::io::Result<()> {
-    let coverage_min = read_baseline().and_then(|b| b.get("coverage.min").copied()).unwrap_or(0);
-    let counts = suppression_counts(results);
-    let mut lines: Vec<String> =
-        counts.iter().map(|(key, count)| format!("{key} {count}")).collect();
-    lines.push(format!("coverage.min {coverage_min}"));
-    fs::write(root().join(BASELINE_FILE), format!("{}\n", lines.join("\n")))
+    let existing = read_baseline().unwrap_or_default();
+    let measurements = measure_ratcheted();
+    let (merged, dropped) =
+        match merge_baseline(&existing, &suppression_counts(results), &measurements) {
+            Ok(outcome) => outcome,
+            Err(broken) => {
+                println!(
+                    "  {RED}\u{2717}{RESET} {BASELINE_FILE} not written \u{2014} could not measure:"
+                );
+                for (key, reason) in &broken {
+                    println!("    {key}: {reason}");
+                }
+                println!(
+                    "  ↳ fix: make the measurement pass, then rerun \
+                     `cargo harness suppressions --update-baseline`"
+                );
+                std::process::exit(1);
+            }
+        };
+    for line in &dropped {
+        println!("  {GREEN}\u{26a0}{RESET} {line}");
+    }
+    fs::write(root().join(BASELINE_FILE), serialize_baseline(&merged))
 }
 
 fn print_suppressions_breakdown(results: &SuppressionCounts) {
@@ -1220,32 +1404,136 @@ fn cmd_gherkin_guard() {
     }
 }
 
-/// Run lizard as a cyclomatic-complexity gate. Mirrors bun/python invocation.
+/// lizard argv at this template's thresholds, tolerating `max_violations` warnings.
+///
+/// lizard's own `-i N` is the count ratchet: it exits 0 while the number of flagged
+/// functions stays at or below N, so lizard does the counting. Single-sourced
+/// because a floor measured against a different target set does not reproduce —
+/// the gate and the measurement must pass byte-identical arguments.
+fn complexity_argv(max_violations: u32) -> Vec<String> {
+    [
+        "uvx",
+        "lizard@1.22.2",
+        "-l",
+        "rust",
+        "src",
+        "tests",
+        "-C",
+        &COMPLEXITY_MAX_CCN.to_string(),
+        "-a",
+        &COMPLEXITY_MAX_ARGS.to_string(),
+        "-L",
+        &COMPLEXITY_MAX_LENGTH.to_string(),
+        "-i",
+        &max_violations.to_string(),
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
+/// The lizard gate at the committed floor, or report-only when there is none.
+///
+/// With no floor recorded, `-i 0` would demand a legacy tree already be perfect —
+/// exactly the day-one red that stops the harness being adopted. Measure instead:
+/// `-i` goes high enough that lizard always exits 0, and the label says why.
+fn complexity_gate_for(floor: Option<u32>) -> Gate {
+    let argv = complexity_argv(floor.unwrap_or(REPORT_ONLY_LIMIT));
+    let cmd: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let Some(floor) = floor else {
+        return Gate::new(
+            format!("Complexity (lizard, report-only: no {BASELINE_FILE} floor)"),
+            &cmd,
+        )
+        .with_hint("run `cargo harness suppressions --update-baseline` to record a floor")
+        .report_only();
+    };
+    let description = if floor == 0 {
+        "Complexity (lizard)".to_string()
+    } else {
+        format!("Complexity (lizard, baseline {floor})")
+    };
+    Gate::new(description, &cmd).with_hint(format!(
+        "extract helpers or flatten branches until CCN <= {COMPLEXITY_MAX_CCN}; \
+         do not raise the threshold"
+    ))
+}
+
 fn complexity_gate() -> Gate {
-    Gate::new(
-        "Complexity (lizard)",
-        &[
-            "uvx",
-            "lizard@1.22.2",
-            "-l",
-            "rust",
-            "src",
-            "tests",
-            "-C",
-            "15",
-            "-a",
-            "8",
-            "-L",
-            "100",
-            "-i",
-            "0",
-        ],
-    )
-    .with_hint("extract helpers or flatten branches until CCN <= 15; do not raise the threshold")
+    complexity_gate_for(baseline_floor("complexity.max_violations"))
 }
 
 fn cmd_complexity() {
     print_gate_result(&run_capture(&complexity_gate()), false);
+}
+
+/// Read the `Warning cnt` column out of lizard's final summary row.
+///
+/// The summary is the only place lizard states the count as a number; every other
+/// rendering would have to be counted line by line, which changes shape with the
+/// `-w`/`--csv` flags.
+fn lizard_warning_count(stdout: &str) -> Option<u32> {
+    let lines: Vec<&str> = stdout.lines().collect();
+    let header = lines.iter().position(|line| line.starts_with("Total nloc"))?;
+    for row in &lines[header + 1..] {
+        let trimmed = row.trim();
+        if trimmed.is_empty() || trimmed.chars().all(|c| c == '-') {
+            continue;
+        }
+        let fields: Vec<&str> = row.split_whitespace().collect();
+        if fields.len() < 6 {
+            continue;
+        }
+        return fields[5].parse::<u32>().ok();
+    }
+    None
+}
+
+/// Count of functions lizard flags at the template's thresholds.
+fn measured_complexity_violations() -> Measurement {
+    if !root().join("src").is_dir() {
+        return Measurement::Unavailable("no src/ sources".to_string());
+    }
+    let argv = complexity_argv(REPORT_ONLY_LIMIT);
+    let output = Command::new(&argv[0]).args(&argv[1..]).current_dir(root()).output();
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => return Measurement::Error(format!("lizard failed to run: {e}")),
+    };
+    if !output.status.success() {
+        return Measurement::Error(format!(
+            "lizard failed to run (exit {:?})",
+            output.status.code()
+        ));
+    }
+    lizard_warning_count(&String::from_utf8_lossy(&output.stdout)).map_or_else(
+        || Measurement::Error("lizard printed no summary row to count warnings from".to_string()),
+        Measurement::Value,
+    )
+}
+
+/// Selects the CRAP gate's status glyph/color and the `(advisory)` suffix.
+/// `✗`/red is reserved for `--enforce` runs, which actually exit 1; the
+/// default advisory mode always exits 0, so it gets `⚠`/green even when it
+/// lists offenders or a lizard failure — a red ✗ that still exits 0 tells the
+/// human the build failed when it did not.
+const fn crap_status_glyph(enforce: bool) -> (&'static str, &'static str, &'static str) {
+    if enforce { (RED, "\u{2717}", "") } else { (GREEN, "\u{26a0}", " (advisory)") }
+}
+
+/// What scoring CRAP produced: the offenders, or why there are none to report.
+enum CrapOutcome {
+    /// cargo-llvm-cov is not installed. Nothing to score, and not a failure —
+    /// the measurement is `unavailable`, not an error.
+    Skipped(String),
+    /// Coverage data could not be produced or read. Fatal even in advisory mode:
+    /// scoring against absent data would print a green ✓ that means nothing.
+    Fatal(String),
+    /// lizard itself failed. Advisory mode degrades this to a warning; reporting
+    /// "all functions below max" instead would be a silent false pass.
+    ToolFailure { message: String, detail: String, code: i32 },
+    /// Functions whose CRAP exceeds the threshold, worst first.
+    Scored(Vec<CrapFn>),
 }
 
 /// Compute CRAP = CCN² × (1-cov)³ + CCN per function. Advisory by default.
@@ -1258,87 +1546,135 @@ fn cmd_complexity() {
 /// `target/llvm-cov/lcov.info`; this command reuses it. Standalone runs (or
 /// runs where `src/` is newer than the existing LCOV) trigger a full test
 /// re-execution to avoid scoring against stale coverage.
-/// Selects the CRAP gate's status glyph/color and the `(advisory)` suffix.
-/// `✗`/red is reserved for `--enforce` runs, which actually exit 1; the
-/// default advisory mode always exits 0, so it gets `⚠`/green even when it
-/// lists offenders or a lizard failure — a red ✗ that still exits 0 tells the
-/// human the build failed when it did not.
-const fn crap_status_glyph(enforce: bool) -> (&'static str, &'static str, &'static str) {
-    if enforce { (RED, "\u{2717}", "") } else { (GREEN, "\u{26a0}", " (advisory)") }
+///
+/// Score every function's CRAP against `max_crap`, refreshing coverage if stale.
+///
+/// Split out from `cmd_crap` so `--update-baseline` can measure the same number
+/// the gate reports without the printing or the `exit()` calls — a floor recorded
+/// from a different code path is a floor that does not reproduce.
+/// Whether `target/llvm-cov/lcov.info` is usable, and why not when it is not.
+enum LcovStatus {
+    Ready(PathBuf),
+    /// cargo-llvm-cov is not installed. Not a failure — nothing can be measured.
+    Skipped(String),
+    /// The run happened and could not produce readable coverage data.
+    Fatal(String),
 }
 
-fn cmd_crap() {
-    let max_crap: f64 = arg_value("--max").and_then(|v| v.parse::<f64>().ok()).unwrap_or(30.0);
-    let enforce = arg_flag("--enforce");
-
+/// Ensure the LCOV artifact exists and is newer than the sources it scores.
+///
+/// Shared by `crap_measure` and the `coverage.min` measurement so both read one
+/// instrumented run: regenerating it twice would double the slowest step of
+/// `suppressions --update-baseline` for no new information.
+fn ensure_lcov() -> LcovStatus {
     if !tool_installed("llvm-cov") {
-        println!("  {DIM}\u{2298} CRAP skipped (install: cargo install cargo-llvm-cov){RESET}");
-        return;
-    }
-
-    let lcov_path = root().join("target").join("llvm-cov").join("lcov.info");
-    if !lcov_path.exists() || !lcov_is_fresh(&lcov_path, &["src", "tests"]) {
-        if let Some(parent) = lcov_path.parent()
-            && let Err(e) = fs::create_dir_all(parent)
-        {
-            println!("  {RED}\u{2717}{RESET} CRAP: cannot create {}: {e}", parent.display());
-            std::process::exit(1);
-        }
-        let env = llvm_tools_env();
-        let lcov_str = lcov_path.to_string_lossy().into_owned();
-        let run_result = run(
-            "CRAP: running tests under llvm-cov",
-            &["cargo", "llvm-cov", "--no-report"],
-            Some(&RunOpts { env: env.clone(), no_exit: true, ..RunOpts::default() }),
+        return LcovStatus::Skipped(
+            "CRAP skipped (install: cargo install cargo-llvm-cov)".to_string(),
         );
-        let report_result = if run_result.ok {
-            run(
-                "CRAP: emit LCOV",
-                &["cargo", "llvm-cov", "report", "--lcov", "--output-path", &lcov_str],
-                Some(&RunOpts { env, no_exit: true, ..RunOpts::default() }),
-            )
-        } else {
-            run_result
-        };
-        if !report_result.ok || !lcov_path.exists() {
-            println!("  {RED}\u{2717}{RESET} CRAP: could not produce {}", lcov_path.display());
-            std::process::exit(1);
-        }
     }
+    let lcov_path = root().join("target").join("llvm-cov").join("lcov.info");
+    if lcov_path.exists() && lcov_is_fresh(&lcov_path, &["src", "tests"]) {
+        return LcovStatus::Ready(lcov_path);
+    }
+    if let Some(parent) = lcov_path.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        return LcovStatus::Fatal(format!("CRAP: cannot create {}: {e}", parent.display()));
+    }
+    let env = llvm_tools_env();
+    let lcov_str = lcov_path.to_string_lossy().into_owned();
+    let run_result = run(
+        "CRAP: running tests under llvm-cov",
+        &["cargo", "llvm-cov", "--no-report"],
+        Some(&RunOpts { env: env.clone(), no_exit: true, ..RunOpts::default() }),
+    );
+    let report_result = if run_result.ok {
+        run(
+            "CRAP: emit LCOV",
+            &["cargo", "llvm-cov", "report", "--lcov", "--output-path", &lcov_str],
+            Some(&RunOpts { env, no_exit: true, ..RunOpts::default() }),
+        )
+    } else {
+        run_result
+    };
+    if !report_result.ok || !lcov_path.exists() {
+        return LcovStatus::Fatal(format!("CRAP: could not produce {}", lcov_path.display()));
+    }
+    LcovStatus::Ready(lcov_path)
+}
 
+/// Total line coverage from the LCOV artifact, truncated to an integer.
+///
+/// Truncated, never rounded: 53.9% recorded as 54 would fail the very gate that
+/// measured it. LCOV `DA:` records are the same lines cargo-llvm-cov counts as its
+/// line coverage, so the floor written here is the number
+/// `coverage --fail-under-lines` compares against.
+fn measured_coverage_min() -> Measurement {
+    let lcov_path = match ensure_lcov() {
+        LcovStatus::Ready(path) => path,
+        LcovStatus::Skipped(reason) => return Measurement::Unavailable(reason),
+        LcovStatus::Fatal(reason) => return Measurement::Error(reason),
+    };
     let Some(cov_map) = parse_lcov(&lcov_path) else {
-        println!("  {RED}\u{2717}{RESET} CRAP: failed to read {}", lcov_path.display());
-        std::process::exit(1);
+        return Measurement::Error(format!("failed to read {}", lcov_path.display()));
+    };
+    lcov_line_coverage(&cov_map).map_or_else(
+        || Measurement::Unavailable("no line coverage data".to_string()),
+        Measurement::Value,
+    )
+}
+
+/// Percent of tracked lines that were hit, truncated toward zero.
+///
+/// `None` when nothing is tracked at all — a repo with no instrumented lines has
+/// no coverage to floor, which is different from 0% coverage.
+fn lcov_line_coverage(cov_map: &HashMap<String, HashMap<u32, u32>>) -> Option<u32> {
+    let mut tracked: u64 = 0;
+    let mut covered: u64 = 0;
+    for lines in cov_map.values() {
+        tracked += lines.len() as u64;
+        covered += lines.values().filter(|&&hits| hits > 0).count() as u64;
+    }
+    if tracked == 0 {
+        return None;
+    }
+    u32::try_from(covered * 100 / tracked).ok()
+}
+
+fn crap_measure(max_crap: f64) -> CrapOutcome {
+    let lcov_path = match ensure_lcov() {
+        LcovStatus::Ready(path) => path,
+        LcovStatus::Skipped(reason) => return CrapOutcome::Skipped(reason),
+        LcovStatus::Fatal(reason) => return CrapOutcome::Fatal(reason),
     };
 
+    let Some(cov_map) = parse_lcov(&lcov_path) else {
+        return CrapOutcome::Fatal(format!("CRAP: failed to read {}", lcov_path.display()));
+    };
+
+    // `-i` high: here lizard is a measuring tape, not a gate. Left at its default
+    // it exits 1 on any function over CCN 15, and CRAP would report "lizard
+    // exited" for exactly the repos that most need scoring.
     let lz_output = Command::new("uvx")
-        .args(["lizard@1.22.2", "-l", "rust", "src", "--csv"])
+        .args(["lizard@1.22.2", "-l", "rust", "src", "--csv", "-i", &REPORT_ONLY_LIMIT.to_string()])
         .current_dir(root())
         .output();
 
     let lz_stdout = match lz_output {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
         Ok(o) => {
-            // Lizard ran but exited non-zero. Trusting partial output would
-            // print a green ✓ while leaving high-CCN functions unscored;
-            // surface the failure and degrade to advisory unless --enforce.
-            let (color, symbol, suffix) = crap_status_glyph(enforce);
-            println!("  {color}{symbol}{RESET} CRAP: lizard exited {:?}{suffix}", o.status.code());
-            if !o.stderr.is_empty() {
-                print!("{}", String::from_utf8_lossy(&o.stderr));
-            }
-            if enforce {
-                std::process::exit(o.status.code().unwrap_or(1));
-            }
-            return;
+            return CrapOutcome::ToolFailure {
+                message: format!("CRAP: lizard exited {:?}", o.status.code()),
+                detail: String::from_utf8_lossy(&o.stderr).into_owned(),
+                code: o.status.code().unwrap_or(1),
+            };
         }
         Err(e) => {
-            let (color, symbol, suffix) = crap_status_glyph(enforce);
-            println!("  {color}{symbol}{RESET} CRAP: failed to run lizard: {e}{suffix}");
-            if enforce {
-                std::process::exit(1);
-            }
-            return;
+            return CrapOutcome::ToolFailure {
+                message: format!("CRAP: failed to run lizard: {e}"),
+                detail: String::new(),
+                code: 1,
+            };
         }
     };
 
@@ -1377,17 +1713,93 @@ fn cmd_crap() {
             });
         }
     }
+    offenders.sort_by(|a, b| b.crap.partial_cmp(&a.crap).unwrap_or(std::cmp::Ordering::Equal));
+    CrapOutcome::Scored(offenders)
+}
+
+/// Count of functions above the default CRAP threshold, for the baseline writer.
+fn measured_crap_violations() -> Measurement {
+    match crap_measure(CRAP_MAX_DEFAULT) {
+        CrapOutcome::Skipped(reason) => Measurement::Unavailable(reason),
+        CrapOutcome::Fatal(message) | CrapOutcome::ToolFailure { message, .. } => {
+            Measurement::Error(message)
+        }
+        CrapOutcome::Scored(offenders) => {
+            Measurement::Value(u32::try_from(offenders.len()).unwrap_or(u32::MAX))
+        }
+    }
+}
+
+fn cmd_crap() {
+    let max_crap: f64 =
+        arg_value("--max").and_then(|v| v.parse::<f64>().ok()).unwrap_or(CRAP_MAX_DEFAULT);
+    let enforce = arg_flag("--enforce");
+
+    let offenders = match crap_measure(max_crap) {
+        CrapOutcome::Skipped(message) => {
+            println!("  {DIM}\u{2298} {message}{RESET}");
+            return;
+        }
+        CrapOutcome::Fatal(message) => {
+            println!("  {RED}\u{2717}{RESET} {message}");
+            std::process::exit(1);
+        }
+        CrapOutcome::ToolFailure { message, detail, code } => {
+            let (color, symbol, suffix) = crap_status_glyph(enforce);
+            println!("  {color}{symbol}{RESET} {message}{suffix}");
+            if !detail.is_empty() {
+                print!("{detail}");
+            }
+            if enforce {
+                std::process::exit(code);
+            }
+            return;
+        }
+        CrapOutcome::Scored(offenders) => offenders,
+    };
 
     if offenders.is_empty() {
         println!("  {GREEN}\u{2713}{RESET} CRAP: all functions below {max_crap:.0}");
         return;
     }
-    offenders.sort_by(|a, b| b.crap.partial_cmp(&a.crap).unwrap_or(std::cmp::Ordering::Equal));
+
+    // The baseline is a count floor: a repo adopting the harness starts wherever it
+    // already is, and that number may only come down.
+    let count = u32::try_from(offenders.len()).unwrap_or(u32::MAX);
+    let Some(floor) = baseline_floor("crap.max_violations") else {
+        // Nothing recorded is not a floor of 0; it is a repo that has never been
+        // measured. Report what is there and pass — `--enforce` included — so
+        // retrofitting the harness into a legacy tree is green on day one.
+        println!(
+            "  {GREEN}\u{26a0}{RESET} CRAP: {count} function(s) exceed \
+             {max_crap:.0} (report-only: no {BASELINE_FILE} floor)"
+        );
+        print_crap_offenders(&offenders);
+        println!("  ↳ fix: run `cargo harness suppressions --update-baseline` to record a floor");
+        return;
+    };
+    if count <= floor {
+        println!(
+            "  {GREEN}\u{2713}{RESET} CRAP: {count} function(s) exceed \
+             {max_crap:.0} (baseline {floor})"
+        );
+        return;
+    }
+
     let (color, symbol, suffix) = crap_status_glyph(enforce);
     println!(
-        "  {color}{symbol}{RESET} CRAP: {} function(s) exceed {max_crap:.0}{suffix}",
-        offenders.len()
+        "  {color}{symbol}{RESET} CRAP: {count} function(s) exceed \
+         {max_crap:.0} (baseline {floor}){suffix}"
     );
+    print_crap_offenders(&offenders);
+    if enforce {
+        std::process::exit(1);
+    }
+}
+
+/// List the worst offenders under a CRAP verdict line. Capped at 20: past that the
+/// list stops being something anyone reads and starts being a wall.
+fn print_crap_offenders(offenders: &[CrapFn]) {
     for o in offenders.iter().take(20) {
         println!(
             "    CRAP={:6.1}  CCN={:3}  cov={:5.1}%  {}",
@@ -1396,9 +1808,6 @@ fn cmd_crap() {
             o.cov * 100.0,
             o.location
         );
-    }
-    if enforce {
-        std::process::exit(1);
     }
 }
 
@@ -2055,6 +2464,147 @@ mod tests {
         assert_eq!(parsed.get("suppressions.allow"), Some(&2));
         assert_eq!(parsed.get("coverage.min"), Some(&50));
         assert!(!parsed.contains_key("bad"));
+    }
+
+    // ── Ratcheted baseline merge ─────────────────────────────────────────
+
+    fn baseline_of(pairs: &[(&str, u32)]) -> BaselineMap {
+        pairs.iter().map(|(key, value)| ((*key).to_string(), *value)).collect()
+    }
+
+    #[test]
+    fn merge_baseline_preserves_unknown_keys() {
+        let existing = baseline_of(&[("coverage.min", 80), ("mutation.min", 42)]);
+        let (merged, dropped) = merge_baseline(
+            &existing,
+            &baseline_of(&[("suppressions.allow", 3)]),
+            &[("complexity.max_violations", Measurement::Value(7))],
+        )
+        .expect("measurable");
+        assert_eq!(merged.get("coverage.min"), Some(&80));
+        assert_eq!(merged.get("mutation.min"), Some(&42));
+        assert_eq!(merged.get("complexity.max_violations"), Some(&7));
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn merge_baseline_records_ratcheted_to_zero_kinds_as_zero() {
+        // `allow_crate` was 3 and is now gone from the scan: it must be recorded
+        // as 0, not carried forward as a stale tolerance.
+        let existing = baseline_of(&[("suppressions.allow", 5), ("suppressions.allow_crate", 3)]);
+        let (merged, _) =
+            merge_baseline(&existing, &baseline_of(&[("suppressions.allow", 2)]), &[])
+                .expect("measurable");
+        assert_eq!(merged.get("suppressions.allow"), Some(&2));
+        assert_eq!(merged.get("suppressions.allow_crate"), Some(&0));
+    }
+
+    #[test]
+    fn merge_baseline_drops_unavailable_keys() {
+        let existing = baseline_of(&[("crap.max_violations", 4)]);
+        let (merged, dropped) = merge_baseline(
+            &existing,
+            &BaselineMap::new(),
+            &[("crap.max_violations", Measurement::Unavailable("no coverage tool".to_string()))],
+        )
+        .expect("measurable");
+        assert!(!merged.contains_key("crap.max_violations"));
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].contains("crap.max_violations"), "{dropped:?}");
+        assert!(dropped[0].contains("no coverage tool"), "{dropped:?}");
+    }
+
+    #[test]
+    fn merge_baseline_is_all_or_nothing_on_a_measurement_error() {
+        let existing = baseline_of(&[("coverage.min", 80)]);
+        let broken = merge_baseline(
+            &existing,
+            &baseline_of(&[("suppressions.allow", 9)]),
+            &[
+                ("complexity.max_violations", Measurement::Value(1)),
+                ("crap.max_violations", Measurement::Error("lizard exited 2".to_string())),
+            ],
+        )
+        .expect_err("a measurement error must abort the merge");
+        assert_eq!(broken.len(), 1);
+        assert_eq!(broken[0].0, "crap.max_violations");
+        assert!(broken[0].1.contains("lizard exited 2"));
+    }
+
+    #[test]
+    fn serialize_baseline_writes_sorted_key_value_lines() {
+        let text = serialize_baseline(&baseline_of(&[("coverage.min", 80), ("arch.max", 1)]));
+        assert_eq!(text, "arch.max 1\ncoverage.min 80\n");
+    }
+
+    #[test]
+    fn ratcheted_keys_are_unique() {
+        let mut keys: Vec<&str> = RATCHETED_KEYS.iter().map(|(key, _)| *key).collect();
+        keys.sort_unstable();
+        let count = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), count, "duplicate key in RATCHETED_KEYS");
+    }
+
+    // ── Coverage floor ───────────────────────────────────────────────────
+
+    #[test]
+    fn lcov_line_coverage_truncates_never_rounds() {
+        // 2 of 3 lines hit is 66.6%: recorded as 66, because a floor of 67 would
+        // fail the very gate that measured it.
+        let map =
+            HashMap::from([("src/a.rs".to_string(), HashMap::from([(1, 1), (2, 4), (3, 0)]))]);
+        assert_eq!(lcov_line_coverage(&map), Some(66));
+    }
+
+    #[test]
+    fn lcov_line_coverage_without_tracked_lines_is_none() {
+        assert_eq!(lcov_line_coverage(&HashMap::new()), None);
+    }
+
+    // ── Complexity floor ─────────────────────────────────────────────────
+
+    #[test]
+    fn lizard_warning_count_reads_the_summary_row() {
+        let stdout = "Total nloc   Avg.NLOC  AvgCCN  Avg.token   Fun Cnt  Warning cnt   Fun Rt   nloc Rt\n                      ---------------------------------------------------------------\n\
+                      133       5.9     1.2       47.8       14            3      0.00    0.00\n";
+        assert_eq!(lizard_warning_count(stdout), Some(3));
+    }
+
+    #[test]
+    fn lizard_warning_count_without_a_summary_row_is_none() {
+        assert_eq!(lizard_warning_count("nothing to see here\n"), None);
+    }
+
+    #[test]
+    fn complexity_gate_without_a_floor_is_report_only() {
+        let gate = complexity_gate_for(None);
+        assert!(gate.description.contains("report-only"), "{}", gate.description);
+        assert!(gate.cmd.iter().any(|a| a == &REPORT_ONLY_LIMIT.to_string()));
+    }
+
+    #[test]
+    fn complexity_gate_passes_the_floor_to_lizard() {
+        let gate = complexity_gate_for(Some(4));
+        assert!(gate.description.contains("baseline 4"), "{}", gate.description);
+        let i_index = gate.cmd.iter().position(|a| a == "-i").expect("-i flag");
+        assert_eq!(gate.cmd[i_index + 1], "4");
+    }
+
+    #[test]
+    fn complexity_gate_at_zero_keeps_the_plain_label() {
+        let gate = complexity_gate_for(Some(0));
+        assert_eq!(gate.description, "Complexity (lizard)");
+    }
+
+    #[test]
+    fn complexity_argv_is_identical_apart_from_the_tolerance() {
+        let floor = complexity_argv(3);
+        let report_only = complexity_argv(REPORT_ONLY_LIMIT);
+        assert_eq!(floor.len(), report_only.len());
+        let differing: Vec<usize> =
+            (0..floor.len()).filter(|&i| floor[i] != report_only[i]).collect();
+        assert_eq!(differing.len(), 1, "only `-i N` may differ: {floor:?} vs {report_only:?}");
     }
 
     #[test]

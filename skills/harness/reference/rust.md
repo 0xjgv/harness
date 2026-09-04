@@ -43,8 +43,20 @@ paraphrase (it drifts). Two sections:
   `check`/`stop-hook`, and skips silently when the repo has no `.feature`
   files anywhere.
   `crap` is advisory (warns by default, `--enforce` to hard-fail; joins
-  lizard `--csv` with `target/llvm-cov/lcov.info`). Suppressions are ratcheted
-  by `.harness-baseline`; `coverage.min` in the same file is the default coverage floor. Requires `uvx` on PATH
+  lizard `--csv` with `target/llvm-cov/lcov.info`). Suppressions,
+  `coverage.min`, `complexity.max_violations` and `crap.max_violations` are all
+  ratcheted by `.harness-baseline`. `complexity` passes its floor to lizard as
+  `-i N`; `crap` compares its offender count to `crap.max_violations`. A missing
+  file, or a missing key, makes either gate report-only — labelled `report-only:
+  no .harness-baseline floor`, with the hint to record one — and it passes, for
+  `crap --enforce` too: nothing recorded is a repo that was never measured, not
+  a floor of zero, and a legacy tree has to be green on day one.
+  `suppressions --update-baseline` measures all three, merges them over the
+  existing file (unknown keys such as `mutation.min` are preserved untouched, a
+  suppression kind that ratcheted to zero is recorded as `0`), and is
+  all-or-nothing: a metric that cannot be measured aborts the write, a metric
+  that does not apply has its key dropped with a warning. `coverage.min` is the
+  measured total truncated, never rounded up. Requires `uvx` on PATH
   for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
   length≤100).
 - `## Behavior contract` — Layer 2; see

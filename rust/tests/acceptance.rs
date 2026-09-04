@@ -103,6 +103,25 @@ fn artifact_present(world: &mut CrateWorld) {
         .expect("write lcov.info");
 }
 
+#[given("a recorded CRAP floor of 0")]
+fn crap_floor_zero(world: &mut CrateWorld) {
+    let dir = world.tmp.clone().expect("tmp dir not initialised");
+    fs::write(dir.join(".harness-baseline"), "crap.max_violations 0\n")
+        .expect("write .harness-baseline");
+}
+
+#[given("a project with no .harness-baseline")]
+fn no_baseline(world: &mut CrateWorld) {
+    world.make_tmp();
+}
+
+#[given("a project with a complexity floor of 0")]
+fn complexity_floor_zero(world: &mut CrateWorld) {
+    let dir = world.make_tmp();
+    fs::write(dir.join(".harness-baseline"), "complexity.max_violations 0\n")
+        .expect("write .harness-baseline");
+}
+
 #[given("no coverage artifact")]
 fn artifact_missing(world: &mut CrateWorld) {
     world.make_tmp();

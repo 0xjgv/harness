@@ -1,3 +1,5 @@
+complexity.max_violations 0
+coverage.min 52
+crap.max_violations 0
 suppressions.allow 10
 suppressions.allow_crate 3
-coverage.min 0
