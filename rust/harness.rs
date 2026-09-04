@@ -564,6 +564,7 @@ const RATCHETED_KEYS: &[(&str, MeasureFn)] = &[
     ("coverage.min", measured_coverage_min),
     ("complexity.max_violations", measured_complexity_violations),
     ("crap.max_violations", measured_crap_violations),
+    ("duplication.max_blocks", measured_duplication_blocks),
 ];
 
 /// Measure every ratcheted metric, stopping at the first one that failed.
@@ -949,7 +950,11 @@ fn cmd_stop_hook() {
     cmd_post_edit(); // mutating — sequential, first
     check_arch_config_guard(true, false, false); // warn-only in stop-hook, never fails it
     check_gherkin_guard(true, false, false); // warn-only in stop-hook, never fails it
-    let failed = run_gates_parallel_detailed(&[complexity_gate()]); // read-only batch
+    let mut failed = run_gates_parallel_detailed(&[complexity_gate()]); // read-only batch
+    let duplication = duplication_result();
+    if !print_gate_result(&duplication, true) {
+        failed.push(duplication.description);
+    }
     if !failed.is_empty() {
         eprintln!("Stop hook failed: {}", failed.join(", "));
         std::process::exit(2);
@@ -1413,13 +1418,7 @@ fn cmd_gherkin_guard() {
 /// because a floor measured against a different target set does not reproduce —
 /// the gate and the measurement must pass byte-identical arguments.
 fn complexity_argv(max_violations: u32) -> Vec<String> {
-    [
-        "uvx",
-        "lizard@1.22.2",
-        "-l",
-        "rust",
-        "src",
-        "tests",
+    lizard_argv(&[
         "-C",
         &COMPLEXITY_MAX_CCN.to_string(),
         "-a",
@@ -1428,10 +1427,20 @@ fn complexity_argv(max_violations: u32) -> Vec<String> {
         &COMPLEXITY_MAX_LENGTH.to_string(),
         "-i",
         &max_violations.to_string(),
-    ]
-    .iter()
-    .map(|s| (*s).to_string())
-    .collect()
+    ])
+}
+
+/// `uvx lizard` over this template's sources, plus one run's own flags.
+///
+/// The target set lives here and nowhere else: complexity and duplication are two
+/// invocations of the same tool over the same files, and a floor measured over a
+/// different file set does not reproduce.
+fn lizard_argv(flags: &[&str]) -> Vec<String> {
+    ["uvx", "lizard@1.22.2", "-l", "rust", "src", "tests"]
+        .iter()
+        .chain(flags.iter())
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 /// The lizard gate at the committed floor, or report-only when there is none.
@@ -1465,8 +1474,16 @@ fn complexity_gate() -> Gate {
     complexity_gate_for(baseline_floor("complexity.max_violations"))
 }
 
+/// Both lizard gates: per-function complexity, then duplicate blocks.
+///
+/// Neither short-circuits the other — one run reports every offender — and the
+/// command exits 1 when either failed.
 fn cmd_complexity() {
-    print_gate_result(&run_capture(&complexity_gate()), false);
+    let complexity_ok = print_gate_result(&run_capture(&complexity_gate()), true);
+    let duplication_ok = print_gate_result(&duplication_result(), true);
+    if !complexity_ok || !duplication_ok {
+        std::process::exit(1);
+    }
 }
 
 /// Read the `Warning cnt` column out of lizard's final summary row.
@@ -1512,6 +1529,124 @@ fn measured_complexity_violations() -> Measurement {
         || Measurement::Error("lizard printed no summary row to count warnings from".to_string()),
         Measurement::Value,
     )
+}
+
+/// lizard argv for the duplicate-block scan over the complexity target set.
+///
+/// A second invocation on purpose: `-Eduplicate` composes with the complexity
+/// thresholds, but lizard's exit code still tracks CCN warnings only, so a
+/// duplicate block could never fail the shared run. Here lizard is a measuring
+/// tape: `-w` is warnings-only mode, which drops the per-function and summary
+/// tables this run does not read, and `-i` goes high enough that lizard always
+/// exits 0. The floor is enforced in the runner, from the block count in the
+/// report. Any warning line `-w` does print is scored at lizard's own defaults,
+/// not this template's thresholds — the complexity gate owns those, and nothing
+/// here reads them.
+fn duplication_argv() -> Vec<String> {
+    lizard_argv(&["-Eduplicate", "-w", "-i", &REPORT_ONLY_LIMIT.to_string()])
+}
+
+/// Count the duplicate blocks in lizard's `-Eduplicate` report.
+///
+/// lizard heads every block with a bare `Duplicate block:` line, so the headers
+/// are the count; the `file:line ~ line` rows below them vary per block and the
+/// trailing `Total duplicate rate` is a percentage, not a count.
+fn count_duplicate_blocks(stdout: &str) -> u32 {
+    let count = stdout.lines().filter(|line| line.trim() == "Duplicate block:").count();
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+/// Run the duplicate scan once: the block count plus lizard's report, or why not.
+fn scan_duplicate_blocks() -> Result<(u32, String), String> {
+    let argv = duplication_argv();
+    let output = Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(root())
+        .output()
+        .map_err(|e| format!("lizard failed to run: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("lizard failed to run (exit {:?})", output.status.code()));
+    }
+    let report = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok((count_duplicate_blocks(&report), report))
+}
+
+/// Number of duplicate blocks lizard reports over this template's sources.
+fn measured_duplication_blocks() -> Measurement {
+    if !root().join("src").is_dir() {
+        return Measurement::Unavailable("no src/ sources".to_string());
+    }
+    scan_duplicate_blocks().map_or_else(Measurement::Error, |(count, _)| Measurement::Value(count))
+}
+
+/// The duplicate-block gate at the committed floor, or report-only without one.
+///
+/// Built as a `GateResult` rather than a `Gate`: lizard exits 0 whatever it finds
+/// here, so the verdict is the count-versus-floor comparison, not an exit code.
+/// Reusing the struct keeps the ✓/✗ line, the `--verbose` echo, the hint and the
+/// report-only rule identical to every other gate.
+///
+/// Takes the scan as an argument so the verdict is testable without lizard: the
+/// over-the-floor path is the one a green tree never exercises.
+fn duplication_gate_result(scan: Result<(u32, String), String>, floor: Option<u32>) -> GateResult {
+    let cmd = duplication_argv();
+    let (count, report) = match scan {
+        Ok(scan) => scan,
+        Err(reason) => {
+            return GateResult {
+                description: "Duplication (lizard)".to_string(),
+                cmd,
+                ok: false,
+                exit_code: 1,
+                output: reason,
+                detail: None,
+                hint: None,
+                report_only: false,
+            };
+        }
+    };
+    let detail = Some(format!("duplicate blocks: {count}"));
+    let Some(floor) = floor else {
+        return GateResult {
+            description: format!("Duplication (lizard, report-only: no {BASELINE_FILE} floor)"),
+            cmd,
+            ok: true,
+            exit_code: 0,
+            output: report,
+            detail,
+            hint: Some(
+                "run `cargo harness suppressions --update-baseline` to record a floor".to_string(),
+            ),
+            report_only: true,
+        };
+    };
+    let ok = count <= floor;
+    let description = if floor == 0 {
+        "Duplication (lizard)".to_string()
+    } else {
+        format!("Duplication (lizard, baseline {floor})")
+    };
+    GateResult {
+        description,
+        cmd,
+        ok,
+        exit_code: i32::from(!ok),
+        output: if ok {
+            report
+        } else {
+            format!("{report}\nduplicate blocks: {count} > baseline {floor}\n")
+        },
+        detail,
+        hint: (!ok).then(|| {
+            "extract the repeated code into a shared helper; do not raise the floor".to_string()
+        }),
+        report_only: false,
+    }
+}
+
+/// Scan for duplicates and judge the count against the recorded floor, if any.
+fn duplication_result() -> GateResult {
+    duplication_gate_result(scan_duplicate_blocks(), baseline_floor("duplication.max_blocks"))
 }
 
 /// Selects the CRAP gate's status glyph/color and the `(advisory)` suffix.
@@ -2065,6 +2200,8 @@ fn cmd_check() {
 
     let complexity_failed = run_gates_parallel_detailed(&[complexity_gate()]);
     results.push(RunResult { ok: complexity_failed.is_empty(), output: String::new() });
+    let duplication_ok = print_gate_result(&duplication_result(), true);
+    results.push(RunResult { ok: duplication_ok, output: String::new() });
 
     check_stop_hooks_present();
     check_arch_config_guard(true, false, false);
@@ -2148,6 +2285,9 @@ fn cmd_ci() {
     // queuing behind each other under the illusion of concurrency — see
     // run_gates_sequential.
     let parallel_ok = run_gates_parallel(&[format_check_gate(), complexity_gate()]);
+    // Not in that batch: lizard exits 0 whatever it finds here, so this gate's
+    // verdict is a count comparison the runner makes — see duplication_gate_result.
+    let duplication_ok = print_gate_result(&duplication_result(), true);
 
     let mut cargo_gates = vec![lint_gate()];
     cargo_gates.extend(acceptance_gates_or_warn());
@@ -2174,6 +2314,7 @@ fn cmd_ci() {
     let gherkin_ok = check_gherkin_guard(false, false, false);
     let suppressions_ok = check_suppressions_baseline(true);
     if !parallel_ok
+        || !duplication_ok
         || !cargo_ok
         || !audit_ok
         || !tests_ok
@@ -2455,6 +2596,78 @@ mod tests {
         let map = parse_lcov_str(input);
         assert_eq!(map.get("src/foo.rs"), Some(&HashMap::from([(1, 3), (2, 0), (5, 1)])));
         assert_eq!(map.get("src/bar.rs"), Some(&HashMap::from([(10, 7)])));
+    }
+
+    #[test]
+    fn count_duplicate_blocks_counts_block_headers() {
+        let report = "Duplicates\n\
+                      ===================================\n\
+                      Duplicate block:\n\
+                      --------------------------\n\
+                      src/a.rs:10 ~ 42\n\
+                      src/b.rs:60 ~ 92\n\
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\
+                      \n\
+                      Duplicate block:\n\
+                      --------------------------\n\
+                      src/c.rs:1 ~ 30\n\
+                      src/d.rs:5 ~ 34\n\
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\
+                      \n\
+                      Total duplicate rate: 2.64%\n";
+        assert_eq!(count_duplicate_blocks(report), 2);
+    }
+
+    #[test]
+    fn count_duplicate_blocks_is_zero_on_a_clean_report() {
+        let report = "Duplicates\n\
+                      ===================================\n\
+                      Total duplicate rate: 0.00%\n\
+                      Total unique rate: 100.00%\n";
+        assert_eq!(count_duplicate_blocks(report), 0);
+    }
+
+    #[test]
+    fn duplication_scans_the_complexity_target_set() {
+        // The floor only reproduces while both lizard runs read the same files,
+        // so both argvs must start with the shared target set and add only flags.
+        let targets = lizard_argv(&[]);
+        assert!(complexity_argv(0).starts_with(&targets), "complexity moved off lizard_argv");
+        assert!(duplication_argv().starts_with(&targets), "duplication moved off lizard_argv");
+        assert!(duplication_argv().contains(&"-Eduplicate".to_string()));
+    }
+
+    #[test]
+    fn duplication_gate_is_report_only_without_a_floor() {
+        // Report-only never fails, and says why on the passing line.
+        let result = duplication_gate_result(Ok((7, String::new())), None);
+        assert!(result.ok);
+        assert!(result.report_only);
+        assert!(result.description.contains("report-only"), "{}", result.description);
+    }
+
+    #[test]
+    fn duplication_gate_passes_at_the_floor() {
+        let result = duplication_gate_result(Ok((3, String::new())), Some(3));
+        assert!(result.ok);
+        assert!(!result.report_only);
+        assert_eq!(result.description, "Duplication (lizard, baseline 3)");
+    }
+
+    #[test]
+    fn duplication_gate_fails_over_the_floor() {
+        let result = duplication_gate_result(Ok((4, "report".to_string())), Some(3));
+        assert!(!result.ok);
+        assert_eq!(result.exit_code, 1);
+        assert!(result.output.contains("4 > baseline 3"), "{}", result.output);
+        assert!(result.hint.is_some());
+    }
+
+    #[test]
+    fn duplication_gate_fails_when_lizard_fails() {
+        let result = duplication_gate_result(Err("lizard failed to run".to_string()), Some(0));
+        assert!(!result.ok);
+        assert_eq!(result.output, "lizard failed to run");
     }
 
     #[test]

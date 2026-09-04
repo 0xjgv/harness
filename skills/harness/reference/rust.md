@@ -19,7 +19,8 @@ paraphrase (it drifts). Two sections:
   fail on drift). `check` runs clippy `--fix`, `cargo fmt`, and tests — the
   `acceptance` `[[test]]` target runs under plain `cargo test`, so this
   already covers the cucumber scenarios, unlike python/bun/go, which need a
-  separate acceptance step in `check` — then complexity, then warns (does not
+  separate acceptance step in `check` — then complexity and duplication,
+  then warns (does not
   block) via `arch-config-guard` and `gherkin-guard`, checks `agents-md-drift`,
   and ratchets suppressions. Invariant: `ci` minus `check` == every gate that
   needs the network or a build lock (`audit`, `coverage`, advisory `crap`)
@@ -28,7 +29,9 @@ paraphrase (it drifts). Two sections:
   lock on `target/`). `ci` runs the read-only gates (`clippy`, `format check`,
   `complexity`, `acceptance`, `arch`) **in parallel** — captured and
   printed in submission order, run to completion so one pass surfaces every
-  failure — then runs `audit`, streams `tests` + `coverage`, and the
+  failure — then the duplication count gate (outside that batch: lizard exits
+  0 whatever it finds, so the verdict is the runner's count comparison), then
+  runs `audit`, streams `tests` + `coverage`, and the
   advisory `crap`; `ci` also runs `arch-config-guard` and `gherkin-guard` in
   strict (blocking) mode.
   `pre-push` is the offline push gate: `clippy`, `format
@@ -44,14 +47,23 @@ paraphrase (it drifts). Two sections:
   files anywhere.
   `crap` is advisory (warns by default, `--enforce` to hard-fail; joins
   lizard `--csv` with `target/llvm-cov/lcov.info`). Suppressions,
-  `coverage.min`, `complexity.max_violations` and `crap.max_violations` are all
+  `coverage.min`, `complexity.max_violations`, `crap.max_violations` and
+  `duplication.max_blocks` are all
   ratcheted by `.harness-baseline`. `complexity` passes its floor to lizard as
-  `-i N`; `crap` compares its offender count to `crap.max_violations`. A missing
+  `-i N`; `crap` compares its offender count to `crap.max_violations`. The
+  `complexity` command also runs a second lizard pass over the same targets
+  (`-Eduplicate -w -i`), counts the `Duplicate block:` reports and compares them
+  to `duplication.max_blocks` — a `✗` and exit 1 over the floor, report-only
+  without one, an error (never a silent 0) when lizard itself fails. lizard only
+  reports a block once it repeats for ~70 tokens, and both gates read `src` +
+  `tests` only (`harness.rs` is a crate-root `[[bin]]` outside that set), so the
+  shipped template measures 0 blocks — the floor matters in an adopting repo,
+  where it starts wherever that repo already is. A missing
   file, or a missing key, makes either gate report-only — labelled `report-only:
   no .harness-baseline floor`, with the hint to record one — and it passes, for
   `crap --enforce` too: nothing recorded is a repo that was never measured, not
   a floor of zero, and a legacy tree has to be green on day one.
-  `suppressions --update-baseline` measures all three, merges them over the
+  `suppressions --update-baseline` measures all four, merges them over the
   existing file (unknown keys such as `mutation.min` are preserved untouched, a
   suppression kind that ratcheted to zero is recorded as `0`), and is
   all-or-nothing: a metric that cannot be measured aborts the write, a metric

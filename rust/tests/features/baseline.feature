@@ -3,18 +3,23 @@ Feature: Ratcheted floors come from .harness-baseline
   never recorded one must still be green on day one, so the gate degrades to
   report-only instead of demanding perfection.
 
-  Scenario: Complexity is report-only without a recorded floor
+  # Each gate is named in full: "report-only" alone would pass on either
+  # lizard gate's line, hiding a regression in the other.
+  Scenario: Both lizard gates are report-only without a recorded floor
     Given a project with no .harness-baseline
     When I run "harness complexity"
     Then the exit code is 0
-    And the output contains "report-only: no .harness-baseline floor"
+    And the output contains "Complexity (lizard, report-only: no .harness-baseline floor)"
+    And the output contains "Duplication (lizard, report-only: no .harness-baseline floor)"
     And the output contains "suppressions --update-baseline"
 
-  Scenario: Complexity enforces the recorded floor
-    Given a project with a complexity floor of 0
+  Scenario: Both lizard gates enforce their recorded floors
+    Given a project with complexity and duplication floors of 0
     When I run "harness complexity"
     Then the exit code is 0
     And the output contains "Complexity (lizard)"
+    And the output contains "Duplication (lizard)"
+    And the output contains "duplicate blocks: 0"
     And the output does not contain "report-only"
 
   Scenario: CRAP is report-only without a recorded floor, even under --enforce

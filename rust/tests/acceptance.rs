@@ -115,11 +115,16 @@ fn no_baseline(world: &mut CrateWorld) {
     world.make_tmp();
 }
 
-#[given("a project with a complexity floor of 0")]
-fn complexity_floor_zero(world: &mut CrateWorld) {
+// Both lizard floors in one fixture: `harness complexity` runs both gates, so a
+// baseline carrying only one of them leaves the other report-only.
+#[given("a project with complexity and duplication floors of 0")]
+fn lizard_floors_zero(world: &mut CrateWorld) {
     let dir = world.make_tmp();
-    fs::write(dir.join(".harness-baseline"), "complexity.max_violations 0\n")
-        .expect("write .harness-baseline");
+    fs::write(
+        dir.join(".harness-baseline"),
+        "complexity.max_violations 0\nduplication.max_blocks 0\n",
+    )
+    .expect("write .harness-baseline");
 }
 
 #[given("no coverage artifact")]
