@@ -49,10 +49,16 @@ suppressions.<kind>         # per-kind suppression counts (noqa, type_ignore, ..
 
 A key that is missing from the file is report-only for that gate; this
 skill may add it, at the measured value, through the same writer it uses for
-everything else. `mutation.min` is only written when that writer runs with
-`--with-mutation` (a mutation run costs minutes); the score is
+everything else.
+
+`mutation.min` takes two commands, and only two. Read the score with
+`<prefix> mutation --all` — the standalone command scoped to the whole tree,
+which also prints the survivors. Record it with
+`<prefix> suppressions --update-baseline --with-mutation`; the plain
+`--update-baseline` never touches `mutation.min`, it carries the existing
+value through untouched, because a mutation run costs minutes. The score is
 `round(100 * killed / (killed + survived))`, so it moves up by killing
-surviving mutants with tests.
+surviving mutants with tests — nothing else raises it.
 
 CRAP = `ccn^2 * (1-cov)^3 + ccn`. It weights uncovered complexity cubically,
 so covering a single high-CRAP function tends to move `coverage.min` and
@@ -70,7 +76,8 @@ Run this once per invocation. One run raises each floor at most one notch.
    touching anything.
 2. **Pick targets.** Read the `crap` offender list, highest CRAP first. Skip
    any offender you cannot cover from the test directory alone (see
-   guardrails). Then the surviving mutants from `mutation`. Then the
+   guardrails). Then the surviving mutants from `<prefix> mutation --all`,
+   each named in its output. Then the
    **changed-but-untested modules**: every `⚠` line the scoped `test` gate
    printed for a changed source file with no mapped test. Those get a
    characterization test — a test that pins what the code does today, in
@@ -84,7 +91,8 @@ Run this once per invocation. One run raises each floor at most one notch.
    law-like (a formula, parser, codec, or invariant) — see the language
    reference for which library.
 4. **Re-measure.** Run the full suite (`test --all`). It must be green.
-   Recompute every baseline key.
+   Recompute every baseline key, and re-run `<prefix> mutation --all` if you
+   killed a mutant — that run is the only source of the new `mutation.min`.
 5. **Raise the floors one notch**, and only the floors that actually moved:
    `coverage.min` and `mutation.min` up; `crap.max_violations`,
    `complexity.max_violations`, `duplication.max_blocks`,

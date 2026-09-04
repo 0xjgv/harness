@@ -73,16 +73,18 @@ cd monorepo && make check           # dispatches check to every subproject copie
 | `check` | after edits | fix, format, typecheck, test, plus every other gate that is offline, fast, and takes no build lock (complexity, acceptance, deadcode where shipped, a lockfile check in Python/Bun, `go mod tidy -diff` in Go, and — Python/Bun only — the architecture boundary check `arch` itself); warns on `arch-config-guard` and `gherkin-guard`; checks agents-md drift; ratchets suppressions | yes |
 | `pre-commit` | git pre-commit hook | same, staged files only, then re-stages (`git add`) the files it fixed | yes |
 | `pre-push` | git pre-push hook | read-only: lint, format check, acceptance, arch, over the whole tree, in parallel; strict `arch-config-guard` + `gherkin-guard` | no |
-| `ci` | CI pipeline | read-only gates (lint, typecheck, dep audit, complexity, deadcode, acceptance, arch) in parallel, then coverage + advisory CRAP; strict `arch-config-guard` + `gherkin-guard` | no |
+| `ci` | CI pipeline | read-only gates (lint, typecheck, dep audit, complexity, deadcode, acceptance, arch) in parallel, then coverage + advisory CRAP + advisory mutation; strict `arch-config-guard` + `gherkin-guard` | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
 | `post-edit` | Stop hook helper | format changed source files | yes |
 | `stop-hook` | agent Stop hook | `post-edit` + complexity (+ deadcode where shipped); exits 2 with a stderr failure summary so Claude's Stop hook blocks and feeds the failure back to the agent | yes |
 
 Invariant every runner documents: `ci` minus `check` is only the network dependency
-audit, coverage, and advisory CRAP — plus, in Go and Rust only, the architecture
-boundary check itself (`arch`), which stays `ci`/`pre-push`-only there (Go's needs to
-fetch a module, Rust's takes cargo's build lock); Python and Bun's `arch` has neither
-constraint, so it runs inside `check` too — so a green `check` predicts a green `ci`.
+audit, coverage, advisory CRAP, and advisory mutation (which runs after coverage and
+never fails `ci`; only the standalone `mutation --enforce` hard-fails) — plus, in Go
+and Rust only, the architecture boundary check itself (`arch`), which stays
+`ci`/`pre-push`-only there (Go's needs to fetch a module, Rust's takes cargo's build
+lock); Python and Bun's `arch` has neither constraint, so it runs inside `check` too —
+so a green `check` predicts a green `ci`.
 
 Other standalone subcommands every template exposes: `complexity`, `crap`, `acceptance`,
 `coverage` (Go also keeps `test-cov`), `mutation`, `arch`, `arch-config-guard`,

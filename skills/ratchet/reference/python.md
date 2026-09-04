@@ -24,11 +24,19 @@ macOS `python3` is the system 3.9, which dies with
   test to write.
 - `<prefix> coverage` — `coverage report --format=total` under the hood;
   re-run after adding tests to get the new `coverage.min` candidate.
-- `<prefix> mutation` — mutmut over the changed `src/` files
-  (`--all` for the whole tree); prints the integer % killed and the
-  surviving mutants. Each survivor is a missing test in a function that
-  already has coverage — the second target list after CRAP. Advisory unless
-  `--enforce`.
+- `<prefix> mutation --all` — mutmut over the whole `src/` tree; prints the
+  integer % killed and names the surviving mutants. Bare `<prefix> mutation`
+  is scoped to the changed files, which is what `ci` wants and not what a
+  ratchet wants: always pass `--all` here, because `mutation.min` is a
+  whole-tree number and a scoped run would not reproduce it. Each survivor
+  is a missing test in a function that already has coverage — the second
+  target list after CRAP. Advisory unless `--enforce`. Two python facts:
+  mutmut needs the project's own venv (`.venv/bin/mutmut`; `uvx mutmut`
+  cannot work), and the gate warns and skips when it is absent — run
+  `uv sync` first. The template ships `mutation.min 94` with two survivors,
+  `core.pricing.x_apply_discount__mutmut_6` and
+  `adapters.formatting.x_render_receipt__mutmut_13`; those are the first
+  ratchet targets in a fresh copy.
 - `<prefix> complexity` — `lizard` (CCN, args, length) plus a second
   `-Eduplicate` run that counts duplicate blocks (`duplication.max_blocks`,
   over `src/` and `tests/` together, so consolidating duplicated test code
@@ -45,7 +53,9 @@ macOS `python3` is the system 3.9, which dies with
   write `.harness-baseline`, and the writer of **all seven** floor families
   (`coverage.min`, `complexity.max_violations`, `duplication.max_blocks`,
   `crap.max_violations`, `arch.max_violations`, `deadcode.max_findings`,
-  `suppressions.*`, plus `mutation.min` under `--with-mutation` only). Run
+  `suppressions.*`, plus `mutation.min` under `--with-mutation` only —
+  `<prefix> suppressions --update-baseline` on its own leaves `mutation.min`
+  exactly as it found it). Run
   it once, at the end of a successful loop, after every floor has been
   re-measured. It is all-or-nothing: if it aborts, it names the metric that
   errored — fix that, do not hand-edit `.harness-baseline`. A missing key
