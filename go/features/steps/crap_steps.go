@@ -178,9 +178,9 @@ func (w *crapWorld) outputDoesNotContain(text string) error {
 	return nil
 }
 
-// InitializeCrapScenario registers crap step definitions with a fresh world
-// per scenario. Called from features/acceptance_test.go alongside the smoke
-// scenario initializer.
+// InitializeCrapScenario registers the crap and ratcheted-baseline step
+// definitions with a fresh world per scenario. Called from
+// features/acceptance_test.go alongside the smoke scenario initializer.
 func InitializeCrapScenario(sc *godog.ScenarioContext) {
 	w := &crapWorld{}
 	sc.Before(func(ctx context.Context, _ *godog.Scenario) (context.Context, error) {
@@ -199,4 +199,5 @@ func InitializeCrapScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^the exit code is (\d+)$`, w.exitCodeIs)
 	sc.Step(`^the output contains "([^"]+)"$`, w.outputContains)
 	sc.Step(`^the output does not contain "([^"]+)"$`, w.outputDoesNotContain)
+	initializeBaselineSteps(sc, w)
 }

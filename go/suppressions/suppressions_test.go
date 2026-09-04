@@ -1,6 +1,7 @@
 package suppressions
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -160,7 +161,7 @@ func TestBaselineReadWrite(t *testing.T) {
 		kindNolint:     {{ruleErrcheck}},
 		kindLintIgnore: {{ruleFoo}},
 	}
-	if err := WriteBaseline(tmp, results); err != nil {
+	if _, err := WriteBaseline(tmp, results, nil); err != nil {
 		t.Fatal(err)
 	}
 	updated, ok := ReadBaseline(tmp)
@@ -171,6 +172,135 @@ func TestBaselineReadWrite(t *testing.T) {
 		updated["suppressions.lint_ignore"] != 1 ||
 		updated["coverage.min"] != 65 {
 		t.Fatalf("updated baseline = %#v", updated)
+	}
+}
+
+func writeBaselineFile(t *testing.T, dir, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, ".harness-baseline"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func measurer(key string, m Measurement) Measurer {
+	return Measurer{Key: key, Measure: func() Measurement { return m }}
+}
+
+func TestWriteBaselineMergesOverUnknownKeys(t *testing.T) {
+	tmp := t.TempDir()
+	writeBaselineFile(t, tmp, "custom.thing 7\nmutation.min 40\ncrap.max_violations 9\n")
+	measurers := []Measurer{
+		measurer("complexity.max_violations", Measured(3)),
+		measurer("crap.max_violations", Unavailable("no tests")),
+	}
+
+	var written map[string]int
+	var err error
+	out := captureStdout(t, func() {
+		written, err = WriteBaseline(tmp, map[string][][]string{kindNolint: {{ruleErrcheck}}}, measurers)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Unknown keys preserved, measured key written, inapplicable key dropped with a warning.
+	if written["custom.thing"] != 7 || written["mutation.min"] != 40 {
+		t.Fatalf("unknown keys not preserved: %#v", written)
+	}
+	if written["complexity.max_violations"] != 3 {
+		t.Fatalf("measured key not written: %#v", written)
+	}
+	if _, has := written["crap.max_violations"]; has {
+		t.Fatalf("unavailable key kept: %#v", written)
+	}
+	if !strings.Contains(out, "crap.max_violations: dropped") {
+		t.Fatalf("expected drop warning, got: %q", out)
+	}
+	want := "complexity.max_violations 3\ncustom.thing 7\nmutation.min 40\nsuppressions.lint_ignore 0\nsuppressions.nolint 1\n"
+	if content := formatBaseline(written); content != want {
+		t.Fatalf("baseline = %q, want %q", content, want)
+	}
+}
+
+func TestWriteBaselineZeroesAVanishedSuppressionKind(t *testing.T) {
+	tmp := t.TempDir()
+	writeBaselineFile(t, tmp, "suppressions.nolint 5\n")
+
+	written, err := WriteBaseline(tmp, map[string][][]string{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, has := written["suppressions.nolint"]; !has || value != 0 {
+		t.Fatalf("vanished kind not recorded as 0: %#v", written)
+	}
+}
+
+func TestWriteBaselineRecordsALegitimateZero(t *testing.T) {
+	tmp := t.TempDir()
+
+	written, err := WriteBaseline(tmp, nil, []Measurer{measurer("complexity.max_violations", Measured(0))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, has := written["complexity.max_violations"]; !has || value != 0 {
+		t.Fatalf("measured 0 not recorded: %#v", written)
+	}
+}
+
+func TestWriteBaselineAbortsAndWritesNothingOnAFailedMeasurement(t *testing.T) {
+	tmp := t.TempDir()
+	original := "coverage.min 40\n"
+	writeBaselineFile(t, tmp, original)
+	measurers := []Measurer{
+		measurer("complexity.max_violations", Failed("lizard failed to run (exit 2)")),
+		measurer("crap.max_violations", Measured(1)),
+	}
+
+	written, err := WriteBaseline(tmp, nil, measurers)
+
+	var mErr *MeasurementError
+	if !errors.As(err, &mErr) {
+		t.Fatalf("expected *MeasurementError, got %v", err)
+	}
+	if mErr.Key != "complexity.max_violations" || !strings.Contains(mErr.Reason, "exit 2") {
+		t.Fatalf("unexpected error: %#v", mErr)
+	}
+	if written != nil {
+		t.Fatalf("expected no baseline on failure, got %#v", written)
+	}
+	after, _ := ReadBaseline(tmp)
+	if len(after) != 1 || after["coverage.min"] != 40 {
+		t.Fatalf("baseline file changed on failure: %#v", after)
+	}
+}
+
+func TestMeasureRatchetedStopsAtTheFirstFailure(t *testing.T) {
+	calls := 0
+	count := func(m Measurement) func() Measurement {
+		return func() Measurement { calls++; return m }
+	}
+	measured := MeasureRatcheted([]Measurer{
+		{Key: "a", Measure: count(Measured(1))},
+		{Key: "b", Measure: count(Failed("boom"))},
+		{Key: "c", Measure: count(Measured(3))},
+	})
+
+	if calls != 2 || len(measured) != 2 || measured[1].Key != "b" || measured[1].Error != "boom" {
+		t.Fatalf("calls=%d measured=%#v", calls, measured)
+	}
+}
+
+func TestBaselineFloor(t *testing.T) {
+	tmp := t.TempDir()
+	if _, ok := BaselineFloor(tmp, "complexity.max_violations"); ok {
+		t.Fatal("expected no floor without a baseline file")
+	}
+	writeBaselineFile(t, tmp, "coverage.min 0\ncomplexity.max_violations 12\n")
+	if _, ok := BaselineFloor(tmp, "crap.max_violations"); ok {
+		t.Fatal("expected no floor for an absent key")
+	}
+	if floor, ok := BaselineFloor(tmp, "complexity.max_violations"); !ok || floor != 12 {
+		t.Fatalf("BaselineFloor = %d, %v", floor, ok)
 	}
 }
 

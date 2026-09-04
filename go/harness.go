@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -31,6 +32,13 @@ var root = func() string {
 const (
 	lizard            = "lizard@1.22.2"
 	complexityMaxArgs = "8"
+	// reportOnlyLimit is a lizard `-i N` high enough that it never fails: the
+	// gate reports instead of blocking when no floor is recorded, and the
+	// baseline writer counts warnings from the summary row it still prints.
+	reportOnlyLimit = "1000000"
+	baselineFile    = ".harness-baseline"
+	updateBaseline  = "go run harness.go suppressions --update-baseline"
+	crapMaxDefault  = 30.0
 )
 
 // ── Output ──────────────────────────────────────────────────────────
@@ -63,6 +71,7 @@ type runResult struct {
 
 type runOpts struct {
 	extract func(output string) string
+	hint    string
 	noExit  bool
 	// stream inherits stdio for commands whose live output is part of the contract.
 	stream bool
@@ -146,6 +155,9 @@ func run(description string, cmd []string, opts *runOpts) runResult {
 		err := c.Run()
 		if err != nil {
 			fmt.Printf("  %s✗%s %s\n", red, reset, description)
+			if opts != nil && opts.hint != "" {
+				fmt.Printf("  ↳ fix: %s\n", opts.hint)
+			}
 			if opts == nil || !opts.noExit {
 				os.Exit(exitCode(err))
 			}
@@ -158,6 +170,7 @@ func run(description string, cmd []string, opts *runOpts) runResult {
 	g := gate{description: description, cmd: cmd}
 	if opts != nil {
 		g.extract = opts.extract
+		g.hint = opts.hint
 	}
 	r := runCapture(g)
 	ok := printGateResult(r, opts != nil && opts.noExit)
@@ -808,18 +821,29 @@ func crapGlyphAndColor(enforce bool) (glyph, color string) {
 	return glyph, color
 }
 
-func cmdCrap() {
-	maxCrap, _ := strconv.ParseFloat(flagValue("max", "30"), 64)
-	enforce := hasFlag("enforce")
+type crapOffender struct {
+	crap   float64
+	cov    float64
+	metric funcMetric
+}
 
+// crapMeasurement is one CRAP scoring pass: the offenders above the
+// threshold, or the reason a tool could not produce a score.
+type crapMeasurement struct {
+	offenders []crapOffender
+	problem   string
+}
+
+// crapMeasure scores every function's CRAP against maxCrap, refreshing
+// coverage if stale.
+func crapMeasure(maxCrap float64) crapMeasurement {
 	covPath := filepath.Join(root, "coverage.out")
 	if !coverageFresh(covPath) {
 		cmdTestCov()
 	}
 	covText, err := os.ReadFile(covPath)
 	if err != nil {
-		fmt.Printf("  %s✗%s CRAP: coverage.out not found after test-cov\n", red, reset)
-		os.Exit(1)
+		return crapMeasurement{problem: "coverage.out not found after test-cov"}
 	}
 
 	// coverprofile paths are module-qualified ("harness/suppressions/foo.go");
@@ -837,50 +861,84 @@ func cmdCrap() {
 	if metrics == nil {
 		// Lizard produced no usable output (uvx missing, lizard crash, format
 		// drift). Reporting "all functions below max" would be a silent false-
-		// pass; surface the failure and degrade to advisory unless --enforce.
-		suffix := ""
-		if !enforce {
-			suffix = " (advisory)"
-		}
-		glyph, color := crapGlyphAndColor(enforce)
-		fmt.Printf("  %s%s%s CRAP: lizard failed to run%s\n", color, glyph, reset, suffix)
-		if enforce {
-			os.Exit(1)
-		}
-		return
+		// pass; surface the failure.
+		return crapMeasurement{problem: "lizard failed to run"}
 	}
 
-	type scored struct {
-		crap   float64
-		cov    float64
-		metric funcMetric
-	}
-	var offenders []scored
+	var offenders []crapOffender
 	for _, m := range metrics {
 		c := functionCoverage(cov[m.file], m.line, m.end)
 		score := crap.Score(m.ccn, c)
 		if score > maxCrap {
-			offenders = append(offenders, scored{score, c, m})
+			offenders = append(offenders, crapOffender{score, c, m})
 		}
 	}
-
-	if len(offenders) == 0 {
-		fmt.Printf("  %s✓%s CRAP: all functions below %.0f\n", green, reset, maxCrap)
-		return
-	}
 	sort.Slice(offenders, func(i, j int) bool { return offenders[i].crap > offenders[j].crap })
-	suffix := " (advisory)"
-	if enforce {
-		suffix = ""
-	}
-	glyph, color := crapGlyphAndColor(enforce)
-	fmt.Printf("  %s%s%s CRAP: %d function(s) exceed %.0f%s\n", color, glyph, reset, len(offenders), maxCrap, suffix)
+	return crapMeasurement{offenders: offenders}
+}
+
+// printCrapOffenders lists the worst offenders, capped so a legacy tree does
+// not bury the rest of the run.
+func printCrapOffenders(offenders []crapOffender) {
 	limit := min(len(offenders), 20)
 	for _, o := range offenders[:limit] {
 		m := o.metric
 		fmt.Printf("    CRAP=%6.1f  CCN=%3d  cov=%5.1f%%  %s@%d %s\n",
 			o.crap, m.ccn, o.cov*100, m.name, m.line, m.file)
 	}
+}
+
+func cmdCrap() {
+	maxCrap := crapMaxDefault
+	if raw := flagValue("max", ""); raw != "" {
+		value, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			fmt.Printf("  %s✗%s CRAP: invalid --max=%q (must be a number)\n", red, reset, raw)
+			os.Exit(1)
+		}
+		maxCrap = value
+	}
+	enforce := hasFlag("enforce")
+	suffix := " (advisory)"
+	if enforce {
+		suffix = ""
+	}
+	glyph, color := crapGlyphAndColor(enforce)
+
+	measurement := crapMeasure(maxCrap)
+	if measurement.problem != "" {
+		// Degrade to advisory unless --enforce.
+		fmt.Printf("  %s%s%s CRAP: %s%s\n", color, glyph, reset, measurement.problem, suffix)
+		if enforce {
+			os.Exit(1)
+		}
+		return
+	}
+
+	offenders := measurement.offenders
+	if len(offenders) == 0 {
+		fmt.Printf("  %s✓%s CRAP: all functions below %.0f\n", green, reset, maxCrap)
+		return
+	}
+	// The baseline is a count floor: a repo adopting the harness starts wherever
+	// it already is, and that number may only come down.
+	floor, hasFloor := suppressions.BaselineFloor(root, "crap.max_violations")
+	if !hasFloor {
+		// Nothing recorded is not a floor of 0; it is a repo that has never been
+		// measured. Report what is there and pass — `--enforce` included — so
+		// retrofitting the harness into a legacy tree is green on day one.
+		fmt.Printf("  %s⚠%s CRAP: %d function(s) exceed %.0f (report-only: no %s floor)\n",
+			green, reset, len(offenders), maxCrap, baselineFile)
+		printCrapOffenders(offenders)
+		fmt.Printf("  ↳ fix: run `%s` to record a floor\n", updateBaseline)
+		return
+	}
+	if len(offenders) <= floor {
+		fmt.Printf("  %s✓%s CRAP: %d function(s) exceed %.0f (baseline %d)\n", green, reset, len(offenders), maxCrap, floor)
+		return
+	}
+	fmt.Printf("  %s%s%s CRAP: %d function(s) exceed %.0f (baseline %d)%s\n", color, glyph, reset, len(offenders), maxCrap, floor, suffix)
+	printCrapOffenders(offenders)
 	if enforce {
 		os.Exit(1)
 	}
@@ -1127,7 +1185,7 @@ func cmdCheck() {
 			root,
 			suppressions.ScanFindings(root),
 			true,
-			"go run harness.go suppressions --update-baseline",
+			updateBaseline,
 			true,
 		),
 	})
@@ -1223,7 +1281,7 @@ func cmdCi() {
 		root,
 		suppressions.ScanFindings(root),
 		true,
-		"go run harness.go suppressions --update-baseline",
+		updateBaseline,
 		true,
 	)
 	if !allOk || !archConfigOk || !gherkinOk || !suppressionsOk {
@@ -1259,17 +1317,152 @@ func cmdPrePush() {
 // driven tests legitimately branch a lot) and `harness.go` (carries
 // `//go:build ignore`, not part of any production package). The cmdCrap join
 // applies the same exclusions so both gates target the same code set.
-func complexityGate() gate {
-	return gate{description: "Complexity (lizard)", cmd: []string{
+func complexityArgv(maxViolations string) []string {
+	// lizard's own `-i N` is the count ratchet: it exits 0 while the number of
+	// flagged functions stays at or below N, so lizard does the counting.
+	return []string{
 		"uvx", lizard, "-l", "go", ".",
-		"-C", "15", "-a", complexityMaxArgs, "-L", "100", "-i", "0",
+		"-C", "15", "-a", complexityMaxArgs, "-L", "100", "-i", maxViolations,
 		"-x", "*_test.go", "-x", "./harness.go",
-	}, hint: "extract helpers or flatten branches until CCN <= 15; do not raise the threshold"}
+	}
+}
+
+// complexityGate is the lizard gate at the committed floor, or report-only
+// when there is none. With no floor recorded, `-i 0` would demand a legacy
+// tree already be perfect — exactly the day-one red that stops the harness
+// being adopted. Measure instead.
+func complexityGate() gate {
+	floor, ok := suppressions.BaselineFloor(root, "complexity.max_violations")
+	if !ok {
+		return gate{
+			description: fmt.Sprintf("Complexity (lizard, report-only: no %s floor)", baselineFile),
+			cmd:         complexityArgv(reportOnlyLimit),
+			hint:        fmt.Sprintf("run `%s` to record a floor", updateBaseline),
+		}
+	}
+	description := "Complexity (lizard)"
+	if floor > 0 {
+		description = fmt.Sprintf("Complexity (lizard, baseline %d)", floor)
+	}
+	return gate{
+		description: description,
+		cmd:         complexityArgv(strconv.Itoa(floor)),
+		hint:        "extract helpers or flatten branches until CCN <= 15; do not raise the threshold",
+	}
 }
 
 func cmdComplexity() {
 	g := complexityGate()
-	run(g.description, g.cmd, nil)
+	run(g.description, g.cmd, &runOpts{hint: g.hint})
+}
+
+// lizardWarningCount reads the `Warning cnt` column out of lizard's final
+// summary row. ok=false when there is no summary row to read.
+func lizardWarningCount(stdout string) (int, bool) {
+	lines := strings.Split(stdout, "\n")
+	for index, line := range lines {
+		if !strings.HasPrefix(line, "Total nloc") {
+			continue
+		}
+		for _, row := range lines[index+1:] {
+			fields := strings.Fields(row)
+			if len(fields) < 6 || strings.Trim(row, "- ") == "" {
+				continue
+			}
+			count, err := strconv.Atoi(fields[5])
+			return count, err == nil
+		}
+	}
+	return 0, false
+}
+
+// ── Ratcheted baseline ──────────────────────────────────────────────
+// Every key `suppressions --update-baseline` measures. Later gates append
+// their own {key, measure} entry here; suppressions.WriteBaseline rewrites
+// exactly these keys and carries every other key (`coverage.min`,
+// `mutation.min`, anything hand-written) through untouched.
+var ratcheted = []suppressions.Measurer{
+	{Key: "coverage.min", Measure: measuredCoverageMin},
+	{Key: "complexity.max_violations", Measure: measuredComplexityViolations},
+	{Key: "crap.max_violations", Measure: measuredCrapViolations},
+}
+
+// measuredCoverageMin is total coverage floored to an integer — the floor the
+// coverage gate then enforces. Measured first so the profile it writes is
+// still fresh when the CRAP measurement joins against it. Mirrors python's
+// _measured_coverage: refresh only a stale profile, and a tree with no tests
+// has no percentage to record.
+func measuredCoverageMin() suppressions.Measurement {
+	if !hasTestFiles() {
+		return suppressions.Unavailable("no *_test.go files")
+	}
+	if !coverageFresh(filepath.Join(root, "coverage.out")) {
+		c := exec.Command("go", "test", "-race", "-count=1", "-coverprofile=coverage.out", "./...")
+		c.Dir = root
+		if _, err := c.CombinedOutput(); err != nil {
+			return suppressions.Failed(fmt.Sprintf("the test run under coverage failed (exit %d)", exitCode(err)))
+		}
+	}
+	pct, ok := coveragePercent()
+	if !ok {
+		return suppressions.Failed("`go tool cover` produced no total")
+	}
+	// Truncate, never round up: a floor above the measured number fails the very
+	// next run.
+	return suppressions.Measured(int(pct))
+}
+
+// measuredComplexityViolations counts the functions lizard flags at the
+// template's thresholds.
+func measuredComplexityViolations() suppressions.Measurement {
+	argv := complexityArgv(reportOnlyLimit)
+	c := exec.Command(argv[0], argv[1:]...)
+	c.Dir = root
+	out, err := c.Output()
+	if err != nil {
+		return suppressions.Failed(fmt.Sprintf("lizard failed to run (exit %d)", exitCode(err)))
+	}
+	count, ok := lizardWarningCount(string(out))
+	if !ok {
+		return suppressions.Failed("lizard printed no summary row to count warnings from")
+	}
+	return suppressions.Measured(count)
+}
+
+// measuredCrapViolations counts the functions above the default CRAP threshold.
+func measuredCrapViolations() suppressions.Measurement {
+	if !hasTestFiles() {
+		return suppressions.Unavailable("no *_test.go files")
+	}
+	measurement := crapMeasure(crapMaxDefault)
+	if measurement.problem != "" {
+		return suppressions.Failed(measurement.problem)
+	}
+	return suppressions.Measured(len(measurement.offenders))
+}
+
+// hasTestFiles reports whether any *_test.go exists under root (vendor/ and
+// hidden directories excluded).
+func hasTestFiles() bool {
+	found := false
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == "vendor" || (strings.HasPrefix(name, ".") && path != root) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), "_test.go") {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
 }
 
 // ── Hook wiring (installed by `setup-hooks`) ────────────────────────
@@ -1463,15 +1656,29 @@ func cmdSuppressions() {
 	findings := suppressions.ScanFindings(root)
 	results := suppressions.BucketByKind(findings)
 	if hasFlag("update-baseline") {
-		if err := suppressions.WriteBaseline(root, results); err != nil {
-			fmt.Printf("  %s✗%s .harness-baseline: %v\n", red, reset, err)
+		baseline, err := suppressions.WriteBaseline(root, results, ratcheted)
+		var unmeasured *suppressions.MeasurementError
+		if errors.As(err, &unmeasured) {
+			fmt.Printf("  %s✗%s %s not written — could not measure:\n", red, reset, baselineFile)
+			fmt.Printf("    %s: %s\n", unmeasured.Key, unmeasured.Reason)
+			fmt.Println("  ↳ fix: make the measurement pass, then rerun `suppressions --update-baseline`")
+			os.Exit(1)
+		}
+		if err != nil {
+			fmt.Printf("  %s✗%s %s: %v\n", red, reset, baselineFile, err)
 			os.Exit(1)
 		}
 		total := 0
 		for _, entries := range results {
 			total += len(entries)
 		}
-		fmt.Printf("  %s✓%s .harness-baseline: suppressions baseline set to %d\n", green, reset, total)
+		recorded := []string{fmt.Sprintf("suppressions %d", total)}
+		for _, m := range ratcheted {
+			if value, ok := baseline[m.Key]; ok {
+				recorded = append(recorded, fmt.Sprintf("%s %d", m.Key, value))
+			}
+		}
+		fmt.Printf("  %s✓%s %s: %s\n", green, reset, baselineFile, strings.Join(recorded, ", "))
 		return
 	}
 	suppressions.PrintReport(results)
@@ -1479,7 +1686,7 @@ func cmdSuppressions() {
 		root,
 		findings,
 		true,
-		"go run harness.go suppressions --update-baseline",
+		updateBaseline,
 		false,
 	) {
 		os.Exit(1)
