@@ -19,7 +19,7 @@ paraphrase (it drifts). Two sections:
   `check` + `pre-commit` fail on drift). `check` runs a lockfile check
   (`bun install --frozen-lockfile`), fix + format, typecheck, and test
   (warns/skips when no tests exist), then — as a read-only parallel batch —
-  complexity, duplication, deadcode, acceptance (self-skips with a warning when no
+  complexity (CCN + duplicate blocks), deadcode, acceptance (self-skips with a warning when no
   `.feature` files exist), and `arch` (dependency-cruiser qualifies for
   `check`'s batch: it's a local devDependency, runs offline, and takes no
   build lock), then warns (does not block) via `arch-config-guard`
@@ -27,7 +27,7 @@ paraphrase (it drifts). Two sections:
   ratchets suppressions. Invariant: `ci` minus `check` == every gate that
   needs the network or a build lock (`audit`, `coverage`, advisory `crap`).
   `ci` runs the read-only gates
-  (`lint`, `typecheck`, `audit`, `complexity`, `duplication`, `deadcode`, `acceptance`,
+  (`lint`, `typecheck`, `audit`, `complexity`, `deadcode`, `acceptance`,
   `arch`) **in parallel** — captured and printed in submission order, run to
   completion so one pass surfaces every failure — then streams `coverage` and
   the advisory `crap`; `ci` also runs `arch-config-guard` and `gherkin-guard`
@@ -59,8 +59,10 @@ paraphrase (it drifts). Two sections:
   `Duplicate block:` headers itself and compares them to `duplication.max_blocks`
   (report-only when absent, the same way). lizard reports a block only once it
   spans ~70 unified tokens and counts overlapping near-duplicates separately, so
-  the number jitters by one on trivial edits: treat it as a floor to hold, never
-  a threshold to hit. `test`, `coverage`, `mutation`, and
+  the count can move by more than one when unrelated code changes in the same
+  file (observed in this template: 2 → 0 when a test file grew by ~50 lines that
+  touched none of the duplicated regions). Treat it as a floor to hold, never a
+  threshold to hit. `test`, `coverage`, `mutation`, and
   `crap` warn and skip when no Bun test files exist. `check` also warns on
   missing Stop hook wiring and arch config changes. Requires `uvx`
   on PATH for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
