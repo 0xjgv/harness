@@ -31,6 +31,11 @@ var root = func() string {
 const (
 	lizard            = "lizard@1.22.2"
 	complexityMaxArgs = "8"
+	// golangciLintVersion is the golangci-lint release this template's
+	// .golangci.yaml is tuned for. Keep it in sync with the install step in
+	// .github/workflows/ci.yml. A different installed version only warns —
+	// adopters legitimately run their own.
+	golangciLintVersion = "2.13.2"
 )
 
 // ── Output ──────────────────────────────────────────────────────────
@@ -298,11 +303,45 @@ func changedGoFiles() []string {
 
 // ── Commands ────────────────────────────────────────────────────────
 
+var golangciLintVersionOnce sync.Once
+
+// warnGolangciLintVersion prints one ⚠ line per process when the installed
+// golangci-lint reports a version other than the pinned golangciLintVersion.
+// Warn, never fail: a mismatch means different lint results, not a broken
+// tree, and adopters pin their own. A missing binary stays silent here — the
+// lint gate itself already fails on it.
+func warnGolangciLintVersion() {
+	golangciLintVersionOnce.Do(func() {
+		c := exec.Command("golangci-lint", "version")
+		c.Dir = root
+		// Output is parsed even on a non-zero exit: a binary that prints its
+		// banner and then errors still tells us its version, and a binary that
+		// prints nothing recognizable falls through to the silent branch below.
+		out, _ := c.CombinedOutput()
+		got := suppressions.GolangciLintVersion(string(out))
+		// Builds installed with `go install` report `v2.13.2`; release archives
+		// report `2.13.2`. Same version — compare without the tag prefix.
+		if got == "" || strings.TrimPrefix(got, "v") == golangciLintVersion {
+			return
+		}
+		fmt.Printf("  %s⚠%s golangci-lint %s installed, %s pinned\n",
+			green, reset, got, golangciLintVersion)
+		fmt.Printf("  ↳ fix: curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v%s/install.sh"+
+			" | sh -s -- -b \"$(go env GOPATH)/bin\" v%s\n", golangciLintVersion, golangciLintVersion)
+	})
+}
+
+// golangciLintCmd builds a golangci-lint command line, checking the pin first.
+func golangciLintCmd(args ...string) []string {
+	warnGolangciLintVersion()
+	return append([]string{"golangci-lint"}, args...)
+}
+
 func cmdFix(pkgs []string) {
 	if len(pkgs) == 0 {
 		pkgs = []string{"./..."}
 	}
-	run("Fix & format", append([]string{"golangci-lint", "run", "--fix"}, pkgs...), nil)
+	run("Fix & format", golangciLintCmd(append([]string{"run", "--fix"}, pkgs...)...), nil)
 }
 
 func lintGate(pkgs []string) gate {
@@ -311,7 +350,7 @@ func lintGate(pkgs []string) gate {
 	}
 	return gate{
 		description: "Lint & format check",
-		cmd:         append([]string{"golangci-lint", "run"}, pkgs...),
+		cmd:         golangciLintCmd(append([]string{"run"}, pkgs...)...),
 		hint:        "run `go run harness.go fix`",
 	}
 }
@@ -372,7 +411,7 @@ func cmdPostEdit() {
 	if len(changedGoFiles()) == 0 {
 		return
 	}
-	run("Fix & format", []string{"golangci-lint", "run", "--fix", "./..."}, &runOpts{noExit: true})
+	run("Fix & format", golangciLintCmd("run", "--fix", "./..."), &runOpts{noExit: true})
 }
 
 // cmdStopHook exits 2 (not 1) on failure: Claude Code treats a Stop hook's
@@ -1095,7 +1134,7 @@ func cmdCheck() {
 	fmt.Printf("\n%s[check]%s Running pre-flight checks...\n\n", blue, reset)
 
 	results := []runResult{
-		run("Fix & format", []string{"golangci-lint", "run", "--fix", "./..."}, &runOpts{noExit: true}),
+		run("Fix & format", golangciLintCmd("run", "--fix", "./..."), &runOpts{noExit: true}),
 		run("Tests", []string{"go", "test", "./..."}, &runOpts{extract: extractTestSummary, noExit: true}),
 	}
 

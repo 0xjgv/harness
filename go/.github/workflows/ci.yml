@@ -14,10 +14,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Pinned toolchain: CI must run the version the harness was tuned for.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version: "1.24.0"
 
       # uv provides `uvx`, which the complexity and CRAP gates use to run lizard.
       - name: Install uv
@@ -25,10 +26,12 @@ jobs:
         with:
           enable-cache: true
 
+      # Version pinned to `golangciLintVersion` in harness.go — keep both in sync.
+      # The installer script itself is pinned to the same tag.
       - name: Install golangci-lint
         run: |
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
-            | sh -s -- -b "$(go env GOPATH)/bin"
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.13.2/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.13.2
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Download modules

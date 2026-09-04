@@ -22,6 +22,7 @@ func TestFeatures(t *testing.T) {
 		ScenarioInitializer: func(sc *godog.ScenarioContext) {
 			steps.InitializeScenario(sc)
 			steps.InitializeCrapScenario(sc)
+			steps.InitializePinsScenario(sc)
 		},
 		Options: &godog.Options{
 			Format:   "pretty",

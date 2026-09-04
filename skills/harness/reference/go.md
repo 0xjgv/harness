@@ -55,8 +55,9 @@ keep the command names and semantics.
 ## Bootstrap commands (greenfield)
 
 ```bash
-# Install golangci-lint v2+ first
-brew install golangci-lint  # or: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+# Install the pinned golangci-lint first (see "Pinned tools" below)
+curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.13.2/install.sh \
+  | sh -s -- -b "$(go env GOPATH)/bin" v2.13.2
 
 cp -r ~/Code/harness-templates/go/ my-project && cd my-project
 go mod edit -module my-project
@@ -76,6 +77,27 @@ Claude Stop command:
 `cd $CLAUDE_PROJECT_DIR && go run harness.go stop-hook`.
 Codex Stop command:
 `cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh go run harness.go stop-hook`.
+
+## Pinned tools
+
+Every tool version the gates depend on is fixed in one place:
+
+- lizard `1.22.2` via `uvx`, govulncheck `v1.1.4`, go-arch-lint `v1.15.0`,
+  gremlins `v0.5.0` — pinned in the `go run` / `uvx` invocations themselves, so
+  the runner fetches exactly that version.
+- golangci-lint `2.13.2` — the `golangciLintVersion` constant in `harness.go`
+  and the install step in `.github/workflows/ci.yml` (`install.sh` URL pinned
+  to the same tag, version passed positionally). The binary still resolves from
+  PATH (it is too slow to build per run), so the pin is enforced by inspection,
+  not by fetching: every gate that shells out to golangci-lint runs
+  `golangci-lint version` first and prints one `⚠` line naming both versions
+  when they differ — a warning, never a failure, because adopters legitimately
+  run their own. `v2.13.2` (a `go install` build) and `2.13.2` (a release
+  archive) count as the same version. A missing binary still fails the lint
+  gate. When porting, keep the constant and the CI install step in sync.
+- Go toolchain: `go-version: "1.24.0"` in CI (`actions/setup-go`) — an exact
+  patch, above the `go 1.24` floor `go.mod` declares. Bumping the floor does
+  not move CI; bump both.
 
 ## Canonical anchors
 

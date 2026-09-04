@@ -115,6 +115,28 @@ func buildHarness() (string, error) {
 	return harnessBin, errHarnessBin
 }
 
+// runHarness runs `harness <args>` (the leading word "harness" is dropped) from
+// dir with extraEnv appended to the ambient environment, returning its combined
+// output and exit code. Shared by every step file that drives the real binary.
+func runHarness(dir string, extraEnv []string, cmdLine string) (string, int, error) {
+	bin, err := buildHarness()
+	if err != nil {
+		return "", 0, err
+	}
+	parts := strings.Fields(cmdLine)
+	if len(parts) > 0 && parts[0] == "harness" {
+		parts = parts[1:]
+	}
+	//nolint:gosec // test fixture invokes the local harness binary with scenario arguments.
+	c := exec.Command(bin, parts...)
+	c.Dir = dir
+	if len(extraEnv) > 0 {
+		c.Env = append(os.Environ(), extraEnv...)
+	}
+	out, _ := c.CombinedOutput()
+	return string(out), c.ProcessState.ExitCode(), nil
+}
+
 func (w *crapWorld) makeTmp() error {
 	d, err := os.MkdirTemp("", "crap-")
 	if err != nil {
@@ -139,21 +161,12 @@ func (w *crapWorld) artifactMissing() error {
 }
 
 func (w *crapWorld) iRun(cmd string) error {
-	bin, err := buildHarness()
+	out, code, err := runHarness(w.tmp, nil, cmd)
 	if err != nil {
 		return err
 	}
-	// Drop leading "harness" — the rest is forwarded to the harness binary.
-	parts := strings.Fields(cmd)
-	if len(parts) > 0 && parts[0] == "harness" {
-		parts = parts[1:]
-	}
-	//nolint:gosec // test fixture invokes the local harness binary with scenario arguments.
-	c := exec.Command(bin, parts...)
-	c.Dir = w.tmp
-	out, _ := c.CombinedOutput()
-	w.output = string(out)
-	w.exitCode = c.ProcessState.ExitCode()
+	w.output = out
+	w.exitCode = code
 	return nil
 }
 

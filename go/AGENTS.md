@@ -22,6 +22,11 @@
 - Setup: `go run harness.go setup-hooks` installs git pre-commit + pre-push hooks (path resolved via `git rev-parse`, worktree-safe) and idempotently installs the Claude/Codex Stop wiring
 - Stop hook: auto-formats/fixes changed files, then runs complexity (`stop-hook`). On failure it exits **2** and prints a short failure summary to stderr — Claude Code treats a Stop hook's exit code 2 as blocking and feeds stderr back to the model; any other non-zero exit is silently swallowed. `check`/`ci`/`pre-commit`/`pre-push` keep exiting 1 on failure. Codex's wrapper (`codex-stop-hook.sh`) maps any non-zero exit to a block decision, so it is unaffected by the exit-code change.
 
+## Pinned tools
+
+- golangci-lint `2.13.2` — `golangciLintVersion` in `harness.go`, installed at that tag by `.github/workflows/ci.yml`. The binary comes from PATH, so the pin is checked, not fetched: any gate that shells out to golangci-lint (`fix`, `lint`, `check`, `pre-commit`, `pre-push`, `ci`, `post-edit`, `stop-hook`) reads `golangci-lint version` first and prints one `⚠` line naming both versions when they differ — a warning, never a failure; a missing binary still fails the lint gate. Install the pin: `curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.13.2/install.sh | sh -s -- -b "$(go env GOPATH)/bin" v2.13.2`
+- lizard `1.22.2` via `uvx` (complexity + CRAP), govulncheck `v1.1.4`, go-arch-lint `v1.15.0`, gremlins `v0.5.0` — pinned in the `go run`/`uvx` invocations. CI's Go toolchain is pinned to `1.24.0`, an exact patch above `go.mod`'s `go 1.24` floor; bumping the floor does not move CI.
+
 ## Definition of done
 
 - `go run harness.go check` passes clean — never stop with check failing.
