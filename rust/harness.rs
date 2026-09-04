@@ -557,23 +557,39 @@ enum Measurement {
 /// this table.
 ///
 /// `coverage.min` is measured first so the instrumented run it needs is the one
-/// CRAP then reuses. `mutation.min` is deliberately absent: it is carried through
-/// untouched (see `merge_baseline`), because measuring it costs a mutation run the
-/// automatic pass must not silently pay for.
+/// CRAP then reuses. `mutation.min` is deliberately absent: it costs a full
+/// mutation run, minutes the automatic pass must not silently pay for, so it is
+/// carried through untouched (see `merge_baseline`) unless `--with-mutation`
+/// explicitly asks for it — see `ratcheted_keys`.
 const RATCHETED_KEYS: &[(&str, MeasureFn)] = &[
     ("coverage.min", measured_coverage_min),
     ("complexity.max_violations", measured_complexity_violations),
     ("crap.max_violations", measured_crap_violations),
 ];
 
+/// The metrics to measure for this `--update-baseline` run.
+///
+/// `mutation.min` joins the list only under `--with-mutation`. Opt-in because it
+/// is the one metric whose measurement is measured in minutes rather than
+/// seconds — and note the merge rules still apply to it: a `--with-mutation` pass
+/// that cannot measure a score *removes* the recorded floor rather than keeping a
+/// number nothing verified.
+fn ratcheted_keys(with_mutation: bool) -> Vec<(&'static str, MeasureFn)> {
+    let mut keys = RATCHETED_KEYS.to_vec();
+    if with_mutation {
+        keys.push(("mutation.min", measured_mutation_min));
+    }
+    keys
+}
+
 /// Measure every ratcheted metric, stopping at the first one that failed.
 ///
 /// Sequential and short-circuiting on purpose: a broken tool usually breaks the
 /// metrics after it too (CRAP re-runs the coverage suite), so the first failure is
 /// the one worth reporting and the later ones would only be noise.
-fn measure_ratcheted() -> Vec<(&'static str, Measurement)> {
-    let mut measured = Vec::with_capacity(RATCHETED_KEYS.len());
-    for (key, measure) in RATCHETED_KEYS {
+fn measure_ratcheted(keys: &[(&'static str, MeasureFn)]) -> Vec<(&'static str, Measurement)> {
+    let mut measured = Vec::with_capacity(keys.len());
+    for (key, measure) in keys {
         let value = measure();
         let failed = matches!(value, Measurement::Error(_));
         measured.push((*key, value));
@@ -655,9 +671,9 @@ fn serialize_baseline(baseline: &BaselineMap) -> String {
 /// All-or-nothing: when any ratcheted metric fails to measure, nothing is written
 /// and the process exits 1. The write is the last statement for exactly that
 /// reason — an abort can never leave a half-updated floor behind.
-fn write_baseline(results: &SuppressionCounts) -> std::io::Result<()> {
+fn write_baseline(results: &SuppressionCounts, with_mutation: bool) -> std::io::Result<()> {
     let existing = read_baseline().unwrap_or_default();
-    let measurements = measure_ratcheted();
+    let measurements = measure_ratcheted(&ratcheted_keys(with_mutation));
     let (merged, dropped) =
         match merge_baseline(&existing, &suppression_counts(results), &measurements) {
             Ok(outcome) => outcome,
@@ -764,7 +780,7 @@ fn cmd_suppressions() {
     let findings = scan_suppression_findings(&default_suppression_roots());
     let results = bucket_suppressions(&findings);
     if arg_flag("--update-baseline") {
-        if let Err(e) = write_baseline(&results) {
+        if let Err(e) = write_baseline(&results, arg_flag("--with-mutation")) {
             println!("  {RED}\u{2717}{RESET} {BASELINE_FILE}: {e}");
             std::process::exit(1);
         }
@@ -1083,21 +1099,396 @@ fn llvm_tools_env() -> Vec<(String, String)> {
     Vec::new()
 }
 
-/// Run cargo-mutants. Advisory — NOT wired into `ci`.
+// ── Mutation ────────────────────────────────────────────────────────
+
+/// Production sources cargo-mutants is pointed at.
 ///
-/// Mutation testing injects small bugs and checks whether the test suite
-/// catches them. It is slow and noisy by nature, so it stays an explicit
-/// opt-in rather than a blocking gate. Absent → warn + skip.
-fn cmd_mutation() {
-    if !tool_installed("mutants") {
-        println!("  {DIM}\u{2298} Mutation skipped (install: cargo install cargo-mutants){RESET}");
-        return;
+/// `harness.rs` is a `[[bin]]` of this crate but it is the task runner, not the
+/// product — the same reason the complexity gate targets `src tests`, python
+/// mutates `source_paths = ["src"]` and bun mutates `src/`. Including it would
+/// also make the gate unusable: 461 mutants at roughly two minutes each.
+const MUTATION_SOURCES: &str = "src";
+
+/// Scoring-input override: a finished `outcomes.json` to read instead of running.
+///
+/// A mutation pass costs minutes, so `HARNESS_MUTATION_OUTCOMES=<path>` re-scores
+/// a run that already happened — the acceptance scenarios use it, and so can a CI
+/// job that produced the file in an earlier step.
+const MUTATION_OUTCOMES_ENV: &str = "HARNESS_MUTATION_OUTCOMES";
+
+fn mutation_outcomes_override() -> Option<String> {
+    env::var(MUTATION_OUTCOMES_ENV).ok().filter(|path| !path.is_empty())
+}
+
+/// The ref mutation diffs against: `--base=<ref>` wins, then `HARNESS_ARCH_BASE`,
+/// then `GITHUB_BASE_REF`, then whichever default branch resolves. `None` when
+/// none of them do — a local branch with no upstream and no `main`.
+///
+/// An explicit `--base=` that does not resolve is fatal rather than skipped: the
+/// fallbacks would silently mutate a scope nobody asked for. The env vars keep
+/// falling through, because they are ambient rather than typed on this command
+/// line (`GITHUB_BASE_REF` names a branch that need not be fetched locally).
+fn mutation_base_ref() -> Option<String> {
+    if let Some(explicit) = arg_value("--base") {
+        if git_lines(&["rev-parse", "--verify", &explicit]).is_empty() {
+            println!("  {RED}\u{2717}{RESET} Mutation: --base={explicit} is not a git ref");
+            std::process::exit(1);
+        }
+        return Some(explicit);
     }
-    run(
-        "Mutation (cargo-mutants)",
-        &["cargo", "mutants", "--no-shuffle"],
-        Some(&RunOpts { no_exit: true, ..RunOpts::default() }),
+    let candidates = [
+        env::var("HARNESS_ARCH_BASE").ok().filter(|value| !value.is_empty()),
+        env::var("GITHUB_BASE_REF")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|branch| format!("origin/{branch}")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|candidate| !git_lines(&["rev-parse", "--verify", candidate]).is_empty())
+        .or_else(default_base_ref)
+}
+
+/// The changed-source diff cargo-mutants scopes to.
+///
+/// `--relative` is load-bearing: `--in-diff` matches paths against the crate root,
+/// and from a template subdirectory an unrelativised diff names `rust/src/main.rs`,
+/// which matches no mutant at all — a green gate that tested nothing.
+///
+/// Against a resolved base ref this is `<base>...HEAD`; with none it falls back to
+/// the uncommitted diff, the same change-set rule the other local-stage gates use.
+fn mutation_diff() -> String {
+    let range =
+        mutation_base_ref().map_or_else(|| "HEAD".to_string(), |base| format!("{base}...HEAD"));
+    git_output(&["diff", "--relative", &range, "--", MUTATION_SOURCES])
+}
+
+/// A finished cargo-mutants run: its `outcomes.json`, and whether the tool itself
+/// exited 0.
+///
+/// The exit code cannot simply be ignored, even though cargo-mutants exits
+/// non-zero whenever a mutant survives (a finding to score, not a failed run).
+/// When the *unmutated* tree's tests fail it exits 4 and still writes a
+/// well-formed `outcomes.json` with every total at zero — indistinguishable, from
+/// the file alone, from a diff that generated nothing to mutate. See
+/// `mutation_measurement`.
+struct MutationRun {
+    outcomes_json: String,
+    completed: bool,
+}
+
+/// Run cargo-mutants and return its `outcomes.json`.
+///
+/// `diff` scopes the run to changed lines; `None` mutates all of
+/// `MUTATION_SOURCES`. The scratch output directory lives under the system temp
+/// dir, not the repo: nothing to gitignore, and nothing for `clean` to sweep.
+fn mutation_run(diff: Option<&str>) -> Result<MutationRun, String> {
+    let output_dir = env::temp_dir().join(format!("harness-mutants-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&output_dir);
+    fs::create_dir_all(&output_dir)
+        .map_err(|e| format!("cannot create {}: {e}", output_dir.display()))?;
+
+    let mut argv: Vec<String> =
+        ["cargo", "mutants", "--no-shuffle", "--output"].iter().map(|s| (*s).to_string()).collect();
+    argv.push(output_dir.to_string_lossy().into_owned());
+    let scoped = if let Some(text) = diff {
+        let path = output_dir.join("changed.diff");
+        argv.push("--in-diff".to_string());
+        argv.push(path.to_string_lossy().into_owned());
+        fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    } else {
+        argv.push("--file".to_string());
+        argv.push(format!("{MUTATION_SOURCES}/**"));
+        Ok(())
+    };
+    let outcomes = scoped.and_then(|()| execute_mutants(&argv, &output_dir));
+    let _ = fs::remove_dir_all(&output_dir);
+    outcomes
+}
+
+/// Spawn cargo-mutants and read the `outcomes.json` it leaves behind.
+fn execute_mutants(argv: &[String], output_dir: &Path) -> Result<MutationRun, String> {
+    let verbose = is_verbose();
+    if verbose {
+        println!("  {DIM}\u{2192} {}{RESET}", argv.join(" "));
+    }
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]).current_dir(root());
+    let (completed, captured) = if verbose {
+        command.status().map(|status| (status.success(), String::new()))
+    } else {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped()).output().map(|out| {
+            (
+                out.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr),
+                ),
+            )
+        })
+    }
+    .map_err(|e| format!("cargo mutants failed to start: {e}"))?;
+
+    fs::read_to_string(output_dir.join("mutants.out").join("outcomes.json"))
+        .map(|outcomes_json| MutationRun { outcomes_json, completed })
+        .map_err(|e| {
+            let mut tail: Vec<&str> = captured.lines().rev().take(10).collect();
+            tail.reverse();
+            format!("cargo mutants produced no outcomes.json ({e})\n{}", tail.join("\n"))
+        })
+}
+
+/// The `outcomes.json` to score: the `HARNESS_MUTATION_OUTCOMES` override when it
+/// is set, otherwise a fresh run.
+fn mutation_outcomes(diff: Option<&str>) -> Result<MutationRun, String> {
+    mutation_outcomes_override().map_or_else(
+        || mutation_run(diff),
+        |path| {
+            // An override names a run that already finished; there is no exit
+            // status left to consult, so take the file at its word.
+            fs::read_to_string(&path)
+                .map(|outcomes_json| MutationRun { outcomes_json, completed: true })
+                .map_err(|e| format!("{MUTATION_OUTCOMES_ENV}={path}: {e}"))
+        },
+    )
+}
+
+/// `round(100 * killed / total)` in integer arithmetic — halves round up, and no
+/// float ever reaches a number that gets written into `.harness-baseline`.
+/// `total` must be non-zero; `mutation_score` is the only caller and checks it.
+fn kill_percent(killed: u32, total: u32) -> u32 {
+    let (killed, total) = (u64::from(killed), u64::from(total));
+    u32::try_from((200 * killed + total) / (2 * total)).unwrap_or(100)
+}
+
+/// Kill rate from a cargo-mutants `outcomes.json`, as an integer percentage.
+///
+/// `round(100 * (caught + timeout) / (caught + timeout + missed))` — the same
+/// definition every template in this repo uses, so the four numbers are
+/// comparable. `unviable` (did not compile) and `total_mutants` are excluded from
+/// both sides: a mutant that never ran is evidence of nothing.
+///
+/// A run with nothing to kill (a tests-only diff) is `Unavailable`, not 0%, so the
+/// gate degrades to report-only instead of recording a floor it never measured.
+/// A missing field is `Error`: cargo-mutants documents this file's layout as
+/// subject to change, and scoring a half-understood file is worse than failing.
+fn mutation_score(outcomes_json: &str) -> Measurement {
+    let (Some(caught), Some(timeout), Some(missed)) = (
+        json_top_level_u32(outcomes_json, "caught"),
+        json_top_level_u32(outcomes_json, "timeout"),
+        json_top_level_u32(outcomes_json, "missed"),
+    ) else {
+        return Measurement::Error(
+            "outcomes.json has no caught/timeout/missed totals — cargo-mutants 27.0.0 \
+             writes them at the top level"
+                .to_string(),
+        );
+    };
+    let killed = caught.saturating_add(timeout);
+    let total = killed.saturating_add(missed);
+    if total == 0 {
+        return Measurement::Unavailable("no mutants were generated".to_string());
+    }
+    Measurement::Value(kill_percent(killed, total))
+}
+
+/// Score a finished run, telling "nothing to mutate" apart from "the run broke".
+///
+/// cargo-mutants writes a well-formed `outcomes.json` with every total at zero in
+/// two very different situations: a diff that generated no mutants, and a tree
+/// whose *unmutated* tests fail (exit 4, `cargo test failed in an unmutated
+/// tree`). Only the exit status separates them, and calling the second one
+/// `Unavailable` would be a lie with teeth — `merge_baseline` *drops* an
+/// unavailable key, so `--update-baseline --with-mutation` against a red suite
+/// would silently delete the recorded floor instead of aborting the write.
+fn mutation_measurement(run: &MutationRun) -> Measurement {
+    let measured = mutation_score(&run.outcomes_json);
+    if run.completed || !matches!(measured, Measurement::Unavailable(_)) {
+        return measured;
+    }
+    Measurement::Error(
+        "cargo mutants exited non-zero without testing a mutant — the unmutated tree's \
+         tests have to pass before mutants mean anything"
+            .to_string(),
+    )
+}
+
+/// Read a top-level integer field out of a JSON object, ignoring nested ones.
+///
+/// `outcomes.json` opens with an `outcomes` array whose per-mutant entries repeat
+/// the summary field names, so a plain substring scan reads the wrong number.
+/// Depth- and string-aware, and no JSON dependency — the runner has none.
+fn json_top_level_u32(text: &str, key: &str) -> Option<u32> {
+    let bytes = text.as_bytes();
+    let mut depth = 0u32;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' | b'[' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            b'"' => {
+                let (token, next) = json_string_at(text, index)?;
+                index = next;
+                if depth != 1 || token != key {
+                    continue;
+                }
+                return json_u32_after_colon(text, index);
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// The string literal starting at `start` (a `"`), plus the index past its close.
+///
+/// Escapes are stepped over, not decoded: the only tokens compared here are plain
+/// ASCII field names, and an escaped key simply fails to match.
+fn json_string_at(text: &str, start: usize) -> Option<(&str, usize)> {
+    let bytes = text.as_bytes();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'"' => return Some((text.get(start + 1..index)?, index + 1)),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Parse `: <digits>` starting at `index`, or `None` when the value is not a
+/// plain non-negative integer.
+fn json_u32_after_colon(text: &str, index: usize) -> Option<u32> {
+    let bytes = text.as_bytes();
+    let mut cursor = index;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b':') {
+        return None;
+    }
+    cursor += 1;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    let start = cursor;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+    }
+    text.get(start..cursor)?.parse().ok()
+}
+
+/// Print the verdict for a measured kill rate. False only on an enforced miss.
+fn report_mutation(measurement: &Measurement, enforce: bool) -> bool {
+    let (color, symbol, suffix) = crap_status_glyph(enforce);
+    let score = match measurement {
+        Measurement::Unavailable(reason) => {
+            println!("  {GREEN}\u{26a0}{RESET} Mutation: {reason} (report-only)");
+            return true;
+        }
+        Measurement::Error(message) => {
+            println!("  {color}{symbol}{RESET} Mutation: {message}{suffix}");
+            return !enforce;
+        }
+        Measurement::Value(score) => *score,
+    };
+    let Some(floor) = baseline_floor("mutation.min") else {
+        // Nothing recorded is not a floor of 0; it is a repo that was never
+        // measured. Report and pass, `--enforce` included.
+        println!(
+            "  {GREEN}\u{26a0}{RESET} Mutation: {score}% of mutants killed \
+             (report-only: no {BASELINE_FILE} floor)"
+        );
+        println!(
+            "  ↳ fix: run `cargo harness suppressions --update-baseline --with-mutation` \
+             to record a floor"
+        );
+        return true;
+    };
+    if score >= floor {
+        println!(
+            "  {GREEN}\u{2713}{RESET} Mutation: {score}% of mutants killed (baseline {floor}%)"
+        );
+        return true;
+    }
+    println!(
+        "  {color}{symbol}{RESET} Mutation: {score}% of mutants killed \
+         (baseline {floor}%){suffix}"
     );
+    println!("  ↳ fix: add tests that fail when the surviving mutants are applied");
+    !enforce
+}
+
+/// Mutation kill rate over changed sources, against the `mutation.min` floor.
+///
+/// Advisory by default, and always advisory from `ci` (`enforce: false`): mutation
+/// is the slowest and noisiest signal in the harness, so it informs without ever
+/// turning a build red. `--enforce` on the standalone command is where it fails.
+///
+/// Returns false only when the floor is missed, or the run broke, under `enforce`.
+fn run_mutation(enforce: bool, all: bool) -> bool {
+    // Scope first: a run with nothing to mutate needs neither the tool nor a
+    // scratch directory, and its message must not depend on either being there.
+    let diff = if all {
+        None
+    } else {
+        let text = mutation_diff();
+        if text.trim().is_empty() {
+            println!(
+                "  {GREEN}\u{26a0}{RESET} Mutation skipped: no changed sources under \
+                 {MUTATION_SOURCES}/ (use --all for the whole tree)"
+            );
+            return true;
+        }
+        Some(text)
+    };
+
+    if mutation_outcomes_override().is_none() && !tool_installed("mutants") {
+        println!("  {DIM}\u{2298} Mutation skipped (install: cargo install cargo-mutants){RESET}");
+        return true;
+    }
+
+    let measurement = match mutation_outcomes(diff.as_deref()) {
+        Ok(run) => mutation_measurement(&run),
+        Err(message) => Measurement::Error(message),
+    };
+    report_mutation(&measurement, enforce)
+}
+
+/// Whole-tree kill rate, for `suppressions --update-baseline --with-mutation`.
+///
+/// Deliberately not the diff-scoped run the gate does: a floor only reproduces if
+/// it is measured over a fixed target set, and one recorded from a branch's diff
+/// would mean something different on the next branch.
+fn measured_mutation_min() -> Measurement {
+    if mutation_outcomes_override().is_none() && !tool_installed("mutants") {
+        return Measurement::Unavailable("cargo-mutants is not installed".to_string());
+    }
+    match mutation_outcomes(None) {
+        Ok(run) => mutation_measurement(&run),
+        Err(message) => Measurement::Error(message),
+    }
+}
+
+/// Mutation testing: inject small bugs, check the suite notices.
+///
+/// Scoped to sources changed against the base ref (`--all` widens it to all of
+/// `src/`), advisory by default (`--enforce` to hard-fail), compared to the
+/// `mutation.min` floor in `.harness-baseline` when one is recorded. `ci` runs it
+/// advisory after coverage; no other stage does, because it costs minutes.
+fn cmd_mutation() {
+    if !run_mutation(arg_flag("--enforce"), arg_flag("--all")) {
+        std::process::exit(1);
+    }
 }
 
 /// Run architecture checks via cargo-modules against `arch.toml`.
@@ -1149,6 +1540,18 @@ fn git_lines(args: &[&str]) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// Raw stdout of a git command; empty on any failure. `git_lines`'s sibling for
+/// the one caller that needs the text itself (a diff) rather than a path list.
+fn git_output(args: &[&str]) -> String {
+    let Ok(output) = Command::new("git").args(args).current_dir(root()).output() else {
+        return String::new();
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 fn git_prefix() -> String {
@@ -2170,6 +2573,10 @@ fn cmd_ci() {
     };
     cmd_coverage();
     cmd_crap();
+    // Advisory always, and scoped to the changed sources: mutation is the slowest
+    // signal here, so `enforce: false` keeps it out of the exit-code chain below.
+    // Argv is not consulted for `--enforce`/`--all` on purpose — `ci` decides.
+    run_mutation(false, false);
     let arch_config_ok = check_arch_config_guard(false, false, false);
     let gherkin_ok = check_gherkin_guard(false, false, false);
     let suppressions_ok = check_suppressions_baseline(true);
@@ -2560,6 +2967,123 @@ mod tests {
         let count = keys.len();
         keys.dedup();
         assert_eq!(keys.len(), count, "duplicate key in RATCHETED_KEYS");
+    }
+
+    #[test]
+    fn ratcheted_keys_add_mutation_only_when_asked() {
+        let automatic: Vec<&str> = ratcheted_keys(false).iter().map(|(key, _)| *key).collect();
+        let with_mutation: Vec<&str> = ratcheted_keys(true).iter().map(|(key, _)| *key).collect();
+        assert!(!automatic.contains(&"mutation.min"), "{automatic:?}");
+        assert_eq!(with_mutation.last(), Some(&"mutation.min"), "{with_mutation:?}");
+        assert_eq!(with_mutation.len(), automatic.len() + 1);
+    }
+
+    // ── Mutation score ───────────────────────────────────────────────────
+
+    /// A cut-down `outcomes.json`: an `outcomes` array whose entries repeat the
+    /// summary field names, then the top-level totals that actually count.
+    fn outcomes_json(caught: u32, timeout: u32, missed: u32) -> String {
+        format!(
+            r#"{{
+  "outcomes": [
+    {{"scenario": "Baseline", "summary": "Success", "caught": 999, "missed": 999}},
+    {{"scenario": {{"Mutant": {{"name": "src/lib.rs:1:1: replace f with ()"}}}},
+     "summary": "MissedMutant", "timeout": 999}}
+  ],
+  "total_mutants": 12,
+  "missed": {missed},
+  "caught": {caught},
+  "timeout": {timeout},
+  "unviable": 4,
+  "cargo_mutants_version": "27.0.0"
+}}
+"#
+        )
+    }
+
+    #[test]
+    fn json_top_level_u32_ignores_nested_fields() {
+        // The nested 999s come first in the text; only the top-level totals count.
+        let text = outcomes_json(3, 0, 1);
+        assert_eq!(json_top_level_u32(&text, "caught"), Some(3));
+        assert_eq!(json_top_level_u32(&text, "missed"), Some(1));
+        assert_eq!(json_top_level_u32(&text, "timeout"), Some(0));
+        assert_eq!(json_top_level_u32(&text, "absent"), None);
+    }
+
+    #[test]
+    fn json_top_level_u32_skips_escaped_quotes_in_strings() {
+        let text = r#"{"name": "a \" }} brace", "caught": 7}"#;
+        assert_eq!(json_top_level_u32(text, "caught"), Some(7));
+    }
+
+    #[test]
+    fn json_top_level_u32_rejects_non_integer_values() {
+        assert_eq!(json_top_level_u32(r#"{"caught": null}"#, "caught"), None);
+        assert_eq!(json_top_level_u32(r#"{"caught": "3"}"#, "caught"), None);
+    }
+
+    #[test]
+    fn mutation_score_counts_timeouts_as_killed() {
+        // (2 + 1) killed of (2 + 1 + 1) run = 75%. `unviable` is excluded.
+        assert_eq!(mutation_score(&outcomes_json(2, 1, 1)), Measurement::Value(75));
+    }
+
+    #[test]
+    fn mutation_score_rounds_to_the_nearest_percent() {
+        // 2/3 = 66.66… → 67.
+        assert_eq!(mutation_score(&outcomes_json(2, 0, 1)), Measurement::Value(67));
+    }
+
+    #[test]
+    fn mutation_score_without_mutants_is_unavailable() {
+        // A tests-only diff generates nothing to kill: no evidence, not 0%.
+        let Measurement::Unavailable(reason) = mutation_score(&outcomes_json(0, 0, 0)) else {
+            panic!("an empty run must be unavailable, not a score");
+        };
+        assert!(reason.contains("no mutants"), "{reason}");
+    }
+
+    #[test]
+    fn mutation_score_missing_field_is_an_error_not_a_zero() {
+        let Measurement::Error(message) = mutation_score(r#"{"caught": 3, "missed": 1}"#) else {
+            panic!("a layout change must abort, not score");
+        };
+        assert!(message.contains("caught/timeout/missed"), "{message}");
+    }
+
+    #[test]
+    fn mutation_measurement_zero_totals_after_a_failed_run_is_an_error() {
+        // cargo-mutants exits 4 when the unmutated tree's own tests fail, and
+        // still writes zero totals. Scoring that `Unavailable` would make
+        // `--update-baseline --with-mutation` delete the floor instead of abort.
+        let run = MutationRun { outcomes_json: outcomes_json(0, 0, 0), completed: false };
+        let Measurement::Error(message) = mutation_measurement(&run) else {
+            panic!("a run that tested no mutant and exited non-zero must be an error");
+        };
+        assert!(message.contains("unmutated tree"), "{message}");
+    }
+
+    #[test]
+    fn mutation_measurement_zero_totals_after_a_clean_run_is_unavailable() {
+        let run = MutationRun { outcomes_json: outcomes_json(0, 0, 0), completed: true };
+        assert!(matches!(mutation_measurement(&run), Measurement::Unavailable(_)));
+    }
+
+    #[test]
+    fn mutation_measurement_keeps_a_score_from_a_non_zero_exit() {
+        // Exit 2 ("some mutants were missed") is the normal reporting path, not
+        // a broken run: the totals are real and must still be scored.
+        let run = MutationRun { outcomes_json: outcomes_json(3, 0, 1), completed: false };
+        assert_eq!(mutation_measurement(&run), Measurement::Value(75));
+    }
+
+    #[test]
+    fn kill_percent_rounds_halves_up() {
+        assert_eq!(kill_percent(1, 8), 13); // 12.5 → 13
+        assert_eq!(kill_percent(1, 3), 33); // 33.3 → 33
+        assert_eq!(kill_percent(0, 5), 0);
+        assert_eq!(kill_percent(5, 5), 100);
     }
 
     // ── Coverage floor ───────────────────────────────────────────────────

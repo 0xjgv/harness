@@ -22,15 +22,15 @@ paraphrase (it drifts). Two sections:
   separate acceptance step in `check` — then complexity, then warns (does not
   block) via `arch-config-guard` and `gherkin-guard`, checks `agents-md-drift`,
   and ratchets suppressions. Invariant: `ci` minus `check` == every gate that
-  needs the network or a build lock (`audit`, `coverage`, advisory `crap`)
-  plus the architecture boundary check itself (`arch`, which stays
+  needs the network or a build lock (`audit`, `coverage`, advisory `crap`,
+  advisory `mutation`) plus the architecture boundary check itself (`arch`, which stays
   `ci`/`pre-push`-only because cargo-modules takes cargo's exclusive build
   lock on `target/`). `ci` runs the read-only gates (`clippy`, `format check`,
   `complexity`, `acceptance`, `arch`) **in parallel** — captured and
   printed in submission order, run to completion so one pass surfaces every
-  failure — then runs `audit`, streams `tests` + `coverage`, and the
-  advisory `crap`; `ci` also runs `arch-config-guard` and `gherkin-guard` in
-  strict (blocking) mode.
+  failure — then runs `audit`, streams `tests` + `coverage`, then the
+  advisory `crap` and the advisory `mutation`; `ci` also runs
+  `arch-config-guard` and `gherkin-guard` in strict (blocking) mode.
   `pre-push` is the offline push gate: `clippy`, `format
   check`, `acceptance`, `arch`, and strict `arch-config-guard` + `gherkin-guard` over the whole pushed tree (the deterministic
   checks pre-commit and stop-hook skip). There is **no** `deadcode` target —
@@ -43,22 +43,43 @@ paraphrase (it drifts). Two sections:
   `check`/`stop-hook`, and skips silently when the repo has no `.feature`
   files anywhere.
   `crap` is advisory (warns by default, `--enforce` to hard-fail; joins
-  lizard `--csv` with `target/llvm-cov/lcov.info`). Suppressions,
-  `coverage.min`, `complexity.max_violations` and `crap.max_violations` are all
+  lizard `--csv` with `target/llvm-cov/lcov.info`). `mutation` is advisory the
+  same way (`--enforce` to hard-fail) and always advisory inside `ci`, where it
+  ignores the command line and can never turn the build red. It runs
+  cargo-mutants `--in-diff` over the sources changed against the base ref
+  (`--base=<ref>` / `HARNESS_ARCH_BASE` / `GITHUB_BASE_REF` / `origin/HEAD` /
+  `origin/main` / `main`, else the uncommitted diff) and scores
+  `round(100 × (caught + timeout) / (caught + timeout + missed))` from the run's
+  `outcomes.json`; `--all` mutates all of `src/` instead, an empty scope warns
+  and skips rather than widening, and a run that generated no mutants is
+  report-only rather than 0% — unless cargo-mutants exited non-zero, which is the
+  only thing separating "nothing to mutate" from "the unmutated tree's own tests
+  fail" (both write zero totals); that is an error, so `--with-mutation` aborts
+  rather than dropping the floor. An explicit `--base=` that is not a git ref
+  exits 1 instead of falling through. Targets are `src/` only — `harness.rs` is a
+  `[[bin]]` of the crate but it is the runner, not the product, the same reason
+  `complexity` scopes to `src tests`. Suppressions, `coverage.min`,
+  `complexity.max_violations`, `crap.max_violations` and `mutation.min` are all
   ratcheted by `.harness-baseline`. `complexity` passes its floor to lizard as
-  `-i N`; `crap` compares its offender count to `crap.max_violations`. A missing
-  file, or a missing key, makes either gate report-only — labelled `report-only:
-  no .harness-baseline floor`, with the hint to record one — and it passes, for
-  `crap --enforce` too: nothing recorded is a repo that was never measured, not
-  a floor of zero, and a legacy tree has to be green on day one.
-  `suppressions --update-baseline` measures all three, merges them over the
-  existing file (unknown keys such as `mutation.min` are preserved untouched, a
-  suppression kind that ratcheted to zero is recorded as `0`), and is
-  all-or-nothing: a metric that cannot be measured aborts the write, a metric
-  that does not apply has its key dropped with a warning. `coverage.min` is the
-  measured total truncated, never rounded up. Requires `uvx` on PATH
+  `-i N`; `crap` compares its offender count to `crap.max_violations`;
+  `mutation` compares its score to `mutation.min`. A missing
+  file, or a missing key, makes any of those gates report-only — labelled
+  `report-only: no .harness-baseline floor`, with the hint to record one — and it
+  passes, for `crap --enforce` / `mutation --enforce` too: nothing recorded is a
+  repo that was never measured, not a floor of zero, and a legacy tree has to be
+  green on day one.
+  `suppressions --update-baseline` measures the first three, merges them over the
+  existing file (keys it did not measure — `mutation.min`, anything hand-added —
+  are preserved untouched, a suppression kind that ratcheted to zero is recorded
+  as `0`), and is all-or-nothing: a metric that cannot be measured aborts the
+  write, a metric that does not apply has its key dropped with a warning. Add
+  `--with-mutation` to also measure `mutation.min`, always over all of `src/`
+  rather than a diff (a floor only reproduces against a fixed target set); it is
+  opt-in because a mutation pass costs minutes, and the drop rule still applies —
+  a `--with-mutation` run that cannot score removes the floor. `coverage.min` is
+  the measured total truncated, never rounded up. Requires `uvx` on PATH
   for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
-  length≤100).
+  length≤100) and `cargo-mutants` for `mutation` (absent → skip).
 - `## Behavior contract` — Layer 2; see
   [behavior-contract.md](behavior-contract.md).
 

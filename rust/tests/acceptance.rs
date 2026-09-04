@@ -43,14 +43,17 @@ DA:10,0
 end_of_record
 ";
 
-/// Shared state for a single scenario. Smoke and crap fields coexist because
-/// cucumber-rs binds a single World type per binary.
+/// Shared state for a single scenario. Smoke, crap and mutation fields coexist
+/// because cucumber-rs binds a single World type per binary.
 #[derive(Debug, Default, World)]
 struct CrateWorld {
     // Smoke scenario.
     name: Option<&'static str>,
-    // Crap scenarios.
+    // Crap and mutation scenarios.
     tmp: Option<PathBuf>,
+    /// Environment the harness run inherits — how the mutation scenarios point
+    /// the runner at a fixture `outcomes.json` instead of paying for a real run.
+    env: Vec<(String, String)>,
     exit_code: Option<i32>,
     output: String,
 }
@@ -127,6 +130,42 @@ fn artifact_missing(world: &mut CrateWorld) {
     world.make_tmp();
 }
 
+/// Write a cargo-mutants `outcomes.json` and point the runner at it.
+///
+/// Only the top-level totals matter to the scorer; the per-mutant `outcomes`
+/// array is left empty so the fixture stays readable.
+fn write_outcomes(world: &mut CrateWorld, caught: u32, missed: u32) {
+    let dir = world.make_tmp();
+    let path = dir.join("outcomes.json");
+    let total = caught + missed;
+    fs::write(
+        &path,
+        format!(
+            "{{\n  \"outcomes\": [],\n  \"total_mutants\": {total},\n  \"missed\": {missed},\n  \
+             \"caught\": {caught},\n  \"timeout\": 0,\n  \"unviable\": 0\n}}\n"
+        ),
+    )
+    .expect("write outcomes.json");
+    world.env.push(("HARNESS_MUTATION_OUTCOMES".to_string(), path.to_string_lossy().into_owned()));
+}
+
+#[given(expr = "a cargo-mutants outcomes file where {int} of {int} mutants are killed")]
+fn outcomes_with_kills(world: &mut CrateWorld, killed: u32, total: u32) {
+    write_outcomes(world, killed, total - killed);
+}
+
+#[given("a cargo-mutants outcomes file where no mutants were generated")]
+fn outcomes_without_mutants(world: &mut CrateWorld) {
+    write_outcomes(world, 0, 0);
+}
+
+#[given(expr = "a recorded mutation floor of {int}")]
+fn mutation_floor(world: &mut CrateWorld, floor: u32) {
+    let dir = world.tmp.clone().expect("tmp dir not initialised");
+    fs::write(dir.join(".harness-baseline"), format!("mutation.min {floor}\n"))
+        .expect("write .harness-baseline");
+}
+
 #[when(expr = "I run {string}")]
 fn i_run(world: &mut CrateWorld, cmd: String) {
     // Drop leading "harness" — the rest is forwarded to the binary.
@@ -137,6 +176,7 @@ fn i_run(world: &mut CrateWorld, cmd: String) {
     let tmp = world.tmp.as_ref().expect("tmp dir not initialised");
     let output = Command::new(HARNESS_BIN)
         .args(&argv)
+        .envs(world.env.iter().map(|(key, value)| (key.as_str(), value.as_str())))
         .current_dir(tmp)
         .output()
         .expect("spawn harness binary");
