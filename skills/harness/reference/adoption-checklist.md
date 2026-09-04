@@ -343,7 +343,8 @@ Gap examples:
 
 The baseline is **not** suppression-only. It records seven metric families
 (eight keys), each a floor that starts where the repo already is. The key
-names are identical in all four languages:
+names are identical in all four languages (`mutation.min` is absent below
+because the automatic pass does not measure it):
 
 ```
 arch.max_violations 0
@@ -352,7 +353,6 @@ coverage.min 100
 crap.max_violations 0
 deadcode.max_findings 0
 duplication.max_blocks 0
-mutation.min 78          # only present after --with-mutation
 suppressions.noqa 8
 suppressions.pyright_ignore 2
 suppressions.type_ignore 4
