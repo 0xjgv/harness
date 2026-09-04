@@ -2,7 +2,11 @@ package suppressions
 
 import "testing"
 
-const testHarnessGo = "harness.go"
+const (
+	testHarnessGo  = "harness.go"
+	testCrapSource = "crap/crap.go"
+	testCrapPkg    = "./crap/..."
+)
 
 func TestNormalizeChangedPath(t *testing.T) {
 	tests := []struct {
@@ -60,7 +64,7 @@ func TestIsGherkinGuardProductionPath(t *testing.T) {
 		path string
 		want bool
 	}{
-		{"package source is production", "crap/crap.go", true},
+		{"package source is production", testCrapSource, true},
 		{"harness.go itself is excluded", testHarnessGo, false},
 		{"test file is excluded", "suppressions/gitstatus_test.go", false},
 		{"feature file itself is not go", "features/smoke.feature", false},
@@ -102,4 +106,79 @@ func TestEvaluateGherkinGuard(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPackagesForChangedGoFiles(t *testing.T) {
+	tested := func(dirs ...string) func(string) bool {
+		set := map[string]bool{}
+		for _, d := range dirs {
+			set[d] = true
+		}
+		return func(dir string) bool { return set[dir] }
+	}
+	tests := []struct {
+		name         string
+		files        []string
+		hasTests     func(string) bool
+		wantPkgs     []string
+		wantUntested []string
+	}{
+		{
+			name:     "one package per changed directory, deduped",
+			files:    []string{testCrapSource, "crap/crap_test.go", "suppressions/gitstatus.go"},
+			hasTests: tested("crap", "suppressions"),
+			wantPkgs: []string{testCrapPkg, "./suppressions/..."},
+		},
+		{
+			name:         "a changed package with no tests is reported, not run",
+			files:        []string{testCrapSource, "features/steps/steps.go"},
+			hasTests:     tested("crap"),
+			wantPkgs:     []string{testCrapPkg},
+			wantUntested: []string{"features/steps"},
+		},
+		{
+			name:     "harness.go maps to no package",
+			files:    []string{testHarnessGo},
+			hasTests: tested("."),
+		},
+		{
+			name:     "a root-package file scopes to the root package alone",
+			files:    []string{"main.go"},
+			hasTests: tested("."),
+			wantPkgs: []string{"."},
+		},
+		{
+			name:     "non-go paths are ignored and ./ prefixes trimmed",
+			files:    []string{"README.md", "./" + testCrapSource},
+			hasTests: tested("crap"),
+			wantPkgs: []string{testCrapPkg},
+		},
+		{
+			name:     "an empty change set yields no packages",
+			hasTests: tested("crap"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pkgs, untested := PackagesForChangedGoFiles(tt.files, tt.hasTests)
+			if !equalStrings(pkgs, tt.wantPkgs) {
+				t.Errorf("packages = %v, want %v", pkgs, tt.wantPkgs)
+			}
+			if !equalStrings(untested, tt.wantUntested) {
+				t.Errorf("untested = %v, want %v", untested, tt.wantUntested)
+			}
+		})
+	}
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }

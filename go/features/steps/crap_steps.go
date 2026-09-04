@@ -2,13 +2,8 @@ package steps
 
 import (
 	"context"
-	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
-	"strings"
-	"sync"
 
 	"github.com/cucumber/godog"
 )
@@ -71,48 +66,11 @@ test/stub.go:25.10,27.3 1 0
 test/stub.go:28.2,28.10 1 0
 `
 
-// crapWorld carries state across one scenario.
+// crapWorld carries state across one scenario. The harness run itself lives
+// in sharedRun (harness_run.go) so the `I run …` / `the exit code is …` steps
+// are registered exactly once across all features.
 type crapWorld struct {
-	tmp      string
-	exitCode int
-	output   string
-}
-
-// Build the harness binary once per test run. `harness.go` carries
-// `//go:build ignore`, so `go test` does not build it transitively — we
-// shell out to `go build` ourselves and reuse the artifact across scenarios.
-var (
-	harnessBin     string
-	errHarnessBin  error
-	harnessBinOnce sync.Once
-)
-
-func buildHarness() (string, error) {
-	harnessBinOnce.Do(func() {
-		_, file, _, ok := runtime.Caller(0)
-		if !ok {
-			errHarnessBin = fmt.Errorf("cannot locate harness source")
-			return
-		}
-		// features/steps/crap_steps.go → go template root is two levels up.
-		goRoot := filepath.Dir(filepath.Dir(filepath.Dir(file)))
-		bin, err := os.CreateTemp("", "harness-bin-*")
-		if err != nil {
-			errHarnessBin = err
-			return
-		}
-		_ = bin.Close()
-		_ = os.Remove(bin.Name())
-		//nolint:gosec // test fixture builds the local harness with fixed argv.
-		cmd := exec.Command("go", "build", "-o", bin.Name(), "harness.go")
-		cmd.Dir = goRoot
-		if out, err := cmd.CombinedOutput(); err != nil {
-			errHarnessBin = fmt.Errorf("go build: %w\n%s", err, out)
-			return
-		}
-		harnessBin = bin.Name()
-	})
-	return harnessBin, errHarnessBin
+	tmp string
 }
 
 func (w *crapWorld) makeTmp() error {
@@ -121,6 +79,7 @@ func (w *crapWorld) makeTmp() error {
 		return err
 	}
 	w.tmp = d
+	sharedRun.dir = d
 	if err := os.WriteFile(filepath.Join(d, "go.mod"), []byte(stubGoMod), 0o600); err != nil {
 		return err
 	}
@@ -136,46 +95,6 @@ func (w *crapWorld) artifactPresent() error {
 
 func (w *crapWorld) artifactMissing() error {
 	return w.makeTmp()
-}
-
-func (w *crapWorld) iRun(cmd string) error {
-	bin, err := buildHarness()
-	if err != nil {
-		return err
-	}
-	// Drop leading "harness" — the rest is forwarded to the harness binary.
-	parts := strings.Fields(cmd)
-	if len(parts) > 0 && parts[0] == "harness" {
-		parts = parts[1:]
-	}
-	//nolint:gosec // test fixture invokes the local harness binary with scenario arguments.
-	c := exec.Command(bin, parts...)
-	c.Dir = w.tmp
-	out, _ := c.CombinedOutput()
-	w.output = string(out)
-	w.exitCode = c.ProcessState.ExitCode()
-	return nil
-}
-
-func (w *crapWorld) exitCodeIs(code int) error {
-	if w.exitCode != code {
-		return fmt.Errorf("expected exit %d, got %d\n--- output ---\n%s", code, w.exitCode, w.output)
-	}
-	return nil
-}
-
-func (w *crapWorld) outputContains(text string) error {
-	if !strings.Contains(w.output, text) {
-		return fmt.Errorf("expected %q in output:\n%s", text, w.output)
-	}
-	return nil
-}
-
-func (w *crapWorld) outputDoesNotContain(text string) error {
-	if strings.Contains(w.output, text) {
-		return fmt.Errorf("unexpected %q in output:\n%s", text, w.output)
-	}
-	return nil
 }
 
 // InitializeCrapScenario registers crap step definitions with a fresh world
@@ -195,8 +114,4 @@ func InitializeCrapScenario(sc *godog.ScenarioContext) {
 	})
 	sc.Step(`^a coverage artifact for a high-CCN, zero-coverage function$`, w.artifactPresent)
 	sc.Step(`^no coverage artifact$`, w.artifactMissing)
-	sc.Step(`^I run "([^"]+)"$`, w.iRun)
-	sc.Step(`^the exit code is (\d+)$`, w.exitCodeIs)
-	sc.Step(`^the output contains "([^"]+)"$`, w.outputContains)
-	sc.Step(`^the output does not contain "([^"]+)"$`, w.outputDoesNotContain)
 }

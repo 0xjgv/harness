@@ -18,10 +18,13 @@ import (
 
 // TestFeatures executes every *.feature file in this directory.
 func TestFeatures(t *testing.T) {
+	t.Cleanup(steps.RemoveHarnessBin)
 	suite := godog.TestSuite{
 		ScenarioInitializer: func(sc *godog.ScenarioContext) {
 			steps.InitializeScenario(sc)
+			steps.InitializeHarnessRunScenario(sc)
 			steps.InitializeCrapScenario(sc)
+			steps.InitializeScopingScenario(sc)
 		},
 		Options: &godog.Options{
 			Format:   "pretty",

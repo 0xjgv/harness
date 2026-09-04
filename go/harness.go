@@ -263,23 +263,20 @@ func stagedPackages(files []string) []string {
 	return pkgs
 }
 
-func hasNonTestFiles(files []string) bool {
-	for _, f := range files {
-		if !strings.HasSuffix(f, "_test.go") {
-			return true
-		}
-	}
-	return false
-}
-
 // changedGoFiles returns .go files with uncommitted changes in this
 // template's subtree. `git status --porcelain` prints repo-root-relative
 // paths regardless of cwd, so the `-- .` pathspec scopes it to the current
 // template and PorcelainChangedGoPath rejects anything git still reports
 // outside that subtree (defense in depth) as well as deletions and renames'
 // old-side paths.
+//
+// `-uall` matters: porcelain collapses an untracked directory to a single
+// `?? newpkg/` entry by default, which ends in "/" and would drop every file
+// in a newly created package.  Only the trailing newline is trimmed — trimming
+// the whole blob would eat the leading status space of the first line and
+// mis-parse that one path.
 func changedGoFiles() []string {
-	c := exec.Command("git", "status", "--porcelain", "--", ".")
+	c := exec.Command("git", "status", "--porcelain", "-uall", "--", ".")
 	c.Dir = root
 	out, err := c.Output()
 	if err != nil {
@@ -288,12 +285,126 @@ func changedGoFiles() []string {
 
 	prefix := gitPrefix()
 	var files []string
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimRight(string(out), "\n"), "\n") {
 		if f, ok := suppressions.PorcelainChangedGoPath(line, prefix); ok {
 			files = append(files, f)
 		}
 	}
 	return files
+}
+
+// ── Test scoping ────────────────────────────────────────────────────
+
+// warn prints a non-blocking warning line.
+func warn(message string) {
+	fmt.Printf("  %s⚠%s %s\n", green, reset, message)
+}
+
+// requestedTestBaseRef is the base ref someone explicitly asked the scoped
+// test gate to diff against — `--base=<ref>`, then HARNESS_ARCH_BASE, then
+// GITHUB_BASE_REF (set only on GitHub Actions `pull_request` events) — or ""
+// when nobody did.
+//
+// Deliberately no origin/HEAD fallback, unlike the arch config guard: the
+// local stages' change set is the uncommitted one, and quietly widening it to
+// "everything since main" would make a clean tree re-run tests for packages
+// this edit never touched. Work that is committed but not pushed is covered by
+// `ci`, which runs the whole suite under coverage.
+func requestedTestBaseRef() string {
+	if base := flagValue("base", ""); base != "" {
+		return base
+	}
+	if base := os.Getenv("HARNESS_ARCH_BASE"); base != "" {
+		return base
+	}
+	if githubBase := os.Getenv("GITHUB_BASE_REF"); githubBase != "" {
+		return "origin/" + githubBase
+	}
+	return ""
+}
+
+// changedGoFilesForTests is the scoped test gate's change set: the uncommitted
+// files, plus the diff against a base ref when one was explicitly requested.
+// A requested base only ever widens the scope — dropping the uncommitted set
+// for it would skip the very edit that triggered this run. Duplicates are
+// harmless; PackagesForChangedGoFiles dedupes by directory.
+//
+// The second return value is a requested base ref git cannot resolve: a typo
+// there warns instead of quietly looking like nothing changed.
+func changedGoFilesForTests() (files []string, unresolvedBase string) {
+	base := requestedTestBaseRef()
+	if base == "" {
+		return changedGoFiles(), ""
+	}
+	if len(gitLines("rev-parse", "--verify", base)) == 0 {
+		return nil, base
+	}
+	files = changedGoFiles()
+	prefix := gitPrefix()
+	for _, p := range gitLines("diff", "--name-only", "--diff-filter=d", base+"...HEAD", "--", ".") {
+		if f := normalizeChangedPath(p, prefix); strings.HasSuffix(f, ".go") {
+			files = append(files, f)
+		}
+	}
+	return files, ""
+}
+
+// presentFiles keeps the paths that exist under root. A change set can name a
+// file this template does not hold: a base diff lists paths the working tree
+// has since deleted, and git run from a hook resolves paths against the repo
+// root rather than the template. Mapping those to a package would hand
+// `go test` a directory that is not there, so they are dropped — worst case
+// the scope empties out and the gate warns and skips.
+func presentFiles(files []string) []string {
+	var present []string
+	for _, f := range files {
+		if _, err := os.Stat(filepath.Join(root, f)); err == nil {
+			present = append(present, f)
+		}
+	}
+	return present
+}
+
+// dirHasGoTests reports whether dir (template-relative) holds a *_test.go file.
+func dirHasGoTests(dir string) bool {
+	entries, err := os.ReadDir(filepath.Join(root, dir))
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), "_test.go") {
+			return true
+		}
+	}
+	return false
+}
+
+// runScopedTests runs the test gate over the packages this change touches:
+// one `./<dir>/...` per changed .go file's directory. An empty scope warns and
+// skips — it never widens to the whole tree, or adopting this harness into a
+// large existing repo would run that repo's whole suite after every edit. A
+// changed package with no tests warns too, and the packages that do have tests
+// still run. `--all` runs the whole suite here; `ci` runs it separately under
+// coverage (`pre-push` runs no tests at all — it is the lint/acceptance/arch
+// gate).
+func runScopedTests(files []string, unresolvedBase string, noExit bool) runResult {
+	opts := &runOpts{extract: extractTestSummary, noExit: noExit}
+	if hasFlag("all") {
+		return run("Tests", []string{"go", "test", "./..."}, opts)
+	}
+	if unresolvedBase != "" {
+		warn(fmt.Sprintf("Tests: skipped — diff base %q does not resolve, nothing tested", unresolvedBase))
+		return runResult{ok: true}
+	}
+	pkgs, untested := suppressions.PackagesForChangedGoFiles(presentFiles(files), dirHasGoTests)
+	for _, dir := range untested {
+		warn(fmt.Sprintf("Tests: no *_test.go in %s — nothing to run for that change", dir))
+	}
+	if len(pkgs) == 0 {
+		warn("Tests: no changed Go packages (use --all for the whole suite); skipped")
+		return runResult{ok: true}
+	}
+	return run("Tests", append([]string{"go", "test"}, pkgs...), opts)
 }
 
 // ── Commands ────────────────────────────────────────────────────────
@@ -1094,9 +1205,10 @@ func cmdCheck() {
 	start := time.Now()
 	fmt.Printf("\n%s[check]%s Running pre-flight checks...\n\n", blue, reset)
 
+	changed, unresolvedBase := changedGoFilesForTests()
 	results := []runResult{
 		run("Fix & format", []string{"golangci-lint", "run", "--fix", "./..."}, &runOpts{noExit: true}),
-		run("Tests", []string{"go", "test", "./..."}, &runOpts{extract: extractTestSummary, noExit: true}),
+		runScopedTests(changed, unresolvedBase, true),
 	}
 
 	// Read-only parallel batch, after the mutating fix step above. Invariant:
@@ -1175,10 +1287,7 @@ func cmdPreCommit() {
 	cmdFix(pkgs)
 	restageFixedFiles(files)
 	checkAgentsMdDrift(false)
-
-	if hasNonTestFiles(files) {
-		cmdTest()
-	}
+	runScopedTests(files, "", false)
 }
 
 // restageFixedFiles re-adds staged files after cmdFix rewrites the working

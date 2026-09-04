@@ -16,8 +16,14 @@ paraphrase (it drifts). Two sections:
   `crap`, `arch`, `arch-config-guard`, `gherkin-guard`, `suppressions`, and the
   drift pair `agents-md-drift` / `sync-agents-md`
   (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
-  fail on drift). `check` runs fix + format + lint (`--fix`), test, then — as
-  a read-only parallel batch — complexity, `go mod tidy -diff` (fails if
+  fail on drift). `check` runs fix + format + lint (`--fix`), test — scoped to the
+  packages the change touches (one `go test ./<dir>/...` per changed `.go`
+  file's directory; an empty scope warns and skips instead of widening, a
+  changed package with no `*_test.go` warns instead of failing, `--all` runs
+  the whole suite, and `--base=<ref>`/`HARNESS_ARCH_BASE`/`GITHUB_BASE_REF`
+  add a base ref's diff to that scope; `pre-commit` scopes to the staged
+  packages, and `ci` still runs the whole suite under coverage) — then, as
+  a read-only parallel batch, complexity, `go mod tidy -diff` (fails if
   `go.mod`/`go.sum` don't match what `go mod tidy` would produce), and
   acceptance (self-skips with a warning when no `.feature` files exist), then
   warns (does not block) via `arch-config-guard` and `gherkin-guard`, checks

@@ -1,6 +1,7 @@
 package suppressions
 
 import (
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -46,6 +47,40 @@ func PorcelainChangedGoPath(line, prefix string) (string, bool) {
 		return "", false
 	}
 	return normalized, true
+}
+
+// PackagesForChangedGoFiles maps changed .go files to `go test` package
+// patterns — one `./<dir>/...` per distinct directory, in first-seen order —
+// so the local stages test what the change touched instead of the whole tree.
+// hasTests reports whether a directory holds a *_test.go file; directories
+// without one come back in untested instead, so the caller can warn once per
+// directory and still run the packages that do have tests.
+//
+// harness.go maps to nothing: it carries `//go:build ignore`, belongs to no
+// package, and `go test .` on it fails with "build constraints exclude all Go
+// files". Excluding deletions is the caller's job (git's --diff-filter=d).
+func PackagesForChangedGoFiles(files []string, hasTests func(dir string) bool) (pkgs, untested []string) {
+	seen := map[string]bool{}
+	for _, file := range files {
+		normalized := strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(file)), "./")
+		if !strings.HasSuffix(normalized, ".go") || normalized == "harness.go" {
+			continue
+		}
+		dir := path.Dir(normalized)
+		if seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		switch {
+		case !hasTests(dir):
+			untested = append(untested, dir)
+		case dir == ".":
+			pkgs = append(pkgs, ".")
+		default:
+			pkgs = append(pkgs, "./"+dir+"/...")
+		}
+	}
+	return pkgs, untested
 }
 
 // IsGherkinGuardProductionPath reports whether a normalized (gitPrefix-
