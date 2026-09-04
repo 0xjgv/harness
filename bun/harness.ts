@@ -40,6 +40,8 @@ const COVERAGE_CMD = [
 const ROOT = import.meta.dir;
 const BASELINE_FILE = '.harness-baseline';
 const SUPPRESSION_BASELINE_PREFIX = 'suppressions.';
+// Every gate that finds no floor points at the same command.
+const BASELINE_FLOOR_HINT = 'run `bun harness.ts suppressions --update-baseline` to record a floor';
 const ARCH_CONFIGS = ['.dependency-cruiser.json'] as const;
 const ARCH_CONFIG_ALLOW_ENV = 'HARNESS_ALLOW_ARCH_CONFIG';
 const GHERKIN_ALLOW_ENV = 'HARNESS_ALLOW_NO_FEATURE';
@@ -1315,23 +1317,39 @@ async function cmdCrap(): Promise<void> {
   }
 
   // The baseline is a count floor: a repo adopting the harness starts wherever it
-  // already is, and that number may only come down. No floor recorded means no
-  // tolerance — safe here, unlike complexity, because CRAP is advisory: with no
-  // baseline it warns and still exits 0.
-  const floor = (await baselineFloor('crap.max_violations')) ?? 0;
+  // already is, and that number may only come down.
+  const floor = await baselineFloor('crap.max_violations');
+  if (floor === undefined) {
+    // Nothing recorded is not a floor of 0; it is a repo that has never been
+    // measured. Report what is there and pass — `--enforce` included — so
+    // retrofitting the harness into a legacy tree is green on day one.
+    console.log(
+      `  ${GREEN}⚠${RESET} CRAP: ${offenders.length} function(s) exceed ` +
+        `${maxCrap} (report-only: no ${BASELINE_FILE} floor)`,
+    );
+    printCrapOffenders(offenders);
+    console.log(`  ↳ fix: ${BASELINE_FLOOR_HINT}`);
+    return;
+  }
+
   const summary = `CRAP: ${offenders.length} function(s) exceed ${maxCrap} (baseline ${floor})`;
   if (offenders.length <= floor) {
     console.log(`  ${GREEN}✓${RESET} ${summary}`);
     return;
   }
   console.log(`  ${crapOffenderGlyph(enforce)} ${summary}${suffix}`);
+  printCrapOffenders(offenders);
+  if (enforce) process.exit(1);
+}
+
+/** List the worst offenders, capped so a legacy tree does not bury the summary. */
+function printCrapOffenders(offenders: CrapFn[]): void {
   for (const o of offenders.slice(0, 20)) {
     console.log(
       `    CRAP=${o.crap.toFixed(1).padStart(6)}  CCN=${String(o.ccn).padStart(3)}  ` +
         `cov=${(o.cov * 100).toFixed(1).padStart(5)}%  ${o.loc}`,
     );
   }
-  if (enforce) process.exit(1);
 }
 
 async function measuredCrapViolations(): Promise<Measurement> {
@@ -1407,13 +1425,12 @@ export async function complexityGatesOrWarn(base = ROOT): Promise<Gate[]> {
   }
   const floor = await baselineFloor('complexity.max_violations', base);
   if (floor === undefined) {
-    const hint = 'run `bun harness.ts suppressions --update-baseline` to record a floor';
     return [
       {
         description: `Complexity (lizard, report-only: no ${BASELINE_FILE} floor)`,
         cmd: complexityArgv(targets, REPORT_ONLY_LIMIT),
-        extract: () => hint,
-        hint,
+        extract: () => BASELINE_FLOOR_HINT,
+        hint: BASELINE_FLOOR_HINT,
       },
     ];
   }

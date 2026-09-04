@@ -49,10 +49,10 @@ paraphrase (it drifts). Two sections:
   (a vanished kind is written as 0), drops a key it cannot measure in this repo
   (with a warning), preserves keys it does not own (`mutation.min`), and writes
   nothing if any measurement errors. `complexity` passes the floor to lizard as
-  `-i N`; `crap` compares its offender count to the floor (0 when absent — safe,
-  the gate is advisory). A missing file or key makes `complexity` report-only:
-  it passes, labelled `report-only: no .harness-baseline floor`, with a hint to
-  run `bun harness.ts suppressions --update-baseline`. `test`, `coverage`, `mutation`, and
+  `-i N`; `crap` compares its offender count to the floor. A missing file or key
+  makes both gates report-only: they pass — `crap` under `--enforce` too —
+  labelled `report-only: no .harness-baseline floor`, with a hint to run
+  `bun harness.ts suppressions --update-baseline`. `test`, `coverage`, `mutation`, and
   `crap` warn and skip when no Bun test files exist. `check` also warns on
   missing Stop hook wiring and arch config changes. Requires `uvx`
   on PATH for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,

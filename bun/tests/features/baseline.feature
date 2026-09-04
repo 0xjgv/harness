@@ -32,3 +32,10 @@ Feature: The baseline is a ratchet, not a wall
     When I run "harness crap --max=0 --enforce"
     Then the exit code is 0
     And the output contains "baseline 1"
+
+  Scenario: CRAP is report-only until a floor is recorded, --enforce included
+    Given a coverage artifact for a high-CCN, zero-coverage function
+    When I run "harness crap --max=0 --enforce"
+    Then the exit code is 0
+    And the output contains "report-only: no .harness-baseline floor"
+    And the output contains "suppressions --update-baseline"
