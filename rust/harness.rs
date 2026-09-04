@@ -1151,17 +1151,47 @@ fn arch_violation_count(cycles_ok: bool, orphans_ok: bool, orphans_stdout: &str)
     cycle_flag + orphans
 }
 
-/// Run both cargo-modules passes: the violation count, plus the output to show
-/// when the gate fails (only the passes that actually failed contribute).
-fn arch_scan() -> (u32, String) {
+/// Both cargo-modules passes, reduced to what the gate and the baseline need.
+struct ArchScan {
+    /// `orphan_count + cycle_flag` — see `arch_violation_count`.
+    count: u32,
+    /// False when the orphans pass printed no count at all. cargo-modules
+    /// always states one (`N orphans found:` or `No orphans found.`) when it
+    /// analyzed the crate, so its absence means it could not — no `[lib]`
+    /// target, no manifest, a crash. `count` is then a statement about the
+    /// tool, not about the code, and must never become a floor.
+    analyzed: bool,
+    /// The failing passes' output, each under its own label, for the ✗ body.
+    output: String,
+}
+
+/// Run both cargo-modules passes.
+fn arch_scan() -> ArchScan {
     let cycles = run_capture(&Gate::new("Arch: no module cycles", ARCH_CYCLES_CMD));
     let orphans = run_capture(&Gate::new("Arch: no orphan files", ARCH_ORPHANS_CMD));
-    let count = arch_violation_count(cycles.ok, orphans.ok, &orphans.output);
-    let mut detail = String::new();
-    for failed in [&cycles, &orphans].into_iter().filter(|result| !result.ok) {
-        detail.push_str(&failed.output);
+    ArchScan {
+        count: arch_violation_count(cycles.ok, orphans.ok, &orphans.output),
+        analyzed: parse_orphan_count(&orphans.output).is_some(),
+        output: [&cycles, &orphans]
+            .into_iter()
+            .filter(|pass| !pass.ok)
+            .map(|pass| format!("--- {} ---\n{}", pass.description, pass.output))
+            .collect::<Vec<_>>()
+            .concat(),
     }
-    (count, detail)
+}
+
+/// Why cargo-modules cannot check this repo, or `None` when it can.
+///
+/// One rule, two renderings: the gate prints it as a skip, the baseline writer
+/// turns it into `Measurement::Unavailable`. Kept together so the two cannot
+/// drift into disagreeing about when arch applies.
+fn arch_unavailable() -> Option<String> {
+    if !root().join(ARCH_CONFIG).exists() {
+        return Some(format!("no {ARCH_CONFIG}"));
+    }
+    (!tool_installed("modules"))
+        .then(|| "cargo-modules is not installed (cargo install cargo-modules)".to_string())
 }
 
 /// The arch gate's label: names the floor it is held to, or says there is none.
@@ -1184,35 +1214,37 @@ fn arch_description(floor: Option<u32>, count: u32) -> String {
 /// orphaned (unlinked) source files. Those are the invariants this gate counts —
 /// see `arch_violation_count` for the definition. `arch.toml` is guarded by
 /// `arch-config-guard`, which blocks integration until the change is reviewed.
-/// Absent config, or cargo-modules not installed → skip.
 ///
 /// With no `arch.max_violations` floor recorded the gate is report-only: it
 /// prints the count and passes. A legacy crate full of orphans has to be green on
 /// day one, and a floor of 0 inferred from a missing number is not a floor.
 fn arch_check(no_exit: bool) -> bool {
-    if !root().join("arch.toml").exists() {
-        println!("  {GREEN}\u{26a0}{RESET} Arch: no arch.toml \u{2014} skipped");
+    if let Some(reason) = arch_unavailable() {
+        println!("  {DIM}\u{2298} Arch skipped: {reason}{RESET}");
         return true;
     }
-    if !tool_installed("modules") {
-        println!("  {DIM}\u{2298} Arch skipped (install: cargo install cargo-modules){RESET}");
+    let scan = arch_scan();
+    if !scan.analyzed {
+        // Not a failure: a crate cargo-modules cannot read has no arch metric,
+        // and blocking on that would make the harness unadoptable. Print what
+        // the tool said, though — silence here reads as a clean crate.
+        println!("  {DIM}\u{2298} Arch skipped: cargo-modules could not analyze this crate{RESET}");
+        print!("{}", scan.output);
         return true;
     }
     let floor = baseline_floor("arch.max_violations");
-    let (count, output) = arch_scan();
-    let ok = floor.is_none_or(|floor| count <= floor);
     let hint = if floor.is_none() {
         "run `cargo harness suppressions --update-baseline` to record a floor".to_string()
     } else {
         ARCH_HINT.to_string()
     };
     let result = GateResult {
-        description: arch_description(floor, count),
+        description: arch_description(floor, scan.count),
         cmd: vec![ARCH_CYCLES_CMD.join(" "), "&&".to_string(), ARCH_ORPHANS_CMD.join(" ")],
-        ok,
+        ok: floor.is_none_or(|floor| scan.count <= floor),
         exit_code: 1,
-        output,
-        detail: (count > 0).then(|| format!("{count} violations")),
+        output: scan.output,
+        detail: (scan.count > 0).then(|| format!("{} violations", scan.count)),
         hint: Some(hint),
         report_only: floor.is_none(),
     };
@@ -1220,14 +1252,20 @@ fn arch_check(no_exit: bool) -> bool {
 }
 
 /// Count of architectural violations, for the baseline writer.
+///
+/// A crate cargo-modules could not analyze is `Unavailable`, never a `Value`:
+/// recording the fallback count as a floor would tolerate that many real
+/// violations forever, on the strength of a tool error.
 fn measured_arch_violations() -> Measurement {
-    if !root().join("arch.toml").exists() {
-        return Measurement::Unavailable("no arch.toml".to_string());
+    if let Some(reason) = arch_unavailable() {
+        return Measurement::Unavailable(reason);
     }
-    if !tool_installed("modules") {
-        return Measurement::Unavailable("cargo-modules is not installed".to_string());
+    let scan = arch_scan();
+    if scan.analyzed {
+        Measurement::Value(scan.count)
+    } else {
+        Measurement::Unavailable("cargo-modules could not analyze this crate".to_string())
     }
-    Measurement::Value(arch_scan().0)
 }
 
 fn cmd_arch() {
@@ -2690,6 +2728,16 @@ mod tests {
         assert_eq!(arch_violation_count(true, false, "Error: no projects"), 1);
         // ...but an unparseable success is still zero — nothing was reported.
         assert_eq!(arch_violation_count(true, true, "Error: no projects"), 0);
+    }
+
+    #[test]
+    fn arch_analysis_is_recognised_by_the_count_line_alone() {
+        // `analyzed` in `arch_scan` is exactly this predicate: cargo-modules
+        // always states a count when it read the crate, so its absence means
+        // the tool failed and the fallback count must not become a floor.
+        assert!(parse_orphan_count(ORPHANS_HEADER).is_some());
+        assert!(parse_orphan_count("No orphans found.").is_some());
+        assert!(parse_orphan_count("Error: No library target found.").is_none());
     }
 
     #[test]

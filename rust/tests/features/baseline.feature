@@ -24,8 +24,10 @@ Feature: Ratcheted floors come from .harness-baseline
     And the output contains "report-only: no .harness-baseline floor"
     And the output contains "suppressions --update-baseline"
 
-  # Asserted as "never fails" rather than by label: without cargo-modules the
-  # gate skips instead, and a copy-pasted template must be green either way.
+  # The fixture is a real crate with one orphan file, so with cargo-modules
+  # installed this exercises report-only against a count of 1. Asserted as
+  # "never fails" rather than by label because without cargo-modules the gate
+  # skips instead, and a copy-pasted template must be green either way.
   Scenario: Arch cannot fail before a floor is recorded
     Given a project with an arch.toml and no .harness-baseline
     When I run "harness arch"

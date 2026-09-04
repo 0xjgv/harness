@@ -122,11 +122,26 @@ fn complexity_floor_zero(world: &mut CrateWorld) {
         .expect("write .harness-baseline");
 }
 
+/// Minimal, dependency-free crate so cargo-modules has a real `[lib]` target to
+/// analyze — without one it bails out and the arch gate skips, which would make
+/// the scenario below pass without ever reaching the report-only path.
+const MINIMAL_MANIFEST: &str = "[package]
+name = \"fixture\"
+version = \"0.1.0\"
+edition = \"2021\"
+
+[lib]
+name = \"fixture\"
+path = \"src/lib.rs\"
+";
+
 #[given("a project with an arch.toml and no .harness-baseline")]
 fn arch_config_no_baseline(world: &mut CrateWorld) {
     let dir = world.make_tmp();
-    // Content is irrelevant: the arch gate only checks the file exists before
-    // shelling out to cargo-modules, which reports against the crate, not this.
+    fs::write(dir.join("Cargo.toml"), MINIMAL_MANIFEST).expect("write Cargo.toml");
+    fs::write(dir.join("src").join("lib.rs"), "pub const N: u32 = 1;\n").expect("write lib.rs");
+    // Content is irrelevant: the arch gate only checks that this file exists
+    // before shelling out to cargo-modules, which reports against the crate.
     fs::write(dir.join("arch.toml"), "[arch]\n").expect("write arch.toml");
 }
 

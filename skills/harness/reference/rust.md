@@ -48,12 +48,16 @@ paraphrase (it drifts). Two sections:
   `arch.max_violations` are all ratcheted by `.harness-baseline`. `complexity`
   passes its floor to lizard as `-i N`; `crap` and `arch` do the comparison in
   the runner, because neither cargo-modules nor the CRAP join has a tolerance
-  flag. cargo-modules 0.26.0 reports no count at all — `dependencies --acyclic`
-  is pass/fail and `orphans` only adds `--deny` — so the runner *defines* one:
+  flag. cargo-modules 0.26.0 exposes no JSON and no aggregate number —
+  `dependencies --acyclic` is pass/fail — so the runner *defines* one:
   `arch.max_violations = orphan_count + cycle_flag`, where `cycle_flag` is 1
   when the acyclic check exits non-zero (the tool never says how many cycles)
-  and `orphan_count` is the `N orphans found:` header, falling back to 1 when
-  that line is absent and the command failed. A missing file, or a missing key,
+  and `orphan_count` is the `N orphans found:` header `orphans` prints. Note
+  that both conditions share one budget: a floor recorded from N orphans also
+  tolerates a newly introduced cycle. When cargo-modules prints no count at all
+  it did not analyze the crate (no `[lib]` target, no manifest): arch then
+  skips, showing the tool's error, and the key is dropped rather than a tool
+  failure being recorded as a floor. A missing file, or a missing key,
   makes any of these gates report-only — labelled `report-only: no
   .harness-baseline floor`, with the hint to record one — and it passes, for
   `crap --enforce` too: nothing recorded is a repo that was never measured, not
