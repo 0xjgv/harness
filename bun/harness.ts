@@ -1254,6 +1254,58 @@ async function cmdStopHook(): Promise<void> {
   }
 }
 
+// ── Runtime pin ─────────────────────────────────────────────────────
+// The tool versions this template runs are exact in package.json + bun.lock, so
+// the only floating input left is the bun runtime itself. package.json's
+// `packageManager` field records the pin; the runner reports drift and never
+// fails on it — an adopting repo may legitimately run another bun.
+
+/**
+ * Exact bun version from a package.json `packageManager` field, if it pins bun.
+ *
+ * Accepts the plain form and corepack's `bun@1.4.1+sha512.…`, whose integrity
+ * suffix is build metadata, not part of the version. A range (`bun@^1.4`) or a
+ * typo yields undefined — the caller warns rather than pinning to nonsense.
+ */
+export function pinnedBunVersion(pkg: unknown): string | undefined {
+  const field = asObject(pkg as JsonObject)?.packageManager;
+  if (typeof field !== 'string') return undefined;
+  const semver = /^bun@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+[0-9A-Za-z.-]+)?$/;
+  return semver.exec(field.trim())?.[1];
+}
+
+/** Drift message for a pinned vs. running bun, or undefined when they agree. */
+export function bunVersionDrift(pinned: string | undefined, running: string): string | undefined {
+  if (!pinned || pinned === running) return undefined;
+  return `Bun ${running} does not match pinned bun@${pinned} (package.json packageManager) — run \`bun upgrade\` or repin`;
+}
+
+async function checkBunVersionPin(): Promise<void> {
+  const { existsSync } = await import('node:fs');
+  const { readFile } = await import('node:fs/promises');
+  const manifest = `${ROOT}/package.json`;
+  if (!existsSync(manifest)) return;
+  let pkg: unknown;
+  try {
+    pkg = JSON.parse(await readFile(manifest, 'utf8'));
+  } catch {
+    return; // an unreadable manifest is the lockfile gate's problem, not this one
+  }
+  const pinned = pinnedBunVersion(pkg);
+  if (!pinned) {
+    // A field that names bun but does not parse is a broken pin, not the absence
+    // of one — say so, or it looks identical to an unpinned repo.
+    const field = asObject(pkg as JsonObject)?.packageManager;
+    if (typeof field === 'string' && field.trim().startsWith('bun@'))
+      warn(`Unreadable bun pin in package.json packageManager: ${field.trim()}`);
+    return;
+  }
+  const drift = bunVersionDrift(pinned, Bun.version);
+  if (drift) warn(drift);
+  else if (VERBOSE)
+    console.log(`  ${GREEN}✓${RESET} Bun ${Bun.version} matches pinned bun@${pinned}`);
+}
+
 // ── Stages ──────────────────────────────────────────────────────────
 
 async function checkStopHooksPresent(): Promise<void> {
@@ -1632,6 +1684,7 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
 };
 
 if (import.meta.main) {
+  await checkBunVersionPin();
   const args = process.argv.slice(2).filter((a) => !a.startsWith('-'));
   const taskName = args[0];
 

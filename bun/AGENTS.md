@@ -32,6 +32,7 @@ offline, no-build-lock gate to `ci`, add it to `check` too.
 - Setup: `bun run setup-hooks` installs git pre-commit + pre-push hooks (path resolved via `git rev-parse`, worktree-safe) and idempotently installs the Claude/Codex Stop wiring
 - Post-edit: `bun run post-edit` — format/fix files with uncommitted changes in this template's subtree; used internally by `stop-hook` and directly by agents after edits
 - Stop hook: `bun run stop-hook` — auto-formats/fixes changed files, warns via `arch-config-guard` and `gherkin-guard`, then runs complexity and deadcode in parallel. On failure it exits 2 and writes a short summary to stderr (which Claude Code's Stop hook treats as blocking and feeds back to the model); Codex's wrapper (`.codex/hooks/codex-stop-hook.sh`) turns any non-zero exit into a block regardless.
+- Runtime pin: the four tool devDependencies are exact in `package.json` + `bun.lock`, and `packageManager` (`bun@1.4.1`) pins the bun runtime. Every command warns (`⚠`, never fails) when the running bun differs from `packageManager`; `--verbose` also prints the match. `bun-version` in `.github/workflows/ci.yml` must be kept equal to `packageManager` **by hand** — the runner never reads the workflow, so bumping bun means editing both.
 
 ## Definition of done
 

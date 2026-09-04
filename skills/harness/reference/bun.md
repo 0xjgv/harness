@@ -86,3 +86,34 @@ Codex Stop command:
   see `tests/properties.test.ts`), dependency-cruiser (arch)
 - Protected arch config: `.dependency-cruiser.json` (`bun harness.ts arch-config-guard`)
 - Dead-code config: `knip.json`
+
+## Pinned versions
+
+Every input that decides a gate's *verdict* is pinned, so the same tree gates
+the same way on any machine and in CI:
+
+- **Tool devDependencies** are exact, not ranged: `@biomejs/biome`,
+  `@stryker-mutator/core`, `dependency-cruiser`, and `typescript` carry bare
+  versions in `package.json`, and `bun.lock` is committed. `check` runs
+  `bun install --frozen-lockfile` first, so a hand-edited manifest fails there.
+  `@types/bun`, `@cucumber/cucumber`, and `fast-check` stay ranged; the committed
+  lock still pins what actually installs, so only a deliberate `bun update` moves
+  them.
+- **Tools fetched on demand** carry the version in the runner: `lizard@1.22.2`
+  (`LIZARD`) and `knip@5.88.1` (`KNIP`).
+- **The bun runtime** is pinned by `package.json`'s `packageManager` field
+  (`bun@1.4.1`), and `bun-version` under `oven-sh/setup-bun@v2` in
+  `.github/workflows/ci.yml` is set to the same value. The runner compares
+  `Bun.version` to `packageManager` at startup and prints a green `⚠` on drift;
+  it never fails, because an adopting repo may legitimately run another bun.
+  `--verbose` also prints the match. `packageManager` is read in the plain form
+  and in corepack's `bun@1.4.1+sha512.…` form; a field that names bun but does
+  not parse (a range, a typo) warns, and an absent field or another package
+  manager is ignored silently.
+
+  **The workflow pin is not checked.** The runner reads `package.json`, never
+  `.github/workflows/ci.yml`, so bumping one and forgetting the other ships two
+  runtimes with every gate green. Change both in the same commit.
+
+When porting to an existing repo, pin the runtime the same way — add
+`packageManager` and the CI `bun-version` together, and treat them as one edit.

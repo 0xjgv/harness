@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   appTargets,
+  bunVersionDrift,
   existingTargets,
   type Gate,
   hasTests,
@@ -11,6 +12,7 @@ import {
   isQualityTsFile,
   isTestFile,
   normalizeChangedPath,
+  pinnedBunVersion,
   porcelainPath,
   qualityTargets,
   resolveFallbackArchBase,
@@ -160,5 +162,39 @@ describe('parallel gate runner', () => {
 
   test('empty batch passes', async () => {
     expect(await runGatesParallel([])).toBe(true);
+  });
+});
+
+describe('bun runtime pin', () => {
+  test('reads an exact bun pin from packageManager', () => {
+    expect(pinnedBunVersion({ packageManager: 'bun@1.4.1' })).toBe('1.4.1');
+    expect(pinnedBunVersion({ packageManager: ' bun@1.4.1 ' })).toBe('1.4.1');
+    expect(pinnedBunVersion({ packageManager: 'bun@1.4.1-canary.3' })).toBe('1.4.1-canary.3');
+  });
+
+  test("drops corepack's build-metadata suffix", () => {
+    // `corepack use bun@1.4.1` rewrites the field with an integrity hash; the
+    // hash is metadata, not part of the version, so the pin must survive it.
+    expect(pinnedBunVersion({ packageManager: 'bun@1.4.1+sha512.abc123' })).toBe('1.4.1');
+    expect(pinnedBunVersion({ packageManager: 'bun@1.4.1-canary.3+sha512.abc' })).toBe(
+      '1.4.1-canary.3',
+    );
+  });
+
+  test('ignores a missing or foreign pin, and refuses an unparseable one', () => {
+    expect(pinnedBunVersion({})).toBeUndefined();
+    expect(pinnedBunVersion(null)).toBeUndefined();
+    expect(pinnedBunVersion('not an object')).toBeUndefined();
+    expect(pinnedBunVersion({ packageManager: 'pnpm@10.0.0' })).toBeUndefined();
+    // a range is not a pin, and a typo must not become one
+    expect(pinnedBunVersion({ packageManager: 'bun@^1.4' })).toBeUndefined();
+    expect(pinnedBunVersion({ packageManager: 'bun@1.4.1_typo' })).toBeUndefined();
+  });
+
+  test('drift is reported only when a pin exists and differs', () => {
+    expect(bunVersionDrift(undefined, '1.4.1')).toBeUndefined();
+    expect(bunVersionDrift('1.4.1', '1.4.1')).toBeUndefined();
+    expect(bunVersionDrift('1.4.1', '1.3.0')).toContain('Bun 1.3.0');
+    expect(bunVersionDrift('1.4.1', '1.3.0')).toContain('pinned bun@1.4.1');
   });
 });
