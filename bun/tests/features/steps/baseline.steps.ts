@@ -17,6 +17,24 @@ ${Array.from({ length: 20 }, (_, i) => `  if (n === ${i}) t += ${i};\n`).join(''
 }
 `;
 
+// Two copies of one token-dense body. lizard only reports a duplicate block
+// once it spans ~70 unified tokens, so the body is packed with operators and
+// calls rather than merely long — line count alone would not trip it.
+const DUPLICATED_BODY = [
+  '  const s = a * b + c * a - b * c + a / (b + 1) + c * c - a + b;',
+  '  const t = Math.max(a, b) * Math.min(b, c) + Math.abs(a - c) + s * 2;',
+  '  const u = Math.round(t * 1.5) + Math.floor(s / 2) - Math.ceil(t / 3);',
+  '  const v = (u + s) * (t - u) + (a + 1) ** 2 - Math.sqrt(Math.abs(c));',
+  '  const w = [s, t, u, v].reduce((acc, n) => acc + n * 2 - 1, 0);',
+  '  return Math.round(w + s * t - u / (v + 1) + a * b * c);',
+  '}',
+  '',
+].join('\n');
+const DUPLICATED_TS = ['alpha', 'beta']
+  .map((name) => `export function ${name}(a: number, b: number, c: number): number {\n`)
+  .map((signature) => signature + DUPLICATED_BODY)
+  .join('\n');
+
 async function writeBaselineLine(tmp: string, line: string): Promise<void> {
   await writeFile(join(tmp, BASELINE), `${line}\n`);
 }
@@ -33,6 +51,14 @@ Given(
   'a project with a CCN-21 function and a baseline line {string}',
   async function (this: BaselineWorld, line: string) {
     this.tmp = await makeTmp(COMPLEX_TS);
+    await writeBaselineLine(this.tmp, line);
+  },
+);
+
+Given(
+  'a project with two copies of the same function and a baseline line {string}',
+  async function (this: BaselineWorld, line: string) {
+    this.tmp = await makeTmp(DUPLICATED_TS);
     await writeBaselineLine(this.tmp, line);
   },
 );

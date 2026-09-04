@@ -6,6 +6,7 @@ import {
   baselineFloor,
   complexityGatesOrWarn,
   coverageMinDefault,
+  duplicateBlockCount,
   lizardWarningCount,
   type Measurement,
   measureRatcheted,
@@ -18,6 +19,27 @@ import {
   scanSuppressions,
   writeBaseline,
 } from '../harness';
+
+/** A real `lizard -Eduplicate` tail: two blocks, then the footer that proves it ran. */
+const DUPLICATE_REPORT = [
+  'Duplicates',
+  '===================================',
+  'Duplicate block:',
+  '--------------------------',
+  'src/a.ts:24 ~ 28',
+  'src/b.ts:50 ~ 55',
+  '^^^^^^^^^^^^^^^^^^^^^^^^^^',
+  '',
+  'Duplicate block:',
+  '--------------------------',
+  'src/a.ts:24 ~ 28',
+  'src/b.ts:60 ~ 66',
+  '^^^^^^^^^^^^^^^^^^^^^^^^^^',
+  '',
+  'Total duplicate rate: 2.97%',
+  'Total unique rate: 96.73%',
+  '',
+].join('\n');
 
 describe('parseLineForSuppressions', () => {
   test('plain code returns no matches', () => {
@@ -271,12 +293,13 @@ describe('measureRatcheted', () => {
     expect(RATCHETED_METRICS.map((m) => m.key)).toEqual([
       'coverage.min',
       'complexity.max_violations',
+      'duplication.max_blocks',
       'crap.max_violations',
     ]);
   });
 });
 
-describe('complexity floor', () => {
+describe('lizard floors', () => {
   const roots: string[] = [];
 
   afterAll(() => {
@@ -318,6 +341,55 @@ describe('complexity floor', () => {
     expect(gate?.description).toBe('Complexity (lizard)');
     expect(gate?.cmd.slice(-2)).toEqual(['-i', '0']);
   });
+
+  // The floor only reproduces against the same target set the complexity gate uses.
+  test('the duplicate-block gate scans the same targets as the complexity gate', async () => {
+    const root = project();
+    const [complexity, duplication] = await complexityGatesOrWarn(root);
+
+    expect(complexity?.cmd.slice(0, 3)).toEqual(['uvx', 'lizard@1.22.2', 'src']);
+    expect(duplication?.cmd).toEqual([
+      'uvx',
+      'lizard@1.22.2',
+      'src',
+      '-Eduplicate',
+      '-w',
+      '-i',
+      '1000000',
+    ]);
+  });
+
+  test('no duplication floor recorded means report-only, never a failing verdict', async () => {
+    const root = project();
+    const [, gate] = await complexityGatesOrWarn(root);
+
+    expect(gate?.description).toContain('report-only: no .harness-baseline floor');
+    const verdict = gate?.verdict?.(DUPLICATE_REPORT);
+    expect(verdict?.ok).toBe(true);
+    expect(verdict?.detail).toContain('suppressions --update-baseline');
+  });
+
+  test('a recorded floor tolerates exactly that many blocks', async () => {
+    const root = project('duplication.max_blocks 2\n');
+    const [, gate] = await complexityGatesOrWarn(root);
+
+    expect(gate?.description).toBe('Duplicate blocks (lizard, baseline 2)');
+    expect(gate?.verdict?.(DUPLICATE_REPORT)).toEqual({ ok: true, detail: '2 block(s)' });
+  });
+
+  test('one block over the floor fails', async () => {
+    const root = project('duplication.max_blocks 1\n');
+    const [, gate] = await complexityGatesOrWarn(root);
+
+    expect(gate?.verdict?.(DUPLICATE_REPORT)?.ok).toBe(false);
+  });
+
+  test('a missing report fails the verdict instead of passing at zero', async () => {
+    const root = project('duplication.max_blocks 5\n');
+    const [, gate] = await complexityGatesOrWarn(root);
+
+    expect(gate?.verdict?.('uvx: command not found')?.ok).toBe(false);
+  });
 });
 
 describe('lizardWarningCount', () => {
@@ -334,6 +406,20 @@ describe('lizardWarningCount', () => {
 
   test('no summary row is null, never a silent 0', () => {
     expect(lizardWarningCount('lizard: command not found')).toBeNull();
+  });
+});
+
+describe('duplicateBlockCount', () => {
+  test('counts the block headers, not the file lines under them', () => {
+    expect(duplicateBlockCount(DUPLICATE_REPORT)).toBe(2);
+  });
+
+  test('a report with no blocks is 0', () => {
+    expect(duplicateBlockCount('Duplicates\n===\nTotal duplicate rate: 0.00%\n')).toBe(0);
+  });
+
+  test('no report at all is null, never a silent 0', () => {
+    expect(duplicateBlockCount('uvx: command not found')).toBeNull();
   });
 });
 

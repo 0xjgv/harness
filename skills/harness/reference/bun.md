@@ -19,7 +19,7 @@ paraphrase (it drifts). Two sections:
   `check` + `pre-commit` fail on drift). `check` runs a lockfile check
   (`bun install --frozen-lockfile`), fix + format, typecheck, and test
   (warns/skips when no tests exist), then — as a read-only parallel batch —
-  complexity, deadcode, acceptance (self-skips with a warning when no
+  complexity, duplication, deadcode, acceptance (self-skips with a warning when no
   `.feature` files exist), and `arch` (dependency-cruiser qualifies for
   `check`'s batch: it's a local devDependency, runs offline, and takes no
   build lock), then warns (does not block) via `arch-config-guard`
@@ -27,7 +27,7 @@ paraphrase (it drifts). Two sections:
   ratchets suppressions. Invariant: `ci` minus `check` == every gate that
   needs the network or a build lock (`audit`, `coverage`, advisory `crap`).
   `ci` runs the read-only gates
-  (`lint`, `typecheck`, `audit`, `complexity`, `deadcode`, `acceptance`,
+  (`lint`, `typecheck`, `audit`, `complexity`, `duplication`, `deadcode`, `acceptance`,
   `arch`) **in parallel** — captured and printed in submission order, run to
   completion so one pass surfaces every failure — then streams `coverage` and
   the advisory `crap`; `ci` also runs `arch-config-guard` and `gherkin-guard`
@@ -45,14 +45,22 @@ paraphrase (it drifts). Two sections:
   files anywhere. `crap` is advisory (warns by default, `--enforce` to
   hard-fail) but runs in `ci`, not `stop-hook` or `check`. `.harness-baseline` is
   a merge-based ratchet: `suppressions --update-baseline` re-measures `coverage.min`,
-  `complexity.max_violations`, `crap.max_violations` and every `suppressions.<kind>`
+  `complexity.max_violations`, `duplication.max_blocks`, `crap.max_violations` and every
+  `suppressions.<kind>`
   (a vanished kind is written as 0), drops a key it cannot measure in this repo
   (with a warning), preserves keys it does not own (`mutation.min`), and writes
   nothing if any measurement errors. `complexity` passes the floor to lizard as
   `-i N`; `crap` compares its offender count to the floor. A missing file or key
   makes both gates report-only: they pass — `crap` under `--enforce` too —
   labelled `report-only: no .harness-baseline floor`, with a hint to run
-  `bun harness.ts suppressions --update-baseline`. `test`, `coverage`, `mutation`, and
+  `bun harness.ts suppressions --update-baseline`. `complexity` also runs
+  lizard a second time with `-Eduplicate -w` over the same targets — lizard's
+  exit code only ever reflects CCN warnings, so the runner counts
+  `Duplicate block:` headers itself and compares them to `duplication.max_blocks`
+  (report-only when absent, the same way). lizard reports a block only once it
+  spans ~70 unified tokens and counts overlapping near-duplicates separately, so
+  the number jitters by one on trivial edits: treat it as a floor to hold, never
+  a threshold to hit. `test`, `coverage`, `mutation`, and
   `crap` warn and skip when no Bun test files exist. `check` also warns on
   missing Stop hook wiring and arch config changes. Requires `uvx`
   on PATH for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,

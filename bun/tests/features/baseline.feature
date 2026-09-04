@@ -1,6 +1,6 @@
 Feature: The baseline is a ratchet, not a wall
   `.harness-baseline` records where the repo already is — coverage, complexity,
-  CRAP and suppressions — so adoption never starts on a red gate, and each
+  duplication, CRAP and suppressions — so adoption never starts on a red gate, and each
   number may only move down. A metric with no recorded floor reports instead of
   blocking. The merge semantics themselves (drop, preserve, abort) are unit
   tested against `writeBaseline`; these scenarios are the end-to-end slice.
@@ -11,6 +11,7 @@ Feature: The baseline is a ratchet, not a wall
     Then the exit code is 0
     And the baseline file contains "coverage.min"
     And the baseline file contains "complexity.max_violations 0"
+    And the baseline file contains "duplication.max_blocks 0"
     And the baseline file contains "crap.max_violations"
 
   Scenario: Complexity is report-only until a floor is recorded
@@ -25,6 +26,13 @@ Feature: The baseline is a ratchet, not a wall
     When I run "harness complexity"
     Then the exit code is 1
     And the output contains "Complexity (lizard)"
+
+  Scenario: The duplication floor blocks a newly copy-pasted block
+    Given a project with two copies of the same function and a baseline line "duplication.max_blocks 0"
+    When I run "harness complexity"
+    Then the exit code is 1
+    And the output contains "Duplicate blocks (lizard, baseline 0)"
+    And the output contains "1 block(s)"
 
   Scenario: The CRAP floor tolerates exactly the recorded offenders
     Given a coverage artifact for a high-CCN, zero-coverage function

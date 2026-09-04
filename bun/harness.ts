@@ -164,6 +164,13 @@ export interface Gate {
   description: string;
   cmd: string[];
   extract?: (output: string) => string | undefined;
+  /**
+   * Decide pass/fail from the output instead of the exit code, for a tool that
+   * reports a count but always exits 0 (lizard's `-Eduplicate`). Consulted only
+   * on a clean exit: a crashed tool prints no findings, and reading that as
+   * "zero findings" would be a silent false-pass.
+   */
+  verdict?: (output: string) => { ok: boolean; detail?: string };
   hint?: string;
 }
 
@@ -186,14 +193,16 @@ async function runCapture(gate: Gate): Promise<GateResult> {
   ]);
   const exitCode = await proc.exited;
   const output = stdout + stderr;
-  const ok = exitCode === 0;
+  const verdict = exitCode === 0 ? gate.verdict?.(output) : undefined;
+  const ok = exitCode === 0 && (verdict?.ok ?? true);
   return {
     description: gate.description,
     cmd: gate.cmd,
     ok,
-    exitCode,
+    // A verdict that fails on a clean exit still has to exit non-zero.
+    exitCode: ok ? 0 : exitCode || 1,
     output,
-    detail: ok ? gate.extract?.(output) : undefined,
+    detail: verdict ? verdict.detail : ok ? gate.extract?.(output) : undefined,
     hint: gate.hint,
   };
 }
@@ -203,12 +212,12 @@ function printGateResult(result: GateResult, opts?: { noExit?: boolean }): boole
   if (VERBOSE) console.log(`${DIM}  → ${result.cmd.join(' ')}${RESET}`);
   if (VERBOSE && result.output.trim()) console.log(result.output);
 
+  const suffix = result.detail ? ` ${DIM}(${result.detail})${RESET}` : '';
   if (result.ok) {
-    const suffix = result.detail ? ` ${DIM}(${result.detail})${RESET}` : '';
     console.log(`  ${GREEN}✓${RESET} ${result.description}${suffix}`);
     return true;
   }
-  console.log(`  ${RED}✗${RESET} ${result.description}`);
+  console.log(`  ${RED}✗${RESET} ${result.description}${suffix}`);
   if (!VERBOSE && result.output.trim()) console.log(result.output);
   if (result.hint) console.log(`  ↳ fix: ${result.hint}`);
   if (!opts?.noExit) process.exit(result.exitCode);
@@ -1413,7 +1422,69 @@ async function measuredComplexityViolations(): Promise<Measurement> {
 }
 
 /**
- * The lizard gate at the committed floor, or report-only when there is none.
+ * lizard argv for the duplicate-block scan: the same target set as the
+ * complexity gate (the floor only reproduces against an identical one) plus
+ * `-Eduplicate`. `-w` drops the per-function table, and `-i` is parked high
+ * because lizard's exit code is driven by CCN warnings only — the duplicate
+ * count never reaches it, so the runner enforces the floor itself.
+ */
+function duplicationArgv(targets: string[]): string[] {
+  return ['uvx', LIZARD, ...targets, '-Eduplicate', '-w', '-i', String(REPORT_ONLY_LIMIT)];
+}
+
+/**
+ * Count the `Duplicate block:` headers in lizard's `-Eduplicate` report.
+ *
+ * null means there was no report to count, never a clean 0: lizard prints the
+ * `Total duplicate rate:` footer whenever the extension ran, including at zero
+ * blocks, so its absence is a garbled run.
+ */
+export function duplicateBlockCount(stdout: string): number | null {
+  const lines = stdout.split('\n').map((line) => line.trimEnd());
+  if (!lines.some((line) => line.startsWith('Total duplicate rate:'))) return null;
+  return lines.filter((line) => line === 'Duplicate block:').length;
+}
+
+async function measuredDuplicateBlocks(): Promise<Measurement> {
+  const targets = await appTargets({ includeTests: true });
+  if (targets.length === 0) return { unavailable: 'no app sources' };
+  const res = await runCapture({ description: 'Duplication', cmd: duplicationArgv(targets) });
+  if (!res.ok) return { error: `lizard failed to run (exit ${res.exitCode})` };
+  const count = duplicateBlockCount(res.output);
+  if (count == null) return { error: 'lizard printed no duplicate report to count blocks from' };
+  return { value: count };
+}
+
+/**
+ * The duplicate-block gate at the committed floor, or report-only when absent.
+ *
+ * Copy-paste is the one complexity signal a per-function CCN gate cannot see: a
+ * block duplicated ten times is ten simple functions. lizard reports a block
+ * once it spans ~70 unified tokens, and overlapping near-duplicates are counted
+ * separately, so the number jitters by one on trivial edits — fine for a floor
+ * that only has to stop the trend, wrong for a hard threshold.
+ */
+function duplicationGate(targets: string[], floor: number | undefined): Gate {
+  const record = 'run `bun harness.ts suppressions --update-baseline` to record a floor';
+  return {
+    description:
+      floor === undefined
+        ? `Duplicate blocks (lizard, report-only: no ${BASELINE_FILE} floor)`
+        : `Duplicate blocks (lizard, baseline ${floor})`,
+    cmd: duplicationArgv(targets),
+    verdict: (output) => {
+      const count = duplicateBlockCount(output);
+      if (count == null) return { ok: false, detail: 'no duplicate report to count blocks from' };
+      const blocks = `${count} block(s)`;
+      if (floor === undefined) return { ok: true, detail: `${blocks}; ${record}` };
+      return { ok: count <= floor, detail: blocks };
+    },
+    hint: 'extract the repeated block into a shared helper; do not raise the floor',
+  };
+}
+
+/**
+ * The lizard gates at their committed floors, or report-only when there is none.
  * With no floor recorded, `-i 0` would demand a legacy tree already be perfect —
  * exactly the day-one red that stops the harness being adopted. Measure instead.
  */
@@ -1423,6 +1494,7 @@ export async function complexityGatesOrWarn(base = ROOT): Promise<Gate[]> {
     warn('Complexity: no app sources; skipped');
     return [];
   }
+  const duplication = duplicationGate(targets, await baselineFloor('duplication.max_blocks', base));
   const floor = await baselineFloor('complexity.max_violations', base);
   if (floor === undefined) {
     return [
@@ -1432,6 +1504,7 @@ export async function complexityGatesOrWarn(base = ROOT): Promise<Gate[]> {
         extract: () => BASELINE_FLOOR_HINT,
         hint: BASELINE_FLOOR_HINT,
       },
+      duplication,
     ];
   }
   return [
@@ -1440,6 +1513,7 @@ export async function complexityGatesOrWarn(base = ROOT): Promise<Gate[]> {
       cmd: complexityArgv(targets, floor),
       hint: `extract helpers or flatten branches until CCN <= ${COMPLEXITY_MAX_CCN}; do not raise the threshold`,
     },
+    duplication,
   ];
 }
 
@@ -1451,6 +1525,9 @@ export async function complexityGatesOrWarn(base = ROOT): Promise<Gate[]> {
 export const RATCHETED_METRICS: RatchetedMetric[] = [
   { key: 'coverage.min', measure: measuredCoverage },
   { key: 'complexity.max_violations', measure: measuredComplexityViolations },
+  { key: 'duplication.max_blocks', measure: measuredDuplicateBlocks },
+  // Last: CRAP re-runs the whole coverage suite, and measureRatcheted stops at
+  // the first error, so the cheap measurements go first.
   { key: 'crap.max_violations', measure: measuredCrapViolations },
 ];
 
@@ -1473,10 +1550,10 @@ export async function measureRatcheted(
 }
 
 async function cmdComplexity(): Promise<void> {
-  // `extract` carries the report-only gate's hint onto its passing line; the
-  // parallel batches get it for free through runCapture, this path does not.
-  for (const gate of await complexityGatesOrWarn())
-    await run(gate.description, gate.cmd, { extract: gate.extract });
+  // The same batch runner the stages use, so this path keeps `extract` (the
+  // report-only hint) and `verdict` (the duplicate-block count) — `run` takes a
+  // command, not a gate, and would silently drop both.
+  if (!(await runGatesParallel(await complexityGatesOrWarn()))) process.exit(1);
 }
 
 function deadcodeGate(): Gate {
@@ -1879,7 +1956,7 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   suppressions: [cmdSuppressions, 'Show suppressions; --update-baseline re-measures every floor'],
   complexity: [
     cmdComplexity,
-    'Cyclomatic complexity gate (lizard, CCN 15, args 8; violations ratcheted by .harness-baseline)',
+    'Complexity + duplicate-block gates (lizard, CCN 15, args 8; both ratcheted by .harness-baseline)',
   ],
   deadcode: [cmdDeadcode, 'Detect unused files/exports/deps (knip, via bunx)'],
   arch: [cmdArch, 'Architecture checks (dependency-cruiser)'],
