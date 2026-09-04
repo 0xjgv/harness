@@ -57,6 +57,13 @@ func (w *crapWorld) stubTest() error {
 	return os.WriteFile(filepath.Join(w.tmp, "stub_test.go"), []byte(stubTestGo), 0o600)
 }
 
+// projectWithoutArchConfig is the temp module as makeTmp builds it: a Go
+// module with no .go-arch-lint.yml, which is what an adopting repo looks like
+// before the arch contract is written.
+func (w *crapWorld) projectWithoutArchConfig() error {
+	return w.ensureTmp()
+}
+
 func (w *crapWorld) baselineWith(content string) error {
 	if err := w.ensureTmp(); err != nil {
 		return err
@@ -104,6 +111,7 @@ func (w *crapWorld) baselineFileDoesNotContain(text string) error {
 func initializeBaselineSteps(sc *godog.ScenarioContext, w *crapWorld) {
 	sc.Step(`^a function above the complexity threshold$`, w.complexFunction)
 	sc.Step(`^a test that exercises the stub function$`, w.stubTest)
+	sc.Step(`^a project with no arch config$`, w.projectWithoutArchConfig)
 	sc.Step(`^a \.harness-baseline recording (\d+) complexity violations$`, w.baselineRecordsComplexity)
 	sc.Step(`^a \.harness-baseline carrying "([^"]+)"$`, w.baselineWith)
 	sc.Step(`^the \.harness-baseline file contains "([^"]+)"$`, w.baselineFileContains)

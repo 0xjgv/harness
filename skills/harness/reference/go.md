@@ -42,7 +42,7 @@ paraphrase (it drifts). Two sections:
   review); it only warns in `check`/`stop-hook`, and skips silently when the
   repo has no `.feature` files anywhere. `crap` is
   advisory (warns by default, `--enforce` to hard-fail). Suppressions,
-  complexity, and CRAP are ratcheted by `.harness-baseline` (see below);
+  complexity, CRAP and arch are ratcheted by `.harness-baseline` (see below);
   `coverage.min` in the same file is the default coverage floor. Requires `uvx` on
   PATH for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
   length≤100 — replaces the old gocyclo gate).
@@ -80,6 +80,7 @@ Codex Stop command:
 ## `.harness-baseline` — ratcheted floors
 
 ```
+arch.max_violations 0
 complexity.max_violations 0
 coverage.min 59
 crap.max_violations 0
@@ -107,6 +108,19 @@ suppressions.nolint 11
   repo has never been measured, not that it must be perfect. (Python's
   `cmd_crap` uses `_baseline_floor(...) or 0` here, which collapses those two
   cases; go does not, and bun and rust should follow go.)
+- **`arch.max_violations`** is compared in the runner too, from go-arch-lint's
+  `check --json --max-warnings 32768` report:
+  `len(ArchWarningsDeps) + len(ArchWarningsNotMatched) + len(ArchWarningsDeepScan) + OmittedCount`.
+  The tool's exit code is ignored — it exits 1 whenever it reports anything,
+  which is not the same as being over the floor — so the two states that mean
+  "nothing was checked" are read out of the report itself and treated as
+  *failures*, never as a clean tree: no decodable JSON, and a non-empty
+  `ExecutionWarnings` (a component whose `in:` directory is gone, a malformed
+  rule — go-arch-lint then skips the boundary check and returns empty warning
+  arrays). Both also abort `--update-baseline`. Absent key ⇒ report-only,
+  same rule as CRAP. Unavailable (key dropped) when there is no
+  `.go-arch-lint.yml`. Adopting a repo whose boundaries are already crossed
+  means recording the count, not deleting the arch config.
 - **`coverage.min`** is total coverage truncated to an integer, never rounded
   up — a floor above the measured number fails the very next run. It is
   measured first, so the profile it writes is still fresh when the CRAP
@@ -126,9 +140,10 @@ suppressions.nolint 11
   ↳ fix: make the measurement pass, then rerun `suppressions --update-baseline`
 ```
 
-- Go's table has **3** entries where python's `RATCHETED_KEYS` has 4:
-  `deadcode.max_findings` has no go equivalent (golangci-lint's `unused` linter
-  covers it, and it has no count to floor).
+- Go's table carries `coverage.min`, `complexity.max_violations`,
+  `crap.max_violations` and `arch.max_violations`. `deadcode.max_findings` has
+  no go equivalent (golangci-lint's `unused` linter covers it, and it has no
+  count to floor).
 - Extending it: `harness.go` keeps a `var ratcheted = []suppressions.Measurer`
   table of `{Key, Measure}` pairs. A new floor is one entry plus a function
   returning `suppressions.Measured` / `Unavailable` / `Failed`.
@@ -140,5 +155,6 @@ suppressions.nolint 11
 - Tooling: Go compiler typecheck, gofmt, golangci-lint v2, `go test -race`,
   govulncheck, lizard (complexity, via `uvx`), godog (acceptance),
   gremlins (mutation), rapid (property-based tests, see
-  `crap/properties_test.go`), go-arch-lint (arch)
+  `crap/properties_test.go`), go-arch-lint v1.18.0 (arch, counted from
+  `check --json`)
 - Protected arch config: `.go-arch-lint.yml` (`go run harness.go arch-config-guard`)

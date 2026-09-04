@@ -31,6 +31,7 @@ var root = func() string {
 
 const (
 	lizard            = "lizard@1.22.2"
+	goArchLint        = "github.com/fe3dback/go-arch-lint@v1.18.0"
 	complexityMaxArgs = "8"
 	// reportOnlyLimit is a lizard `-i N` high enough that it never fails: the
 	// gate reports instead of blocking when no floor is recorded, and the
@@ -83,6 +84,14 @@ type gate struct {
 	cmd         []string
 	extract     func(output string) string
 	hint        string
+	// verdict replaces the exit-code pass/fail rule for a tool that exits
+	// non-zero merely because it found something to report — a count-ratcheted
+	// gate passes while the count stays at or below its floor. It gets the
+	// tool's combined output and exit code, and returns the verdict plus a
+	// human summary, printed as the `(…)` suffix on a pass and as the failure
+	// body in place of the tool's own output (`--verbose` still dumps that raw
+	// output).
+	verdict func(output string, exitCode int) (bool, string)
 }
 
 type gateResult struct {
@@ -102,15 +111,19 @@ func runCapture(g gate) gateResult {
 	c.Dir = root
 	out, err := c.CombinedOutput()
 	output := string(out)
-	ok := err == nil
-	detail := ""
 	code := 0
-	if ok {
-		if g.extract != nil {
-			detail = g.extract(output)
-		}
-	} else {
+	if err != nil {
 		code = exitCode(err)
+	}
+	ok := code == 0
+	detail := ""
+	if g.verdict != nil {
+		ok, detail = g.verdict(output, code)
+	} else if ok && g.extract != nil {
+		detail = g.extract(output)
+	}
+	if !ok && code == 0 {
+		code = 1 // the tool passed but the verdict didn't
 	}
 	return gateResult{g.description, g.cmd, ok, code, output, detail, g.hint}
 }
@@ -133,7 +146,14 @@ func printGateResult(r gateResult, noExit bool) bool {
 		return true
 	}
 	fmt.Printf("  %s✗%s %s\n", red, reset, r.description)
-	if !verbose && r.output != "" {
+	switch {
+	case r.detail != "":
+		// A verdict gate summarised the failure itself; its tool's own output
+		// is machine-readable (JSON), so print the summary instead.
+		for line := range strings.SplitSeq(r.detail, "\n") {
+			fmt.Printf("    %s\n", line)
+		}
+	case !verbose && r.output != "":
 		fmt.Print(r.output)
 	}
 	if r.hint != "" {
@@ -496,21 +516,130 @@ func cmdAcceptance() {
 	}
 }
 
-// archGatesOrWarn builds the import/dependency-boundary gate, or warns + returns
-// nil when .go-arch-lint.yml is absent.
+// archArgv is the go-arch-lint invocation both the gate and the baseline
+// measurement run. `--max-warnings` caps the reported notice list (default
+// 100) and folds the rest into OmittedCount, which the count adds back;
+// 32768 is the tool's validated maximum, so the list stays complete.
+func archArgv() []string {
+	return []string{"go", "run", goArchLint, "check", "--json", "--max-warnings", "32768"}
+}
+
+// archWarning is the union of the fields go-arch-lint puts on a notice.
+// A bucket that does not carry one leaves it empty — the summary line drops
+// what is missing rather than demanding one struct per bucket.
+type archWarning struct {
+	ComponentName      string
+	FileRelativePath   string
+	ResolvedImportName string
+}
+
+// archCheck decodes `check --json` into a violation count plus one summary
+// line per notice. problem is non-empty when the run cannot be counted at all:
+// no decodable report (a crash, or a flag that stopped meaning what it meant),
+// or execution warnings — a component pointing at a directory that no longer
+// exists, a malformed rule — which make go-arch-lint skip the boundary check
+// and report empty warning arrays. Neither is the same as a clean tree, so
+// callers must treat a problem as a failure, never as zero violations. The
+// summary lines then describe the problem instead of the violations.
+func archCheck(output string) (int, []string, string) {
+	var report struct {
+		Payload struct {
+			ExecutionWarnings []struct {
+				Text string
+				File string
+				Line int
+			}
+			ArchWarningsDeps       []archWarning
+			ArchWarningsNotMatched []archWarning
+			ArchWarningsDeepScan   []archWarning
+			OmittedCount           int
+		}
+	}
+	// `go run` prefixes module-download chatter and appends `exit status 1`
+	// around the document, so decode the first JSON value and ignore the rest.
+	noReport := "go-arch-lint printed no JSON report to count violations from"
+	start := strings.Index(output, "{")
+	if start < 0 {
+		return 0, nil, noReport
+	}
+	if err := json.NewDecoder(strings.NewReader(output[start:])).Decode(&report); err != nil {
+		return 0, nil, noReport
+	}
+	payload := report.Payload
+	if len(payload.ExecutionWarnings) > 0 {
+		var lines []string
+		for _, w := range payload.ExecutionWarnings {
+			lines = append(lines, fmt.Sprintf("%s (%s:%d)", w.Text, filepath.Base(w.File), w.Line))
+		}
+		return 0, lines, fmt.Sprintf(
+			"go-arch-lint skipped the boundary check: %d problem(s) in %s",
+			len(payload.ExecutionWarnings), archConfig)
+	}
+	count := len(payload.ArchWarningsDeps) + len(payload.ArchWarningsNotMatched) +
+		len(payload.ArchWarningsDeepScan) + payload.OmittedCount
+	var lines []string
+	for _, w := range payload.ArchWarningsDeps {
+		lines = append(lines, fmt.Sprintf("%s: %s may not import %s", w.FileRelativePath, w.ComponentName, w.ResolvedImportName))
+	}
+	for _, w := range payload.ArchWarningsNotMatched {
+		lines = append(lines, fmt.Sprintf("%s: not matched by any component", w.FileRelativePath))
+	}
+	for _, w := range payload.ArchWarningsDeepScan {
+		lines = append(lines, fmt.Sprintf("%s: %s reaches %s (deep scan)", w.FileRelativePath, w.ComponentName, w.ResolvedImportName))
+	}
+	if limit := min(len(lines), 10); limit < len(lines) {
+		lines = append(lines[:limit:limit], fmt.Sprintf("… and %d more", count-limit))
+	}
+	return count, lines, ""
+}
+
+// archGatesOrWarn builds the import/dependency-boundary gate, or warns +
+// returns nil when .go-arch-lint.yml is absent.
+//
+// go-arch-lint has no count ratchet of its own — it exits 1 whenever it finds
+// anything — so the gate counts the notices in its JSON report and compares
+// them to the committed floor. With no floor recorded the gate reports and
+// passes: a repo adopting the harness with a boundary already crossed has to
+// be green on day one, and only then may the number come down.
 func archGatesOrWarn() []gate {
 	if _, err := os.Stat(filepath.Join(root, archConfig)); err != nil {
 		fmt.Printf("  %s⚠%s Arch: no %s — skipped\n", green, reset, archConfig)
 		return nil
 	}
-	return []gate{{description: "Arch (go-arch-lint)", cmd: []string{
-		"go", "run", "github.com/fe3dback/go-arch-lint@v1.15.0", "check",
-	}, hint: "boundary crossed; surface the design decision to the human; don't edit arch config"}}
+	floor, hasFloor := suppressions.BaselineFloor(root, "arch.max_violations")
+	description := "Arch (go-arch-lint)"
+	hint := "boundary crossed; surface the design decision to the human; don't edit arch config"
+	switch {
+	case !hasFloor:
+		description = fmt.Sprintf("Arch (go-arch-lint, report-only: no %s floor)", baselineFile)
+		hint = fmt.Sprintf("run `%s` to record a floor", updateBaseline)
+	case floor > 0:
+		description = fmt.Sprintf("Arch (go-arch-lint, baseline %d)", floor)
+	}
+	return []gate{{
+		description: description,
+		cmd:         archArgv(),
+		hint:        hint,
+		verdict: func(output string, _ int) (bool, string) {
+			count, lines, problem := archCheck(output)
+			switch {
+			case problem != "":
+				return false, strings.Join(append([]string{problem}, lines...), "\n")
+			case hasFloor && count > floor:
+				summary := fmt.Sprintf("%d violation(s), baseline %d", count, floor)
+				return false, strings.Join(append([]string{summary}, lines...), "\n")
+			case count == 0:
+				return true, ""
+			default:
+				return true, fmt.Sprintf("%d violation(s)", count)
+			}
+		},
+	}}
 }
 
 func cmdArch() {
 	for _, g := range archGatesOrWarn() {
-		run(g.description, g.cmd, nil)
+		printGateResult(runCapture(g), false)
 	}
 }
 
@@ -1385,6 +1514,7 @@ var ratcheted = []suppressions.Measurer{
 	{Key: "coverage.min", Measure: measuredCoverageMin},
 	{Key: "complexity.max_violations", Measure: measuredComplexityViolations},
 	{Key: "crap.max_violations", Measure: measuredCrapViolations},
+	{Key: "arch.max_violations", Measure: measuredArchViolations},
 }
 
 // measuredCoverageMin is total coverage floored to an integer — the floor the
@@ -1425,6 +1555,27 @@ func measuredComplexityViolations() suppressions.Measurement {
 	count, ok := lizardWarningCount(string(out))
 	if !ok {
 		return suppressions.Failed("lizard printed no summary row to count warnings from")
+	}
+	return suppressions.Measured(count)
+}
+
+// measuredArchViolations counts the boundary notices go-arch-lint reports, so
+// a repo with a crossed boundary can adopt the harness at its current number
+// and ratchet it down. Not applicable without an arch config; a run that
+// prints no JSON is a broken tool, not a clean tree.
+func measuredArchViolations() suppressions.Measurement {
+	if _, err := os.Stat(filepath.Join(root, archConfig)); err != nil {
+		return suppressions.Unavailable("no " + archConfig)
+	}
+	argv := archArgv()
+	c := exec.Command(argv[0], argv[1:]...)
+	c.Dir = root
+	// go-arch-lint exits 1 whenever it found anything to report — the count in
+	// the JSON is the measurement, so the exit code carries no extra signal.
+	out, _ := c.CombinedOutput()
+	count, _, problem := archCheck(string(out))
+	if problem != "" {
+		return suppressions.Failed(problem)
 	}
 	return suppressions.Measured(count)
 }

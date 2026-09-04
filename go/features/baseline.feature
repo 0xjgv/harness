@@ -1,9 +1,9 @@
 Feature: Ratcheted floors in .harness-baseline
   A repo adopting the harness starts wherever it already is. Without a
-  recorded floor the complexity gate measures and reports; with one it
-  blocks any growth past it. `suppressions --update-baseline` records the
-  floors it can measure, drops the ones it cannot, and never disturbs a
-  key it does not own.
+  recorded floor the complexity, CRAP and arch gates measure and report;
+  with one they block any growth past it. `suppressions --update-baseline`
+  records the floors it can measure, drops the ones it cannot, and never
+  disturbs a key it does not own.
 
   Scenario: Complexity is report-only when no floor is recorded
     Given a function above the complexity threshold
@@ -47,6 +47,20 @@ Feature: Ratcheted floors in .harness-baseline
     Then the exit code is 0
     And the output contains "crap.max_violations: dropped"
     And the .harness-baseline file does not contain "crap.max_violations"
+
+  Scenario: Arch is skipped when the repo has no arch config
+    Given a project with no arch config
+    When I run "harness arch"
+    Then the exit code is 0
+    And the output contains "no .go-arch-lint.yml — skipped"
+
+  Scenario: Updating the baseline drops the arch floor when there is no arch config
+    Given a project with no arch config
+    And a .harness-baseline carrying "arch.max_violations 3"
+    When I run "harness suppressions --update-baseline"
+    Then the exit code is 0
+    And the output contains "arch.max_violations: dropped"
+    And the .harness-baseline file does not contain "arch.max_violations"
 
   Scenario: CRAP is report-only when no floor is recorded, even under --enforce
     Given a coverage artifact for a high-CCN, zero-coverage function
