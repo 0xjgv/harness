@@ -636,7 +636,9 @@ fn merge_baseline(
                     dropped.push(format!("{key}: dropped — {reason}"));
                 }
             }
-            Measurement::Error(_) => return Err(broken),
+            // Filtered and returned above; reaching here would mean the two
+            // passes disagree about what an error is.
+            Measurement::Error(_) => unreachable!("measurement errors short-circuit above"),
         }
     }
     Ok((merged, dropped))
@@ -1553,6 +1555,10 @@ enum CrapOutcome {
 /// the gate reports without the printing or the `exit()` calls — a floor recorded
 /// from a different code path is a floor that does not reproduce.
 /// Whether `target/llvm-cov/lcov.info` is usable, and why not when it is not.
+///
+/// The reasons are deliberately gate-neutral: they surface both as CRAP's own
+/// failure line and as the `coverage.min` measurement's reason, and a coverage
+/// key dropped "because CRAP skipped" reads like a bug.
 enum LcovStatus {
     Ready(PathBuf),
     /// cargo-llvm-cov is not installed. Not a failure — nothing can be measured.
@@ -1568,18 +1574,16 @@ enum LcovStatus {
 /// `suppressions --update-baseline` for no new information.
 fn ensure_lcov() -> LcovStatus {
     if !tool_installed("llvm-cov") {
-        return LcovStatus::Skipped(
-            "CRAP skipped (install: cargo install cargo-llvm-cov)".to_string(),
-        );
+        return LcovStatus::Skipped("cargo-llvm-cov is not installed".to_string());
     }
     let lcov_path = root().join("target").join("llvm-cov").join("lcov.info");
-    if lcov_path.exists() && lcov_is_fresh(&lcov_path, &["src", "tests"]) {
+    if lcov_path.exists() && lcov_is_fresh(&lcov_path, &["src", "tests", "harness.rs"]) {
         return LcovStatus::Ready(lcov_path);
     }
     if let Some(parent) = lcov_path.parent()
         && let Err(e) = fs::create_dir_all(parent)
     {
-        return LcovStatus::Fatal(format!("CRAP: cannot create {}: {e}", parent.display()));
+        return LcovStatus::Fatal(format!("cannot create {}: {e}", parent.display()));
     }
     let env = llvm_tools_env();
     let lcov_str = lcov_path.to_string_lossy().into_owned();
@@ -1598,7 +1602,7 @@ fn ensure_lcov() -> LcovStatus {
         run_result
     };
     if !report_result.ok || !lcov_path.exists() {
-        return LcovStatus::Fatal(format!("CRAP: could not produce {}", lcov_path.display()));
+        return LcovStatus::Fatal(format!("could not produce {}", lcov_path.display()));
     }
     LcovStatus::Ready(lcov_path)
 }
@@ -1649,7 +1653,7 @@ fn crap_measure(max_crap: f64) -> CrapOutcome {
     };
 
     let Some(cov_map) = parse_lcov(&lcov_path) else {
-        return CrapOutcome::Fatal(format!("CRAP: failed to read {}", lcov_path.display()));
+        return CrapOutcome::Fatal(format!("failed to read {}", lcov_path.display()));
     };
 
     // `-i` high: here lizard is a measuring tape, not a gate. Left at its default
@@ -1664,14 +1668,14 @@ fn crap_measure(max_crap: f64) -> CrapOutcome {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
         Ok(o) => {
             return CrapOutcome::ToolFailure {
-                message: format!("CRAP: lizard exited {:?}", o.status.code()),
+                message: format!("lizard exited {:?}", o.status.code()),
                 detail: String::from_utf8_lossy(&o.stderr).into_owned(),
                 code: o.status.code().unwrap_or(1),
             };
         }
         Err(e) => {
             return CrapOutcome::ToolFailure {
-                message: format!("CRAP: failed to run lizard: {e}"),
+                message: format!("failed to run lizard: {e}"),
                 detail: String::new(),
                 code: 1,
             };
@@ -1736,17 +1740,17 @@ fn cmd_crap() {
     let enforce = arg_flag("--enforce");
 
     let offenders = match crap_measure(max_crap) {
-        CrapOutcome::Skipped(message) => {
-            println!("  {DIM}\u{2298} {message}{RESET}");
+        CrapOutcome::Skipped(_) => {
+            println!("  {DIM}\u{2298} CRAP skipped (install: cargo install cargo-llvm-cov){RESET}");
             return;
         }
         CrapOutcome::Fatal(message) => {
-            println!("  {RED}\u{2717}{RESET} {message}");
+            println!("  {RED}\u{2717}{RESET} CRAP: {message}");
             std::process::exit(1);
         }
         CrapOutcome::ToolFailure { message, detail, code } => {
             let (color, symbol, suffix) = crap_status_glyph(enforce);
-            println!("  {color}{symbol}{RESET} {message}{suffix}");
+            println!("  {color}{symbol}{RESET} CRAP: {message}{suffix}");
             if !detail.is_empty() {
                 print!("{detail}");
             }
@@ -1817,12 +1821,21 @@ fn print_crap_offenders(offenders: &[CrapFn]) {
 /// staleness: scoring fresh complexity data against an old LCOV silently
 /// misattributes coverage. Returns false (force regeneration) on any I/O or
 /// metadata error so the safe path is to re-run, not to trust stale data.
-fn lcov_is_fresh(lcov_path: &Path, src_dirs: &[&str]) -> bool {
+fn lcov_is_fresh(lcov_path: &Path, targets: &[&str]) -> bool {
     let Ok(lcov_meta) = fs::metadata(lcov_path) else { return false };
     let Ok(lcov_mtime) = lcov_meta.modified() else { return false };
-    for dir in src_dirs {
-        let dir_path = root().join(dir);
-        let mut stack = vec![dir_path];
+    for target in targets {
+        let target_path = root().join(target);
+        // A target may be a single file (`harness.rs`): `read_dir` silently
+        // skips those, which would make every harness-only edit look fresh —
+        // and harness.rs is nearly every tracked line in this crate.
+        if target_path.is_file() {
+            if newer_than(&target_path, lcov_mtime) {
+                return false;
+            }
+            continue;
+        }
+        let mut stack = vec![target_path];
         while let Some(p) = stack.pop() {
             let Ok(entries) = fs::read_dir(&p) else { continue };
             for entry in entries.flatten() {
@@ -1832,17 +1845,20 @@ fn lcov_is_fresh(lcov_path: &Path, src_dirs: &[&str]) -> bool {
                     stack.push(path);
                     continue;
                 }
-                if path.extension().is_some_and(|e| e == "rs")
-                    && let Ok(meta) = path.metadata()
-                    && let Ok(mtime) = meta.modified()
-                    && mtime > lcov_mtime
-                {
+                if path.extension().is_some_and(|e| e == "rs") && newer_than(&path, lcov_mtime) {
                     return false;
                 }
             }
         }
     }
     true
+}
+
+/// True when `path` was modified after `mtime`. An unreadable mtime counts as
+/// "not newer": the caller's other targets still decide, and the fallback for a
+/// path we cannot stat is to keep looking rather than to force a rebuild.
+fn newer_than(path: &Path, mtime: std::time::SystemTime) -> bool {
+    path.metadata().and_then(|meta| meta.modified()).is_ok_and(|m| m > mtime)
 }
 
 /// CRAP score = CCN² × (1-cov)³ + CCN. `cov` is in [0,1].
