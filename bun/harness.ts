@@ -1465,7 +1465,6 @@ async function measuredDuplicateBlocks(): Promise<Measurement> {
  * that only has to stop the trend, wrong for a hard threshold.
  */
 function duplicationGate(targets: string[], floor: number | undefined): Gate {
-  const record = 'run `bun harness.ts suppressions --update-baseline` to record a floor';
   return {
     description:
       floor === undefined
@@ -1476,7 +1475,7 @@ function duplicationGate(targets: string[], floor: number | undefined): Gate {
       const count = duplicateBlockCount(output);
       if (count == null) return { ok: false, detail: 'no duplicate report to count blocks from' };
       const blocks = `${count} block(s)`;
-      if (floor === undefined) return { ok: true, detail: `${blocks}; ${record}` };
+      if (floor === undefined) return { ok: true, detail: `${blocks}; ${BASELINE_FLOOR_HINT}` };
       return { ok: count <= floor, detail: blocks };
     },
     hint: 'extract the repeated block into a shared helper; do not raise the floor',
