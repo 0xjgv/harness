@@ -373,7 +373,7 @@ describe('arch floor', () => {
     const [gate] = await archGatesOrWarn(project());
 
     expect(gate?.description).toContain('report-only: no .harness-baseline floor');
-    expect(gate?.evaluate?.(report(3, 1))).toEqual({
+    expect(gate?.verdict?.(report(3, 1), 3)).toEqual({
       ok: true,
       detail: '4; run `bun harness.ts suppressions --update-baseline` to record a floor',
       // The passing gate prints no body — `--verbose` must not dump the report.
@@ -385,12 +385,14 @@ describe('arch floor', () => {
     const [gate] = await archGatesOrWarn(project('arch.max_violations 2\n'));
 
     expect(gate?.description).toBe('Arch (dependency-cruiser, baseline 2)');
-    expect(gate?.evaluate?.(report(1, 1))).toEqual({ ok: true, detail: '2 <= 2', output: '' });
+    // Exit code 1 (dependency-cruiser's own error count) is ignored: only the
+    // count against the floor decides.
+    expect(gate?.verdict?.(report(1, 1), 1)).toEqual({ ok: true, detail: '2 <= 2', output: '' });
   });
 
   test('one violation over the floor fails, with the offenders as the body', async () => {
     const [gate] = await archGatesOrWarn(project('arch.max_violations 0\n'));
-    const verdict = gate?.evaluate?.(
+    const verdict = gate?.verdict?.(
       report(1, 0, [
         {
           from: 'src/leak.ts',
@@ -403,6 +405,7 @@ describe('arch floor', () => {
           rule: { name: 'not-to-unresolvable', severity: 'info' },
         },
       ]),
+      1,
     );
 
     expect(verdict?.ok).toBe(false);
@@ -415,13 +418,13 @@ describe('arch floor', () => {
     const [gate] = await archGatesOrWarn(project('arch.max_violations 0\n'));
 
     expect(gate?.description).toBe('Arch (dependency-cruiser)');
-    expect(gate?.evaluate?.(report(0, 0))).toEqual({ ok: true, detail: '0 <= 0', output: '' });
+    expect(gate?.verdict?.(report(0, 0), 0)).toEqual({ ok: true, detail: '0 <= 0', output: '' });
   });
 
   test('an unreadable report fails instead of passing on a null count', async () => {
     const [gate] = await archGatesOrWarn(project('arch.max_violations 0\n'));
 
-    expect(gate?.evaluate?.('depcruise: command not found')?.ok).toBe(false);
+    expect(gate?.verdict?.('depcruise: command not found', 127)?.ok).toBe(false);
   });
 
   test('the depcruise argv asks for JSON so the runner can count', async () => {

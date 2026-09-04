@@ -166,12 +166,12 @@ export interface Gate {
   extract?: (output: string) => string | undefined;
   hint?: string;
   /**
-   * Decide the outcome from the output instead of the exit code, and optionally
-   * replace the body printed on failure. Needed by a count-ratcheted gate whose
-   * tool has no `-i N`-style tolerance flag: dependency-cruiser's exit code is
-   * its own error count, which says nothing about the `.harness-baseline` floor.
+   * Decide pass/fail from the tool's output. Receives the exit code so a gate
+   * can ignore it (depcruise: exit code = error count) or refuse to score a
+   * crashed tool (lizard). `detail` replaces `extract` on the result line;
+   * `output` replaces what is echoed on failure.
    */
-  evaluate?: (output: string) => { ok: boolean; detail?: string; output?: string };
+  verdict?: (output: string, exitCode: number) => { ok: boolean; detail?: string; output?: string };
 }
 
 interface GateResult {
@@ -193,17 +193,18 @@ async function runCapture(gate: Gate): Promise<GateResult> {
   ]);
   const exitCode = await proc.exited;
   const output = stdout + stderr;
-  const verdict = gate.evaluate?.(output);
+  const verdict = gate.verdict?.(output, exitCode);
   const ok = verdict ? verdict.ok : exitCode === 0;
+  // A verdict that fails on a clean exit still has to exit non-zero:
+  // printGateResult exits with this code.
+  const effectiveExit = ok ? exitCode : exitCode === 0 ? 1 : exitCode;
   return {
     description: gate.description,
     cmd: gate.cmd,
     ok,
-    // A gate that evaluates its own output may fail on a tool that exited 0;
-    // printGateResult exits with this code, so it must never be 0 when !ok.
-    exitCode: ok ? 0 : exitCode || 1,
+    exitCode: effectiveExit,
     output: verdict?.output ?? output,
-    detail: ok ? (verdict?.detail ?? gate.extract?.(output)) : undefined,
+    detail: verdict?.detail ?? (ok ? gate.extract?.(output) : undefined),
     hint: gate.hint,
   };
 }
@@ -249,7 +250,7 @@ async function run(
     cmd,
     extract: opts?.extract,
     hint: opts?.hint,
-    evaluate: opts?.evaluate,
+    verdict: opts?.verdict,
   });
   const ok = printGateResult(result, { noExit: opts?.noExit });
   return { ok, output: result.output };
@@ -927,7 +928,7 @@ export async function archGatesOrWarn(base = ROOT): Promise<Gate[]> {
       cmd: archArgv(targets),
       // depcruise's exit code is its error count, so it is ignored: only the
       // violation count measured against the floor decides this gate.
-      evaluate: (output) => {
+      verdict: (output) => {
         const count = depcruiseViolationCount(output);
         // No count means dependency-cruiser itself broke (bad config, crash);
         // its own message is the only actionable thing here, so keep it.
