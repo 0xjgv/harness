@@ -740,7 +740,9 @@ fn cmd_audit_inner(strict: bool) -> bool {
         println!("  {RED}\u{2717}{RESET} Dep audit (cargo-audit not installed)");
         return false;
     }
-    println!("  {DIM}\u{2298} Dep audit skipped (install: cargo install cargo-audit){RESET}");
+    println!(
+        "  {DIM}\u{2298} Dep audit skipped (install: cargo install cargo-audit --version {CARGO_AUDIT_VERSION}){RESET}"
+    );
     true
 }
 
@@ -829,7 +831,9 @@ fn cmd_coverage() {
     let min_pct = coverage_min_default();
 
     if !tool_installed("llvm-cov", CARGO_LLVM_COV_VERSION) {
-        println!("  {DIM}\u{2298} Coverage skipped (install: cargo install cargo-llvm-cov){RESET}");
+        println!(
+            "  {DIM}\u{2298} Coverage skipped (install: cargo install cargo-llvm-cov --version {CARGO_LLVM_COV_VERSION}){RESET}"
+        );
         return;
     }
 
@@ -905,7 +909,9 @@ fn llvm_tools_env() -> Vec<(String, String)> {
 /// opt-in rather than a blocking gate. Absent → warn + skip.
 fn cmd_mutation() {
     if !tool_installed("mutants", CARGO_MUTANTS_VERSION) {
-        println!("  {DIM}\u{2298} Mutation skipped (install: cargo install cargo-mutants){RESET}");
+        println!(
+            "  {DIM}\u{2298} Mutation skipped (install: cargo install cargo-mutants --version {CARGO_MUTANTS_VERSION}){RESET}"
+        );
         return;
     }
     run(
@@ -928,7 +934,9 @@ fn arch_gates_or_warn() -> Vec<Gate> {
         return Vec::new();
     }
     if !tool_installed("modules", CARGO_MODULES_VERSION) {
-        println!("  {DIM}\u{2298} Arch skipped (install: cargo install cargo-modules){RESET}");
+        println!(
+            "  {DIM}\u{2298} Arch skipped (install: cargo install cargo-modules --version {CARGO_MODULES_VERSION}){RESET}"
+        );
         return Vec::new();
     }
     vec![
@@ -1273,7 +1281,9 @@ fn cmd_crap() {
     let enforce = arg_flag("--enforce");
 
     if !tool_installed("llvm-cov", CARGO_LLVM_COV_VERSION) {
-        println!("  {DIM}\u{2298} CRAP skipped (install: cargo install cargo-llvm-cov){RESET}");
+        println!(
+            "  {DIM}\u{2298} CRAP skipped (install: cargo install cargo-llvm-cov --version {CARGO_LLVM_COV_VERSION}){RESET}"
+        );
         return;
     }
 
