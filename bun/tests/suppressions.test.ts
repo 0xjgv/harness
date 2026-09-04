@@ -367,7 +367,7 @@ describe('lizard floors', () => {
     const [, gate] = await complexityGatesOrWarn(root);
 
     expect(gate?.description).toContain('report-only: no .harness-baseline floor');
-    const verdict = gate?.verdict?.(DUPLICATE_REPORT);
+    const verdict = gate?.verdict?.(DUPLICATE_REPORT, 0);
     expect(verdict?.ok).toBe(true);
     expect(verdict?.detail).toContain('suppressions --update-baseline');
   });
@@ -377,21 +377,21 @@ describe('lizard floors', () => {
     const [, gate] = await complexityGatesOrWarn(root);
 
     expect(gate?.description).toBe('Duplicate blocks (lizard, baseline 2)');
-    expect(gate?.verdict?.(DUPLICATE_REPORT)).toEqual({ ok: true, detail: '2 block(s)' });
+    expect(gate?.verdict?.(DUPLICATE_REPORT, 0)).toEqual({ ok: true, detail: '2 block(s)' });
   });
 
   test('one block over the floor fails', async () => {
     const root = project('duplication.max_blocks 1\n');
     const [, gate] = await complexityGatesOrWarn(root);
 
-    expect(gate?.verdict?.(DUPLICATE_REPORT)?.ok).toBe(false);
+    expect(gate?.verdict?.(DUPLICATE_REPORT, 0)?.ok).toBe(false);
   });
 
   test('a missing report fails the verdict instead of passing at zero', async () => {
     const root = project('duplication.max_blocks 5\n');
     const [, gate] = await complexityGatesOrWarn(root);
 
-    expect(gate?.verdict?.('uvx: command not found')?.ok).toBe(false);
+    expect(gate?.verdict?.('uvx: command not found', 0)?.ok).toBe(false);
   });
 
   // Report-only means report-only: a garbled run cannot turn day one red either.
@@ -399,20 +399,28 @@ describe('lizard floors', () => {
     const root = project();
     const [, gate] = await complexityGatesOrWarn(root);
 
-    expect(gate?.verdict?.('uvx: command not found')?.ok).toBe(true);
+    expect(gate?.verdict?.('uvx: command not found', 0)?.ok).toBe(true);
   });
 
-  // The guard that makes `verdict` safe: a crashed tool prints no findings, and
-  // scoring that as "zero findings" is the false-pass the whole design avoids.
-  test('a verdict is not consulted when the command exited non-zero', async () => {
+  // A crashed tool prints no findings, and scoring that as "zero findings" is a
+  // false pass — but the rule belongs to the gate, not the runner: the arch gate
+  // reads depcruise's exit code as a violation count and must be able to ignore it.
+  test('the duplication gate refuses to score a lizard that crashed', async () => {
+    const root = project('duplication.max_blocks 5\n');
+    const [, gate] = await complexityGatesOrWarn(root);
+
+    expect(gate?.verdict?.('', 3)).toEqual({ ok: false, detail: 'lizard exited 3' });
+  });
+
+  test('a verdict may pass a non-zero exit, and keeps that exit code', async () => {
     const result = await runCapture({
-      description: 'crashes',
+      description: 'exit code is a count',
       cmd: ['sh', '-c', 'exit 3'],
-      verdict: () => ({ ok: true, detail: 'looks clean to me' }),
+      verdict: () => ({ ok: true, detail: '3 findings, all under the floor' }),
     });
 
-    expect(result.ok).toBe(false);
-    expect(result.exitCode).toBe(3);
+    expect(result.ok).toBe(true);
+    expect(result.detail).toBe('3 findings, all under the floor');
   });
 
   test('a failing verdict on a clean exit still exits non-zero', async () => {

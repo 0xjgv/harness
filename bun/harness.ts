@@ -165,14 +165,12 @@ export interface Gate {
   cmd: string[];
   extract?: (output: string) => string | undefined;
   /**
-   * Decide pass/fail from the output instead of the exit code, for a tool that
-   * reports a count but always exits 0 (lizard's `-Eduplicate`). Consulted only
-   * on a clean exit: a crashed tool prints no findings, and reading that as
-   * "zero findings" would be a silent false-pass. Takes precedence over
-   * `extract`, which is not consulted when a verdict is present — a gate wanting
-   * a summary on its passing line returns it as the verdict's `detail`.
+   * Decide pass/fail from the tool's output. Receives the exit code so a gate can
+   * ignore it (depcruise: exit code = error count) or refuse to score a crashed
+   * tool (lizard). `detail` replaces `extract` on the result line; `output`
+   * replaces what is echoed on failure.
    */
-  verdict?: (output: string) => { ok: boolean; detail?: string };
+  verdict?: (output: string, exitCode: number) => { ok: boolean; detail?: string; output?: string };
   hint?: string;
 }
 
@@ -195,16 +193,17 @@ export async function runCapture(gate: Gate): Promise<GateResult> {
   ]);
   const exitCode = await proc.exited;
   const output = stdout + stderr;
-  const verdict = exitCode === 0 ? gate.verdict?.(output) : undefined;
-  const ok = exitCode === 0 && (verdict?.ok ?? true);
+  const verdict = gate.verdict?.(output, exitCode);
+  const ok = verdict ? verdict.ok : exitCode === 0;
+  // a verdict that fails on a clean exit still has to exit non-zero
+  const effectiveExit = ok ? exitCode : exitCode === 0 ? 1 : exitCode;
   return {
     description: gate.description,
     cmd: gate.cmd,
     ok,
-    // A verdict that fails on a clean exit still has to exit non-zero.
-    exitCode: ok ? 0 : exitCode || 1,
-    output,
-    detail: verdict ? verdict.detail : ok ? gate.extract?.(output) : undefined,
+    exitCode: effectiveExit,
+    output: verdict?.output ?? output,
+    detail: verdict?.detail ?? (ok ? gate.extract?.(output) : undefined),
     hint: gate.hint,
   };
 }
@@ -1490,11 +1489,16 @@ function duplicationGate(targets: string[], floor: number | undefined): Gate {
         ? `Duplicate blocks (lizard, report-only: no ${BASELINE_FILE} floor)`
         : `Duplicate blocks (lizard, baseline ${floor})`,
     cmd: duplicationArgv(targets),
-    verdict: (output) => {
-      // Report-only passes whatever it finds — a garbled report included. A
-      // repo with no recorded floor must not go red on day one, which is the
-      // whole point of the branch, and `--update-baseline` errors on the same
-      // output anyway, so the missing report is never recorded as a clean 0.
+    verdict: (output, exitCode) => {
+      // A crashed lizard prints no findings; scoring that as zero blocks is the
+      // silent false-pass this gate exists to avoid. The verdict owns the rule
+      // because the shared runner hands the exit code over rather than acting on
+      // it — depcruise's arch gate reads its exit code as a count.
+      if (exitCode !== 0) return { ok: false, detail: `lizard exited ${exitCode}` };
+      // Report-only passes whatever it finds — a garbled report included. A repo
+      // with no recorded floor must not go red on day one, and
+      // `--update-baseline` errors on the same output anyway, so the missing
+      // report is never recorded as a clean 0.
       const count = duplicateBlockCount(output);
       const detail =
         count == null ? 'no duplicate report to count blocks from' : `${count} block(s)`;
