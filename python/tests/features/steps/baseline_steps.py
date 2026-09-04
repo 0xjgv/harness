@@ -25,6 +25,18 @@ def step_project_without_baseline(context):
     _make_project(context)
 
 
+@given("a project with tests and no baseline")
+def step_project_with_tests_no_baseline(context):
+    root = _make_project(context)
+    (root / "tests").mkdir()
+    (root / "tests" / "test_stub.py").write_text(
+        "import unittest\n\n"
+        "class TestStub(unittest.TestCase):\n"
+        "    def test_smoke(self):\n"
+        "        self.assertTrue(True)\n"
+    )
+
+
 @given('a project with a baseline line "{line}"')
 def step_project_with_baseline_line(context, line):
     (_make_project(context) / BASELINE).write_text(f"{line}\n")

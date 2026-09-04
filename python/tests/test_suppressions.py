@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stdout
+from fnmatch import fnmatch
 from pathlib import Path
 from unittest import mock
 
@@ -325,8 +326,15 @@ class TestMutationMeasurement(unittest.TestCase):
                 "src/adapters/__init__.py",
                 "src/core/pricing.py",
             ]),
-            ["core.pricing.*", "adapters.*"],
+            ["core.pricing.x*", "adapters.x*"],
         )
+
+    def test_a_package_init_does_not_select_the_whole_package(self) -> None:
+        # mutmut filters with fnmatch, where `*` crosses dots — `adapters.*` would
+        # also select `adapters.formatting`'s mutants and widen the scoped run.
+        [pattern] = harness._mutation_patterns(["src/adapters/__init__.py"])
+        self.assertFalse(fnmatch("adapters.formatting.x_render__mutmut_1", pattern))
+        self.assertTrue(fnmatch("adapters.x_helper__mutmut_1", pattern))
 
     def test_score_counts_timeouts_as_kills_and_suspicious_as_survivors(self) -> None:
         stats = {"killed": 17, "timeout": 2, "survived": 1, "suspicious": 1, "no_tests": 40}
@@ -345,11 +353,42 @@ class TestMutationMeasurement(unittest.TestCase):
     def test_a_missing_mutmut_is_unavailable_not_an_error(self) -> None:
         # An `error` would abort the whole baseline write, so a repo without mutmut
         # could never run `--update-baseline --with-mutation` at all.
-        with tempfile.TemporaryDirectory() as tmp, cwd(Path(tmp)):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            cwd(Path(tmp)),
+            mock.patch.object(harness, "_has_tests", return_value=True),
+        ):
             measured = harness._run_mutation(None)
         self.assertIsNone(measured.value)
         self.assertFalse(measured.error)
         self.assertIn("mutmut", measured.unavailable)
+
+    def test_a_repo_with_no_tests_never_pays_for_a_run(self) -> None:
+        # Every mutant would come back `no_tests` after minutes of wall clock, the
+        # way `coverage` and `crap` already refuse to start without a suite.
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            cwd(Path(tmp)),
+            mock.patch.object(harness.subprocess, "run") as never,
+        ):
+            measured = harness._run_mutation(None)
+        never.assert_not_called()
+        self.assertIn("test", measured.unavailable)
+
+    def test_a_git_tracked_mutants_directory_is_refused_not_deleted(self) -> None:
+        # mutmut hardcodes `mutants/` and this gate deletes it around every run, so
+        # a tracked directory of that name is the adopter's, not mutmut's.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".venv" / "bin").mkdir(parents=True)
+            (root / ".venv" / "bin" / "mutmut").touch()
+            with (
+                cwd(root),
+                mock.patch.object(harness, "_has_tests", return_value=True),
+                mock.patch.object(harness, "_git_lines", return_value=["mutants/keep.py"]),
+            ):
+                measured = harness._run_mutation(None)
+        self.assertIn("mutants/", measured.error)
 
     def test_the_automatic_pass_carries_the_floor_through_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

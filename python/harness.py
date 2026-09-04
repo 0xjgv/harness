@@ -55,6 +55,8 @@ MUTMUT = "mutmut"
 # removed by `clean`.
 MUTATION_DIR = "mutants"
 MUTATION_STATS_FILE = "mutmut-cicd-stats.json"
+# The whole sentence mutmut asserts with when a mutant filter selects nothing.
+MUTMUT_EMPTY_FILTER = "Filtered for specific mutants, but nothing matches"
 VULTURE = "vulture"
 VULTURE_MIN_CONFIDENCE = "60"
 VULTURE_ALLOWLIST = "vulture_allowlist.py"
@@ -647,16 +649,28 @@ def _measured_deadcode_findings() -> Measurement:
     return _run_deadcode()[0]
 
 
-def _mutmut_argv() -> list[str] | None:
-    """Argv that runs mutmut, or None when it is not installed in this project.
+def _mutation_blocker() -> Measurement | None:
+    """Why this repo cannot run mutation testing at all, or None when it can.
 
-    The only tool here with no `uvx` fallback: mutmut imports the project's own
-    modules and test suite, so it has to run from the venv those live in. A repo
-    that has not added it as a dev dependency skips the gate instead of failing it.
+    Three reasons, none of them a failure of the change under test:
+      * no test suite — every mutant would come back `no_tests`, after minutes;
+      * no mutmut. It is the one tool here with no `uvx` fallback, because it
+        imports the project's own modules and test suite and so has to run from
+        the venv those live in;
+      * git tracks a `mutants/` directory. mutmut hardcodes that path for its
+        working copy and this gate deletes it around every run, so a *tracked*
+        one is the adopter's and must not be touched. An untracked one is a
+        killed run's residue, and clearing it is the point.
     """
+    if not _has_tests():
+        return Measurement(unavailable=f"no {TEST_DIR}/test*.py files")
     if not Path(".venv", "bin", MUTMUT).exists():
-        return None
-    return _tool(MUTMUT, read_only=True)
+        return Measurement(unavailable=f"{MUTMUT} is not installed in .venv/bin")
+    if _git_lines(["ls-files", "--", MUTATION_DIR]):
+        return Measurement(
+            error=f"git tracks {MUTATION_DIR}/, the directory mutmut overwrites — move it aside"
+        )
+    return None
 
 
 def _mutation_patterns(files: Iterable[str]) -> list[str]:
@@ -665,13 +679,19 @@ def _mutation_patterns(files: Iterable[str]) -> list[str]:
     mutmut names a mutant `<dotted module>.<mangled function>` after stripping a
     literal leading `src.` and collapsing `.__init__.` (mutmut 3.7,
     `mutmut/utils/format_utils.py:get_mutant_name`), so `src/core/pricing.py`
-    selects as `core.pricing.*`, never `src.core.pricing.*`. Mirror that rule
-    exactly: `mutmut run` aborts on a pattern that matches no mutant.
+    selects as `core.pricing.x*`, never `src.core.pricing.*`.
+
+    The trailing `x*` matters as much as the prefix rule. mutmut filters with
+    `fnmatch`, where `*` crosses dots — so `core.*` (the glob a naive reading of
+    `src/core/__init__.py` produces) would also select every mutant in
+    `core.pricing`, quietly widening a scoped run to the whole package. Mangled
+    function names always start `x_` or `xǁ`, so anchoring on `x` selects the
+    module's own mutants and nothing below it.
     """
     patterns: dict[str, None] = {}
     for path in files:
         dotted = path.removesuffix(".py").replace("/", ".").removeprefix("src.")
-        patterns.setdefault(f"{dotted}.*".replace(".__init__.", "."), None)
+        patterns.setdefault(f"{dotted.removesuffix('.__init__')}.x*", None)
     return list(patterns)
 
 
@@ -709,33 +729,45 @@ def _mutation_stats(path: Path) -> Measurement:
 def _run_mutation(patterns: list[str] | None) -> Measurement:
     """Run mutmut over `patterns` (None = the whole tree) and score the result.
 
-    `mutants/` is cleared first: mutmut keeps every previous verdict there and
-    `export-cicd-stats` totals the whole store, so a scoped run layered on a
-    previous, differently scoped one would score files this change never touched.
+    `mutants/` is cleared on the way in *and* on the way out. In: mutmut keeps
+    every previous verdict in `<file>.py.meta` there and `export-cicd-stats`
+    totals the whole store, so a scoped run layered on a previous, differently
+    scoped one would score files this change never touched (measured: a run
+    filtered to one module reported the other module's survivors). Out: the copy
+    contains `mutants/tests/`, and leaving it behind makes a pytest suite abort
+    collection on duplicate module names the next time `test` runs.
     """
-    argv = _mutmut_argv()
-    if argv is None:
-        return Measurement(unavailable=f"{MUTMUT} is not installed in .venv/bin")
+    blocker = _mutation_blocker()
+    if blocker is not None:
+        return blocker
+    argv = _tool(MUTMUT, read_only=True)
     shutil.rmtree(MUTATION_DIR, ignore_errors=True)
-    res = subprocess.run(
-        [*argv, "run", *(patterns or [])], capture_output=True, text=True, check=False
-    )
-    if res.returncode != 0:
-        # mutmut asserts rather than exiting cleanly when a filter matches no mutant
-        # (mutmut 3.7, `__main__.py`: "Filtered for specific mutants, but nothing
-        # matches"). A change confined to files with nothing mutable — an empty
-        # `__init__.py`, constants — is not a broken tool.
-        if "nothing matches" in res.stderr + res.stdout:
-            return Measurement(unavailable="the changed sources contain no mutable code")
-        detail = (res.stderr.strip() or res.stdout.strip()).splitlines()
-        reason = f": {detail[-1]}" if detail else ""
-        return Measurement(error=f"`mutmut run` failed (exit {res.returncode}){reason}")
-    export = subprocess.run(
-        [*argv, "export-cicd-stats"], capture_output=True, text=True, check=False
-    )
-    if export.returncode != 0:
-        return Measurement(error=f"`mutmut export-cicd-stats` failed (exit {export.returncode})")
-    return _mutation_stats(Path(MUTATION_DIR, MUTATION_STATS_FILE))
+    try:
+        res = subprocess.run(
+            [*argv, "run", *(patterns or [])], capture_output=True, text=True, check=False
+        )
+        if res.returncode != 0:
+            # mutmut asserts rather than exiting cleanly when a filter matches no
+            # mutant (mutmut 3.7, `__main__.py:1247`). A change confined to files
+            # with nothing mutable — an empty `__init__.py`, constants — is not a
+            # broken tool. Matched on stderr only, and on the whole sentence: the
+            # captured stdout carries every mutant's pytest output, so a looser
+            # match would let a project's own test text fake this verdict.
+            if MUTMUT_EMPTY_FILTER in res.stderr:
+                return Measurement(unavailable="the changed sources contain no mutable code")
+            detail = (res.stderr.strip() or res.stdout.strip()).splitlines()
+            reason = f": {detail[-1]}" if detail else ""
+            return Measurement(error=f"`mutmut run` failed (exit {res.returncode}){reason}")
+        export = subprocess.run(
+            [*argv, "export-cicd-stats"], capture_output=True, text=True, check=False
+        )
+        if export.returncode != 0:
+            return Measurement(
+                error=f"`mutmut export-cicd-stats` failed (exit {export.returncode})"
+            )
+        return _mutation_stats(Path(MUTATION_DIR, MUTATION_STATS_FILE))
+    finally:
+        shutil.rmtree(MUTATION_DIR, ignore_errors=True)
 
 
 def _measured_mutation_score() -> Measurement:
@@ -2417,11 +2449,11 @@ def cmd_check() -> None:
     """Lockfile check, fix, format, typecheck, test, and every offline read-only gate.
 
     Invariant: `check` runs every gate that is offline, fast, and takes no build
-    lock — `ci` adds only the network dependency audit, coverage, and CRAP
-    (advisory). Arch (import-linter) qualifies here: it is a local dev dependency,
-    runs offline, and takes no build lock, so it joins the read-only parallel batch
-    below alongside complexity and acceptance, so a green `check`
-    predicts a green `ci`. Accumulates every step's pass/fail instead of failing
+    lock — `ci` adds only the network dependency audit, coverage, and the two
+    advisory gates, CRAP and mutation. Arch (import-linter) qualifies here: it is a
+    local dev dependency, runs offline, and takes no build lock, so it joins the
+    read-only parallel batch below alongside complexity and acceptance, so a green
+    `check` predicts a green `ci`. Accumulates every step's pass/fail instead of failing
     fast, so one run surfaces every problem — matching the bun/go/rust harnesses'
     `check` behavior — and ends with an `OK`/`FAIL` summary line.
     """
@@ -2530,7 +2562,8 @@ def cmd_pre_push() -> None:
     complexity. This fills the gap with the deterministic, offline gates none of them
     run — lint, format check, acceptance, arch — validating the whole pushed tree
     (after merges/rebases/--no-verify, which pre-commit may never have seen) before it
-    leaves the machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
+    leaves the machine. Network (audit) and advisory (coverage/CRAP/mutation) gates
+    stay in ci.
     """
     print("\n=== Pre-push Checks ===\n")
     base_ok = _check_base_ref(no_exit=True)

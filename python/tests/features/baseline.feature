@@ -72,17 +72,29 @@ Feature: The baseline is a ratchet, not a wall
     Then the exit code is 0
     And the baseline file contains "mutation.min 94"
 
+  # Which of the two skip reasons a scoped run reports depends on whether a base
+  # ref was requested — GITHUB_BASE_REF is set for every pull_request CI run and is
+  # inherited by the harness this step launches — so the scenario asserts only what
+  # holds either way: it skipped, and it exited 0. The exact wording of each reason
+  # is pinned in tests/test_harness_targets.py and tests/test_suppressions.py.
   Scenario: Mutation testing skips a change that touched no app source
     Given a project with no baseline
     When I run "harness mutation"
     Then the exit code is 0
-    And the output contains "no changed app sources"
+    And the output contains "Mutation (mutmut)"
+    And the output contains "skipped"
 
   Scenario: Mutation testing skips a repo that has not installed mutmut
-    Given a project with no baseline
+    Given a project with tests and no baseline
     When I run "harness mutation --all"
     Then the exit code is 0
     And the output contains "mutmut is not installed"
+
+  Scenario: Mutation testing skips a repo with no tests at all
+    Given a project with no baseline
+    When I run "harness mutation --all"
+    Then the exit code is 0
+    And the output contains "no tests/test*.py files"
 
   Scenario: The complexity floor tolerates exactly the recorded violations
     Given a project with a CCN-21 function and a baseline line "complexity.max_violations 1"

@@ -693,9 +693,15 @@ repo that did not have them.
   minutes; the ordinary pass carries the key through untouched), mutmut has no
   `uvx` fallback so the gate skips when `.venv/bin/mutmut` is missing, and
   `mutants/` **must** reach the adopter's `.gitignore` (that file is on the
-  MERGE list in §1, so it is easy to half-merge) as well as `clean`. Miss it and
-  every mutation run leaves an untracked tree that the scoped gates then pick up
-  through `git ls-files --others`.
+  MERGE list in §1, so it is easy to half-merge) as well as `clean`.
+- Patterns mirror `get_mutant_name` *and* fnmatch: `src/core/pricing.py` selects
+  as `core.pricing.x*`. The `x*` anchor is not decoration — mutmut filters with
+  fnmatch, where `*` crosses dots, so the naive `core.*` for a changed
+  `__init__.py` would silently pull in every module in the package.
+- mutmut hardcodes `mutants/` for its working copy and the gate deletes that
+  directory before and after every run. If the adopter's repo already has a
+  git-tracked `mutants/`, the gate refuses instead of deleting it — tell them,
+  because there is no override.
 - Protected arch config: `.importlinter` (`<prefix> arch-config-guard`)
 - Dead-code allowlist: `vulture_allowlist.py`
 - Ratchet skill (moves the floors after adoption): `skills/ratchet/`
