@@ -1,8 +1,9 @@
 Feature: The baseline is a ratchet, not a wall
   `.harness-baseline` records where the repo already is — coverage, complexity,
-  CRAP, dead code and suppressions — so adoption never starts on a red gate, and
-  each number may only move down. A metric with no recorded floor reports instead
-  of blocking; a metric that could not be measured is never recorded at all.
+  CRAP, dead code, mutation score and suppressions — so adoption never starts on a
+  red gate, and each number may only move toward better. A metric with no recorded
+  floor reports instead of blocking; a metric that could not be measured is never
+  recorded at all.
 
   Scenario: A repo with no baseline is report-only and passes
     Given a project with no baseline
@@ -19,6 +20,7 @@ Feature: The baseline is a ratchet, not a wall
     And the baseline file contains "deadcode.max_findings"
     But the baseline file does not contain "coverage.min"
     And the baseline file does not contain "crap.max_violations"
+    And the baseline file does not contain "mutation.min"
 
   Scenario: A shipped coverage floor never leaks into an adopting repo's baseline
     Given a project with a baseline line "coverage.min 100"
@@ -63,6 +65,24 @@ Feature: The baseline is a ratchet, not a wall
     When I run "harness suppressions --update-baseline"
     Then the exit code is 0
     And the baseline file contains "custom.thing 7"
+
+  Scenario: The mutation floor survives an update that did not measure it
+    Given a project with a baseline line "mutation.min 94"
+    When I run "harness suppressions --update-baseline"
+    Then the exit code is 0
+    And the baseline file contains "mutation.min 94"
+
+  Scenario: Mutation testing skips a change that touched no app source
+    Given a project with no baseline
+    When I run "harness mutation"
+    Then the exit code is 0
+    And the output contains "no changed app sources"
+
+  Scenario: Mutation testing skips a repo that has not installed mutmut
+    Given a project with no baseline
+    When I run "harness mutation --all"
+    Then the exit code is 0
+    And the output contains "mutmut is not installed"
 
   Scenario: The complexity floor tolerates exactly the recorded violations
     Given a project with a CCN-21 function and a baseline line "complexity.max_violations 1"

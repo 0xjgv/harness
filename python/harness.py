@@ -15,6 +15,8 @@ Count-ratcheted gates (complexity, CRAP, coverage, dead code, suppressions) stay
 whole-tree on purpose: scoping them would make their counts meaningless. Each
 reads its floor from `.harness-baseline`; with no floor recorded they report
 instead of blocking, so retrofitting into an existing repo is green on day one.
+`mutation` is the one ratcheted gate that *is* scoped — one whole-tree run costs
+minutes — so it reports rather than blocks unless asked to `--enforce`.
 """
 
 from __future__ import annotations
@@ -48,6 +50,11 @@ TEST_DIR = "tests"
 # the tuple ("-m", "pytest", "-q").
 TEST_COMMAND = ("-m", "unittest", "discover", "-s", TEST_DIR, "-q")
 LIZARD = "lizard"
+MUTMUT = "mutmut"
+# mutmut's working copy of the project, rewritten on every run: gitignored, and
+# removed by `clean`.
+MUTATION_DIR = "mutants"
+MUTATION_STATS_FILE = "mutmut-cicd-stats.json"
 VULTURE = "vulture"
 VULTURE_MIN_CONFIDENCE = "60"
 VULTURE_ALLOWLIST = "vulture_allowlist.py"
@@ -101,6 +108,9 @@ RESET = "\033[0m"
 VERBOSE = "--verbose" in sys.argv
 ALL_FILES = "--all" in sys.argv
 WHOLE_FILE = "--whole-file" in sys.argv
+# A whole-tree mutation run costs minutes, so `suppressions --update-baseline`
+# measures `mutation.min` only when asked to; otherwise it carries the key through.
+WITH_MUTATION = "--with-mutation" in sys.argv
 BASE_OVERRIDE = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--base=")), None)
 
 # Ruff codes a line-scoped filter would hide, because the change that causes them
@@ -637,11 +647,114 @@ def _measured_deadcode_findings() -> Measurement:
     return _run_deadcode()[0]
 
 
+def _mutmut_argv() -> list[str] | None:
+    """Argv that runs mutmut, or None when it is not installed in this project.
+
+    The only tool here with no `uvx` fallback: mutmut imports the project's own
+    modules and test suite, so it has to run from the venv those live in. A repo
+    that has not added it as a dev dependency skips the gate instead of failing it.
+    """
+    if not Path(".venv", "bin", MUTMUT).exists():
+        return None
+    return _tool(MUTMUT, read_only=True)
+
+
+def _mutation_patterns(files: Iterable[str]) -> list[str]:
+    """mutmut mutant-key globs selecting the given source files.
+
+    mutmut names a mutant `<dotted module>.<mangled function>` after stripping a
+    literal leading `src.` and collapsing `.__init__.` (mutmut 3.7,
+    `mutmut/utils/format_utils.py:get_mutant_name`), so `src/core/pricing.py`
+    selects as `core.pricing.*`, never `src.core.pricing.*`. Mirror that rule
+    exactly: `mutmut run` aborts on a pattern that matches no mutant.
+    """
+    patterns: dict[str, None] = {}
+    for path in files:
+        dotted = path.removesuffix(".py").replace("/", ".").removeprefix("src.")
+        patterns.setdefault(f"{dotted}.*".replace(".__init__.", "."), None)
+    return list(patterns)
+
+
+def _mutation_score(stats: dict[str, Any]) -> Measurement:
+    """Percent of the mutants the suite actually exercised that it killed.
+
+    killed = caught + timeout; survived = ran undetected, plus `suspicious`
+    (a verdict the run could not reproduce is not a kill). Mutants that never ran
+    — `no_tests`, `skipped` — are excluded from *both* sides, so the number never
+    silently rewards code the tests do not reach; coverage is the gate for that.
+    """
+    killed = stats.get("killed", 0) + stats.get("timeout", 0)
+    survived = stats.get("survived", 0) + stats.get("suspicious", 0)
+    if killed + survived == 0:
+        return Measurement(unavailable="no mutants ran")
+    return Measurement(value=round(100 * killed / (killed + survived)))
+
+
+def _mutation_stats(path: Path) -> Measurement:
+    """Score the file `mutmut export-cicd-stats` just wrote, or say why it cannot be.
+
+    A stats file the harness cannot read has to be louder than a low score: a
+    silently zeroed count would ratchet the recorded floor down to nothing on the
+    next `--update-baseline --with-mutation`.
+    """
+    try:
+        stats = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return Measurement(error=f"could not read {path}: {exc}")
+    if not isinstance(stats, dict):
+        return Measurement(error=f"{path} is not a JSON object")
+    return _mutation_score(stats)
+
+
+def _run_mutation(patterns: list[str] | None) -> Measurement:
+    """Run mutmut over `patterns` (None = the whole tree) and score the result.
+
+    `mutants/` is cleared first: mutmut keeps every previous verdict there and
+    `export-cicd-stats` totals the whole store, so a scoped run layered on a
+    previous, differently scoped one would score files this change never touched.
+    """
+    argv = _mutmut_argv()
+    if argv is None:
+        return Measurement(unavailable=f"{MUTMUT} is not installed in .venv/bin")
+    shutil.rmtree(MUTATION_DIR, ignore_errors=True)
+    res = subprocess.run(
+        [*argv, "run", *(patterns or [])], capture_output=True, text=True, check=False
+    )
+    if res.returncode != 0:
+        # mutmut asserts rather than exiting cleanly when a filter matches no mutant
+        # (mutmut 3.7, `__main__.py`: "Filtered for specific mutants, but nothing
+        # matches"). A change confined to files with nothing mutable — an empty
+        # `__init__.py`, constants — is not a broken tool.
+        if "nothing matches" in res.stderr + res.stdout:
+            return Measurement(unavailable="the changed sources contain no mutable code")
+        detail = (res.stderr.strip() or res.stdout.strip()).splitlines()
+        reason = f": {detail[-1]}" if detail else ""
+        return Measurement(error=f"`mutmut run` failed (exit {res.returncode}){reason}")
+    export = subprocess.run(
+        [*argv, "export-cicd-stats"], capture_output=True, text=True, check=False
+    )
+    if export.returncode != 0:
+        return Measurement(error=f"`mutmut export-cicd-stats` failed (exit {export.returncode})")
+    return _mutation_stats(Path(MUTATION_DIR, MUTATION_STATS_FILE))
+
+
+def _measured_mutation_score() -> Measurement:
+    """Whole-tree mutation score, for `--update-baseline --with-mutation`.
+
+    Whole-tree on purpose: a floor measured from one change's scope would move
+    with the next change's scope, and a moving floor is not a floor.
+    """
+    if not _app_targets():
+        return Measurement(unavailable="no app sources")
+    return _run_mutation(None)
+
+
 RATCHETED_KEYS = (
     "coverage.min",
     "complexity.max_violations",
     "crap.max_violations",
     "deadcode.max_findings",
+    "mutation.min",
 )
 
 
@@ -651,6 +764,11 @@ def _measure_ratcheted() -> dict[str, Measurement]:
     Sequential and short-circuiting on purpose: a broken tool usually breaks the
     metrics after it too (CRAP re-runs the coverage suite), so the first failure is
     the one worth reporting, and the later ones would only be noise.
+
+    `mutation.min` is measured last and only under `--with-mutation`: it re-runs the
+    whole suite once per mutant, which turns a seconds-long baseline update into a
+    minutes-long one. Left out, its key is neither measured nor removed — the merge
+    in `_write_baseline` carries it through untouched.
     """
     measured: dict[str, Measurement] = {}
     for key, measure in (
@@ -658,6 +776,7 @@ def _measure_ratcheted() -> dict[str, Measurement]:
         ("complexity.max_violations", _measured_complexity_violations),
         ("crap.max_violations", _measured_crap_violations),
         ("deadcode.max_findings", _measured_deadcode_findings),
+        *((("mutation.min", _measured_mutation_score),) if WITH_MUTATION else ()),
     ):
         measured[key] = measure()
         if measured[key].error:
@@ -1405,9 +1524,85 @@ def cmd_acceptance() -> None:
         run(gate.description, gate.cmd)
 
 
+MUTATION_LABEL = "Mutation (mutmut)"
+MUTATION_HINT = (
+    "kill the surviving mutants with a test, or record the floor with "
+    "`harness suppressions --update-baseline --with-mutation`"
+)
+
+
+def _mutation_patterns_for_change() -> list[str] | None:
+    """Mutant globs for the app sources this change touched, or None to skip.
+
+    Scoped, never widened: mutation is the most expensive signal the harness has,
+    and an empty scope that quietly became a whole-tree run is how `ci` ends up
+    minutes slower for a docs commit.
+    """
+    changed = [path for path in _scoped_py_files() if _matches_python_target(path, APP_SOURCES)]
+    if changed:
+        return _mutation_patterns(changed)
+    unresolved = _unresolved_requested_base()
+    reason = (
+        f"diff base {unresolved!r} does not resolve, nothing checked"
+        if unresolved is not None
+        else "no changed app sources (use --all for the whole tree)"
+    )
+    warn(f"{MUTATION_LABEL}: {reason}; skipped")
+    return None
+
+
 def cmd_mutation() -> None:
-    """Mutation testing. Not configured by default — warn and skip."""
-    warn("Mutation testing not configured — add mutmut to your dev dependencies to enable")
+    """Mutation score over the app sources this change touched (--all: whole tree).
+
+    Advisory unless `--enforce`, mirroring `crap`, and for a sharper reason than
+    cost: the `mutation.min` floor is whole-tree while this gate is scoped, so a
+    change confined to one weakly-tested module can land under the floor with
+    nothing having regressed. That is a thing to report, not to block on.
+
+    Read-only in the sense `ci` needs — it never rewrites source — but it does
+    clear and repopulate the gitignored `mutants/` working copy, the same way
+    `coverage run` writes `.coverage`. `ci --enforce` makes it blocking, exactly
+    as it already does for CRAP.
+    """
+    patterns: list[str] | None = None
+    if not ALL_FILES:
+        patterns = _mutation_patterns_for_change()
+        if patterns is None:
+            return
+
+    enforce = "--enforce" in sys.argv
+    measured = _run_mutation(patterns)
+    if measured.error:
+        suffix = "" if enforce else " (advisory)"
+        print(f"  {_advisory_glyph(enforce=enforce)} {MUTATION_LABEL}: {measured.error}{suffix}")
+        if enforce:
+            sys.exit(1)
+        return
+    if measured.value is None:
+        warn(f"{MUTATION_LABEL}: {measured.unavailable}; skipped")
+        return
+
+    score = measured.value
+    floor = _baseline_floor("mutation.min")
+    if floor is None:
+        warn(f"{MUTATION_LABEL}: {score}% killed, report-only (no {BASELINE_FILE} floor)")
+        return
+    if score >= floor:
+        suffix = " — run `harness suppressions --update-baseline --with-mutation` to ratchet up"
+        print(
+            f"  {GREEN}✓{RESET} {MUTATION_LABEL}: {score}% killed "
+            f"(baseline {floor}){suffix if score > floor else ''}"
+        )
+        return
+
+    mode_suffix = "" if enforce else " (advisory)"
+    print(
+        f"  {_advisory_glyph(enforce=enforce)} {MUTATION_LABEL}: {score}% killed "
+        f"< baseline {floor}{mode_suffix}"
+    )
+    print(f"  ↳ fix: {MUTATION_HINT}")
+    if enforce:
+        sys.exit(1)
 
 
 def _arch_gates_or_warn() -> list[Gate]:
@@ -2301,8 +2496,9 @@ def cmd_ci() -> None:
     Read-only gates run as a parallel batch (lint, format check, typecheck, audit,
     complexity, acceptance, arch) — captured and printed in submission order, run to
     completion so one pass surfaces every failure. The count-ratcheted gates run after
-    it, sequentially: dead code, then coverage (captured) and CRAP (advisory unless
-    --enforce).
+    it, sequentially: dead code, then coverage (captured), CRAP and mutation (both
+    advisory unless --enforce). Mutation is scoped to this change's app sources, so
+    it costs nothing on a commit that touched none.
     """
     print("\n=== CI Checks ===\n")
     base_ok = _check_base_ref(no_exit=True)
@@ -2320,6 +2516,7 @@ def cmd_ci() -> None:
     all_ok = _check_deadcode(no_exit=True) and all_ok  # count-ratcheted; outside the batch
     cmd_coverage()  # self-skips; sequential, after the batch
     cmd_crap()  # reads .coverage/coverage.xml; advisory unless --enforce
+    cmd_mutation()  # scoped to the change's app sources; advisory unless --enforce
     all_ok = _check_arch_config_guard() and all_ok
     all_ok = _check_gherkin_guard() and all_ok
     all_ok = _check_suppressions_baseline(no_exit=True) and all_ok
@@ -2514,7 +2711,10 @@ TASKS: dict[str, tuple[Callable[..., object], str]] = {
     "audit": (cmd_audit, "Audit dependencies for known vulnerabilities"),
     "acceptance": (cmd_acceptance, "Run acceptance scenarios (behave)"),
     "coverage": (cmd_coverage, "Tests with coverage threshold (--min=N)"),
-    "mutation": (cmd_mutation, "Mutation testing (not configured by default; warns and skips)"),
+    "mutation": (
+        cmd_mutation,
+        "Mutation score for changed app sources (--all, --enforce); advisory",
+    ),
     "crap": (cmd_crap, "CRAP complexity x coverage gate (advisory)"),
     "suppressions": (cmd_suppressions, "Show or update suppression baseline"),
     "complexity": (cmd_complexity, "Cyclomatic complexity gate (lizard, CCN 15, args 8)"),

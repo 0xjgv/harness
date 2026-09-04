@@ -37,6 +37,7 @@ def measurements(
     complexity: harness.Measurement | int | None = None,
     crap: harness.Measurement | int | None = None,
     deadcode: harness.Measurement | int | None = None,
+    mutation: harness.Measurement | int | None = None,
 ):
     """Stub every ratcheted measurement. `None` means "does not apply here"."""
     with (
@@ -49,6 +50,9 @@ def measurements(
         ),
         mock.patch.object(
             harness, "_measured_deadcode_findings", return_value=_as_measurement(deadcode)
+        ),
+        mock.patch.object(
+            harness, "_measured_mutation_score", return_value=_as_measurement(mutation)
         ),
     ):
         yield
@@ -307,6 +311,146 @@ class TestBaseline(unittest.TestCase):
             (root / ".harness-baseline").write_text("coverage.min 0\n", encoding="utf-8")
             with cwd(root):
                 self.assertFalse(harness._check_suppressions_baseline(no_exit=True))
+
+
+class TestMutationMeasurement(unittest.TestCase):
+    """`mutation.min` is the one floor `--update-baseline` does not measure by default."""
+
+    def test_patterns_mirror_mutmuts_own_naming_rule(self) -> None:
+        # mutmut strips a literal leading `src.` and collapses `.__init__.`, so a
+        # pattern of `src.core.pricing.*` would match no mutant at all.
+        self.assertEqual(
+            harness._mutation_patterns([
+                "src/core/pricing.py",
+                "src/adapters/__init__.py",
+                "src/core/pricing.py",
+            ]),
+            ["core.pricing.*", "adapters.*"],
+        )
+
+    def test_score_counts_timeouts_as_kills_and_suspicious_as_survivors(self) -> None:
+        stats = {"killed": 17, "timeout": 2, "survived": 1, "suspicious": 1, "no_tests": 40}
+        self.assertEqual(harness._mutation_score(stats).value, 90)
+
+    def test_score_excludes_mutants_that_never_ran(self) -> None:
+        # `no_tests`/`skipped` on either side would let untested code raise the score.
+        stats = {"killed": 3, "survived": 1, "no_tests": 96, "skipped": 12}
+        self.assertEqual(harness._mutation_score(stats).value, 75)
+
+    def test_score_is_unavailable_when_no_mutant_ran(self) -> None:
+        measured = harness._mutation_score({"killed": 0, "survived": 0, "no_tests": 9})
+        self.assertIsNone(measured.value)
+        self.assertIn("no mutants ran", measured.unavailable)
+
+    def test_a_missing_mutmut_is_unavailable_not_an_error(self) -> None:
+        # An `error` would abort the whole baseline write, so a repo without mutmut
+        # could never run `--update-baseline --with-mutation` at all.
+        with tempfile.TemporaryDirectory() as tmp, cwd(Path(tmp)):
+            measured = harness._run_mutation(None)
+        self.assertIsNone(measured.value)
+        self.assertFalse(measured.error)
+        self.assertIn("mutmut", measured.unavailable)
+
+    def test_the_automatic_pass_carries_the_floor_through_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".harness-baseline").write_text("mutation.min 94\n", encoding="utf-8")
+            with (
+                cwd(root),
+                mock.patch.object(harness, "WITH_MUTATION", False),
+                measurements(coverage=88),
+            ):
+                written = harness._write_baseline({})
+
+        self.assertEqual(written["mutation.min"], 94)
+
+    def test_with_mutation_measures_and_rewrites_the_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".harness-baseline").write_text("mutation.min 94\n", encoding="utf-8")
+            with (
+                cwd(root),
+                mock.patch.object(harness, "WITH_MUTATION", True),
+                measurements(coverage=88, mutation=97),
+            ):
+                written = harness._write_baseline({})
+
+        self.assertEqual(written["mutation.min"], 97)
+
+
+class TestMutationGate(unittest.TestCase):
+    """Advisory unless `--enforce`, mirroring CRAP: the floor is whole-tree, the gate is scoped."""
+
+    @staticmethod
+    def _run(baseline: str | None, measured: harness.Measurement, *, enforce: bool = False):
+        argv = ["harness", "mutation", "--all", *(["--enforce"] if enforce else [])]
+        output = io.StringIO()
+        exit_code = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            if baseline is not None:
+                (root / ".harness-baseline").write_text(baseline, encoding="utf-8")
+            with (
+                cwd(root),
+                mock.patch.object(harness, "ALL_FILES", True),
+                mock.patch.object(harness, "_run_mutation", return_value=measured),
+                mock.patch.object(harness.sys, "argv", argv),
+                redirect_stdout(output),
+            ):
+                try:
+                    harness.cmd_mutation()
+                except SystemExit as exc:
+                    exit_code = exc.code
+        return exit_code, output.getvalue()
+
+    def test_reports_and_passes_without_a_floor(self) -> None:
+        code, out = self._run(None, harness.Measurement(value=94))
+        self.assertEqual(code, 0)
+        self.assertIn("94% killed", out)
+        self.assertIn("report-only", out)
+
+    def test_passes_at_the_floor(self) -> None:
+        code, out = self._run("mutation.min 94\n", harness.Measurement(value=94))
+        self.assertEqual(code, 0)
+        self.assertIn("✓", out)
+        self.assertIn("94% killed (baseline 94)", out)
+
+    def test_suggests_ratcheting_up_when_the_score_improves(self) -> None:
+        _, out = self._run("mutation.min 90\n", harness.Measurement(value=94))
+        self.assertIn("--with-mutation", out)
+
+    def test_warns_below_the_floor_but_does_not_block(self) -> None:
+        code, out = self._run("mutation.min 94\n", harness.Measurement(value=88))
+        self.assertEqual(code, 0)
+        self.assertIn("⚠", out)
+        self.assertIn("88% killed < baseline 94 (advisory)", out)
+
+    def test_enforce_turns_the_same_miss_into_a_failure(self) -> None:
+        code, out = self._run("mutation.min 94\n", harness.Measurement(value=88), enforce=True)
+        self.assertEqual(code, 1)
+        self.assertIn("✗", out)
+        self.assertNotIn("advisory", out)
+
+    def test_a_broken_mutmut_never_fails_ci_on_its_own(self) -> None:
+        code, out = self._run(None, harness.Measurement(error="`mutmut run` failed (exit 2)"))
+        self.assertEqual(code, 0)
+        self.assertIn("`mutmut run` failed (exit 2)", out)
+
+    def test_skips_a_change_that_touched_no_app_source(self) -> None:
+        output = io.StringIO()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            cwd(Path(tmp)),
+            mock.patch.object(harness, "ALL_FILES", False),
+            mock.patch.object(harness, "_scoped_py_files", return_value=["tests/test_a.py"]),
+            mock.patch.object(harness, "_unresolved_requested_base", return_value=None),
+            mock.patch.object(harness, "_run_mutation") as never,
+            redirect_stdout(output),
+        ):
+            harness.cmd_mutation()
+
+        never.assert_not_called()
+        self.assertIn("no changed app sources", output.getvalue())
 
 
 class TestReportOnlyWithoutABaseline(unittest.TestCase):

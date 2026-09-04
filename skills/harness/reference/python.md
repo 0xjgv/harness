@@ -55,6 +55,8 @@ DO NOT COPY — template-only
   .importlinter               its layering is the worked example; see §3
   src/__init__.py  src/core/  src/adapters/
   tests/__init__.py  tests/test_init.py
+  tests/conftest.py           mutmut shim, needed only when the package is
+                              literally named `src` — see its docstring
   tests/test_crap.py  tests/test_harness_targets.py  tests/test_suppressions.py
   tests/test_properties.py
   tests/test_core_pricing.py  tests/test_adapters_formatting.py
@@ -393,25 +395,33 @@ Two measured details:
 
 ---
 
-## `.harness-baseline` — five metrics, one writer
+## `.harness-baseline` — six metrics, one writer
 
 ```
 complexity.max_violations 0
 coverage.min 100
 crap.max_violations 0
 deadcode.max_findings 0
+mutation.min 94
 suppressions.noqa 8
 suppressions.pyright_ignore 2
 suppressions.type_ignore 4
 ```
 
-- **Five**, not four. `deadcode.max_findings` was added because vulture
-  produced 1,583 findings on doghouse with no floor and no escape.
+- **Six**, not four. `deadcode.max_findings` was added because vulture produced
+  1,583 findings on doghouse with no floor and no escape; `mutation.min` because
+  a coverage floor says which lines ran, never whether a test would notice them
+  changing.
 - **The only writer is `suppressions --update-baseline`.** Nobody guesses that
   from the name — say it out loud when handing the repo over. The name is a
   known wart, deliberately unfixed: `suppressions` sits in the parity gate's
   non-allowlistable `CORE_COMMANDS`, so a `baseline` command would have to land
   in all four templates. Deferred to the bun/go/rust port.
+- **`mutation.min` needs `--with-mutation` on top of it.** The ordinary pass
+  neither measures nor removes the key, it carries it through: one whole-tree
+  mutmut run costs minutes, and paying that on every baseline update would make
+  the update a thing adopters avoid. Everything else about the key is normal —
+  all-or-nothing, dropped when it cannot be measured, report-only when absent.
 - **A missing `.harness-baseline` is report-only and passes** — verified for
   every metric, complexity included:
   `✓ Complexity (lizard, report-only: no .harness-baseline floor)`,
@@ -672,8 +682,20 @@ repo that did not have them.
 - Tooling: uv, ruff (lint + format + bandit-style security), basedpyright,
   unittest/pytest via `TEST_COMMAND`, coverage, pip-audit, lizard (complexity,
   pinned `1.22.2`), vulture (dead code, pinned `2.16`), behave (acceptance),
-  hypothesis (property-based tests), import-linter (arch). Mutation testing is
-  not configured by default — `harness mutation` warns and exits 0.
+  hypothesis (property-based tests), import-linter (arch), mutmut (mutation,
+  `>=3.7`, configured under `[tool.mutmut]`).
+- Mutation: `harness mutation` runs mutmut over the app sources the change
+  touched (`--all` for the whole tree) and compares
+  `round(100 × (killed + timeout) / (killed + timeout + survived + suspicious))`
+  to `mutation.min`. Advisory unless `--enforce`; report-only with no floor.
+  Three things a port must carry: the floor is written **only** by
+  `suppressions --update-baseline --with-mutation` (a whole-tree run costs
+  minutes; the ordinary pass carries the key through untouched), mutmut has no
+  `uvx` fallback so the gate skips when `.venv/bin/mutmut` is missing, and
+  `mutants/` **must** reach the adopter's `.gitignore` (that file is on the
+  MERGE list in §1, so it is easy to half-merge) as well as `clean`. Miss it and
+  every mutation run leaves an untracked tree that the scoped gates then pick up
+  through `git ls-files --others`.
 - Protected arch config: `.importlinter` (`<prefix> arch-config-guard`)
 - Dead-code allowlist: `vulture_allowlist.py`
 - Ratchet skill (moves the floors after adoption): `skills/ratchet/`

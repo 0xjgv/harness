@@ -253,22 +253,25 @@ class TestNoTestBehavior(unittest.TestCase):
                 run_mock.assert_not_called()
                 subprocess_run.assert_not_called()
 
-    def test_mutation_warns_and_skips_when_not_configured(self):
-        # Mutation is unconfigured by default: it must warn and exit 0 without
-        # shelling out, whether or not tests exist.
+    def test_mutation_skips_an_empty_scope_without_launching_mutmut(self):
+        # Mutation is scoped, not test-gated: a change that touched no app source
+        # warns and exits 0 without paying for a run, whether or not tests exist.
         for with_tests in (False, True):
             with self.subTest(with_tests=with_tests), temp_project(with_tests=with_tests):
                 output = io.StringIO()
                 with (
                     redirect_stdout(output),
-                    mock.patch.object(harness, "run") as run_mock,
-                    mock.patch.object(harness.subprocess, "run") as subprocess_run,
+                    mock.patch.object(harness, "ALL_FILES", False),
+                    mock.patch.object(harness, "_scoped_py_files", return_value=[]),
+                    # Pinned so a CI run with GITHUB_BASE_REF set does not swap in the
+                    # unresolvable-base message; that path has its own tests above.
+                    mock.patch.object(harness, "_unresolved_requested_base", return_value=None),
+                    mock.patch.object(harness, "_run_mutation") as run_mutation,
                 ):
                     harness.cmd_mutation()
 
-                self.assertIn("Mutation testing not configured", output.getvalue())
-                run_mock.assert_not_called()
-                subprocess_run.assert_not_called()
+                self.assertIn("no changed app sources", output.getvalue())
+                run_mutation.assert_not_called()
 
 
 class TestStopHook(unittest.TestCase):
