@@ -7,6 +7,7 @@
  *   bun harness.ts check            # full pre-flight
  *   bun harness.ts fix              # fix lint errors + format
  *   bun harness.ts pre-commit       # staged checks + tests
+ *   bun harness.ts test --all       # whole suite (check/pre-commit scope to changes)
  *   bun harness.ts ci               # CI verification
  *   bun harness.ts acceptance       # cucumber scenarios
  *   bun harness.ts coverage --min=N # tests with coverage threshold
@@ -57,6 +58,14 @@ const DIM = '\x1b[2m';
 const RESET = '\x1b[0m';
 
 const VERBOSE = process.argv.includes('--verbose');
+// Scoped-gate flags, parsed at module scope like --verbose: --all widens a scoped gate
+// to the whole tree, --base=<ref> picks the ref the change set is diffed against.
+const ALL_FILES = process.argv.includes('--all');
+const BASE_OVERRIDE =
+  process.argv
+    .slice(2)
+    .find((arg) => arg.startsWith('--base='))
+    ?.slice('--base='.length) ?? '';
 
 function warn(message: string): void {
   console.log(`  ${GREEN}⚠${RESET} ${message}`);
@@ -599,11 +608,7 @@ async function cmdTypecheck(): Promise<void> {
 }
 
 async function cmdTest(): Promise<void> {
-  if (!(await hasTests())) {
-    warn(`Tests: no ${TEST_DIR}/*.test.ts or *.spec.ts files; skipped`);
-    return;
-  }
-  await run('Tests', ['bun', 'test'], { extract: extractTestSummary });
+  await runTests();
 }
 
 function auditGate(): Gate {
@@ -766,8 +771,10 @@ export async function resolveFallbackArchBase(
   return undefined;
 }
 
-async function changedPathsFromBase(): Promise<string[]> {
+/** Diff bases in priority order: --base=<ref>, the env vars, then the fallback refs. */
+async function diffBases(): Promise<string[]> {
   const bases: string[] = [];
+  if (BASE_OVERRIDE !== '') bases.push(BASE_OVERRIDE);
   if (process.env.HARNESS_ARCH_BASE) bases.push(process.env.HARNESS_ARCH_BASE);
   if (process.env.GITHUB_BASE_REF) bases.push(`origin/${process.env.GITHUB_BASE_REF}`);
 
@@ -777,7 +784,11 @@ async function changedPathsFromBase(): Promise<string[]> {
     );
     if (fallback) bases.push(fallback);
   }
+  return bases;
+}
 
+async function changedPathsFromBase(): Promise<string[]> {
+  const bases = await diffBases();
   const paths: string[] = [];
   for (const base of bases) {
     if ((await gitLines(['rev-parse', '--verify', base])).length === 0) continue;
@@ -854,6 +865,167 @@ async function changedPathsForGuard(
 
   const prefix = await gitPrefix();
   return Array.from(new Set(paths.map((p) => normalizeChangedPath(p, prefix))));
+}
+
+// ── Test scoping ────────────────────────────────────────────────────
+
+const RELATIVE_IMPORT_RE = /(?:from|import)\s*\(?\s*['"](\.[^'"]*)['"]/g;
+
+/**
+ * Project .ts files in the change set for the scoped test gate.
+ *
+ * Same union every other changed-path gate uses — working tree, index, untracked, and
+ * `<base>...HEAD` when a base ref resolves — so a local edit is never invisible and a CI
+ * run, where the working tree is clean, still sees the branch's own commits.
+ */
+async function changedScopeFiles(): Promise<string[]> {
+  return (await changedPathsForGuard()).filter(isProjectTsFile);
+}
+
+/** Every project .ts file (src/**, harness.ts, tests/**), relative to `base`. */
+async function projectTsFiles(base = ROOT): Promise<string[]> {
+  const files: string[] = [];
+  for (const target of [...QUALITY_SOURCES, TEST_DIR]) {
+    if (!(await pathExists(target, base))) continue;
+    if (target.endsWith('.ts')) {
+      files.push(target);
+      continue;
+    }
+    const glob = new Bun.Glob('**/*.ts');
+    for await (const path of glob.scan({ cwd: `${base}/${target}`, onlyFiles: true })) {
+      files.push(`${target}/${path}`);
+    }
+  }
+  return files;
+}
+
+/** importee -> the project files importing it, over relative imports only. */
+async function importerGraph(base: string, files: string[]): Promise<Map<string, string[]>> {
+  const { posix } = await import('node:path');
+  const known = new Set(files);
+  const importers = new Map<string, string[]>();
+  for (const file of files) {
+    const text = await Bun.file(`${base}/${file}`).text();
+    for (const [, spec] of text.matchAll(RELATIVE_IMPORT_RE)) {
+      const joined = posix.normalize(posix.join(posix.dirname(file), spec));
+      const candidates = [
+        joined,
+        `${joined}.ts`,
+        `${joined}/index.ts`,
+        joined.replace(/\.js$/, '.ts'),
+      ];
+      const target = candidates.find((c) => known.has(c));
+      if (target === undefined) continue;
+      importers.set(target, [...(importers.get(target) ?? []), file]);
+    }
+  }
+  return importers;
+}
+
+/** Test files that reach `start` by walking the import graph backwards. */
+function reachingTests(start: string, importers: Map<string, string[]>): string[] {
+  const seen = new Set([start]);
+  const queue = [start];
+  const found: string[] = [];
+  while (queue.length > 0) {
+    for (const importer of importers.get(queue.shift() as string) ?? []) {
+      if (seen.has(importer)) continue;
+      seen.add(importer);
+      if (isTestFile(importer)) found.push(importer);
+      else queue.push(importer);
+    }
+  }
+  return found;
+}
+
+/**
+ * Split a change set into the tests that cover it and the sources nothing tests.
+ *
+ * The mapping is import-based, not name-based, because that is the template's convention:
+ * `tests/*.test.ts` import `../harness` and `../src/index` directly, so walking imports
+ * backwards is what answers "which tests cover this change". A test file maps to itself.
+ * Only sources are reported as unmapped: everything under `tests/` is test code already —
+ * a fixture or cucumber step file no test imports needs no test of its own.
+ */
+export async function mapChangedToTests(
+  changed: string[],
+  base = ROOT,
+): Promise<{ tests: string[]; unmapped: string[] }> {
+  const importers = await importerGraph(base, await projectTsFiles(base));
+  const tests = new Set<string>();
+  const unmapped: string[] = [];
+  for (const path of changed) {
+    if (isTestFile(path)) {
+      tests.add(path);
+      continue;
+    }
+    const reached = reachingTests(path, importers);
+    if (reached.length === 0 && !path.startsWith(`${TEST_DIR}/`)) unmapped.push(path);
+    for (const test of reached) tests.add(test);
+  }
+  return { tests: [...tests].sort(), unmapped };
+}
+
+let changedFlagSupported: boolean | undefined;
+
+/** Does this bun build advertise `bun test --changed`? Feature-detected once. */
+async function supportsChangedFlag(): Promise<boolean> {
+  if (changedFlagSupported === undefined) {
+    const proc = Bun.spawn(['bun', 'test', '--help'], {
+      cwd: ROOT,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [out, err] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    await proc.exited;
+    changedFlagSupported = `${out}${err}`.includes('--changed');
+  }
+  return changedFlagSupported;
+}
+
+/**
+ * Tests scoped to the change set — the ramp that keeps `check` proportional to the edit.
+ *
+ * `--all` runs the whole suite, and so do `ci` (through coverage) and `pre-push`, which
+ * never call this. An empty change set warns and skips: a scoped gate never widens to the
+ * whole tree. A changed source no test reaches warns once and never fails; the tests that
+ * do reach the change still run. `bun test --changed[=<base>]` covers the same union of
+ * working tree and base diff over bun's own import graph, so it is preferred where the
+ * runtime advertises it; the mapped file list is the fallback for builds without it.
+ */
+async function runTests(opts: { noExit?: boolean } = {}): Promise<RunResult> {
+  if (!(await hasTests())) {
+    warn(`Tests: no ${TEST_DIR}/*.test.ts or *.spec.ts files; skipped`);
+    return { ok: true, output: '' };
+  }
+  const runOpts = { extract: extractTestSummary, noExit: opts.noExit };
+  if (ALL_FILES) return await run('Tests', ['bun', 'test'], runOpts);
+
+  const changed = await changedScopeFiles();
+  if (changed.length === 0) {
+    warn('Tests: no changed TypeScript files; skipped (--all runs the whole suite)');
+    return { ok: true, output: '' };
+  }
+  const { tests, unmapped } = await mapChangedToTests(changed);
+  for (const path of unmapped) warn(`Tests: no test imports ${path}; add one`);
+  if (tests.length === 0) {
+    warn('Tests: no test covers the change; skipped (--all runs the whole suite)');
+    return { ok: true, output: '' };
+  }
+
+  const cmd = ['bun', 'test', '--pass-with-no-tests'];
+  if (await supportsChangedFlag()) {
+    const [base] = await diffBases();
+    const resolved =
+      base !== undefined && (await gitLines(['rev-parse', '--verify', base])).length > 0;
+    cmd.push(resolved ? `--changed=${base}` : '--changed');
+  } else {
+    cmd.push(...tests);
+  }
+  return await run('Tests (changed)', cmd, runOpts);
 }
 
 async function changedArchConfigs(
@@ -1444,14 +1616,7 @@ async function cmdCheck(): Promise<void> {
       noExit: true,
     }),
   );
-  if (await hasTests()) {
-    results.push(
-      await run('Tests', ['bun', 'test'], { extract: extractTestSummary, noExit: true }),
-    );
-  } else {
-    warn(`Tests: no ${TEST_DIR}/*.test.ts or *.spec.ts files; skipped`);
-    results.push({ ok: true, output: '' });
-  }
+  results.push(await runTests({ noExit: true }));
 
   // Read-only offline gates, after the mutating fix step above. Folded into
   // `results` as one entry so the summary count stays accurate. Invariant (see
@@ -1527,7 +1692,7 @@ async function cmdPreCommit(): Promise<void> {
   await checkAgentsMdDrift();
 
   if (files.some((f) => isQualityTsFile(f))) {
-    await cmdTest();
+    await runTests();
   }
 }
 
@@ -1601,7 +1766,7 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   fix: [cmdFix, 'Fix lint errors + format code'],
   lint: [cmdLint, 'Lint + format check (read-only)'],
   typecheck: [cmdTypecheck, 'Type-check with tsc'],
-  test: [cmdTest, 'Run tests'],
+  test: [cmdTest, 'Run tests for changed files (--all for the whole suite)'],
   audit: [cmdAudit, 'Audit dependencies for known vulnerabilities'],
   acceptance: [cmdAcceptance, 'Run acceptance scenarios (cucumber)'],
   coverage: [cmdCoverage, 'Tests with coverage threshold (--min=N)'],

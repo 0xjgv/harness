@@ -45,7 +45,14 @@ paraphrase (it drifts). Two sections:
   files anywhere. `crap` is advisory (warns by default, `--enforce` to
   hard-fail) but runs in `ci`, not `stop-hook` or `check`. Suppressions are ratcheted by
   `.harness-baseline`; `coverage.min` in the same file is the default coverage floor. `test`, `coverage`, `mutation`, and
-  `crap` warn and skip when no Bun test files exist. `check` also warns on
+  `crap` warn and skip when no Bun test files exist. `check` and `pre-commit`
+  scope `test` to the change set — the tests that reach a changed file through
+  imports, run via `bun test --changed` where the runtime advertises it. The
+  change set is the same union the guards use (working tree + index + untracked
+  + `<base>...HEAD`, base from `--base=<ref>`/`HARNESS_ARCH_BASE`/
+  `GITHUB_BASE_REF`/fallback refs). An empty change set warns and skips instead
+  of widening; a changed source no test imports warns once and never fails.
+  `--all`, `ci` (through coverage), and `pre-push` run the whole suite. `check` also warns on
   missing Stop hook wiring and arch config changes. Requires `uvx`
   on PATH for `complexity`/`crap` (lizard pinned to `1.22.2`, CCN≤15, args≤8,
   length≤100).
