@@ -4,48 +4,79 @@ Opinionated Go project template with built-in quality guardrails: linting, forma
 
 ## Stack
 
-- **Runner**: `go run harness.go` — zero-dep task runner (stdlib only)
-- **Linter + Formatter**: golangci-lint v2 (with gofmt + goimports)
+- **Runner**: `make <target>` enters the managed Go profile and runs the zero-dependency task runner
+- **Linter + Formatter**: managed golangci-lint 2.12.2 (with gofmt + goimports)
 - **Test runner**: `go test`
 - **Acceptance**: [godog](https://github.com/cucumber/godog) (Gherkin, run as a `go test`)
-- **Architecture**: [go-arch-lint](https://github.com/fe3dback/go-arch-lint) (dependency-boundary linter)
-- **Complexity**: [lizard](https://github.com/terryyin/lizard) (fetched on demand via `uvx`)
-- **Mutation**: gremlins (fetched on demand via `go run`)
+- **Architecture**: managed go-arch-lint 1.15.0 (dependency-boundary linter)
+- **Complexity**: managed lizard 1.22.2
+- **Audit**: managed govulncheck 1.1.4
+- **Mutation**: managed gremlins 0.5.0
 
-## Prerequisites
-
-- [Go](https://go.dev/dl/) 1.24+
-- [golangci-lint](https://golangci-lint.run/welcome/install/) v2+
-- [uv](https://docs.astral.sh/uv/) on `PATH` — `uvx` runs `lizard@1.22.2` for the complexity and CRAP gates
-
-Everything else (godog, go-arch-lint, gremlins, govulncheck) is pulled on
-demand by `go run ...@version`; lizard is pulled on demand by `uvx`. No
-separate install step for any of them.
+The provisioner also supplies Go 1.27.0. No ambient Go, golangci-lint, uv, or
+analyzer installation is part of the project contract.
 
 ## Getting Started
 
 ```bash
 cp -r go/ my-project && cd my-project
 go mod edit -module my-project
-go run harness.go setup-hooks
+git init
+git add . && git commit -m "Initial Go template"
+make workspace
 # Start coding
+```
+
+The module edit is the template customization and must happen before the clean
+initial commit. The [root workspace contract](../README.md#autonomous-workspace)
+lists the supported macOS/glibc Linux platforms and the small VM bootstrap
+layer: Make, Bash, Git, curl, tar, Info-ZIP unzip, a SHA-256 utility, and a
+writable `HOME`. `make workspace` installs the exact managed tools and locked
+modules, deploys skills, installs Git hooks, verifies the checked-in Stop
+wiring, and runs `make check`. It requires a clean tracked/index state;
+untracked files are preserved.
+
+After an online run has populated the exact tool and dependency caches, the
+same workspace converges without network access:
+
+```bash
+make workspace OFFLINE=1
+```
+
+Offline mode makes no network requests and fails on a cold or incomplete
+cache. `make bootstrap` is a compatibility alias for `make workspace`.
+
+### Dependencies and upgrades
+
+`make deps` restores committed modules with
+`GOFLAGS=-mod=readonly go mod download`. In offline mode, the provisioner also
+sets `GOPROXY=off`. Neither path rewrites `go.mod` or `go.sum`.
+
+Dependency upgrades are explicit. Run native Go operations through the managed
+boundary, then review both lock inputs before committing them:
+
+```bash
+.harness/workspace.sh exec go -- go get -u ./...
+.harness/workspace.sh exec go -- go mod tidy
+git diff -- go.mod go.sum
+make deps
 ```
 
 ## The 5-Script Contract
 
 | Script | When | What it does | Fixes code? |
 |---|---|---|---|
-| `go run harness.go check` | After edits | Fix, format, lint, test, suppression ratchet | Yes |
-| `go run harness.go pre-commit` | Git hook | Staged files only | Yes |
-| `go run harness.go pre-push` | Git pre-push hook | Read-only push gate: lint, acceptance, arch over the whole tree | No |
-| `go run harness.go ci` | CI pipeline | Read-only verification (see below) | No |
-| `go run harness.go audit` | CI pipeline | Dependency vulnerability audit | No |
-| `go run harness.go post-edit` | Stop hook helper | Format if source files changed | No |
-| `go run harness.go stop-hook` | Stop hook entrypoint | Format/fix changed files, then run complexity | Yes |
+| `make check` | After edits | Fix, format, lint, test, suppression ratchet | Yes |
+| `make pre-commit` | Git hook | Staged files only | Yes |
+| `make pre-push` | Git pre-push hook | Read-only push gate: lint, acceptance, arch over the whole tree | No |
+| `make ci` | CI pipeline | Read-only verification (see below) | No |
+| `make audit` | CI pipeline | Dependency vulnerability audit | No |
+| `make post-edit` | Stop hook helper | Format if source files changed | Yes |
+| `make stop-hook` | Stop hook entrypoint | Format/fix changed files, then run complexity | Yes |
 
 ### `ci` pipeline
 
-`harness ci` runs the read-only gates — lint, dep audit, complexity (lizard, CCN 15,
+`make ci` runs the read-only gates — lint, dep audit, complexity (lizard, CCN 15,
 args 8), acceptance (godog), arch (go-arch-lint) — **in parallel**: each is captured
 and printed in submission order, and the batch runs to completion so one pass surfaces
 every failure. It then streams coverage (`go test -race -coverprofile`, default
@@ -65,42 +96,53 @@ Mutation testing is also advisory and is NOT wired into `ci` — invoke explicit
 
 ### Continuous integration
 
-`.github/workflows/ci.yml` runs `go run harness.go ci` on every push to `main`
-and every pull request — the same gate you run locally, so local gate == remote
-gate. It installs golangci-lint and `uv` (for the lizard gates). Copying the
-template into a repo brings CI along.
+`.github/workflows/ci.yml` runs the checked-in contract on every push to `main`
+and every pull request:
+
+```bash
+make workspace
+make ci
+```
+
+The local and remote gates use the same managed tools and locks. The workflow
+ships with the template, so copying the template into a repo brings CI along.
 
 All commands minimize output — only errors are shown. Add `--verbose` for full output:
 
 ```bash
-go run harness.go check --verbose
+.harness/workspace.sh exec go -- go run -mod=readonly harness.go check --verbose
 ```
 
-Every command is also a `make` target — `make check`, `make ci`, `make pre-push`, and so on forward to the harness. `make bootstrap` does first-time setup (`go mod download` + `setup-hooks`) in one step.
+Make enters the checked-in managed environment for every normal harness target.
+Use the full provisioner boundary when passing harness-specific arguments.
 
 ## All Commands
 
 | Command | Description |
 |---|---|
-| `go run harness.go check` | Full pre-flight: fix + format + lint + test |
-| `go run harness.go fix` | Fix lint errors + format code |
-| `go run harness.go lint` | Lint + format check (read-only) |
-| `go run harness.go test` | Run tests |
-| `go run harness.go coverage` / `test-cov` | Run tests with race detector + coverage |
-| `go run harness.go audit` | Audit dependencies for known vulnerabilities |
-| `go run harness.go complexity` | Cyclomatic complexity gate (lizard, CCN 15, args 8; excludes `_test.go` + `harness.go`) |
-| `go run harness.go acceptance` | Run acceptance scenarios (godog) against `features/` |
-| `go run harness.go arch` | Architecture checks (go-arch-lint) |
-| `go run harness.go mutation` | Mutation testing (gremlins, advisory) |
-| `go run harness.go crap` | CRAP complexity × coverage gate (advisory) |
-| `go run harness.go suppressions` | Suppression breakdown; `--update-baseline` with human sign-off |
-| `go run harness.go pre-commit` | Staged checks + tests |
-| `go run harness.go pre-push` | Read-only push gate: lint, acceptance, arch |
-| `go run harness.go ci` | Full verification pipeline |
-| `go run harness.go setup-hooks` | Install git pre-commit + pre-push hooks and the Claude/Codex Stop wiring |
-| `go run harness.go clean` | Remove coverage and test cache |
+| `make check` | Full pre-flight: fix + format + lint + test |
+| `make fix` | Fix lint errors + format code |
+| `make lint` | Lint + format check (read-only) |
+| `make test` | Run tests |
+| `make test-cov` | Run tests with race detector + coverage |
+| `make audit` | Audit dependencies for known vulnerabilities |
+| `make complexity` | Cyclomatic complexity gate (lizard, CCN 15, args 8; excludes `_test.go` + `harness.go`) |
+| `make acceptance` | Run acceptance scenarios (godog) against `features/` |
+| `make arch` | Architecture checks (go-arch-lint) |
+| `make mutation` | Mutation testing (gremlins, advisory) |
+| `make crap` | CRAP complexity × coverage gate (advisory) |
+| `make pre-commit` | Staged checks + tests |
+| `make pre-push` | Read-only push gate: lint, acceptance, arch |
+| `make ci` | Full verification pipeline |
+| `make clean` | Remove coverage and test cache |
 
-Add `--verbose` to any command to see all output.
+Advanced arguments use the full managed runner form:
+
+```bash
+.harness/workspace.sh exec go -- go run -mod=readonly harness.go test-cov --min=80
+.harness/workspace.sh exec go -- go run -mod=readonly harness.go crap --max=30
+.harness/workspace.sh exec go -- go run -mod=readonly harness.go suppressions --update-baseline
+```
 
 ## Project Structure
 
@@ -122,8 +164,11 @@ harness.go           Development task runner (zero dependencies; //go:build igno
 - **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
 - **Arch config guard**: `.go-arch-lint.yml` changes warn during `check`/`stop-hook` and fail `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. Note `.golangci.yaml` is deliberately *not* protected — it is the general lint config, and protecting it would block all lint-config edits.
 
-Stop hooks are wired via `.claude/settings.json` for Claude and
-`.codex/hooks.json` for Codex.
+`make workspace` installs the Git hooks and verifies the checked-in Claude and
+Codex Stop configuration. Every Git and Stop hook enters the Git root and calls
+`make pre-commit`, `make pre-push`, or `make stop-hook`, so Make supplies the
+exact managed environment. Unknown existing Git hooks cause setup to fail
+without modification. Only exact legacy harness shims are migrated.
 
 ## Thresholds: start at 0, ratchet up
 
@@ -132,27 +177,33 @@ Day-1 defaults are deliberately loose so adopting this template does not fail ex
 - Complexity is gated at CCN 15 and args 8 (lizard + golangci-lint's `gocyclo`); lower it once the codebase is clean.
 - Acceptance ships one smoke `.feature`; an empty `features/` dir warns and passes. Add real scenarios.
 - `coverage --min=0` — explicit flags win; otherwise the default comes from `.harness-baseline` `coverage.min`.
-- `.harness-baseline` also ratchets suppression counts. New suppressions fail `check`; run `harness suppressions --update-baseline` only with human sign-off.
+- `.harness-baseline` also ratchets suppression counts. New suppressions fail `check`; run `.harness/workspace.sh exec go -- go run -mod=readonly harness.go suppressions --update-baseline` only with human sign-off.
 - Mutation / CRAP are advisory — enable as blocking gates once baselines are established.
-- `crap --max=30` is the starting ceiling; tighten it as coverage rises.
+- `.harness/workspace.sh exec go -- go run -mod=readonly harness.go crap --max=30` is the starting ceiling; tighten it as coverage rises.
 - `.go-arch-lint.yml` ships with one starter rule (the sample `suppressions` package is a leaf — it may not import other project components). Extend the component graph as the module grows.
 
 ### Mutation testing notes
 
-`harness mutation` runs [gremlins](https://github.com/go-gremlins/gremlins) and is advisory:
+`make mutation` runs [gremlins](https://github.com/go-gremlins/gremlins) and is advisory:
 
 - It warms the Go build cache (`go test -count=1`) before running. gremlins derives each
   mutant's test timeout from the baseline run; a cold cache makes the first mutant compile
   blow that budget and every mutant reports `TIMED OUT`.
 - gremlins must target a concrete package. `./...` gathers no coverage here because the
   module root (`harness.go`) is `//go:build ignore`. The command targets `./suppressions`
-  by default — pass a path to mutate a different package: `harness mutation ./mypkg`.
+  by default — pass a path through the managed runner to mutate a different package:
+  `.harness/workspace.sh exec go -- go run -mod=readonly harness.go mutation ./mypkg`.
 
 ## Starting from This Template
 
-1. Copy this directory
-2. `go mod edit -module my-project`
-3. `go run harness.go setup-hooks`
-4. Replace `suppressions/` with your own packages
-5. Update `.go-arch-lint.yml` components to match your module layout
-6. Add real scenarios under `features/` before writing user-visible behavior
+```bash
+cp -r go/ my-project && cd my-project
+go mod edit -module my-project
+git init
+git add . && git commit -m "Initial Go template"
+make workspace
+```
+
+Replace `suppressions/` with your own packages, update `.go-arch-lint.yml` to
+match the module layout, and add real scenarios under `features/` before writing
+user-visible behavior.

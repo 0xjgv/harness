@@ -9,6 +9,9 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
+WORKSPACE := $(CURDIR)/.harness/workspace.sh
+OFFLINE ?= 0
+
 # ── Parallelism (opt-in) ───────────────────────────────────────────
 # PARALLEL=1 → fan out subprojects with xargs -P. Output is buffered per
 # subproject and dumped in deterministic order when each finishes. Keep off
@@ -30,7 +33,16 @@ BUN_DIRS  := $(patsubst %/harness.ts,%,$(wildcard */harness.ts))
 PY_DIRS   := $(patsubst %/harness.py,%,$(wildcard */harness.py))
 GO_DIRS   := $(patsubst %/harness.go,%,$(wildcard */harness.go))
 RUST_DIRS := $(patsubst %/Cargo.toml,%,$(wildcard */Cargo.toml))
-SUBPROJECTS := $(sort $(BUN_DIRS) $(PY_DIRS) $(GO_DIRS) $(RUST_DIRS))
+BUN_PROJECTS  := $(sort $(BUN_DIRS))
+PY_PROJECTS   := $(sort $(filter-out $(BUN_PROJECTS),$(PY_DIRS)))
+GO_PROJECTS   := $(sort $(filter-out $(BUN_PROJECTS) $(PY_PROJECTS),$(GO_DIRS)))
+RUST_PROJECTS := $(sort $(filter-out $(BUN_PROJECTS) $(PY_PROJECTS) $(GO_PROJECTS),$(RUST_DIRS)))
+SUBPROJECTS := $(sort $(BUN_PROJECTS) $(PY_PROJECTS) $(GO_PROJECTS) $(RUST_PROJECTS))
+WORKSPACE_PROFILES := common \
+                      $(if $(BUN_PROJECTS),bun) \
+                      $(if $(PY_PROJECTS),python) \
+                      $(if $(GO_PROJECTS),go) \
+                      $(if $(RUST_PROJECTS),rust)
 
 # ── Shared shell helpers ───────────────────────────────────────────
 # Single filename → {lang, runner} dispatch table. Recipes source it via
@@ -45,9 +57,9 @@ lang_of() {
 }
 runner_of() {
   if   [ -f "$$1/harness.ts" ];  then echo "bun harness.ts";
-  elif [ -f "$$1/harness.py" ];  then echo "uv run harness";
-  elif [ -f "$$1/harness.go" ];  then echo "go run harness.go";
-  elif [ -f "$$1/Cargo.toml" ];  then echo "cargo harness";
+  elif [ -f "$$1/harness.py" ];  then echo "uv run --frozen --no-sync harness";
+  elif [ -f "$$1/harness.go" ];  then echo "go run -mod=readonly harness.go";
+  elif [ -f "$$1/Cargo.toml" ];  then echo "cargo run --quiet --locked --bin harness --";
   else return 1; fi
 }
 endef
@@ -170,8 +182,20 @@ ci: ## Read-only gate across all subprojects
 
 .PHONY: pre-push
 pre-push: ## Read-only push gate across all subprojects (lint, format check, acceptance, arch)
-	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 0 0 1
-	@$(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)"
+	@set -u -o pipefail; \
+	stdin_file=; \
+	if [ ! -t 0 ]; then \
+	  stdin_file=$$(mktemp "$${TMPDIR:-/tmp}/harness-pre-push.XXXXXX") || exit 1; \
+	  trap 'rm -f "$$stdin_file"' EXIT HUP INT TERM; \
+	  cat >"$$stdin_file" || exit 1; \
+	fi; \
+	eval "$$SH_ARCH_CONFIG_GUARD"; \
+	if [ -n "$$stdin_file" ]; then \
+	  arch_config_guard 0 0 1 <"$$stdin_file" || exit 1; \
+	else \
+	  arch_config_guard 0 0 1 || exit 1; \
+	fi; \
+	HARNESS_STDIN_FILE="$$stdin_file" $(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)"
 
 .PHONY: test
 test: ## Run tests only, all subprojects
@@ -234,42 +258,32 @@ _root_agents_sync:
 
 ##@ Setup & misc
 
-.PHONY: setup
-setup: ## Install per-language deps (one-time)
-	@if [ -z "$(SUBPROJECTS)" ]; then \
-	  printf "$(DIM)No subprojects detected. See README for how to add one.$(RESET)\n"; exit 0; \
-	fi
-	@set -eu; for d in $(BUN_DIRS);  do printf "$(BOLD)▶ %s$(RESET) $(DIM)(bun install)$(RESET)\n"    "$$d"; (cd "$$d" && bun install); done
-	@set -eu; for d in $(PY_DIRS);   do printf "$(BOLD)▶ %s$(RESET) $(DIM)(uv sync)$(RESET)\n"       "$$d"; (cd "$$d" && uv sync); done
-	@set -eu; for d in $(GO_DIRS);   do printf "$(BOLD)▶ %s$(RESET) $(DIM)(go mod download)$(RESET)\n" "$$d"; (cd "$$d" && go mod download); done
-	@set -eu; for d in $(RUST_DIRS); do printf "$(BOLD)▶ %s$(RESET) $(DIM)(cargo build)$(RESET)\n"    "$$d"; (cd "$$d" && cargo build); done
+.PHONY: deps
+deps: ## Restore every subproject from its committed dependency lock
+	@set -eu; \
+	for dir in $(SUBPROJECTS); do \
+	  $(MAKE) --no-print-directory -C "$$dir" deps OFFLINE="$(OFFLINE)"; \
+	done
+
+.PHONY: workspace
+workspace: ## Converge an autonomous, deterministic workspace
+	OFFLINE=$(OFFLINE) "$(WORKSPACE)" preflight $(WORKSPACE_PROFILES)
+	OFFLINE=$(OFFLINE) "$(WORKSPACE)" install $(WORKSPACE_PROFILES)
+	$(MAKE) --no-print-directory deps OFFLINE=$(OFFLINE)
+	OFFLINE=$(OFFLINE) "$(WORKSPACE)" sync-skills
+	OFFLINE=$(OFFLINE) "$(WORKSPACE)" install-hooks
+	OFFLINE=$(OFFLINE) "$(WORKSPACE)" verify $(WORKSPACE_PROFILES)
+	$(MAKE) --no-print-directory check OFFLINE=$(OFFLINE)
+	OFFLINE=$(OFFLINE) "$(WORKSPACE)" verify $(WORKSPACE_PROFILES)
+
+.PHONY: bootstrap setup
+bootstrap: workspace ## Compatibility alias for workspace
+
+setup: workspace ## Compatibility alias for workspace
 
 .PHONY: setup-hooks
-setup-hooks: ## Install root pre-commit + pre-push git hooks and verify Claude/Codex Stop hook wiring
-	@if ! env -u GIT_DIR -u GIT_WORK_TREE git rev-parse --git-dir >/dev/null 2>&1; then \
-	  printf "$(RED)Not a git repo.$(RESET) Run 'git init' first.\n"; exit 1; \
-	fi
-	@set -eu; for name in pre-commit pre-push; do \
-	  hook=$$(env -u GIT_DIR -u GIT_WORK_TREE git rev-parse --git-path "hooks/$$name"); \
-	  mkdir -p "$$(dirname "$$hook")"; \
-	  printf '#!/bin/sh\nexec make %s\n' "$$name" > "$$hook"; \
-	  chmod +x "$$hook"; \
-	  printf "$(GREEN)✓$(RESET) Installed %s → make %s\n" "$$hook" "$$name"; \
-	done
-	@if [ -f .claude/settings.json ] && grep -q 'Stop' .claude/settings.json && grep -q 'stop-hook' .claude/settings.json; then \
-	  printf "$(GREEN)✓$(RESET) Stop hook wiring (.claude/settings.json)\n"; \
-	else \
-	  printf "$(RED)⚠$(RESET) Missing Stop hook wiring: .claude/settings.json\n"; \
-	fi
-	@if [ -f .codex/hooks.json ] && grep -q 'Stop' .codex/hooks.json && grep -q 'stop-hook' .codex/hooks.json; then \
-	  printf "$(GREEN)✓$(RESET) Stop hook wiring (.codex/hooks.json)\n"; \
-	else \
-	  printf "$(RED)⚠$(RESET) Missing Stop hook wiring: .codex/hooks.json\n"; \
-	fi
-
-.PHONY: bootstrap
-bootstrap: setup setup-hooks ## Full first-time setup (setup + install hook)
-	@printf "$(GREEN)✓ Bootstrap complete.$(RESET) Try: $(BOLD)make check$(RESET)\n"
+setup-hooks: ## Install collision-safe managed Git hooks
+	OFFLINE=$(OFFLINE) "$(WORKSPACE)" install-hooks
 
 .PHONY: clean
 clean: ## Remove build artifacts and caches in each subproject
@@ -377,28 +391,33 @@ _scoped_run:
 
 _run:
 	@set -u -o pipefail; \
-	dirs="$(DIRS)"; cmd="$(CMD)"; vf="$(if $(VERBOSE),--verbose)"; quiet="$(QUIET)"; args="$(ARGS)"; \
+	dirs="$(DIRS)"; cmd="$(CMD)"; vf="$(if $(VERBOSE),--verbose)"; quiet="$(QUIET)"; args="$(ARGS)"; stdin_file=$${HARNESS_STDIN_FILE:-}; \
 	if [ -z "$$dirs" ]; then \
 	  printf "$(DIM)No subprojects to run '%s'.$(RESET)\n" "$$cmd"; \
 	  exit 0; \
 	fi; \
 	eval "$$SH_LANG_HELPERS"; \
 	run_one() { \
-	  local dir="$$1" cmd="$$2" vf="$$3" quiet="$$4" args="$$5" runner; \
+	  local dir="$$1" cmd="$$2" vf="$$3" quiet="$$4" args="$$5" workspace="$$6" offline="$$7" stdin_file="$$8" profile runner; \
+	  profile=$$(lang_of "$$dir"); \
 	  if ! runner=$$(runner_of "$$dir"); then \
 	    printf "$(RED)✗ %s$(RESET) $(DIM)(no recognized harness — skipped)$(RESET)\n" "$$dir"; \
 	    return 1; \
 	  fi; \
-	  [ -z "$$quiet" ] && printf "\n$(BOLD)▶ %s$(RESET) $(DIM)($(CYAN)%s$(RESET)$(DIM) · %s)$(RESET)\n" "$$dir" "$$(lang_of "$$dir")" "$$cmd"; \
-	  ( cd "$$dir" && $$runner $$cmd $$vf $$args ); \
+	  [ -z "$$quiet" ] && printf "\n$(BOLD)▶ %s$(RESET) $(DIM)($(CYAN)%s$(RESET)$(DIM) · %s)$(RESET)\n" "$$dir" "$$profile" "$$cmd"; \
+	  if [ -n "$$stdin_file" ]; then \
+	    ( cd "$$dir" && OFFLINE="$$offline" "$$workspace" exec "$$profile" -- $$runner "$$cmd" $$vf $$args ) <"$$stdin_file"; \
+	  else \
+	    ( cd "$$dir" && OFFLINE="$$offline" "$$workspace" exec "$$profile" -- $$runner "$$cmd" $$vf $$args ); \
+	  fi; \
 	}; \
 	passed=0; failed=0; failed_dirs=""; t_start=$$(date +%s); \
 	if [ -n "$(PARALLEL)" ]; then \
 	  tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT INT TERM; \
 	  export -f run_one lang_of runner_of; \
 	  printf '%s\n' $$dirs | xargs -n1 -P$(JOBS) -I{} bash -c ' \
-	    run_one "$$1" "$$2" "$$3" "$$4" "$$5" >"$$6/$$1.out" 2>&1; \
-	    echo $$? >"$$6/$$1.rc"' _ {} "$$cmd" "$$vf" "$$quiet" "$$args" "$$tmp"; \
+	    run_one "$$1" "$$2" "$$3" "$$4" "$$5" "$$7" "$$8" "$$9" >"$$6/$$1.out" 2>&1; \
+	    echo $$? >"$$6/$$1.rc"' _ {} "$$cmd" "$$vf" "$$quiet" "$$args" "$$tmp" "$(WORKSPACE)" "$(OFFLINE)" "$$stdin_file"; \
 	  for dir in $$dirs; do \
 	    [ -z "$$quiet" ] && cat "$$tmp/$$dir.out"; \
 	    rc=$$(cat "$$tmp/$$dir.rc" 2>/dev/null || echo 1); \
@@ -407,7 +426,7 @@ _run:
 	  done; \
 	else \
 	  for dir in $$dirs; do \
-	    if run_one "$$dir" "$$cmd" "$$vf" "$$quiet" "$$args"; then \
+	    if run_one "$$dir" "$$cmd" "$$vf" "$$quiet" "$$args" "$(WORKSPACE)" "$(OFFLINE)" "$$stdin_file"; then \
 	      passed=$$((passed+1)); \
 	    else \
 	      failed=$$((failed+1)); failed_dirs="$$failed_dirs $$dir"; \

@@ -10,6 +10,9 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
+WORKSPACE := $(CURDIR)/.harness/workspace.sh
+OFFLINE ?= 0
+
 GREEN := \033[32m
 RED   := \033[31m
 DIM   := \033[2m
@@ -32,7 +35,16 @@ BUN_DIRS  := $(patsubst %/harness.ts,%,$(wildcard */harness.ts))
 PY_DIRS   := $(patsubst %/harness.py,%,$(wildcard */harness.py))
 GO_DIRS   := $(patsubst %/harness.go,%,$(wildcard */harness.go))
 RUST_DIRS := $(patsubst %/Cargo.toml,%,$(wildcard */Cargo.toml))
-SUBPROJECTS := $(sort $(BUN_DIRS) $(PY_DIRS) $(GO_DIRS) $(RUST_DIRS))
+BUN_PROJECTS  := $(sort $(BUN_DIRS))
+PY_PROJECTS   := $(sort $(filter-out $(BUN_PROJECTS),$(PY_DIRS)))
+GO_PROJECTS   := $(sort $(filter-out $(BUN_PROJECTS) $(PY_PROJECTS),$(GO_DIRS)))
+RUST_PROJECTS := $(sort $(filter-out $(BUN_PROJECTS) $(PY_PROJECTS) $(GO_PROJECTS),$(RUST_DIRS)))
+SUBPROJECTS := $(sort $(BUN_PROJECTS) $(PY_PROJECTS) $(GO_PROJECTS) $(RUST_PROJECTS))
+WORKSPACE_PROFILES := common \
+                      $(if $(BUN_PROJECTS),bun) \
+                      $(if $(PY_PROJECTS),python) \
+                      $(if $(GO_PROJECTS),go) \
+                      $(if $(RUST_PROJECTS),rust)
 
 define SH_LANG_HELPERS
 lang_of() {
@@ -44,9 +56,9 @@ lang_of() {
 }
 runner_of() {
   if   [ -f "$$1/harness.ts" ];  then echo "bun harness.ts";
-  elif [ -f "$$1/harness.py" ];  then echo "uv run harness";
-  elif [ -f "$$1/harness.go" ];  then echo "go run harness.go";
-  elif [ -f "$$1/Cargo.toml" ];  then echo "cargo harness";
+  elif [ -f "$$1/harness.py" ];  then echo "uv run --frozen --no-sync harness";
+  elif [ -f "$$1/harness.go" ];  then echo "go run -mod=readonly harness.go";
+  elif [ -f "$$1/Cargo.toml" ];  then echo "cargo run --quiet --locked --bin harness --";
   else return 1; fi
 }
 endef
@@ -233,10 +245,22 @@ pre-commit: ## Root git pre-commit hook
 
 .PHONY: pre-push
 pre-push: ## Root git pre-push hook
-	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 0 0 1
-	@$(MAKE) --no-print-directory agents-md-drift
-	@$(MAKE) --no-print-directory skills-drift
-	@$(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)"
+	@set -u -o pipefail; \
+	stdin_file=; \
+	if [ ! -t 0 ]; then \
+	  stdin_file=$$(mktemp "$${TMPDIR:-/tmp}/harness-pre-push.XXXXXX") || exit 1; \
+	  trap 'rm -f "$$stdin_file"' EXIT HUP INT TERM; \
+	  cat >"$$stdin_file" || exit 1; \
+	fi; \
+	eval "$$SH_ARCH_CONFIG_GUARD"; \
+	if [ -n "$$stdin_file" ]; then \
+	  arch_config_guard 0 0 1 <"$$stdin_file" || exit 1; \
+	else \
+	  arch_config_guard 0 0 1 || exit 1; \
+	fi; \
+	$(MAKE) --no-print-directory agents-md-drift || exit 1; \
+	$(MAKE) --no-print-directory skills-drift || exit 1; \
+	HARNESS_STDIN_FILE="$$stdin_file" $(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)"
 
 .PHONY: ci
 ci: ## Root read-only verification
@@ -255,28 +279,32 @@ check-dirty: ## Run check only in templates with working-tree changes
 	[ -z "$$dirs" ] && { printf "$(DIM)Nothing to check.$(RESET)\n"; exit 0; }; \
 	$(MAKE) --no-print-directory _run CMD=check DIRS="$$dirs"
 
-.PHONY: setup-hooks
-setup-hooks: ## Install root pre-commit/pre-push hooks and verify Stop hook wiring
-	@if ! env -u GIT_DIR -u GIT_WORK_TREE git rev-parse --git-dir >/dev/null 2>&1; then \
-	  printf "$(RED)Not a git repo.$(RESET) Run 'git init' first.\n"; exit 1; \
-	fi
-	@set -eu; for name in pre-commit pre-push; do \
-	  hook=$$(env -u GIT_DIR -u GIT_WORK_TREE git rev-parse --git-path "hooks/$$name"); \
-	  mkdir -p "$$(dirname "$$hook")"; \
-	  printf '#!/bin/sh\nexec make %s\n' "$$name" > "$$hook"; \
-	  chmod +x "$$hook"; \
-	  printf "  $(GREEN)✓$(RESET) Installed %s → make %s\n" "$$hook" "$$name"; \
+.PHONY: deps
+deps: ## Restore every subproject from its committed dependency lock
+	@set -eu; \
+	for dir in $(SUBPROJECTS); do \
+	  $(MAKE) --no-print-directory -C "$$dir" deps OFFLINE="$(OFFLINE)"; \
 	done
-	@if [ -f .claude/settings.json ] && grep -q 'Stop' .claude/settings.json && grep -q 'stop-hook' .claude/settings.json; then \
-	  printf "  $(GREEN)✓$(RESET) Stop hook wiring (.claude/settings.json)\n"; \
-	else \
-	  printf "  $(RED)⚠$(RESET) Missing Stop hook wiring: .claude/settings.json\n"; \
-	fi
-	@if [ -f .codex/hooks.json ] && grep -q 'Stop' .codex/hooks.json && grep -q 'stop-hook' .codex/hooks.json; then \
-	  printf "  $(GREEN)✓$(RESET) Stop hook wiring (.codex/hooks.json)\n"; \
-	else \
-	  printf "  $(RED)⚠$(RESET) Missing Stop hook wiring: .codex/hooks.json\n"; \
-	fi
+
+.PHONY: workspace
+workspace: ## Converge an autonomous, deterministic workspace
+	OFFLINE=$(OFFLINE) "$(WORKSPACE)" preflight $(WORKSPACE_PROFILES)
+	OFFLINE=$(OFFLINE) "$(WORKSPACE)" install $(WORKSPACE_PROFILES)
+	$(MAKE) --no-print-directory deps OFFLINE=$(OFFLINE)
+	OFFLINE=$(OFFLINE) "$(WORKSPACE)" sync-skills
+	OFFLINE=$(OFFLINE) "$(WORKSPACE)" install-hooks
+	OFFLINE=$(OFFLINE) "$(WORKSPACE)" verify $(WORKSPACE_PROFILES)
+	$(MAKE) --no-print-directory check OFFLINE=$(OFFLINE)
+	OFFLINE=$(OFFLINE) "$(WORKSPACE)" verify $(WORKSPACE_PROFILES)
+
+.PHONY: bootstrap setup
+bootstrap: workspace ## Compatibility alias for workspace
+
+setup: workspace ## Compatibility alias for workspace
+
+.PHONY: setup-hooks
+setup-hooks: ## Install collision-safe managed Git hooks
+	OFFLINE=$(OFFLINE) "$(WORKSPACE)" install-hooks
 
 .PHONY: list
 list: ## Show detected language templates
@@ -286,14 +314,22 @@ list: ## Show detected language templates
 .PHONY: _run
 _run:
 	@set -u -o pipefail; \
-	dirs="$(DIRS)"; cmd="$(CMD)"; args="$(ARGS)"; quiet="$(QUIET)"; \
+	dirs="$(DIRS)"; cmd="$(CMD)"; args="$(ARGS)"; quiet="$(QUIET)"; stdin_file=$${HARNESS_STDIN_FILE:-}; \
 	[ -z "$$dirs" ] && { printf "$(DIM)No templates to run '%s'.$(RESET)\n" "$$cmd"; exit 0; }; \
 	eval "$$SH_LANG_HELPERS"; \
 	passed=0; failed=0; failed_dirs=""; \
 	for dir in $$dirs; do \
+	  profile=$$(lang_of "$$dir"); \
 	  runner=$$(runner_of "$$dir") || { printf "  $(RED)✗$(RESET) %s: no recognized runner\n" "$$dir"; failed=$$((failed+1)); continue; }; \
-	  [ -z "$$quiet" ] && printf "\n$(BOLD)▶ %s$(RESET) $(DIM)(%s · %s)$(RESET)\n" "$$dir" "$$(lang_of "$$dir")" "$$cmd"; \
-	  if (cd "$$dir" && $$runner "$$cmd" $$args); then \
+	  [ -z "$$quiet" ] && printf "\n$(BOLD)▶ %s$(RESET) $(DIM)(%s · %s)$(RESET)\n" "$$dir" "$$profile" "$$cmd"; \
+	  if [ -n "$$stdin_file" ]; then \
+	    (cd "$$dir" && OFFLINE="$(OFFLINE)" "$(WORKSPACE)" exec "$$profile" -- $$runner "$$cmd" $$args) <"$$stdin_file"; \
+	    run_status=$$?; \
+	  else \
+	    (cd "$$dir" && OFFLINE="$(OFFLINE)" "$(WORKSPACE)" exec "$$profile" -- $$runner "$$cmd" $$args); \
+	    run_status=$$?; \
+	  fi; \
+	  if [ $$run_status -eq 0 ]; then \
 	    passed=$$((passed+1)); \
 	  else \
 	    failed=$$((failed+1)); failed_dirs="$$failed_dirs $$dir"; \
@@ -303,7 +339,8 @@ _run:
 	printf "\n"; \
 	if [ $$failed -gt 0 ]; then \
 	  printf "$(RED)FAIL$(RESET) %d passed, %d failed\n" "$$passed" "$$failed"; \
-	  for d in $$failed_dirs; do printf "  Retry: $(BOLD)(cd %s && %s %s)$(RESET)\n" "$$d" "$$(runner_of "$$d")" "$$cmd"; done; \
+	  for d in $$failed_dirs; do printf "  Retry: $(BOLD)(cd %s && OFFLINE=%s %s exec %s -- %s %s)$(RESET)\n" \
+	    "$$d" "$(OFFLINE)" "$(WORKSPACE)" "$$(lang_of "$$d")" "$$(runner_of "$$d")" "$$cmd"; done; \
 	  exit 1; \
 	fi; \
 	printf "$(GREEN)OK$(RESET) %d passed\n" "$$passed"

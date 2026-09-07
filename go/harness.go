@@ -3,7 +3,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -28,7 +27,6 @@ var root = func() string {
 }()
 
 const (
-	lizard            = "lizard@1.22.2"
 	complexityMaxArgs = "8"
 )
 
@@ -338,7 +336,7 @@ func cmdTestCov() {
 func auditGate() gate {
 	return gate{
 		description: "Dep audit",
-		cmd:         []string{"go", "run", "golang.org/x/vuln/cmd/govulncheck@v1.1.4", "./..."},
+		cmd:         []string{"govulncheck", "./..."},
 		hint:        "bump the vulnerable dependency or escalate",
 	}
 }
@@ -460,7 +458,7 @@ func archGatesOrWarn() []gate {
 		return nil
 	}
 	return []gate{{description: "Arch (go-arch-lint)", cmd: []string{
-		"go", "run", "github.com/fe3dback/go-arch-lint@v1.15.0", "check",
+		"go-arch-lint", "check",
 	}, hint: "boundary crossed; surface the design decision to the human; don't edit arch config"}}
 }
 
@@ -633,9 +631,7 @@ func cmdMutation() {
 		&runOpts{extract: extractTestSummary, noExit: true})
 
 	fmt.Printf("  %s→%s gremlins unleash %s\n", dim, reset, target)
-	c := exec.Command("go", "run",
-		"github.com/go-gremlins/gremlins/cmd/gremlins@v0.5.0",
-		"unleash", "--timeout-coefficient=10", target)
+	c := exec.Command("gremlins", "unleash", "--timeout-coefficient=10", target)
 	c.Dir = root
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
@@ -693,7 +689,7 @@ func cmdCrap() {
 
 	metrics := complexityMetrics()
 	if metrics == nil {
-		// Lizard produced no usable output (uvx missing, lizard crash, format
+		// Lizard produced no usable output (binary missing, lizard crash, format
 		// drift). Reporting "all functions below max" would be a silent false-
 		// pass; surface the failure and degrade to advisory unless --enforce.
 		suffix := ""
@@ -827,7 +823,7 @@ func goModulePath() string {
 // partial output: if lizard crashed mid-walk, a partial slice would let
 // high-CCN functions slip through the gate silently.
 func complexityMetrics() []funcMetric {
-	c := exec.Command("uvx", lizard, "-l", "go", ".", "--csv")
+	c := exec.Command("lizard", "-l", "go", ".", "--csv")
 	c.Dir = root
 	out, err := c.Output()
 	if err != nil {
@@ -1059,7 +1055,7 @@ func cmdPrePush() {
 // applies the same exclusions so both gates target the same code set.
 func complexityGate() gate {
 	return gate{description: "Complexity (lizard)", cmd: []string{
-		"uvx", lizard, "-l", "go", ".",
+		"lizard", "-l", "go", ".",
 		"-C", "15", "-a", complexityMaxArgs, "-L", "100", "-i", "0",
 		"-x", "*_test.go", "-x", "./harness.go",
 	}, hint: "extract helpers or flatten branches until CCN <= 15; do not raise the threshold"}
@@ -1070,168 +1066,8 @@ func cmdComplexity() {
 	run(g.description, g.cmd, nil)
 }
 
-// ── Hook wiring (installed by `setup-hooks`) ────────────────────────
-// Claude reads .claude/settings.json and runs the harness directly; Codex reads
-// .codex/hooks.json and goes through the codex-stop-hook.sh wrapper (which turns
-// the exit code into the block/continue JSON Codex expects).
-const (
-	claudeSettingsSchema = "https://json.schemastore.org/claude-code-settings.json"
-	claudeStopCommand    = "cd $CLAUDE_PROJECT_DIR && go run harness.go stop-hook"
-	codexStopCommand     = `cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh go run harness.go stop-hook`
-)
-
-func claudeStopHook() map[string]any {
-	return map[string]any{"type": "command", "command": claudeStopCommand}
-}
-
-func codexStopHook() map[string]any {
-	return map[string]any{
-		"type":          "command",
-		"command":       codexStopCommand,
-		"timeout":       300,
-		"statusMessage": "Running stop-hook checks",
-	}
-}
-
-// gitHookPath resolves a git hook path via `git rev-parse` so worktrees and
-// core.hooksPath land in the right place. GIT_* env is stripped so an ambient
-// GIT_DIR from a parent process can't redirect us.
-func gitHookPath(name string) string {
-	var env []string
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "GIT_") {
-			env = append(env, kv)
-		}
-	}
-	c := exec.Command("git", "rev-parse", "--git-path", "hooks/"+name)
-	c.Dir = root
-	c.Env = env
-	if out, err := c.Output(); err == nil {
-		if p := strings.TrimSpace(string(out)); p != "" {
-			if filepath.IsAbs(p) {
-				return p
-			}
-			return filepath.Join(root, p)
-		}
-	}
-	return filepath.Join(root, ".git", "hooks", name)
-}
-
-func installGitHook(name string) {
-	path := gitHookPath(name)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create hooks directory: %v\n", err)
-		os.Exit(1)
-	}
-	content := fmt.Sprintf("#!/bin/sh\ngo run harness.go %s\n", name)
-	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to write hook: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func isStopHookHandler(handler any) bool {
-	m, ok := handler.(map[string]any)
-	if !ok || m["type"] != "command" {
-		return false
-	}
-	cmd, ok := m["command"].(string)
-	return ok && strings.Contains(cmd, "stop-hook")
-}
-
-func jsonObjectChild(data map[string]any, key, label string) map[string]any {
-	if data[key] == nil {
-		data[key] = map[string]any{}
-	}
-	child, ok := data[key].(map[string]any)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "%s:%s must contain a JSON object\n", label, key)
-		os.Exit(1)
-	}
-	return child
-}
-
-func cloneMap(m map[string]any) map[string]any {
-	out := make(map[string]any, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
-}
-
-// installStopHook injects/refreshes the Stop hook in a settings file, preserving
-// every other hook. Idempotent: an existing stop-hook handler (current or legacy)
-// is replaced in place and duplicates are dropped, so re-running never accumulates
-// entries. (encoding/json sorts object keys, so the file is rewritten in a stable
-// order — cosmetic, and identical on every subsequent run.)
-func installStopHook(rel string, hook map[string]any, claudeSettings bool) {
-	path := filepath.Join(root, filepath.FromSlash(rel))
-	data := map[string]any{}
-	if raw, err := os.ReadFile(path); err == nil {
-		if trimmed := strings.TrimSpace(string(raw)); trimmed != "" {
-			if err := json.Unmarshal([]byte(trimmed), &data); err != nil {
-				fmt.Fprintf(os.Stderr, "%s: invalid JSON: %v\n", rel, err)
-				os.Exit(1)
-			}
-		}
-	}
-	if claudeSettings {
-		if _, ok := data["$schema"]; !ok {
-			data["$schema"] = claudeSettingsSchema
-		}
-	}
-
-	hooks := jsonObjectChild(data, "hooks", rel)
-	stopGroups, _ := hooks["Stop"].([]any)
-	installed := false
-	for _, group := range stopGroups {
-		groupMap, ok := group.(map[string]any)
-		if !ok {
-			continue
-		}
-		groupHooks, ok := groupMap["hooks"].([]any)
-		if !ok {
-			continue
-		}
-		next := []any{}
-		for _, handler := range groupHooks {
-			if isStopHookHandler(handler) {
-				if !installed {
-					next = append(next, cloneMap(hook))
-					installed = true
-				}
-				continue
-			}
-			next = append(next, handler)
-		}
-		groupMap["hooks"] = next
-	}
-	if !installed {
-		stopGroups = append(stopGroups, map[string]any{"hooks": []any{cloneMap(hook)}})
-	}
-	hooks["Stop"] = stopGroups
-
-	out, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: marshal failed: %v\n", rel, err)
-		os.Exit(1)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
-	}
-	if err := os.WriteFile(path, append(out, '\n'), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
-	}
-}
-
 func cmdHooks() {
-	installGitHook("pre-commit")
-	installGitHook("pre-push")
-	installStopHook(".codex/hooks.json", codexStopHook(), false)
-	installStopHook(".claude/settings.json", claudeStopHook(), true)
-	fmt.Println("Installed pre-commit, pre-push, and Claude/Codex Stop hooks")
+	run("Install hooks", []string{".harness/workspace.sh", "install-hooks"}, nil)
 }
 
 func cmdClean() {
@@ -1300,7 +1136,7 @@ var tasks = []task{
 	{"pre-commit", cmdPreCommit, "Staged checks + tests"},
 	{"pre-push", cmdPrePush, "Read-only push gate: lint, acceptance, arch"},
 	{"ci", cmdCi, "Full verification: lint, audit, complexity, acceptance, coverage, crap, arch"},
-	{"setup-hooks", cmdHooks, "Install git pre-commit + pre-push hooks and Claude/Codex Stop wiring"},
+	{"setup-hooks", cmdHooks, "Install managed Git and Claude/Codex Stop hooks"},
 	{"post-edit", cmdPostEdit, "Format if source files changed"},
 	{"stop-hook", cmdStopHook, "Format changed files, then run stop-hook checks"},
 	{"agents-md-drift", cmdAgentsMdDrift, "Fail if AGENTS.md differs from CLAUDE.md"},

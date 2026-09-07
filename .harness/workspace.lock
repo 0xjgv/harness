@@ -1,0 +1,95 @@
+# harness workspace lock format 2
+#
+# Records are tab-separated. This file is data; workspace.sh never sources it.
+#
+# tool:     tool PROFILE NAME VERSION archive PATHS PROBE_ARG EXPECTED SOURCE
+# pin:      pin PROFILE NAME VERSION KIND PATHS PROBE_ARG EXPECTED SOURCE
+# input:    input PROFILE ECOSYSTEM PATH SHA256
+# artifact: artifact NAME KEY PLATFORM URL SHA256 ARCHIVE PAYLOAD
+#
+# PLATFORM is darwin-x86_64, darwin-arm64, linux-x86_64, linux-arm64, or any.
+# PATHS is a comma-separated list relative to the versioned install directory.
+# SOURCE is "-" for directly downloaded tools.
+
+format	2
+
+input	common	uv	.harness/python-downloads.json	8ec7cc98550d812b7aa854173e86c4d73f4ab452abb6deb59360a96077d64422
+input	common	uv	.harness/python-tools.lock	d65d7ba9ac7958c0aacd21a0f7c5fe7106eb15f36179fea052307236b57f89c6
+input	bun	bun	.harness/bun-tools/package.json	b69e87c3e1d9cdfd185fc58ba9b3d397fc9e7532ccb902cbd1cee58c273cef13
+input	bun	bun	.harness/bun-tools/bun.lock	699319fa81f7918cf9eb42ad73de4552db86e89223df617fa1c93c26f9ed887d
+input	go	go	.harness/go-tools/go.mod	5404e63dcf741e41213c0ff662a7d84302c1e730e77495b2f6dca57d7f5760e5
+input	go	go	.harness/go-tools/go.sum	f3e470b7c105dfa570b32616ca36b023dc479ceae8466ed04271880a4c73f5c7
+input	rust	cargo	.harness/rust-dist.lock	47ad3f93fd0a6ce443a2bdaf67b427b038dfb745b8bb9c9dda609be959518f25
+input	rust	cargo	.harness/cargo-modules.lock	4ce064288b714b3e9c080126e3b3db01c91b6d4665c93b57258fe091c02dcba2
+
+tool	common	uv	0.12.5	archive	bin/uv,bin/uvx	--version	uv 0.12.5	-
+artifact	uv	-	darwin-x86_64	https://github.com/astral-sh/uv/releases/download/0.12.5/uv-x86_64-apple-darwin.tar.gz	b3b2137477cf96c9686ebfb71524614cec780c673fd73e59bce099aef02e70e8	tar.gz	uv-x86_64-apple-darwin/uv,uv-x86_64-apple-darwin/uvx
+artifact	uv	-	darwin-arm64	https://github.com/astral-sh/uv/releases/download/0.12.5/uv-aarch64-apple-darwin.tar.gz	5bb0e5fe008a773c3dbcb97ff79cd89e1241464fe9d2f986d52ad8f1b037bd62	tar.gz	uv-aarch64-apple-darwin/uv,uv-aarch64-apple-darwin/uvx
+artifact	uv	-	linux-x86_64	https://github.com/astral-sh/uv/releases/download/0.12.5/uv-x86_64-unknown-linux-gnu.tar.gz	68a509da24b06b4223a1c0175fb5eb5bc79342b76cbeff0cfe51ac3f5b17b6b2	tar.gz	uv-x86_64-unknown-linux-gnu/uv,uv-x86_64-unknown-linux-gnu/uvx
+artifact	uv	-	linux-arm64	https://github.com/astral-sh/uv/releases/download/0.12.5/uv-aarch64-unknown-linux-gnu.tar.gz	9bf43b4d1a07665bf64d4c4e710930b382321a785e0eb10aac07f46471f86a31	tar.gz	uv-aarch64-unknown-linux-gnu/uv,uv-aarch64-unknown-linux-gnu/uvx
+
+pin	common	python	3.13.15	uv-python	-	--version	Python 3.13.15	cpython-3.13.15
+artifact	python	-	darwin-x86_64	https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.13.15%2B20260814-x86_64-apple-darwin-install_only_stripped.tar.gz	bf87354efcd9ae517da606fcda4e3a3f0d73a6f05ca7cba3c6d3c5270074bfc8	tar.gz	python
+artifact	python	-	darwin-arm64	https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.13.15%2B20260814-aarch64-apple-darwin-install_only_stripped.tar.gz	6d472fc49a4d95e58214a992c4c92aa73fe2a935837a01a9a36bab0bec6d72f3	tar.gz	python
+artifact	python	-	linux-x86_64	https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.13.15%2B20260814-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz	aaca2af2ab4d7b68a712660d1334c0cfd5ec13c0312ccd30c29122d8d0342320	tar.gz	python
+artifact	python	-	linux-arm64	https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.13.15%2B20260814-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz	985efd78c1c6521b379f7c64c2a25e6a1130f07441d1af8be441aa05260886aa	tar.gz	python
+
+pin	common	lizard	1.22.2	pypi-wheel	-	--version	1.22.2	lizard==1.22.2
+artifact	lizard	-	any	https://files.pythonhosted.org/packages/ab/89/3cc0dbdfadfc5baa50d1b24a7dfc69b3f59e572653ab9de9312cd731b5e9/lizard-1.22.2-py2.py3-none-any.whl	9a640e35103fbad7aeb6bb7ba5a58419054c2f4d347453a93728ccc3ac14bde1	wheel	lizard-1.22.2-py2.py3-none-any.whl
+
+pin	python	vulture	2.16	pypi-wheel	-	--version	vulture 2.16	vulture==2.16
+artifact	vulture	-	any	https://files.pythonhosted.org/packages/f5/be/f935130312330614811dae2ea9df3f395f6d63889eb6c2e68c14507152ee/vulture-2.16-py3-none-any.whl	6e0f1c312cef1c87856957e5c2ca9608834a7c794c2180477f30bf0e4cc58eee	wheel	vulture-2.16-py3-none-any.whl
+pin	python	pip-audit	2.10.1	pypi-wheel	-	--version	pip-audit 2.10.1	pip-audit==2.10.1
+artifact	pip-audit	-	any	https://files.pythonhosted.org/packages/a3/a7/b0c504148114047bd1bc9d97447453c6850ca176bb2f3c0038835994e8b7/pip_audit-2.10.1-py3-none-any.whl	99ef3f600a317c1945f1e89e227ef26e1c2d618429b8bd3fa6f4f7c440c4611a	wheel	pip_audit-2.10.1-py3-none-any.whl
+
+tool	bun	bun	1.3.14	archive	bin/bun	--version	1.3.14	-
+artifact	bun	-	darwin-x86_64	https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-darwin-x64-baseline.zip	3e35ad6f53971a9834bf9e6786e2adf72b5f1921cc9a9c5fde073d2972944076	zip	bun-darwin-x64-baseline/bun
+artifact	bun	-	darwin-arm64	https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-darwin-aarch64.zip	d8b96221828ad6f97ac7ac0ab7e95872341af763001e8803e8267652c2652620	zip	bun-darwin-aarch64/bun
+artifact	bun	-	linux-x86_64	https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-x64-baseline.zip	a063908ae08b7852ca10939bbdc6ceed3ddabce8fb9402dce83d65d73b36e6c7	zip	bun-linux-x64-baseline/bun
+artifact	bun	-	linux-arm64	https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-aarch64.zip	a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b	zip	bun-linux-aarch64/bun
+pin	bun	knip	5.88.1	npm-package	-	--version	5.88.1	knip@5.88.1
+artifact	knip	-	any	https://registry.npmjs.org/knip/-/knip-5.88.1.tgz	718555c3ddde29655a527d909bda5d2ac8d0fa29aeaf78690c5787153a9e6191	tgz	package
+
+tool	go	go	1.27.0	archive	go/bin/go	version	go version go1.27.0	-
+artifact	go	-	darwin-x86_64	https://go.dev/dl/go1.27.0.darwin-amd64.tar.gz	d3314e25496e4381d71a5c51d2907e7af655d199f6780b549f015bd85fef4986	tar.gz	go
+artifact	go	-	darwin-arm64	https://go.dev/dl/go1.27.0.darwin-arm64.tar.gz	90493b3bbd5e10f91d12153198bf1994fd756399b4fec93b49b0c6e2acdeeb3e	tar.gz	go
+artifact	go	-	linux-x86_64	https://go.dev/dl/go1.27.0.linux-amd64.tar.gz	675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685	tar.gz	go
+artifact	go	-	linux-arm64	https://go.dev/dl/go1.27.0.linux-arm64.tar.gz	51798d2c42d0e1c6ed7fd9f48728b4193abac9e8aad6dbac2fe96a81f5909bda	tar.gz	go
+
+tool	go	golangci-lint	2.12.2	archive	bin/golangci-lint	--version	golangci-lint has version 2.12.2	-
+artifact	golangci-lint	-	darwin-x86_64	https://github.com/golangci/golangci-lint/releases/download/v2.12.2/golangci-lint-2.12.2-darwin-amd64.tar.gz	f6f06d94b6241521c53d15450c5209b028270bf966f842afb11c030c79f5bc16	tar.gz	golangci-lint-2.12.2-darwin-amd64/golangci-lint
+artifact	golangci-lint	-	darwin-arm64	https://github.com/golangci/golangci-lint/releases/download/v2.12.2/golangci-lint-2.12.2-darwin-arm64.tar.gz	a9c54498731b3128f79e090be6110f3e5fffccc617b08142ed244d4126c73f29	tar.gz	golangci-lint-2.12.2-darwin-arm64/golangci-lint
+artifact	golangci-lint	-	linux-x86_64	https://github.com/golangci/golangci-lint/releases/download/v2.12.2/golangci-lint-2.12.2-linux-amd64.tar.gz	8df580d2670fed8fa984aac0507099af8df275e665215f5c7a2ae3943893a553	tar.gz	golangci-lint-2.12.2-linux-amd64/golangci-lint
+artifact	golangci-lint	-	linux-arm64	https://github.com/golangci/golangci-lint/releases/download/v2.12.2/golangci-lint-2.12.2-linux-arm64.tar.gz	44cd40a8c76c86755375adfeea52cfd3533cb43d7bd647771e0ae065e166df3a	tar.gz	golangci-lint-2.12.2-linux-arm64/golangci-lint
+
+pin	go	govulncheck	1.1.4	go-module	-	--version	Scanner: govulncheck@v1.1.4	golang.org/x/vuln/cmd/govulncheck@v1.1.4
+pin	go	go-arch-lint	1.15.0	go-module	-	version	Linter version:	github.com/fe3dback/go-arch-lint@v1.15.0
+pin	go	gremlins	0.5.0	go-module	-	--version	gremlins version dev	github.com/go-gremlins/gremlins/cmd/gremlins@v0.5.0
+
+tool	rust	rustup	1.28.2	archive	bin/rustup-init	--version	rustup-init 1.28.2	-
+artifact	rustup	-	darwin-x86_64	https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-apple-darwin/rustup-init	9c331076f62b4d0edeae63d9d1c9442d5fe39b37b05025ec8d41c5ed35486496	raw	rustup-init
+artifact	rustup	-	darwin-arm64	https://static.rust-lang.org/rustup/archive/1.28.2/aarch64-apple-darwin/rustup-init	20ef5516c31b1ac2290084199ba77dbbcaa1406c45c1d978ca68558ef5964ef5	raw	rustup-init
+artifact	rustup	-	linux-x86_64	https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init	20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c	raw	rustup-init
+artifact	rustup	-	linux-arm64	https://static.rust-lang.org/rustup/archive/1.28.2/aarch64-unknown-linux-gnu/rustup-init	e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c	raw	rustup-init
+
+pin	rust	rust	1.97.1	rustup-toolchain	-	--version	rustc 1.97.1	1.97.1
+artifact	rust	-	darwin-x86_64	https://static.rust-lang.org/dist/rust-1.97.1-x86_64-apple-darwin.tar.xz	891c32ea77b750dccc7fb0ea98e3feb9db3d29fe0cfea5907d002f270c59cf58	tar.xz	rust-1.97.1-x86_64-apple-darwin
+artifact	rust	-	darwin-arm64	https://static.rust-lang.org/dist/rust-1.97.1-aarch64-apple-darwin.tar.xz	c9748cc86107734a2a024069908a895de7caa2d37062fb641eef9f756938ace2	tar.xz	rust-1.97.1-aarch64-apple-darwin
+artifact	rust	-	linux-x86_64	https://static.rust-lang.org/dist/rust-1.97.1-x86_64-unknown-linux-gnu.tar.xz	88f28fa9af20594179f85d6df67078dfd6fa93e2f6da5e1e9b0ac4997988ca4f	tar.xz	rust-1.97.1-x86_64-unknown-linux-gnu
+artifact	rust	-	linux-arm64	https://static.rust-lang.org/dist/rust-1.97.1-aarch64-unknown-linux-gnu.tar.xz	9a7a2c336b4787f1b72f6bab7c35d5b7af2fd03cbd39b4fc721466a70d402a7d	tar.xz	rust-1.97.1-aarch64-unknown-linux-gnu
+artifact	rust	-	any	https://static.rust-lang.org/dist/channel-rust-1.97.1.toml	03569b1886ceb5c05276b50c8431ab111de944cd6140fe1fa7d821dd8e0f29cf	manifest	channel-rust-1.97.1.toml
+
+tool	rust	cargo-audit	0.22.2	archive	bin/cargo-audit	--version	cargo-audit 0.22.2	-
+artifact	cargo-audit	-	darwin-x86_64	https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-apple-darwin-v0.22.2.tgz	847831323de932155b226ab60ee4a180e13e5d007a019f0d4b7b4d89a6de2ab2	tgz	cargo-audit-x86_64-apple-darwin-v0.22.2/cargo-audit
+artifact	cargo-audit	-	darwin-arm64	https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-aarch64-apple-darwin-v0.22.2.tgz	ec7ca4263769593df4d909be85b94a6b79efa2897be5d2bb8ebd516e823175af	tgz	cargo-audit-aarch64-apple-darwin-v0.22.2/cargo-audit
+artifact	cargo-audit	-	linux-x86_64	https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz	ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39	tgz	cargo-audit-x86_64-unknown-linux-gnu-v0.22.2/cargo-audit
+artifact	cargo-audit	-	linux-arm64	https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-aarch64-unknown-linux-gnu-v0.22.2.tgz	c6603814ddaa45e51263dafd31c0ac98808f688d26f7395804f9670b0fd599dd	tgz	cargo-audit-aarch64-unknown-linux-gnu-v0.22.2/cargo-audit
+
+tool	rust	cargo-llvm-cov	0.8.7	archive	bin/cargo-llvm-cov	--version	cargo-llvm-cov 0.8.7	-
+artifact	cargo-llvm-cov	-	darwin-x86_64	https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.8.7/cargo-llvm-cov-x86_64-apple-darwin.tar.gz	288ce0cb976207a9a1ad5af4d7ec9a06c9af116727066fb2287df8d9d1026be9	tar.gz	cargo-llvm-cov
+artifact	cargo-llvm-cov	-	darwin-arm64	https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.8.7/cargo-llvm-cov-aarch64-apple-darwin.tar.gz	3efee732ed7e9a653e20d96c930e0ec799901289cce90f46bb20f627e2c0d2e9	tar.gz	cargo-llvm-cov
+artifact	cargo-llvm-cov	-	linux-x86_64	https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.8.7/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz	9a75fe29538d3800b3da57f6f6efb64cba5c720a257bf0cb8b51f39d495a9168	tar.gz	cargo-llvm-cov
+artifact	cargo-llvm-cov	-	linux-arm64	https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.8.7/cargo-llvm-cov-aarch64-unknown-linux-gnu.tar.gz	8f399d84993d13998b63fbe1084377713c719b00655c7d88d5b56c8c29105d90	tar.gz	cargo-llvm-cov
+
+pin	rust	cargo-modules	0.26.0	cargo-crate	-	--version	cargo-modules 0.26.0	cargo-modules@0.26.0
+artifact	cargo-modules	-	any	https://static.crates.io/crates/cargo-modules/cargo-modules-0.26.0.crate	ee1ab050e427d44d4c46cae625888bdf54f7d5f0bf29717569a538448b6f294b	crate	cargo-modules-0.26.0.crate

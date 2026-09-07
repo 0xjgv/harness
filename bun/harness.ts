@@ -21,31 +21,17 @@
 const APP_SOURCES = ['src'] as const;
 const QUALITY_SOURCES = ['src', 'harness.ts'] as const;
 const TEST_DIR = 'tests';
-const LIZARD = 'lizard@1.22.2';
-const KNIP = 'knip@5.88.1';
+const BIOME = './node_modules/.bin/biome';
+const TSC = './node_modules/.bin/tsc';
+const LIZARD = 'lizard';
+const KNIP = 'knip';
+const WORKSPACE_PROVISIONER = '.harness/workspace.sh';
 const COMPLEXITY_MAX_ARGS = 8;
 const ROOT = import.meta.dir;
 const BASELINE_FILE = '.harness-baseline';
 const SUPPRESSION_BASELINE_PREFIX = 'suppressions.';
 const ARCH_CONFIGS = ['.dependency-cruiser.json'] as const;
 const ARCH_CONFIG_ALLOW_ENV = 'HARNESS_ALLOW_ARCH_CONFIG';
-
-// ── Hook wiring (installed by `setup-hooks`) ────────────────────────
-// Claude reads .claude/settings.json and runs the harness directly; Codex reads
-// .codex/hooks.json and goes through the codex-stop-hook.sh wrapper (which turns
-// the exit code into the block/continue JSON Codex expects). Keep both in sync
-// with the committed template files so re-running the installer is a no-op.
-const CLAUDE_SETTINGS_SCHEMA = 'https://json.schemastore.org/claude-code-settings.json';
-const CLAUDE_STOP_COMMAND = 'cd $CLAUDE_PROJECT_DIR && bun harness.ts stop-hook';
-const CODEX_STOP_COMMAND =
-  'cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh bun harness.ts stop-hook';
-const CLAUDE_STOP_HOOK = { type: 'command', command: CLAUDE_STOP_COMMAND };
-const CODEX_STOP_HOOK = {
-  type: 'command',
-  command: CODEX_STOP_COMMAND,
-  timeout: 300,
-  statusMessage: 'Running stop-hook checks',
-};
 
 // ── Output ──────────────────────────────────────────────────────────
 
@@ -525,16 +511,20 @@ async function changedTsFiles(): Promise<string[]> {
 
 // ── Commands ────────────────────────────────────────────────────────
 
-async function cmdFix(files?: string[]): Promise<void> {
-  const target = files ?? ['.'];
-  await run('Fix & format', ['bunx', 'biome', 'check', '--write', ...target]);
+export function biomeCommand(...args: string[]): string[] {
+  return [BIOME, ...args];
 }
 
-function lintGate(files?: string[]): Gate {
+async function cmdFix(files?: string[]): Promise<void> {
+  const target = files ?? ['.'];
+  await run('Fix & format', biomeCommand('check', '--write', ...target));
+}
+
+export function lintGate(files?: string[]): Gate {
   const target = files ?? ['.'];
   return {
     description: 'Lint & format check',
-    cmd: ['bunx', 'biome', 'check', ...target],
+    cmd: biomeCommand('check', ...target),
     hint: 'run `bun harness.ts fix`',
   };
 }
@@ -544,10 +534,10 @@ async function cmdLint(files?: string[]): Promise<void> {
   await run(gate.description, gate.cmd);
 }
 
-function typecheckGate(): Gate {
+export function typecheckGate(): Gate {
   return {
     description: 'Typecheck',
-    cmd: ['bunx', 'tsc', '--noEmit'],
+    cmd: [TSC, '--noEmit'],
     extract: extractTscSummary,
     hint: 'fix the type; ignores are counted by the suppression ratchet',
   };
@@ -840,6 +830,10 @@ interface CrapFn {
   loc: string;
 }
 
+export function lizardCsvCommand(targets: readonly string[]): string[] {
+  return [LIZARD, ...targets, '--csv'];
+}
+
 export function crapScore(ccn: number, cov: number): number {
   return ccn * ccn * (1 - cov) ** 3 + ccn;
 }
@@ -922,7 +916,7 @@ async function cmdCrap(): Promise<void> {
   }
 
   // lizard --csv columns: nloc,ccn,token,param,length,location,file,name,sig,start,end
-  const lz = Bun.spawn(['uvx', LIZARD, ...targets, '--csv'], {
+  const lz = Bun.spawn(lizardCsvCommand(targets), {
     cwd: ROOT,
     stdout: 'pipe',
     stderr: 'pipe',
@@ -933,7 +927,7 @@ async function cmdCrap(): Promise<void> {
     lz.exited,
   ]);
   if (lzCode !== 0) {
-    // Lizard could not run (uvx missing, network failure, lizard crash).
+    // Lizard could not run (managed install missing or lizard crash).
     // Reporting "all functions below max" here would be a silent false-pass.
     console.log(
       `  ${RED}✗${RESET} CRAP: lizard failed to run (exit ${lzCode})` +
@@ -1000,40 +994,40 @@ async function complexityGatesOrWarn(): Promise<Gate[]> {
     warn('Complexity: no app sources; skipped');
     return [];
   }
-  return [
-    {
-      description: 'Complexity (lizard)',
-      cmd: [
-        'uvx',
-        LIZARD,
-        ...targets,
-        '-C',
-        '15',
-        '-a',
-        String(COMPLEXITY_MAX_ARGS),
-        '-L',
-        '100',
-        '-i',
-        '0',
-      ],
-      hint: 'extract helpers or flatten branches until CCN <= 15; do not raise the threshold',
-    },
-  ];
+  return [complexityGate(targets)];
+}
+
+export function complexityGate(targets: readonly string[]): Gate {
+  return {
+    description: 'Complexity (lizard)',
+    cmd: [
+      LIZARD,
+      ...targets,
+      '-C',
+      '15',
+      '-a',
+      String(COMPLEXITY_MAX_ARGS),
+      '-L',
+      '100',
+      '-i',
+      '0',
+    ],
+    hint: 'extract helpers or flatten branches until CCN <= 15; do not raise the threshold',
+  };
 }
 
 async function cmdComplexity(): Promise<void> {
   for (const gate of await complexityGatesOrWarn()) await run(gate.description, gate.cmd);
 }
 
-function deadcodeGate(): Gate {
+export function deadcodeGate(): Gate {
   // knip finds unused files, exports, and dependencies — coverage biome's
-  // per-file noUnusedVariables can't give. Run on-demand via bunx (like lizard
-  // via uvx), no devDep. knip.json declares the cucumber step files as entries
-  // and ignores the tool devDeps invoked as binaries; --no-config-hints keeps
-  // the gate output to genuine findings.
+  // per-file noUnusedVariables can't give. Workspace provisioning supplies the
+  // exact managed binary. knip.json declares the cucumber step files as entries;
+  // --no-config-hints keeps the gate output to genuine findings.
   return {
     description: 'Dead code (knip)',
-    cmd: ['bunx', KNIP, '--no-config-hints'],
+    cmd: [KNIP, '--no-config-hints'],
     hint: 'delete unused code, or allowlist genuine dynamic refs in knip.json',
   };
 }
@@ -1046,7 +1040,7 @@ async function cmdDeadcode(): Promise<void> {
 async function cmdPostEdit(): Promise<void> {
   const files = await changedTsFiles();
   if (files.length === 0) return;
-  await run('Fix & format', ['bunx', 'biome', 'check', '--write', ...files], { noExit: true });
+  await run('Fix & format', biomeCommand('check', '--write', ...files), { noExit: true });
 }
 
 async function cmdStopHook(): Promise<void> {
@@ -1073,111 +1067,6 @@ async function checkStopHooksPresent(): Promise<void> {
       console.log(`  ${RED}⚠${RESET} Missing Stop hook wiring: ${rel}`);
     }
   }
-}
-
-type JsonObject = Record<string, unknown>;
-
-function asObject(value: unknown): JsonObject | null {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-    ? (value as JsonObject)
-    : null;
-}
-
-function jsonObjectChild(data: JsonObject, key: string, label: string): JsonObject {
-  if (data[key] === undefined) data[key] = {};
-  const child = asObject(data[key]);
-  if (!child) throw new Error(`${label}:${key} must contain a JSON object`);
-  return child;
-}
-
-function jsonListChild(data: JsonObject, key: string, label: string): unknown[] {
-  if (data[key] === undefined) data[key] = [];
-  if (!Array.isArray(data[key])) throw new Error(`${label}:${key} must contain a JSON array`);
-  return data[key] as unknown[];
-}
-
-function isStopHookHandler(handler: unknown): boolean {
-  const obj = asObject(handler);
-  return obj !== null && obj.type === 'command' && typeof obj.command === 'string'
-    ? obj.command.includes('stop-hook')
-    : false;
-}
-
-async function gitHookPath(name: string): Promise<string> {
-  // Resolve via git so worktrees / core.hooksPath land in the right place. Strip
-  // GIT_* env so an ambient GIT_DIR from a parent process can't redirect us.
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined && !key.startsWith('GIT_')) env[key] = value;
-  }
-  const proc = Bun.spawn(['git', 'rev-parse', '--git-path', `hooks/${name}`], {
-    cwd: ROOT,
-    stdout: 'pipe',
-    stderr: 'pipe',
-    env,
-  });
-  const out = (await new Response(proc.stdout).text()).trim();
-  const code = await proc.exited;
-  const { isAbsolute, join } = await import('node:path');
-  if (code === 0 && out) return isAbsolute(out) ? out : join(ROOT, out);
-  return join(ROOT, '.git', 'hooks', name);
-}
-
-async function installGitHook(name: string): Promise<void> {
-  const { mkdirSync, writeFileSync, chmodSync } = await import('node:fs');
-  const { dirname } = await import('node:path');
-  const path = await gitHookPath(name);
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `#!/bin/sh\nbun harness.ts ${name}\n`);
-  chmodSync(path, 0o755);
-}
-
-async function installStopHook(
-  rel: string,
-  hook: JsonObject,
-  claudeSettings = false,
-): Promise<void> {
-  // Inject/refresh the Stop hook, preserving every other hook. Idempotent: an
-  // existing stop-hook handler (current or legacy) is replaced and duplicates
-  // dropped, so re-running never accumulates entries.
-  const { existsSync, readFileSync, writeFileSync, mkdirSync } = await import('node:fs');
-  const { dirname } = await import('node:path');
-  const path = `${ROOT}/${rel}`;
-  let data: JsonObject = {};
-  if (existsSync(path)) {
-    const text = readFileSync(path, 'utf8').trim();
-    if (text) {
-      const parsed: unknown = JSON.parse(text);
-      const obj = asObject(parsed);
-      if (!obj) throw new Error(`${rel} must contain a JSON object`);
-      data = obj;
-    }
-  }
-  if (claudeSettings && !('$schema' in data)) data.$schema = CLAUDE_SETTINGS_SCHEMA;
-
-  const hooks = jsonObjectChild(data, 'hooks', rel);
-  const stopGroups = jsonListChild(hooks, 'Stop', rel);
-  let installed = false;
-  for (const group of stopGroups) {
-    const groupObj = asObject(group);
-    if (!groupObj || !Array.isArray(groupObj.hooks)) continue;
-    const next: unknown[] = [];
-    for (const handler of groupObj.hooks) {
-      if (isStopHookHandler(handler)) {
-        if (!installed) {
-          next.push({ ...hook });
-          installed = true;
-        }
-        continue;
-      }
-      next.push(handler);
-    }
-    groupObj.hooks = next;
-  }
-  if (!installed) stopGroups.push({ hooks: [{ ...hook }] });
-
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`);
 }
 
 function firstDiffLine(a: string, b: string): number {
@@ -1237,14 +1126,12 @@ async function cmdCheck(): Promise<void> {
 
   const results: RunResult[] = [];
   results.push(
-    await run('Lockfile sync', ['bun', 'install', '--frozen-lockfile'], { noExit: true }),
+    await run('Fix & format', biomeCommand('check', '--write', '.'), { noExit: true }),
   );
+  const typecheck = typecheckGate();
   results.push(
-    await run('Fix & format', ['bunx', 'biome', 'check', '--write', '.'], { noExit: true }),
-  );
-  results.push(
-    await run('Typecheck', ['bunx', 'tsc', '--noEmit'], {
-      extract: extractTscSummary,
+    await run(typecheck.description, typecheck.cmd, {
+      extract: typecheck.extract,
       noExit: true,
     }),
   );
@@ -1334,11 +1221,11 @@ async function cmdPrePush(): Promise<void> {
 }
 
 async function cmdHooks(): Promise<void> {
-  await installGitHook('pre-commit');
-  await installGitHook('pre-push');
-  await installStopHook('.codex/hooks.json', CODEX_STOP_HOOK);
-  await installStopHook('.claude/settings.json', CLAUDE_STOP_HOOK, true);
-  console.log('Installed pre-commit, pre-push, and Claude/Codex Stop hooks');
+  await run('Install hooks', setupHooksCommand());
+}
+
+export function setupHooksCommand(): string[] {
+  return [WORKSPACE_PROVISIONER, 'install-hooks'];
 }
 
 async function cmdClean(): Promise<void> {
@@ -1371,17 +1258,17 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   crap: [cmdCrap, 'CRAP complexity x coverage gate (advisory)'],
   suppressions: [cmdSuppressions, 'Show or update suppression baseline'],
   complexity: [cmdComplexity, 'Cyclomatic complexity gate (lizard, CCN 15, args 8)'],
-  deadcode: [cmdDeadcode, 'Detect unused files/exports/deps (knip, via bunx)'],
+  deadcode: [cmdDeadcode, 'Detect unused files/exports/deps with managed knip'],
   arch: [cmdArch, 'Architecture checks (dependency-cruiser)'],
   'arch-config-guard': [cmdArchConfigGuard, 'Block unreviewed arch config changes'],
-  check: [cmdCheck, 'Full pre-flight: lockfile + fix + typecheck + tests'],
+  check: [cmdCheck, 'Full pre-flight: fix + typecheck + tests'],
   'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
   'pre-push': [cmdPrePush, 'Read-only push gate: lint, acceptance, arch'],
   ci: [
     cmdCi,
     'Lint + typecheck + audit + complexity + deadcode + acceptance + coverage + crap + arch',
   ],
-  'setup-hooks': [cmdHooks, 'Install git pre-commit + pre-push hooks and Claude/Codex Stop wiring'],
+  'setup-hooks': [cmdHooks, 'Install managed Git and Claude/Codex Stop hooks'],
   'post-edit': [cmdPostEdit, 'Format if source files changed'],
   'stop-hook': [cmdStopHook, 'Format changed files, then run stop-hook checks'],
   'agents-md-drift': [cmdAgentsMdDrift, 'Fail if AGENTS.md differs from CLAUDE.md'],

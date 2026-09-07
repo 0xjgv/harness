@@ -15,27 +15,54 @@ Two things live here, and they're easy to conflate:
 
 This root directory is the meta-repo, not one of the templates. It now dogfoods a
 small meta-harness: root `AGENTS.md` and `CLAUDE.md` are byte-identical, root Stop
-hooks run `make stop-hook`, and root git hooks can run `make pre-commit` /
+hooks run `make stop-hook`, and root Git hooks run `make pre-commit` /
 `make pre-push`. Each template subdirectory remains a fully independent copy-paste
-unit; there is no shared code or dependency between `python/`, `bun/`, `go/`,
-`rust/`, and `monorepo/`.
+unit. The provisioner bundle is intentionally copied byte-for-byte across surfaces;
+there is no runtime inheritance between `python/`, `bun/`, `go/`, `rust/`, and
+`monorepo/`.
 
 ## Commands (root level)
 
-The root `Makefile` manages repo-level dogfooding and skill deployment:
+The root `Makefile` owns deterministic workspace convergence and repo-level
+dogfooding:
 
-- `make check` — fail if `~/.claude/skills/harness/` or
-  `~/.agents/skills/harness/` differ from the canonical `skills/harness/`, fail if
-  root `AGENTS.md` differs from `CLAUDE.md`, and warn on protected arch config changes
-- `make sync-skills` — copy `skills/harness/*.md` → both deployed locations
-- `make agents-md-drift` — fail if root `AGENTS.md` differs from `CLAUDE.md`
-- `make sync-agents-md` — copy root `CLAUDE.md` → `AGENTS.md`
-- `make arch-config-guard ARGS=--warn` — warn on protected arch config changes
-- `make stop-hook` — root Stop hook: sync derived root docs/skills when needed, warn on
-  arch config changes, and dispatch `stop-hook` into dirty language templates
-- `make setup-hooks` — install root `.git/hooks/pre-commit` and `.git/hooks/pre-push`,
-  then verify root Claude/Codex Stop hook wiring
-- `make help` — list targets
+| Command | Contract |
+|---|---|
+| `make workspace` | Provision the detected profile union, locked dependencies, skills, safe root hooks, verification, `make check`, and final tracked-tree verification |
+| `make workspace OFFLINE=1` | Repeat convergence without network access from warm exact-tool and dependency caches |
+| `make deps` | Call every detected template's lock-preserving `make deps` exactly once in lexical order |
+| `make bootstrap` / `make setup` | Compatibility aliases for `make workspace` |
+| `make ci` | Run the root read-only gate across every detected template |
+| `make check` | Verify deployed skill drift, root instruction parity, and protected architecture config |
+| `make setup-hooks` | Delegate collision-safe root Git-hook installation and Stop verification to the provisioner |
+| `make sync-skills` | Copy the current canonical `skills/harness/` package to `~/.claude/skills/harness/` and `~/.agents/skills/harness/` |
+| `make agents-md-drift` | Fail if root `AGENTS.md` differs from `CLAUDE.md` |
+| `make sync-agents-md` | Copy root `CLAUDE.md` to `AGENTS.md` |
+| `make arch-config-guard ARGS=--warn` | Warn on protected architecture-config changes |
+| `make stop-hook` | Sync current derived root docs/skills, warn on architecture config, and dispatch into dirty templates |
+| `make help` | List targets |
+
+Workspace supports macOS and glibc Linux on `x86_64` and `arm64`. The bootstrap
+layer is Make, Bash, Git, curl, tar, Info-ZIP unzip, and a SHA-256 utility. `HOME`
+must be writable; Rust additionally requires `cc`. A Git worktree is required.
+Tracked/index state must be clean; untracked files are preserved. It
+never uses `sudo`, Homebrew, or shell-profile edits. Exact tools live under
+`~/.local/share/harness/tools/<tool>/<version>`; ambient versions are ignored.
+
+Workspace preflights the platform, bootstrap commands, manifest, input digests,
+Git state, skill source, Stop wiring, and both Git-hook destinations before any
+download or hook/skill mutation. It installs tools and locked dependencies before
+deploying skills or hooks. It verifies exact tools and frozen state, runs the normal
+auto-fixing `make check`, then fails with changed paths if tracked/index state is no
+longer clean; it never reverts those changes.
+
+Root `.harness/workspace.sh`, `.harness/workspace.lock`, and all eight native input
+files are canonical. The same bytes and modes are copied under `.harness/` in all
+five templates. `bash tests/provisioner_drift_test.sh` guards the complete path set,
+bytes, and modes. The native inputs are `python-downloads.json`,
+`python-tools.lock`, `bun-tools/package.json`, `bun-tools/bun.lock`,
+`go-tools/go.mod`, `go-tools/go.sum`, `rust-dist.lock`, and
+`cargo-modules.lock`.
 
 **After editing anything under `skills/harness/`, always run `make sync-skills`**, then
 `make check` to confirm no drift remains. After editing root `CLAUDE.md`, run
@@ -45,17 +72,27 @@ The root `Makefile` manages repo-level dogfooding and skill deployment:
 ## Commands (inside a template)
 
 Each template implements the same **5-script contract** independently, via its own
-zero-dependency task runner (`harness.py` / `harness.ts` / `harness.go` / `cargo harness`).
+zero-dependency task runner (`harness.py` / `harness.ts` / `harness.go` / `harness.rs`).
 There is no cross-template abstraction for this — each runner is stdlib/runtime-only by
 design, so logic is duplicated per language on purpose.
 
 ```bash
-cd python && uv run harness check   # fix, format, typecheck, test, suppression ratchet
-cd bun    && bun run check          # (or: bun harness.ts check)
-cd go     && go run harness.go check
-cd rust   && cargo harness check
+cd python && make check     # fix, format, typecheck, test, suppression ratchet
+cd bun    && make check
+cd go     && make check
+cd rust   && make check
 cd monorepo && make check           # dispatches check to every subproject copied inside it
 ```
+
+Make is the normal command boundary. When harness-specific arguments are needed,
+use the template's provisioner with the exact runner form:
+
+| Profile | Exact direct harness boundary |
+|---|---|
+| Python | `.harness/workspace.sh exec python -- uv run --frozen --no-sync harness <command> [args]` |
+| Bun | `.harness/workspace.sh exec bun -- bun harness.ts <command> [args]` |
+| Go | `.harness/workspace.sh exec go -- go run -mod=readonly harness.go <command> [args]` |
+| Rust | `.harness/workspace.sh exec rust -- cargo run --quiet --locked --bin harness -- <command> [args]` |
 
 | Script | When | Does | Fixes code? |
 |---|---|---|---|
@@ -69,31 +106,52 @@ cd monorepo && make check           # dispatches check to every subproject copie
 
 Other standalone subcommands every template exposes: `complexity`, `crap`, `acceptance`,
 `coverage` (Go also keeps `test-cov`), `mutation`, `arch`, `suppressions`,
-`agents-md-drift`, `sync-agents-md`, `setup-hooks`. Python and Bun additionally expose `deadcode` (vulture / knip); Go and
+`agents-md-drift`, and `sync-agents-md`. Python and Bun additionally expose `deadcode` (vulture / knip); Go and
 Rust rely on their linters (`golangci-lint unused`, clippy `dead_code`) instead of a
 separate target. `crap` is advisory by default (`--enforce` to hard-fail). Full command
 tables with exact flags live in each template's own `CLAUDE.md` — read that file before
 working inside a template rather than re-deriving commands here.
 
-To run a single test, use the template's native test runner scoped to a file/pattern
-(e.g. `uv run python -m unittest tests.test_crap`, `bun test tests/crap.test.ts`,
-`go test ./crap/...`, `cargo test --test smoke`) — the harness `check`/`ci` targets
-always run the full suite.
+To run a single test, keep the managed boundary and scope the native runner:
 
-Each template also ships its own `.github/workflows/ci.yml` that runs that template's
-`harness ci` — the local gate and the remote gate are the same command by design.
+```bash
+cd python && .harness/workspace.sh exec python -- uv run --frozen --no-sync python -m unittest tests.test_crap
+cd bun    && .harness/workspace.sh exec bun -- bun test tests/crap.test.ts
+cd go     && .harness/workspace.sh exec go -- go test -mod=readonly ./crap/...
+cd rust   && .harness/workspace.sh exec rust -- cargo test --locked --test smoke
+```
+
+The harness `check`/`ci` targets always run the full suite.
+
+Each template ships `.github/workflows/ci.yml` with the same two commands used
+locally: `make workspace`, then `make ci`.
+
+Only `.harness/workspace.sh install-hooks` writes Git hooks. `make setup-hooks` and
+the runners' compatibility command delegate to it; do not add hook-writing logic to
+language runners. Unknown existing hooks cause preflight refusal without modifying
+either destination. Only exact legacy harness shims migrate. Installed Git hooks and
+the checked-in Claude/Codex Stop hooks enter the Git root and invoke
+`make pre-commit`, `make pre-push`, or `make stop-hook`, so Make supplies the managed
+environment.
 
 ## Architecture
 
 **Templates are independent, not inherited.** `python/`, `bun/`, `go/`, `rust/` each
 carry their own linter, type checker, test runner, security lint rules, dependency
-auditor, complexity gate (`lizard` via `uvx`, all four languages), and CRAP advisory
+auditor, directly provisioned lizard complexity gate, and CRAP advisory
 gate. `monorepo/` is different in kind: it's a thin Make dispatcher with **no** lint/
 format/test logic of its own — it discovers subprojects by the presence of
 `harness.{ts,py,go}` / `Cargo.toml` in top-level dirs and forwards `check`/`ci`/
 `pre-push`/etc. to each subproject's own harness (see `monorepo/Makefile`'s
 `lang_of`/`runner_of` dispatch table). `monorepo/` is meant to have single-language
 templates copied inside it as subprojects (`cp -r python/ api`), not edited standalone.
+
+The managed manifest provisions lizard and the direct Python vulture/pip-audit,
+Bun knip, Go govulncheck/go-arch-lint/gremlins, and Rust
+cargo-audit/cargo-llvm-cov/cargo-modules tools. Runners invoke these managed commands
+directly. They must not launch tools through `uvx`, `bunx`, version-suffixed `go run`,
+ambient installers, or system-tool fallbacks. Cargo-mutants is intentionally absent;
+Rust `make mutation` reports its deterministic advisory skip.
 
 **Two-layer contract, shipped per template:**
 - **Layer 1 — quality harness** (always on): the 5-script contract above.
