@@ -1,0 +1,77 @@
+name: Workspace Convergence
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Prove the checked-in provisioner converges, reuses its warm cache, works
+# offline, runs the CI gate, and leaves the tracked/index state untouched.
+jobs:
+  linux_x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Assert runner platform
+        run: |
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "x86_64"
+
+      - name: First online convergence
+        run: make workspace
+
+      - name: Second online convergence without downloads
+        run: |
+          shim_dir=$(mktemp -d)
+          trap 'rm -rf "$shim_dir"' EXIT
+          printf '%s\n' '#!/bin/sh' 'exit 97' > "$shim_dir/curl"
+          chmod 0755 "$shim_dir/curl"
+          PATH="$shim_dir:$PATH" make workspace
+
+      - name: Warm offline convergence
+        run: make workspace OFFLINE=1
+
+      - name: Run CI gate
+        run: make ci
+
+      - name: Verify tracked tree is clean
+        run: test -z "$(git status --porcelain --untracked-files=no)"
+
+  macos_arm64:
+    name: macOS arm64
+    runs-on: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Assert runner platform
+        run: |
+          test "$(uname -s)" = "Darwin"
+          test "$(uname -m)" = "arm64"
+
+      - name: First online convergence
+        run: make workspace
+
+      - name: Second online convergence without downloads
+        run: |
+          shim_dir=$(mktemp -d)
+          trap 'rm -rf "$shim_dir"' EXIT
+          printf '%s\n' '#!/bin/sh' 'exit 97' > "$shim_dir/curl"
+          chmod 0755 "$shim_dir/curl"
+          PATH="$shim_dir:$PATH" make workspace
+
+      - name: Warm offline convergence
+        run: make workspace OFFLINE=1
+
+      - name: Run CI gate
+        run: make ci
+
+      - name: Verify tracked tree is clean
+        run: test -z "$(git status --porcelain --untracked-files=no)"

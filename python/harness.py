@@ -5,15 +5,15 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
-import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -23,8 +23,6 @@ if TYPE_CHECKING:
 APP_SOURCES = ("src",)
 QUALITY_SOURCES = ("src", "harness.py")
 TEST_DIR = "tests"
-LIZARD = "lizard@1.22.2"
-VULTURE = "vulture@2.16"
 VULTURE_MIN_CONFIDENCE = "60"
 VULTURE_ALLOWLIST = "vulture_allowlist.py"
 COMPLEXITY_MAX_ARGS = 8
@@ -32,25 +30,8 @@ BASELINE_FILE = ".harness-baseline"
 SUPPRESSION_BASELINE_PREFIX = "suppressions."
 ARCH_CONFIGS = (".importlinter",)
 ARCH_CONFIG_ALLOW_ENV = "HARNESS_ALLOW_ARCH_CONFIG"
-
-# ── Hook wiring (installed by `setup-hooks`) ──────────────────────
-# Claude reads .claude/settings.json and runs the harness directly; Codex reads
-# .codex/hooks.json and goes through the codex-stop-hook.sh wrapper (which turns
-# the exit code into the block/continue JSON Codex expects). Keep both forms in
-# sync with the committed template files so re-running the installer is a no-op.
-CLAUDE_SETTINGS_SCHEMA = "https://json.schemastore.org/claude-code-settings.json"
-CLAUDE_STOP_COMMAND = "cd $CLAUDE_PROJECT_DIR && uv run harness stop-hook"
-CODEX_STOP_COMMAND = (
-    'cd "$(git rev-parse --show-toplevel)" && '
-    ".codex/hooks/codex-stop-hook.sh uv run harness stop-hook"
-)
-CLAUDE_STOP_HOOK: dict[str, Any] = {"type": "command", "command": CLAUDE_STOP_COMMAND}
-CODEX_STOP_HOOK: dict[str, Any] = {
-    "type": "command",
-    "command": CODEX_STOP_COMMAND,
-    "timeout": 300,
-    "statusMessage": "Running stop-hook checks",
-}
+UV_RUN = ("uv", "run", "--frozen", "--no-sync")
+WORKSPACE_PROVISIONER = ".harness/workspace.sh"
 
 # ── Output ────────────────────────────────────────────────────────
 
@@ -180,6 +161,11 @@ def _parse_unittest_summary(output: str) -> str:
 def warn(message: str) -> None:
     """Print a non-blocking warning line."""
     print(f"  {GREEN}⚠{RESET} {message}")
+
+
+def _uv_run(*command: str) -> list[str]:
+    """Run inside the locked project environment without resolving or syncing."""
+    return [*UV_RUN, *command]
 
 
 def _existing(paths: Iterable[str]) -> list[str]:
@@ -457,17 +443,17 @@ def _changed_py_files() -> list[str]:
 
 def cmd_fix(files: list[str] | None = None) -> None:
     target = files or ["."]
-    run("Fix lint errors", ["uv", "run", "ruff", "check", "--fix", *target])
+    run("Fix lint errors", _uv_run("ruff", "check", "--fix", *target))
 
 
 def cmd_format(files: list[str] | None = None) -> None:
     target = files or ["."]
-    run("Format code", ["uv", "run", "ruff", "format", *target])
+    run("Format code", _uv_run("ruff", "format", *target))
 
 
 def _lint_gate(files: list[str] | None = None) -> Gate:
     target = files or ["."]
-    return Gate("Lint check", ["uv", "run", "ruff", "check", *target], "run `harness fix`")
+    return Gate("Lint check", _uv_run("ruff", "check", *target), "run `harness fix`")
 
 
 def cmd_lint(files: list[str] | None = None) -> None:
@@ -476,15 +462,13 @@ def cmd_lint(files: list[str] | None = None) -> None:
 
 
 def _format_check_gate() -> Gate:
-    return Gate(
-        "Format check", ["uv", "run", "ruff", "format", "--check", "."], "run `harness format`"
-    )
+    return Gate("Format check", _uv_run("ruff", "format", "--check", "."), "run `harness format`")
 
 
 def _typecheck_gate() -> Gate:
     return Gate(
         "Type check",
-        ["uv", "run", "basedpyright", *_quality_targets()],
+        _uv_run("basedpyright", *_quality_targets()),
         "fix the type; ignores are counted by the suppression ratchet",
     )
 
@@ -498,7 +482,7 @@ def cmd_test() -> None:
     if _has_tests():
         run(
             "Tests",
-            ["uv", "run", "python", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"],
+            _uv_run("python", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"),
         )
         return
 
@@ -506,7 +490,7 @@ def cmd_test() -> None:
     if not files:
         warn("Syntax check: no Python files found; skipped")
         return
-    run("Syntax check", ["uv", "run", "python", "-m", "py_compile", *files])
+    run("Syntax check", _uv_run("python", "-m", "py_compile", *files))
 
 
 def cmd_coverage() -> None:
@@ -518,11 +502,11 @@ def cmd_coverage() -> None:
     min_pct = _coverage_min_default()
     run(
         "Coverage (run)",
-        ["uv", "run", "coverage", "run", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"],
+        _uv_run("coverage", "run", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"),
     )
     run(
         f"Coverage >= {min_pct}%",
-        ["uv", "run", "coverage", "report", "--show-missing", f"--fail-under={min_pct}"],
+        _uv_run("coverage", "report", "--show-missing", f"--fail-under={min_pct}"),
     )
 
 
@@ -535,7 +519,7 @@ def _acceptance_gates_or_warn() -> list[Gate]:
     return [
         Gate(
             "Acceptance (behave)",
-            ["uv", "run", "behave", str(features_dir), "--no-color"],
+            _uv_run("behave", str(features_dir), "--no-color"),
             "align implementation with the `.feature`, not vice versa",
         )
     ]
@@ -557,8 +541,8 @@ def cmd_mutation() -> None:
         warn(f"Mutation: no {TEST_DIR}/test*.py files; skipped")
         return
 
-    run("Mutation (mutmut)", ["uv", "run", "mutmut", "run"], no_exit=True)
-    run("Mutation results", ["uv", "run", "mutmut", "results"], no_exit=True)
+    run("Mutation (mutmut)", _uv_run("mutmut", "run"), no_exit=True)
+    run("Mutation results", _uv_run("mutmut", "results"), no_exit=True)
 
 
 def _arch_gates_or_warn() -> list[Gate]:
@@ -566,7 +550,7 @@ def _arch_gates_or_warn() -> list[Gate]:
     if not Path(".importlinter").exists():
         warn("Arch: no .importlinter — skipped")
         return []
-    return [Gate("Arch (import-linter)", ["uv", "run", "lint-imports"])]
+    return [Gate("Arch (import-linter)", _uv_run("lint-imports"))]
 
 
 def cmd_arch() -> None:
@@ -763,7 +747,7 @@ def cmd_crap() -> None:
 
     # Emit coverage XML quietly; cmd_coverage must have populated .coverage.
     subprocess.run(
-        ["uv", "run", "coverage", "xml", "-o", "coverage.xml", "-q"],
+        _uv_run("coverage", "xml", "-o", "coverage.xml", "-q"),
         capture_output=True,
         text=True,
         check=False,
@@ -780,13 +764,13 @@ def cmd_crap() -> None:
         return
 
     lizard_res = subprocess.run(
-        ["uvx", LIZARD, *targets],
+        ["lizard", *targets],
         capture_output=True,
         text=True,
         check=False,
     )
     if lizard_res.returncode != 0:
-        # Lizard could not run (uvx missing, network failure, lizard crash).
+        # Lizard could not run (missing managed install or lizard crash).
         # Reporting "all functions below max" would be a silent false-pass.
         suffix = "" if enforce else " (advisory)"
         print(f"  {RED}✗{RESET} CRAP: lizard failed to run (exit {lizard_res.returncode}){suffix}")
@@ -833,7 +817,7 @@ def cmd_crap() -> None:
 def _audit_gate() -> Gate:
     return Gate(
         "Dep audit",
-        ["uv", "run", "--with", "pip-audit", "pip-audit"],
+        ["pip-audit", "--path", sysconfig.get_path("purelib")],
         "bump the vulnerable dependency or escalate",
     )
 
@@ -847,8 +831,7 @@ def _complexity_gate() -> Gate:
     return Gate(
         "Complexity (lizard)",
         [
-            "uvx",
-            LIZARD,
+            "lizard",
             *_app_targets(include_tests=True),
             "-C",
             "15",
@@ -880,8 +863,7 @@ def _deadcode_gate() -> Gate:
     return Gate(
         "Dead code (vulture)",
         [
-            "uvx",
-            VULTURE,
+            "vulture",
             *_app_targets(),
             *_existing([VULTURE_ALLOWLIST]),
             "--min-confidence",
@@ -901,8 +883,8 @@ def cmd_post_edit() -> None:
     files = _changed_py_files()
     if not files:
         return
-    run("Fix lint errors", ["uv", "run", "ruff", "check", "--fix", *files], no_exit=True)
-    run("Format code", ["uv", "run", "ruff", "format", *files], no_exit=True)
+    run("Fix lint errors", _uv_run("ruff", "check", "--fix", *files), no_exit=True)
+    run("Format code", _uv_run("ruff", "format", *files), no_exit=True)
 
 
 def cmd_stop_hook() -> None:
@@ -1058,124 +1040,9 @@ def cmd_pre_push() -> None:
     _exit_if_failed(run_gates_parallel(gates) and arch_config_ok)
 
 
-def _read_json_object(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    text = path.read_text(encoding="utf-8").strip()
-    if not text:
-        return {}
-    data = json.loads(text)
-    if not isinstance(data, dict):
-        raise ValueError(f"{path} must contain a JSON object")
-    return data
-
-
-def _write_json_object(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"{json.dumps(data, indent=2)}\n", encoding="utf-8")
-
-
-def _json_object_child(data: dict[str, Any], key: str, path: Path) -> dict[str, Any]:
-    child = data.get(key)
-    if child is None:
-        child = {}
-        data[key] = child
-    if not isinstance(child, dict):
-        raise ValueError(f"{path}:{key} must contain a JSON object")
-    return child
-
-
-def _json_list_child(data: dict[str, Any], key: str, path: Path) -> list[Any]:
-    child = data.get(key)
-    if child is None:
-        child = []
-        data[key] = child
-    if not isinstance(child, list):
-        raise ValueError(f"{path}:{key} must contain a JSON array")
-    return child
-
-
-def _is_stop_hook_handler(handler: object) -> bool:
-    """True for a command handler that already runs our stop-hook (any form)."""
-    return (
-        isinstance(handler, dict)
-        and handler.get("type") == "command"
-        and isinstance(handler.get("command"), str)
-        and "stop-hook" in handler["command"]
-    )
-
-
-def _install_stop_hook(path: Path, hook: dict[str, Any], *, claude_settings: bool = False) -> None:
-    """Inject/refresh the Stop hook in a settings file, preserving every other hook.
-
-    Idempotent: an existing stop-hook handler (current or legacy) is replaced in
-    place and any duplicates are dropped, so re-running never accumulates entries.
-    """
-    data = _read_json_object(path)
-    if claude_settings and "$schema" not in data:
-        data["$schema"] = CLAUDE_SETTINGS_SCHEMA
-
-    hooks = _json_object_child(data, "hooks", path)
-    stop_groups = _json_list_child(hooks, "Stop", path)
-    installed = False
-
-    for group in stop_groups:
-        if not isinstance(group, dict):
-            continue
-        group_hooks = group.get("hooks")
-        if not isinstance(group_hooks, list):
-            continue
-        next_group_hooks: list[Any] = []
-        for handler in group_hooks:
-            if _is_stop_hook_handler(handler):
-                if not installed:
-                    next_group_hooks.append(dict(hook))
-                    installed = True
-                continue
-            next_group_hooks.append(handler)
-        group["hooks"] = next_group_hooks
-
-    if not installed:
-        stop_groups.append({"hooks": [dict(hook)]})
-
-    _write_json_object(path, data)
-
-
-def _git_hook_path(name: str) -> Path:
-    """Resolve a git hook path via `git rev-parse` so worktrees / core.hooksPath work."""
-    git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--git-path", f"hooks/{name}"],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=git_env,
-        )
-    except FileNotFoundError:
-        return Path(f".git/hooks/{name}")
-
-    hook = result.stdout.strip()
-    if result.returncode == 0 and hook:
-        return Path(hook)
-    return Path(f".git/hooks/{name}")
-
-
-def _install_git_hook(name: str) -> None:
-    """Install a git hook shim that runs the matching `harness <name>`."""
-    hook = _git_hook_path(name)
-    hook.parent.mkdir(parents=True, exist_ok=True)
-    hook.write_text(f"#!/bin/sh\nuv run harness {name}\n", encoding="utf-8")
-    hook.chmod(0o755)
-
-
 def cmd_hooks() -> None:
-    """Install git pre-commit + pre-push hooks and the Claude/Codex Stop wiring."""
-    _install_git_hook("pre-commit")
-    _install_git_hook("pre-push")
-    _install_stop_hook(Path(".codex/hooks.json"), CODEX_STOP_HOOK)
-    _install_stop_hook(Path(".claude/settings.json"), CLAUDE_STOP_HOOK, claude_settings=True)
-    print("Installed pre-commit, pre-push, and Claude/Codex Stop hooks")
+    """Delegate collision-safe hook installation to the workspace provisioner."""
+    run("Install hooks", [WORKSPACE_PROVISIONER, "install-hooks"])
 
 
 def cmd_clean() -> None:
@@ -1202,7 +1069,7 @@ def cmd_clean() -> None:
             shutil.rmtree(p)
     for p in Path().rglob("__pycache__"):
         shutil.rmtree(p)
-    run("Ruff clean", ["uv", "run", "ruff", "clean"])
+    run("Ruff clean", _uv_run("ruff", "clean"))
 
 
 # ── CLI dispatch ──────────────────────────────────────────────────
@@ -1233,7 +1100,7 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "sync-agents-md": (cmd_sync_agents_md, "Overwrite AGENTS.md from CLAUDE.md"),
     "setup-hooks": (
         cmd_hooks,
-        "Install git pre-commit + pre-push hooks and Claude/Codex Stop wiring",
+        "Install collision-safe workspace hooks",
     ),
     "clean": (cmd_clean, "Remove cache and build artifacts"),
 }

@@ -8,23 +8,45 @@ Use this template when a single repo holds multiple subprojects in different lan
 
 ## Getting started
 
+Run these commands from the root of `harness-templates`:
+
 ```bash
-cp -r monorepo/ my-project && cd my-project
+cp -r monorepo/ my-project
+cp -r python/ my-project/api
+cp -r bun/ my-project/web
+# Customize each copied subproject's package/module metadata before committing.
+cd my-project
 git init
+git add . && git commit -m "Initial monorepo template"
+make workspace
 
-# Add subprojects (use any of the single-language templates):
-cp -r ../harness-templates/python/ api
-cp -r ../harness-templates/bun/    web
-
-# One-time install + git hook:
-make bootstrap
-
-# Daily loop:
 make check          # run check across every subproject
 make check-api      # scope to one subproject
 ```
 
-`make` with no arguments prints help. It never mutates files.
+The [root workspace contract](../README.md#autonomous-workspace) supports macOS
+and glibc Linux on `x86_64` and `arm64`. The VM supplies Make, Bash, Git, curl,
+tar, Info-ZIP unzip, a SHA-256 utility, and a writable `HOME`; include `cc` when
+the monorepo contains Rust. No ambient language toolchains are prerequisites.
+
+`make workspace` requires a clean tracked/index state and preserves untracked
+files. It discovers and deduplicates top-level project markers once, provisions
+the union of required language profiles once, restores locked dependencies,
+deploys skills, owns the root Git and Stop hooks, verifies the result, and runs
+`make check`. It never calls a child bootstrap target.
+
+After an online run has populated every required tool and dependency cache, the
+same workspace converges without network access:
+
+```bash
+make workspace OFFLINE=1
+```
+
+Offline mode makes no network requests and fails on a cold or incomplete
+cache. `make bootstrap` and the retained `make setup` command are compatibility
+aliases for `make workspace`.
+
+`make` with no arguments prints help and does not mutate files.
 
 ## Targets
 
@@ -39,9 +61,11 @@ make check-api      # scope to one subproject
 | `make ci` | Read-only gate across all subprojects (no fixes); each subproject runs its read-only gates in parallel |
 | `make test` | Run tests only, all subprojects |
 | `make list` | Show detected subprojects |
-| `make setup` | Per-language deps: `bun install`, `uv sync`, `go mod download`, `cargo build` |
-| `make setup-hooks` | Install git pre-commit + pre-push hooks → `make pre-commit` / `make pre-push` (path resolved via `git rev-parse`, worktree-safe) and verify Claude/Codex Stop hook wiring. Idempotent — re-run any time |
-| `make bootstrap` | `setup` + `setup-hooks` |
+| `make deps` | Restore each subproject's committed native lock exactly once, in lexical order |
+| `make workspace` | Provision the profile union, locked dependencies, skills, root hooks, verification, and `make check` |
+| `make workspace OFFLINE=1` | Repeat convergence from warm caches without network access |
+| `make bootstrap` / `make setup` | Compatibility aliases for `make workspace` |
+| `make setup-hooks` | Reinstall collision-safe managed root hooks; normal setup uses `make workspace` |
 | `make clean` | Delegate `clean` to each subproject |
 
 Scoped variants exist for `ci-<name>`, `pre-push-<name>`, `test-<name>`, `pre-commit-<name>`.
@@ -51,22 +75,40 @@ Flags:
 - `VERBOSE=1 make check` — forward `--verbose` to each subproject's harness.
 - `PARALLEL=1 make check` — fan out subprojects with `xargs -P$(JOBS)`. Per-subproject output is buffered and dumped in-order on completion; exit status matches the sequential run. Off by default — CI logs, the Stop hook, and agent-visible runs stay sequential.
 
+Parallelism applies only to quality-command dispatch. Workspace dependency
+restoration always remains serial: it calls every detected child's `make deps`
+once in lexical order, and each child preserves its native lock.
+
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs `make ci` on every push to `main` and every pull request — the same gate you run locally, so local gate == remote gate. It ships with every toolchain wired (uv, Bun, Go, Rust + golangci-lint and the cargo tools) so any mix of subprojects works out of the box; trim the setup steps to the languages you actually use.
+`.github/workflows/ci.yml` runs the same checked-in contract used locally on
+every push to `main` and every pull request:
+
+```bash
+make workspace
+make ci
+```
+
+There are no floating runtime setup steps to trim. The workspace provisioner
+selects the exact profile union for the detected subprojects.
 
 ## How it works
 
 Subproject discovery is filename-based. A top-level directory is a subproject when it contains one of:
 
-| File | Language | Runner invoked |
+| File | Profile | Root-managed runner invoked |
 |---|---|---|
-| `harness.ts` | bun | `bun harness.ts <cmd>` |
-| `harness.py` | python | `uv run harness <cmd>` |
-| `harness.go` | go | `go run harness.go <cmd>` |
-| `Cargo.toml` | rust | `cargo harness <cmd>` |
+| `harness.ts` | bun | `.harness/workspace.sh exec bun -- bun harness.ts <cmd>` |
+| `harness.py` | python | `.harness/workspace.sh exec python -- uv run --frozen --no-sync harness <cmd>` |
+| `harness.go` | go | `.harness/workspace.sh exec go -- go run -mod=readonly harness.go <cmd>` |
+| `Cargo.toml` | rust | `.harness/workspace.sh exec rust -- cargo run --quiet --locked --bin harness -- <cmd>` |
 
-The Makefile fans out `<cmd>` to each matching subproject, continues past failures, and prints an aggregate summary.
+The root classifies each top-level directory once in table order. If a directory
+contains multiple recognized markers, the first match wins and that directory
+appears only once. The resulting profile set is deduplicated before workspace
+installs tools. Normal and scoped targets always enter the root provisioner's
+managed environment, then run from the child directory. The Makefile continues
+past failures and prints an aggregate summary.
 
 `make pre-commit` is auto-scoped: it reads `git diff --cached --name-only`, maps each staged path to its top-level subproject directory, and runs `pre-commit` only in the affected ones. Staged files outside any subproject are ignored.
 
@@ -79,10 +121,16 @@ The Makefile fans out `<cmd>` to each matching subproject, continues past failur
 - **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
 - **Arch config guard**: edits to any subproject's arch config (`.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, `arch.toml`) warn during `check`/`stop-hook` and fail `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 
-Stop hooks are wired via `.claude/settings.json` for Claude and
-`.codex/hooks.json` for Codex. Each single-language template also ships this
-wiring for standalone use; at a monorepo root only the root copy runs, so a
-subproject's own hooks lie dormant until you open it as its own project.
+Workspace installs the root Git hooks and verifies the checked-in Claude and
+Codex Stop configuration. Every root Git and Stop hook enters the Git root and
+calls `make pre-commit`, `make pre-push`, or `make stop-hook`, so Make supplies
+the exact managed environment. Unknown existing Git hooks cause setup to fail
+without modification. Only exact legacy harness shims are migrated.
+
+The root pre-push target captures its stdin once and replays the exact input to
+the architecture guard and every child pre-push runner, including parallel
+dispatch. Child hook files and Stop wiring remain dormant while the monorepo
+root owns the workspace; they are available if a child is later used alone.
 
 ## Adding a subproject
 
@@ -101,17 +149,17 @@ To support a new language:
 2. Edit three spots in the monorepo Makefile:
    - Add a `<LANG>_DIRS := $(patsubst ...)` line in the discovery section and append it to `SUBPROJECTS`.
    - Add a case to `lang_of()` and `runner_of()` inside the `SH_LANG_HELPERS` define. (`SH_FILTER_DIRS` is language-agnostic; no edit needed there.)
-   - Add the install command to the `setup` target.
+   - Add its managed profile to `WORKSPACE_PROFILES` and to the checked-in provisioner manifest.
 3. Update the README "How it works" table.
 
 ## Design principles
 
-- **Dispatch only** — fix, lint, typecheck, test logic stays in each subproject's harness. The Makefile is pure routing.
+- **Dispatch only** — fix, lint, typecheck, and test logic stays in each subproject's harness. Quality targets are pure routing; workspace orchestration delegates to the checked-in provisioner.
 - **Quiet by default** — subprojects already print `✓`/`✗` summaries; the Makefile adds a one-line header per subproject and an aggregate footer.
 - **Fail-slow** — `check` and `ci` continue past failure so you see every red subproject in one run.
 - **`ci` never fixes** — the read-only gate stays read-only.
-- **No external helper script** — self-contained in the Makefile.
-- **Subprojects remain standalone** — `cd <subproject> && <its runner> check` still works.
+- **Checked-in provisioning** — `.harness/workspace.sh` owns exact tools, locks, skills, and hooks; the Makefile owns routing.
+- **Subprojects remain standalone** — `cd <subproject> && make check` uses that template's managed workspace boundary.
 
 ## Pitfalls for Make newcomers
 

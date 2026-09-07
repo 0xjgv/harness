@@ -1,33 +1,97 @@
 # CLAUDE
 
+## Workspace
+
+`make workspace` is the clean-clone and new-VM entry point. It supports macOS and
+glibc Linux on `x86_64` and `arm64`. The bootstrap layer is Make, Bash, Git, curl,
+tar, Info-ZIP unzip, a SHA-256 utility, and a writable `HOME`. It requires a Git
+worktree with clean tracked/index state; untracked files are preserved.
+
+Workspace preflights the platform, bootstrap commands, lock manifest, checksums,
+Git state, Stop configuration, skill source, and both Git-hook destinations before
+downloading or modifying hooks or skills. It does not use `sudo`, Homebrew, or shell
+profile edits. Ambient Bun and tool versions are ignored. Exact managed tools live
+under `~/.local/share/harness/tools/<tool>/<version>`. Pins are Bun 1.3.14,
+lizard 1.22.2, and knip 5.88.1.
+
+After tools and locked dependencies are installed, workspace deploys skills, installs
+the root Git hooks, verifies the checked-in Claude/Codex Stop wiring, runs the normal
+auto-fixing `make check`, and verifies tracked/index state again. If that check changes
+tracked files, workspace fails with their paths and does not revert them.
+
+`make workspace OFFLINE=1` makes no network requests and succeeds only after an
+online run has warmed the exact tool and dependency caches. A cold or incomplete
+offline cache fails before hooks or skills are modified. `make bootstrap` is a
+compatibility alias for `make workspace`.
+
+`make deps` restores the committed graph with `bun install --frozen-lockfile`;
+`make deps OFFLINE=1` adds `--offline`. It never upgrades or rewrites `bun.lock`.
+Upgrades remain explicit and reviewed:
+
+```bash
+.harness/workspace.sh exec bun -- bun update
+git diff -- bun.lock
+make deps
+```
+
 ## Commands
 
-- After edits: `bun run check` — fix, format, typecheck, test (warns/skips when no tests exist), hook-drift + suppression ratchet
-- Pre-commit: `bun run pre-commit` — staged files only (auto via git hook)
-- Pre-push: `bun run harness.ts pre-push` — read-only push gate over the whole tree: lint (biome covers format), acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
-- CI: `bun run ci` — read-only gates (lint, typecheck, audit, complexity, deadcode, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then coverage (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
-- Complexity: `bun run harness.ts complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over src + tests
-- Deadcode: `bun run harness.ts deadcode` — knip (via bunx, no devDep) flags unused files/exports/deps; `knip.json` lists the cucumber step entries and ignores tool devDeps invoked as binaries. Runs in ci + stop-hook.
-- Audit: `bun run audit` — audit dependencies for known vulnerabilities (via bun audit)
-- Acceptance: `bun run acceptance` — run cucumber against `tests/features/`
-- Coverage: `bun run coverage --min=0` — `bun test` coverage (LCOV) with threshold; default comes from `.harness-baseline` `coverage.min`; warns and skips when no tests exist
-- Mutation (advisory): `bun run mutation` — Stryker mutation score on src/; warns and skips when no tests exist
-- CRAP (advisory): `bun run crap --max=30` — complexity × coverage gate. Add `--enforce` to exit 1 on offenders (default exits 0 with warning). Warns and skips when no tests or coverage artifact exist.
-- Suppressions: `bun harness.ts suppressions` — full suppression breakdown; `--update-baseline` requires human sign-off and updates `.harness-baseline`
-- Arch: `bun run arch` — dependency-cruiser against `.dependency-cruiser.json`
-- Arch config guard: `bun harness.ts arch-config-guard` — blocks unreviewed `.dependency-cruiser.json` changes in pre-commit/pre-push/CI; use `HARNESS_ALLOW_ARCH_CONFIG=1` after review
-- Agents drift: `bun run harness.ts agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
-- Sync: `bun run harness.ts sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
-- Setup: `bun run setup-hooks` installs git pre-commit + pre-push hooks (path resolved via `git rev-parse`, worktree-safe) and idempotently installs the Claude/Codex Stop wiring
-- Stop hook: auto-formats/fixes changed files, then runs complexity and deadcode in parallel (`stop-hook`)
+Make is the normal managed boundary:
+
+- After edits: `make check` — fix, format, typecheck, test (warns/skips when no tests exist), hook drift, and suppression ratchet
+- Pre-commit: `make pre-commit` — staged files only (auto via Git hook)
+- Pre-push: `make pre-push` — read-only push gate over the whole tree: lint (Biome covers format), acceptance, and arch (the offline checks pre-commit and stop-hook skip), in parallel; runs automatically via the Git pre-push hook
+- CI: `make ci` — read-only lint, typecheck, audit, complexity, deadcode, acceptance, and arch gates run in parallel, are captured and printed in submission order, and run to completion; coverage then streams and CRAP remains advisory
+- Complexity: `make complexity` — managed lizard 1.22.2 CC gate (CCN≤15, args≤8, length≤100) over `src/` and `tests/`
+- Deadcode: `make deadcode` — managed knip 5.88.1 flags unused files, exports, and dependencies; `knip.json` lists Cucumber step entries and ignores tool devDependencies invoked as binaries; runs in CI and the Stop hook
+- Audit: `make audit` — audit dependencies for known vulnerabilities with managed Bun
+- Acceptance: `make acceptance` — run Cucumber against `tests/features/`
+- Coverage: `make coverage` — Bun test coverage (LCOV) with the `.harness-baseline` threshold; warns and skips when no tests exist
+- Mutation: `make mutation` — advisory Stryker mutation score over `src/`; warns and skips when no tests exist
+- CRAP: `make crap` — advisory complexity × coverage gate with max 30; use the managed runner's `--enforce` flag to hard-fail, and expect a warning/skip when tests or coverage are absent
+- Suppressions: `make suppressions` — full suppression breakdown; updating `.harness-baseline` requires the managed runner's `--update-baseline` flag and human sign-off
+- Arch: `make arch` — dependency-cruiser against `.dependency-cruiser.json`
+- Arch config guard: `make arch-config-guard` — blocks unreviewed `.dependency-cruiser.json` changes in pre-commit/pre-push/CI; use `HARNESS_ALLOW_ARCH_CONFIG=1` after review
+- Agents drift: `make agents-md-drift` — fail if `AGENTS.md` differs from `CLAUDE.md`
+- Sync: `make sync-agents-md` — overwrite `AGENTS.md` from `CLAUDE.md`
+- Setup: `make setup-hooks` — delegate collision-safe Git-hook installation and Stop verification to the provisioner
+- Stop hook: `make stop-hook` — auto-format/fix changed files, then run complexity and deadcode in parallel
+
+When harness-specific flags are required, use the exact managed runner boundary:
+
+```bash
+.harness/workspace.sh exec bun -- bun harness.ts check --verbose
+.harness/workspace.sh exec bun -- bun harness.ts coverage --min=80
+.harness/workspace.sh exec bun -- bun harness.ts crap --enforce
+.harness/workspace.sh exec bun -- bun harness.ts suppressions --update-baseline
+```
+
+Keep single tests and direct analyzer diagnostics inside the same profile:
+
+```bash
+.harness/workspace.sh exec bun -- bun test tests/crap.test.ts
+.harness/workspace.sh exec bun -- lizard src tests -C 15 -a 8 -L 100 -i 0
+.harness/workspace.sh exec bun -- knip --no-config-hints
+```
+
+Only `.harness/workspace.sh install-hooks` writes hooks. Unknown existing Git hooks
+cause preflight to fail without modifying either hook; only exact legacy harness shims
+are migrated. Installed Git hooks and the checked-in Stop hooks enter the Git root and
+call `make pre-commit`, `make pre-push`, or `make stop-hook`, so Make supplies the
+managed environment. CI uses the same two commands locally and remotely:
+
+```bash
+make workspace
+make ci
+```
 
 ## Definition of done
 
-- `bun run check` passes clean — never stop with check failing.
+- `make check` passes clean — never stop with check failing.
 - User-visible behavior change → a `.feature` scenario exists and acceptance passes.
 - No new suppressions: additions above `.harness-baseline` fail check; suppress only with the human's sign-off, stating why.
 - Arch config changes are integration-blocked: `check`/`stop-hook` warn, and `pre-commit`/`pre-push`/`ci` fail unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
-- `pre-push`/`ci` are the human's gates: leave the tree in a state where they would pass, but do not commit or push yourself.
+- `make pre-push` and `make ci` remain green and read-only; do not commit or push unless the current user prompt authorizes it.
 
 ## Behavior contract
 

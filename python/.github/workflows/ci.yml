@@ -5,7 +5,7 @@ on:
     branches: [main]
   pull_request:
 
-# Local gate == remote gate: this runs the same `harness ci` you run locally.
+# Local and remote use the same checked-in contract: `make workspace`, then `make ci`.
 jobs:
   ci:
     runs-on: ubuntu-latest
@@ -14,16 +14,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-
-      - name: Set up Python
-        run: uv python install
-
-      - name: Sync dependencies
-        run: uv sync
+      - name: Provision workspace
+        run: make workspace
 
       - name: Run CI gate
-        run: uv run harness ci
+        run: make ci

@@ -48,6 +48,8 @@ struct RunOpts {
     no_exit: bool,
     /// Extra environment variables for the child process.
     env: Vec<(String, String)>,
+    /// Ambient environment variables the child process must not inherit.
+    env_remove: Vec<String>,
     /// Stream inherits stdio for commands whose live output is part of the contract.
     stream: bool,
 }
@@ -64,12 +66,16 @@ fn run(description: &str, cmd: &[&str], opts: Option<&RunOpts>) -> RunResult {
     let args = &cmd[1..];
     let dir = root();
     let env = opts.map_or(&[][..], |o| o.env.as_slice());
+    let env_remove = opts.map_or(&[][..], |o| o.env_remove.as_slice());
 
     let build = || {
         let mut c = Command::new(program);
         c.args(args).current_dir(dir);
         for (k, v) in env {
             c.env(k, v);
+        }
+        for key in env_remove {
+            c.env_remove(key);
         }
         c
     };
@@ -746,11 +752,9 @@ fn cmd_coverage() {
         return;
     }
 
-    // cargo-llvm-cov needs llvm-cov/llvm-profdata. rustup ships them via the
-    // `llvm-tools-preview` component; toolchains installed another way (e.g.
-    // Homebrew) may not. When they are absent, fall back to a system LLVM
-    // install via the documented LLVM_COV / LLVM_PROFDATA env vars.
-    let env = llvm_tools_env();
+    // The managed rustup toolchain supplies llvm-tools-preview. Remove ambient
+    // overrides so cargo-llvm-cov cannot select system or Homebrew binaries.
+    let env_remove = vec!["LLVM_COV".to_string(), "LLVM_PROFDATA".to_string()];
     let lcov_path = root().join("target").join("llvm-cov").join("lcov.info");
     if let Some(parent) = lcov_path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -761,71 +765,27 @@ fn cmd_coverage() {
     run(
         "Coverage (run)",
         &["cargo", "llvm-cov", "--no-report"],
-        Some(&RunOpts { env: env.clone(), ..RunOpts::default() }),
+        Some(&RunOpts { env_remove: env_remove.clone(), ..RunOpts::default() }),
     );
     run(
         "Coverage: LCOV report",
         &["cargo", "llvm-cov", "report", "--lcov", "--output-path", &lcov_str],
-        Some(&RunOpts { env: env.clone(), ..RunOpts::default() }),
+        Some(&RunOpts { env_remove: env_remove.clone(), ..RunOpts::default() }),
     );
     run(
         &format!("Coverage >= {min_pct}%"),
         &["cargo", "llvm-cov", "report", "--summary-only", "--fail-under-lines", &threshold],
-        Some(&RunOpts { env, ..RunOpts::default() }),
+        Some(&RunOpts { env_remove, ..RunOpts::default() }),
     );
-}
-
-/// Locate a system LLVM for cargo-llvm-cov when the rustup component is absent.
-///
-/// Returns `LLVM_COV` / `LLVM_PROFDATA` pairs to pass to the child process, or
-/// an empty vec when the rustup `llvm-tools` are present (cargo-llvm-cov finds
-/// them itself) or no system LLVM is found.
-fn llvm_tools_env() -> Vec<(String, String)> {
-    // rustup install: the tools sit in the toolchain sysroot.
-    if let Ok(out) = Command::new("rustc").arg("--print").arg("sysroot").output() {
-        let sysroot = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let host = Command::new("rustc")
-            .arg("-vV")
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .and_then(|s| s.lines().find_map(|l| l.strip_prefix("host: ").map(str::to_string)));
-        if let Some(host) = host {
-            let bin = Path::new(&sysroot).join("lib/rustlib").join(&host).join("bin");
-            if bin.join("llvm-cov").exists() {
-                return Vec::new(); // rustup component present.
-            }
-        }
-    }
-    // System LLVM fallback (Homebrew, Linux package managers).
-    for prefix in ["/opt/homebrew/opt/llvm/bin", "/usr/local/opt/llvm/bin", "/usr/bin"] {
-        let cov = Path::new(prefix).join("llvm-cov");
-        let profdata = Path::new(prefix).join("llvm-profdata");
-        if cov.exists() && profdata.exists() {
-            return vec![
-                ("LLVM_COV".to_string(), cov.to_string_lossy().into_owned()),
-                ("LLVM_PROFDATA".to_string(), profdata.to_string_lossy().into_owned()),
-            ];
-        }
-    }
-    Vec::new()
 }
 
 /// Run cargo-mutants. Advisory — NOT wired into `ci`.
 ///
 /// Mutation testing injects small bugs and checks whether the test suite
-/// catches them. It is slow and noisy by nature, so it stays an explicit
-/// opt-in rather than a blocking gate. Absent → warn + skip.
+/// catches them. cargo-mutants is not part of the managed tool manifest, so
+/// this command skips deterministically instead of probing the ambient PATH.
 fn cmd_mutation() {
-    if !tool_installed("mutants") {
-        println!("  {DIM}\u{2298} Mutation skipped (install: cargo install cargo-mutants){RESET}");
-        return;
-    }
-    run(
-        "Mutation (cargo-mutants)",
-        &["cargo", "mutants", "--no-shuffle"],
-        Some(&RunOpts { no_exit: true, ..RunOpts::default() }),
-    );
+    println!("  {DIM}\u{2298} Mutation skipped (cargo-mutants is not provisioned){RESET}");
 }
 
 /// Run architecture checks via cargo-modules against `arch.toml`.
@@ -1027,22 +987,7 @@ fn cmd_arch_config_guard() {
 fn complexity_gate() -> Gate {
     Gate::new(
         "Complexity (lizard)",
-        &[
-            "uvx",
-            "lizard@1.22.2",
-            "-l",
-            "rust",
-            "src",
-            "tests",
-            "-C",
-            "15",
-            "-a",
-            "8",
-            "-L",
-            "100",
-            "-i",
-            "0",
-        ],
+        &["lizard", "-l", "rust", "src", "tests", "-C", "15", "-a", "8", "-L", "100", "-i", "0"],
     )
     .with_hint("extract helpers or flatten branches until CCN <= 15; do not raise the threshold")
 }
@@ -1078,18 +1023,18 @@ fn cmd_crap() {
             println!("  {RED}\u{2717}{RESET} CRAP: cannot create {}: {e}", parent.display());
             std::process::exit(1);
         }
-        let env = llvm_tools_env();
+        let env_remove = vec!["LLVM_COV".to_string(), "LLVM_PROFDATA".to_string()];
         let lcov_str = lcov_path.to_string_lossy().into_owned();
         let run_result = run(
             "CRAP: running tests under llvm-cov",
             &["cargo", "llvm-cov", "--no-report"],
-            Some(&RunOpts { env: env.clone(), no_exit: true, ..RunOpts::default() }),
+            Some(&RunOpts { env_remove: env_remove.clone(), no_exit: true, ..RunOpts::default() }),
         );
         let report_result = if run_result.ok {
             run(
                 "CRAP: emit LCOV",
                 &["cargo", "llvm-cov", "report", "--lcov", "--output-path", &lcov_str],
-                Some(&RunOpts { env, no_exit: true, ..RunOpts::default() }),
+                Some(&RunOpts { env_remove, no_exit: true, ..RunOpts::default() }),
             )
         } else {
             run_result
@@ -1105,10 +1050,8 @@ fn cmd_crap() {
         std::process::exit(1);
     };
 
-    let lz_output = Command::new("uvx")
-        .args(["lizard@1.22.2", "-l", "rust", "src", "--csv"])
-        .current_dir(root())
-        .output();
+    let lz_output =
+        Command::new("lizard").args(["-l", "rust", "src", "--csv"]).current_dir(root()).output();
 
     let lz_stdout = match lz_output {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
@@ -1305,13 +1248,16 @@ fn parse_lizard_csv_row(row: &str) -> Option<(u32, String, u32, u32, String)> {
 
 /// True when `cargo <subcommand> --version` succeeds (the subcommand is installed).
 fn tool_installed(subcommand: &str) -> bool {
-    Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .args([subcommand, "--version"])
         .current_dir(root())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .stderr(Stdio::null());
+    if subcommand == "llvm-cov" {
+        command.env_remove("LLVM_COV").env_remove("LLVM_PROFDATA");
+    }
+    command.status().is_ok_and(|s| s.success())
 }
 
 /// Return the value of a `--name=value` CLI argument, if present.
@@ -1498,72 +1444,8 @@ fn cmd_pre_push() {
     }
 }
 
-/// Resolve a git hook path via `git rev-parse` so worktrees / `core.hooksPath` land
-/// in the right place. `GIT_*` env is stripped so an ambient `GIT_DIR` from a
-/// parent process can't redirect us. Falls back to `.git/hooks/<name>` if git is absent.
-fn git_hook_path(name: &str) -> PathBuf {
-    let fallback = || root().join(".git").join("hooks").join(name);
-    let mut cmd = Command::new("git");
-    cmd.args(["rev-parse", "--git-path", &format!("hooks/{name}")]).current_dir(root());
-    cmd.env_clear();
-    for (key, value) in env::vars() {
-        if !key.starts_with("GIT_") {
-            cmd.env(key, value);
-        }
-    }
-    let Ok(out) = cmd.output() else { return fallback() };
-    if !out.status.success() {
-        return fallback();
-    }
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if path.is_empty() {
-        return fallback();
-    }
-    let candidate = Path::new(&path);
-    if candidate.is_absolute() { candidate.to_path_buf() } else { root().join(candidate) }
-}
-
-/// Install a git hook shim that runs the matching `cargo harness <name>`.
-fn install_git_hook(name: &str) {
-    let path = git_hook_path(name);
-    if let Some(parent) = path.parent()
-        && let Err(e) = fs::create_dir_all(parent)
-    {
-        eprintln!("Failed to create hooks directory: {e}");
-        std::process::exit(1);
-    }
-    if fs::write(&path, format!("#!/bin/sh\ncargo harness {name}\n")).is_err() {
-        eprintln!("Failed to write {name} hook");
-        std::process::exit(1);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o755));
-    }
-}
-
 fn cmd_hooks() {
-    install_git_hook("pre-commit");
-    install_git_hook("pre-push");
-    println!("Installed pre-commit and pre-push git hooks");
-    // The runner is std-only (no JSON parser), so it verifies the Stop wiring
-    // rather than injecting into settings that may carry other hooks. The template
-    // ships .claude/settings.json and .codex/hooks.json already wired; copy them in
-    // (cp -r the template's .claude / .codex) if this warns.
-    check_stop_hook_present();
-}
-
-fn check_stop_hook_present() {
-    let root = root();
-    for rel in [".claude/settings.json", ".codex/hooks.json"] {
-        let content = fs::read_to_string(root.join(rel)).unwrap_or_default();
-        if content.contains("Stop") && content.contains("stop-hook") {
-            println!("  {GREEN}\u{2713}{RESET} Stop hook wiring ({rel})");
-        } else {
-            println!("  {RED}\u{26a0}{RESET} Missing Stop hook wiring: {rel}");
-        }
-    }
+    run("Install workspace hooks", &[".harness/workspace.sh", "install-hooks"], None);
 }
 
 fn cmd_clean() {

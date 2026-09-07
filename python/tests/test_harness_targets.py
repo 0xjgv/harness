@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import io
 import os
 import subprocess
@@ -120,7 +121,10 @@ class TestNoTestBehavior(unittest.TestCase):
         run_mock.assert_called_once()
         description, command = run_mock.call_args.args
         self.assertEqual(description, "Syntax check")
-        self.assertEqual(command[:5], ["uv", "run", "python", "-m", "py_compile"])
+        self.assertEqual(
+            command[:7],
+            ["uv", "run", "--frozen", "--no-sync", "python", "-m", "py_compile"],
+        )
         self.assertIn("harness.py", command)
         self.assertIn("src/app.py", command)
 
@@ -130,7 +134,19 @@ class TestNoTestBehavior(unittest.TestCase):
 
         run_mock.assert_called_once_with(
             "Tests",
-            ["uv", "run", "python", "-m", "unittest", "discover", "-s", "tests", "-q"],
+            [
+                "uv",
+                "run",
+                "--frozen",
+                "--no-sync",
+                "python",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-q",
+            ],
         )
 
     def test_warning_only_gates_skip_when_no_tests_exist(self):
@@ -152,6 +168,123 @@ class TestNoTestBehavior(unittest.TestCase):
                 self.assertIn(expected, output.getvalue())
                 run_mock.assert_not_called()
                 subprocess_run.assert_not_called()
+
+
+class TestManagedCommandVectors(unittest.TestCase):
+    def test_uv_run_commands_are_centrally_frozen_and_non_syncing(self):
+        self.assertEqual(
+            harness._uv_run("ruff", "check"),
+            ["uv", "run", "--frozen", "--no-sync", "ruff", "check"],
+        )
+
+        source = Path(harness.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        uv_vectors: list[list[str]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.List, ast.Tuple)):
+                continue
+            values = [
+                item.value
+                for item in node.elts
+                if isinstance(item, ast.Constant) and isinstance(item.value, str)
+            ]
+            if values[:2] == ["uv", "run"]:
+                uv_vectors.append(values)
+
+        self.assertEqual(uv_vectors, [["uv", "run", "--frozen", "--no-sync"]])
+        self.assertNotIn('"uvx"', source)
+        self.assertNotIn('"--with"', source)
+
+    def test_managed_analyzer_gates_use_exact_direct_binaries(self):
+        with (
+            temp_project(with_tests=True),
+            mock.patch.object(
+                harness.sysconfig,
+                "get_path",
+                return_value="/managed/project/site-packages",
+            ),
+        ):
+            self.assertEqual(
+                harness._audit_gate().cmd,
+                ["pip-audit", "--path", "/managed/project/site-packages"],
+            )
+            self.assertEqual(
+                harness._complexity_gate().cmd,
+                [
+                    "lizard",
+                    "src",
+                    "tests",
+                    "-C",
+                    "15",
+                    "-a",
+                    "8",
+                    "-L",
+                    "100",
+                    "-i",
+                    "0",
+                ],
+            )
+            self.assertEqual(
+                harness._deadcode_gate().cmd,
+                ["vulture", "src", "--min-confidence", "60"],
+            )
+
+    def test_crap_uses_locked_coverage_and_direct_lizard(self):
+        commands: list[list[str]] = []
+
+        def run_without_downloaders(command, **_kwargs):
+            self.assertNotEqual(command[0], "uvx")
+            self.assertFalse(command[:3] == ["uv", "run", "--with"])
+            if command[:2] == ["uv", "run"]:
+                self.assertEqual(command[:4], ["uv", "run", "--frozen", "--no-sync"])
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with temp_project(with_tests=True):
+            Path("coverage.xml").write_text("<coverage/>\n", encoding="utf-8")
+            Path(".coverage").write_bytes(b"seeded coverage")
+            with (
+                redirect_stdout(io.StringIO()),
+                mock.patch.object(harness.subprocess, "run", side_effect=run_without_downloaders),
+            ):
+                harness.cmd_crap()
+
+        self.assertEqual(
+            commands,
+            [
+                [
+                    "uv",
+                    "run",
+                    "--frozen",
+                    "--no-sync",
+                    "coverage",
+                    "xml",
+                    "-o",
+                    "coverage.xml",
+                    "-q",
+                ],
+                ["lizard", "src"],
+            ],
+        )
+
+    def test_setup_hooks_invokes_only_workspace_provisioner_and_preserves_offline(self):
+        commands: list[list[str]] = []
+        offline_values: list[str | None] = []
+
+        def record_provisioner(command, **_kwargs):
+            commands.append(command)
+            offline_values.append(os.environ.get("OFFLINE"))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.dict(os.environ, {"OFFLINE": "1"}),
+            redirect_stdout(io.StringIO()),
+            mock.patch.object(harness.subprocess, "run", side_effect=record_provisioner),
+        ):
+            harness.cmd_hooks()
+
+        self.assertEqual(commands, [[".harness/workspace.sh", "install-hooks"]])
+        self.assertEqual(offline_values, ["1"])
 
 
 class TestStopHook(unittest.TestCase):
