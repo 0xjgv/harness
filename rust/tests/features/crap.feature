@@ -2,6 +2,8 @@ Feature: CRAP gate is advisory by default, enforceable on demand
   The crap command surfaces high-risk functions (complex + undertested)
   without blocking CI unless --enforce is passed.
 
+  # Offenders are only ever a failure against a recorded floor, so both scenarios
+  # below write one — without it the gate is report-only (see baseline.feature).
   # Unlike the python/bun/go templates, this template's harness tries to
   # auto-generate `target/llvm-cov/lcov.info` via `cargo llvm-cov` when the
   # artifact is missing. From an isolated tmp dir without Cargo.toml that
@@ -9,12 +11,14 @@ Feature: CRAP gate is advisory by default, enforceable on demand
 
   Scenario: Advisory mode exits 0 when offenders exist
     Given a coverage artifact for a high-CCN, zero-coverage function
+    And a recorded CRAP floor of 0
     When I run "harness crap --max=0"
     Then the exit code is 0
     And the output contains "(advisory)"
 
   Scenario: Enforce mode exits 1 when offenders exist
     Given a coverage artifact for a high-CCN, zero-coverage function
+    And a recorded CRAP floor of 0
     When I run "harness crap --max=0 --enforce"
     Then the exit code is 1
     And the output does not contain "(advisory)"

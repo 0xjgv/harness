@@ -14,8 +14,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Keep bun-version equal to package.json's `packageManager` field so CI and
+      # local run the same runtime. Nothing enforces it: the runner compares the
+      # running bun to `packageManager`, never to this file. Bump both together.
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.1
 
       # uv provides `uvx`, which the complexity and CRAP gates use to run lizard.
       - name: Install uv

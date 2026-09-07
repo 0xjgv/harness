@@ -13,6 +13,8 @@ coverage.out
 # Mutation testing
 # gremlins copies the module into a temp dir; some versions leave this behind
 .gremlins/
+# One machine-readable report per mutated package (`harness clean` removes them)
+gremlins-report*.json
 
 # Claude Code hook runtime state
 .claude/state/

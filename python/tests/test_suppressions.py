@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stdout
+from fnmatch import fnmatch
 from pathlib import Path
 from unittest import mock
 
@@ -35,8 +36,11 @@ def _as_measurement(value: harness.Measurement | int | None) -> harness.Measurem
 def measurements(
     coverage: harness.Measurement | int | None = None,
     complexity: harness.Measurement | int | None = None,
+    duplication: harness.Measurement | int | None = None,
     crap: harness.Measurement | int | None = None,
     deadcode: harness.Measurement | int | None = None,
+    arch: harness.Measurement | int | None = None,
+    mutation: harness.Measurement | int | None = None,
 ):
     """Stub every ratcheted measurement. `None` means "does not apply here"."""
     with (
@@ -45,10 +49,19 @@ def measurements(
             harness, "_measured_complexity_violations", return_value=_as_measurement(complexity)
         ),
         mock.patch.object(
+            harness, "_measured_duplicate_blocks", return_value=_as_measurement(duplication)
+        ),
+        mock.patch.object(
             harness, "_measured_crap_violations", return_value=_as_measurement(crap)
         ),
         mock.patch.object(
             harness, "_measured_deadcode_findings", return_value=_as_measurement(deadcode)
+        ),
+        mock.patch.object(
+            harness, "_measured_arch_violations", return_value=_as_measurement(arch)
+        ),
+        mock.patch.object(
+            harness, "_measured_mutation_score", return_value=_as_measurement(mutation)
         ),
     ):
         yield
@@ -150,7 +163,12 @@ class TestBaseline(unittest.TestCase):
             (root / ".harness-baseline").write_text(
                 "custom.thing 7\ncoverage.min 40\n", encoding="utf-8"
             )
-            with cwd(root), measurements(coverage=88, complexity=3, crap=None, deadcode=12):
+            with (
+                cwd(root),
+                measurements(
+                    coverage=88, complexity=3, duplication=8, crap=None, deadcode=12, arch=2
+                ),
+            ):
                 written = harness._write_baseline({"noqa": [["E501"]]})
                 content = (root / ".harness-baseline").read_text(encoding="utf-8")
 
@@ -158,7 +176,9 @@ class TestBaseline(unittest.TestCase):
         self.assertEqual(written["custom.thing"], 7)
         self.assertEqual(written["coverage.min"], 88)
         self.assertEqual(written["complexity.max_violations"], 3)
+        self.assertEqual(written["duplication.max_blocks"], 8)
         self.assertEqual(written["deadcode.max_findings"], 12)
+        self.assertEqual(written["arch.max_violations"], 2)
         self.assertNotIn("crap.max_violations", written)
         self.assertIn("custom.thing 7", content)
 
@@ -309,6 +329,184 @@ class TestBaseline(unittest.TestCase):
                 self.assertFalse(harness._check_suppressions_baseline(no_exit=True))
 
 
+class TestMutationMeasurement(unittest.TestCase):
+    """`mutation.min` is the one floor `--update-baseline` does not measure by default."""
+
+    def test_patterns_mirror_mutmuts_own_naming_rule(self) -> None:
+        # mutmut strips a literal leading `src.` and collapses `.__init__.`, so a
+        # pattern of `src.core.pricing.*` would match no mutant at all.
+        self.assertEqual(
+            harness._mutation_patterns([
+                "src/core/pricing.py",
+                "src/adapters/__init__.py",
+                "src/core/pricing.py",
+            ]),
+            ["core.pricing.x*", "adapters.x*"],
+        )
+
+    def test_a_package_init_does_not_select_the_whole_package(self) -> None:
+        # mutmut filters with fnmatch, where `*` crosses dots — `adapters.*` would
+        # also select `adapters.formatting`'s mutants and widen the scoped run.
+        [pattern] = harness._mutation_patterns(["src/adapters/__init__.py"])
+        self.assertFalse(fnmatch("adapters.formatting.x_render__mutmut_1", pattern))
+        self.assertTrue(fnmatch("adapters.x_helper__mutmut_1", pattern))
+
+    def test_score_counts_timeouts_as_kills_and_suspicious_as_survivors(self) -> None:
+        stats = {"killed": 17, "timeout": 2, "survived": 1, "suspicious": 1, "no_tests": 40}
+        self.assertEqual(harness._mutation_score(stats).value, 90)
+
+    def test_score_excludes_mutants_that_never_ran(self) -> None:
+        # `no_tests`/`skipped` on either side would let untested code raise the score.
+        stats = {"killed": 3, "survived": 1, "no_tests": 96, "skipped": 12}
+        self.assertEqual(harness._mutation_score(stats).value, 75)
+
+    def test_score_is_unavailable_when_no_mutant_ran(self) -> None:
+        measured = harness._mutation_score({"killed": 0, "survived": 0, "no_tests": 9})
+        self.assertIsNone(measured.value)
+        self.assertIn("no mutants ran", measured.unavailable)
+
+    def test_a_missing_mutmut_is_unavailable_not_an_error(self) -> None:
+        # An `error` would abort the whole baseline write, so a repo without mutmut
+        # could never run `--update-baseline --with-mutation` at all.
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            cwd(Path(tmp)),
+            mock.patch.object(harness, "_has_tests", return_value=True),
+        ):
+            measured = harness._run_mutation(None)
+        self.assertIsNone(measured.value)
+        self.assertFalse(measured.error)
+        self.assertIn("mutmut", measured.unavailable)
+
+    def test_a_repo_with_no_tests_never_pays_for_a_run(self) -> None:
+        # Every mutant would come back `no_tests` after minutes of wall clock, the
+        # way `coverage` and `crap` already refuse to start without a suite.
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            cwd(Path(tmp)),
+            mock.patch.object(harness.subprocess, "run") as never,
+        ):
+            measured = harness._run_mutation(None)
+        never.assert_not_called()
+        self.assertIn("test", measured.unavailable)
+
+    def test_a_git_tracked_mutants_directory_is_refused_not_deleted(self) -> None:
+        # mutmut hardcodes `mutants/` and this gate deletes it around every run, so
+        # a tracked directory of that name is the adopter's, not mutmut's.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".venv" / "bin").mkdir(parents=True)
+            (root / ".venv" / "bin" / "mutmut").touch()
+            with (
+                cwd(root),
+                mock.patch.object(harness, "_has_tests", return_value=True),
+                mock.patch.object(harness, "_git_lines", return_value=["mutants/keep.py"]),
+            ):
+                measured = harness._run_mutation(None)
+        self.assertIn("mutants/", measured.error)
+
+    def test_the_automatic_pass_carries_the_floor_through_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".harness-baseline").write_text("mutation.min 94\n", encoding="utf-8")
+            with (
+                cwd(root),
+                mock.patch.object(harness, "WITH_MUTATION", False),
+                measurements(coverage=88),
+            ):
+                written = harness._write_baseline({})
+
+        self.assertEqual(written["mutation.min"], 94)
+
+    def test_with_mutation_measures_and_rewrites_the_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".harness-baseline").write_text("mutation.min 94\n", encoding="utf-8")
+            with (
+                cwd(root),
+                mock.patch.object(harness, "WITH_MUTATION", True),
+                measurements(coverage=88, mutation=97),
+            ):
+                written = harness._write_baseline({})
+
+        self.assertEqual(written["mutation.min"], 97)
+
+
+class TestMutationGate(unittest.TestCase):
+    """Advisory unless `--enforce`, mirroring CRAP: the floor is whole-tree, the gate is scoped."""
+
+    @staticmethod
+    def _run(baseline: str | None, measured: harness.Measurement, *, enforce: bool = False):
+        argv = ["harness", "mutation", "--all", *(["--enforce"] if enforce else [])]
+        output = io.StringIO()
+        exit_code = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            if baseline is not None:
+                (root / ".harness-baseline").write_text(baseline, encoding="utf-8")
+            with (
+                cwd(root),
+                mock.patch.object(harness, "ALL_FILES", True),
+                mock.patch.object(harness, "_run_mutation", return_value=measured),
+                mock.patch.object(harness.sys, "argv", argv),
+                redirect_stdout(output),
+            ):
+                try:
+                    harness.cmd_mutation()
+                except SystemExit as exc:
+                    exit_code = exc.code
+        return exit_code, output.getvalue()
+
+    def test_reports_and_passes_without_a_floor(self) -> None:
+        code, out = self._run(None, harness.Measurement(value=94))
+        self.assertEqual(code, 0)
+        self.assertIn("94% killed", out)
+        self.assertIn("report-only", out)
+
+    def test_passes_at_the_floor(self) -> None:
+        code, out = self._run("mutation.min 94\n", harness.Measurement(value=94))
+        self.assertEqual(code, 0)
+        self.assertIn("✓", out)
+        self.assertIn("94% killed (baseline 94)", out)
+
+    def test_suggests_ratcheting_up_when_the_score_improves(self) -> None:
+        _, out = self._run("mutation.min 90\n", harness.Measurement(value=94))
+        self.assertIn("--with-mutation", out)
+
+    def test_warns_below_the_floor_but_does_not_block(self) -> None:
+        code, out = self._run("mutation.min 94\n", harness.Measurement(value=88))
+        self.assertEqual(code, 0)
+        self.assertIn("⚠", out)
+        self.assertIn("88% killed < baseline 94 (advisory)", out)
+
+    def test_enforce_turns_the_same_miss_into_a_failure(self) -> None:
+        code, out = self._run("mutation.min 94\n", harness.Measurement(value=88), enforce=True)
+        self.assertEqual(code, 1)
+        self.assertIn("✗", out)
+        self.assertNotIn("advisory", out)
+
+    def test_a_broken_mutmut_never_fails_ci_on_its_own(self) -> None:
+        code, out = self._run(None, harness.Measurement(error="`mutmut run` failed (exit 2)"))
+        self.assertEqual(code, 0)
+        self.assertIn("`mutmut run` failed (exit 2)", out)
+
+    def test_skips_a_change_that_touched_no_app_source(self) -> None:
+        output = io.StringIO()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            cwd(Path(tmp)),
+            mock.patch.object(harness, "ALL_FILES", False),
+            mock.patch.object(harness, "_scoped_py_files", return_value=["tests/test_a.py"]),
+            mock.patch.object(harness, "_unresolved_requested_base", return_value=None),
+            mock.patch.object(harness, "_run_mutation") as never,
+            redirect_stdout(output),
+        ):
+            harness.cmd_mutation()
+
+        never.assert_not_called()
+        self.assertIn("no changed app sources", output.getvalue())
+
+
 class TestReportOnlyWithoutABaseline(unittest.TestCase):
     """No `.harness-baseline` means no floor was ever measured — report, never block.
 
@@ -348,6 +546,100 @@ class TestReportOnlyWithoutABaseline(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("1583", output.getvalue())
         self.assertIn("report-only", output.getvalue())
+
+
+class TestDuplicationRatchet(unittest.TestCase):
+    """lizard's exit code ignores `-Eduplicate`, so the block count is judged here."""
+
+    @staticmethod
+    def _result(baseline: str | None, measurement, report: str = "") -> harness.GateResult:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            if baseline is not None:
+                (root / ".harness-baseline").write_text(baseline, encoding="utf-8")
+            with (
+                cwd(root),
+                mock.patch.object(harness, "_run_duplication", return_value=(measurement, report)),
+            ):
+                gate = harness._duplication_gate()
+                assert gate.runner is not None
+                return gate.runner()
+
+    def test_passes_at_the_floor(self) -> None:
+        result = self._result("duplication.max_blocks 8\n", harness.Measurement(value=8))
+        self.assertTrue(result.ok)
+        self.assertIn("8 (baseline 8)", result.description)
+
+    def test_fails_when_one_new_block_appears(self) -> None:
+        report = "Duplicate block:\nsrc/a.py:1 ~ 17\nsrc/a.py:20 ~ 36\n"
+        result = self._result("duplication.max_blocks 8\n", harness.Measurement(value=9), report)
+        self.assertFalse(result.ok)
+        self.assertIn("9 block(s) > baseline 8", result.description)
+        self.assertEqual(result.stdout, report)
+        self.assertEqual(result.hint, harness.DUPLICATION_HINT)
+
+    def test_suggests_ratcheting_down_when_blocks_drop(self) -> None:
+        result = self._result("duplication.max_blocks 8\n", harness.Measurement(value=5))
+        self.assertTrue(result.ok)
+        self.assertIn("ratchet down", result.description)
+
+    def test_reports_and_passes_without_a_floor(self) -> None:
+        result = self._result("coverage.min 0\n", harness.Measurement(value=1583))
+        self.assertTrue(result.ok)
+        self.assertIn("1583 block(s), report-only", result.description)
+
+    def test_a_broken_lizard_fails_instead_of_reporting_zero(self) -> None:
+        result = self._result(None, harness.Measurement(error="lizard failed to run (exit 2)"))
+        self.assertFalse(result.ok)
+        self.assertIn("lizard failed to run (exit 2)", result.description)
+
+    def test_duplicate_block_count_counts_only_exact_headers(self) -> None:
+        report = (
+            "Duplicates\n===================================\n"
+            "Duplicate block:\n--------------------------\n"
+            "src/a.py:1 ~ 17\nsrc/a.py:20 ~ 36\n^^^^^^^^^^^^^^^^^^^^^^^^^^\n\n"
+            "Duplicate block:\n--------------------------\n"
+            "src/b.py:3 ~ 9\nsrc/c.py:3 ~ 9\n^^^^^^^^^^^^^^^^^^^^^^^^^^\n\n"
+            "  Duplicate block: (indented, not a header)\n"
+            "Total duplicate rate: 4.51%\n"
+        )
+        self.assertEqual(harness._duplicate_block_count(report), 2)
+
+    def test_duplication_argv_shares_the_complexity_targets_and_disarms_lizard(self) -> None:
+        # The recorded floor only reproduces against an identical target set, so pin
+        # the two argvs to each other rather than to a hand-written list.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            with cwd(root):
+                argv = harness._duplication_argv()
+                complexity_argv = harness._complexity_argv(harness.REPORT_ONLY_LIMIT)
+                targets = harness._app_targets(include_tests=True)
+
+        # Everything before the trailing flags (4 here, 8 for complexity) is the
+        # resolved lizard command plus the targets, and must match exactly.
+        self.assertEqual(argv[:-4], complexity_argv[:-8])
+        self.assertEqual(
+            argv[-len(targets) - 4 :], [*targets, "-Eduplicate", "-w", "-i", "1000000"]
+        )
+
+    def test_measured_duplicate_blocks_errors_when_lizard_fails(self) -> None:
+        failed = subprocess.CompletedProcess([], 2, "", "lizard: error")
+        with (
+            mock.patch.object(harness, "_app_targets", return_value=["src"]),
+            mock.patch.object(harness.subprocess, "run", return_value=failed),
+        ):
+            measured = harness._measured_duplicate_blocks()
+
+        self.assertEqual(measured.error, "lizard failed to run (exit 2)")
+
+    def test_measured_duplicate_blocks_is_unavailable_without_app_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, cwd(Path(tmp)):
+            measured = harness._measured_duplicate_blocks()
+
+        self.assertIsNone(measured.value)
+        self.assertEqual(measured.unavailable, "no app sources")
 
 
 class TestDeadcodeRatchet(unittest.TestCase):
@@ -432,6 +724,146 @@ class TestDeadcodeRatchet(unittest.TestCase):
 
         self.assertIsNone(measured.value)
         self.assertIn("exit 2", measured.error)
+
+
+# Trimmed to the shape the parser has to survive: the banner, a per-contract heading
+# with its `---` underline, the human sentence, and one `- chain` line per violation.
+BROKEN_OUTPUT = """\
+Contracts: 0 kept, 1 broken.
+
+
+----------------
+Broken contracts
+----------------
+
+src package layers
+------------------
+
+src.core is not allowed to import src.adapters:
+
+- src.core.scratch -> src.adapters.formatting (l.1)
+- src.core.other -> src.adapters.formatting (l.2, l.7)
+"""
+
+KEPT_OUTPUT = """\
+---------
+Contracts
+---------
+
+src package layers KEPT
+
+Contracts: 1 kept, 0 broken.
+"""
+
+
+class TestArchCount(unittest.TestCase):
+    """import-linter has no machine-readable output, so the parser is the contract."""
+
+    def test_counts_one_violation_per_chain_line(self) -> None:
+        self.assertEqual(harness._import_linter_broken_count(BROKEN_OUTPUT), 2)
+
+    def test_a_kept_contract_counts_zero(self) -> None:
+        self.assertEqual(harness._import_linter_broken_count(KEPT_OUTPUT), 0)
+
+    def test_ansi_colour_does_not_hide_the_banner_or_the_chains(self) -> None:
+        coloured = BROKEN_OUTPUT.replace(
+            "Broken contracts", "\x1b[1mBroken contracts\x1b[0m"
+        ).replace("- src.core.scratch", "\x1b[31m- src.core.scratch")
+        self.assertEqual(harness._import_linter_broken_count(coloured), 2)
+
+    def test_a_dash_before_the_banner_is_not_a_violation(self) -> None:
+        # The `---------` rules and any `- ` line in the kept section sit above the
+        # banner; counting from the top would report violations for a clean tree.
+        self.assertEqual(harness._import_linter_broken_count("- decoy\n" + KEPT_OUTPUT), 0)
+
+
+class TestArchGate(unittest.TestCase):
+    """`arch` compares the chain count to `arch.max_violations`, like dead code."""
+
+    @staticmethod
+    def _check(baseline: str | None, measurement, lines=()) -> tuple[bool, str]:
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            if baseline is not None:
+                (root / ".harness-baseline").write_text(baseline, encoding="utf-8")
+            with (
+                cwd(root),
+                mock.patch.object(harness, "_run_arch", return_value=(measurement, list(lines))),
+                redirect_stdout(output),
+            ):
+                ok = harness._check_arch(no_exit=True)
+        return ok, output.getvalue()
+
+    def test_is_report_only_without_a_floor(self) -> None:
+        # The adoption promise: a real layers contract over a legacy tree breaks in
+        # dozens of places on day one and must still be green.
+        ok, out = self._check(None, harness.Measurement(value=41))
+        self.assertTrue(ok)
+        self.assertIn("report-only", out)
+        self.assertIn("41", out)
+
+    def test_passes_at_the_floor(self) -> None:
+        ok, out = self._check("arch.max_violations 41\n", harness.Measurement(value=41))
+        self.assertTrue(ok)
+        self.assertIn("41 (baseline 41)", out)
+
+    def test_fails_when_one_new_violation_appears(self) -> None:
+        ok, out = self._check(
+            "arch.max_violations 41\n",
+            harness.Measurement(value=42),
+            ["- src.core.scratch -> src.adapters.formatting (l.1)"],
+        )
+        self.assertFalse(ok)
+        self.assertIn("42 violation(s) > baseline 41", out)
+        self.assertIn("src.core.scratch", out)
+
+    def test_suggests_ratcheting_down_when_violations_drop(self) -> None:
+        ok, out = self._check("arch.max_violations 10\n", harness.Measurement(value=4))
+        self.assertTrue(ok)
+        self.assertIn("--update-baseline", out)
+
+    def test_skips_without_an_importlinter_config(self) -> None:
+        ok, out = self._check(
+            "arch.max_violations 0\n", harness.Measurement(unavailable="no .importlinter")
+        )
+        self.assertTrue(ok)
+        self.assertIn("no .importlinter", out)
+
+    def test_a_broken_lint_imports_fails_instead_of_reporting_zero(self) -> None:
+        ok, out = self._check(
+            "arch.max_violations 0\n",
+            harness.Measurement(error="lint-imports failed to run (exit 1): bad config"),
+        )
+        self.assertFalse(ok)
+        self.assertIn("lint-imports failed to run", out)
+
+    def test_a_run_without_a_contracts_summary_is_an_error(self) -> None:
+        # import-linter exits 1 for broken contracts *and* for a bad config. Only the
+        # `Contracts:` summary separates a real count from a run that never analysed.
+        completed = subprocess.CompletedProcess(
+            [], returncode=1, stdout="", stderr="ModuleNotFoundError: no root package\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".importlinter").write_text("[importlinter]\n", encoding="utf-8")
+            with cwd(root), mock.patch.object(harness.subprocess, "run", return_value=completed):
+                measured, _ = harness._run_arch()
+
+        self.assertIsNone(measured.value)
+        self.assertIn("exit 1", measured.error)
+        self.assertIn("no root package", measured.error)
+
+    def test_a_broken_contract_is_a_count_not_an_error(self) -> None:
+        completed = subprocess.CompletedProcess([], returncode=1, stdout=BROKEN_OUTPUT, stderr="")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".importlinter").write_text("[importlinter]\n", encoding="utf-8")
+            with cwd(root), mock.patch.object(harness.subprocess, "run", return_value=completed):
+                measured, lines = harness._run_arch()
+
+        self.assertEqual(measured.value, 2)
+        self.assertIn("- src.core.scratch -> src.adapters.formatting (l.1)", lines)
 
 
 if __name__ == "__main__":

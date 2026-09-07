@@ -30,7 +30,9 @@ The root `Makefile` manages repo-level dogfooding and skill deployment:
 - `make check` — `skills-drift` + `agents-md-drift` + `parity`, then warn on protected
   arch config changes
 - `make parity` — fail if `python`/`bun`/`go`/`rust` harness command surfaces have
-  drifted apart (`scripts/parity-gate.sh`)
+  drifted apart, or if the four templates pin different lizard versions
+  (`lizard@<ver>` in the bun/go/rust runners, `lizard==<ver>` in
+  `python/pyproject.toml`) (`scripts/parity-gate.sh`)
 - `make skills-drift` — fail if `~/.claude/skills/{harness,ratchet}/` or
   `~/.agents/skills/{harness,ratchet}/` differ from `skills/<name>/`
 - `make sync-skills` — copy `skills/<name>/` → both deployed locations (file list is
@@ -85,14 +87,21 @@ cd monorepo && make check           # dispatches check to every subproject copie
 | `check` | after edits | fix, format, typecheck, test, plus every other gate that is offline, fast, and takes no build lock (complexity, acceptance, deadcode where shipped, a lockfile check in Python/Bun, `go mod tidy -diff` in Go, and — Python/Bun only — `arch`); warns on `arch-config-guard` and `gherkin-guard`; checks agents-md drift; ratchets suppressions | yes |
 | `pre-commit` | git pre-commit hook | same, staged files only, then re-stages (`git add`) the files it fixed | yes |
 | `pre-push` | git pre-push hook | read-only: lint, format check, acceptance, arch, over the whole tree, in parallel; strict `arch-config-guard` + `gherkin-guard` | no |
-| `ci` | CI pipeline | read-only gates (lint, typecheck, dep audit, complexity, deadcode, acceptance, arch) in parallel, then coverage + advisory CRAP; strict `arch-config-guard` + `gherkin-guard` | no |
+| `ci` | CI pipeline | read-only gates (lint, typecheck, dep audit, complexity, deadcode, acceptance, arch) in parallel, then coverage + advisory CRAP + advisory mutation; strict `arch-config-guard` + `gherkin-guard` | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
 | `post-edit` | Stop hook helper | format changed source files | yes |
 | `stop-hook` | agent Stop hook | `post-edit` + complexity (+ deadcode where shipped); exits 2 with a stderr failure summary so Claude's Stop hook blocks and feeds the failure back to the agent | yes |
 
 Invariant every runner documents: `ci` minus `check` is only the network dependency
-audit, coverage, and advisory CRAP — plus, in Go and Rust only, `arch` (Go's needs to
-fetch a module, Rust's takes cargo's build lock) — so a green `check` predicts a green `ci`.
+audit, coverage over the whole test suite (where `check` ran only the tests mapped to
+the change set), advisory CRAP, and advisory mutation (which runs after coverage and
+never fails `ci`; only the standalone `mutation --enforce` hard-fails) — plus, in Go
+and Rust only, the architecture boundary check itself (`arch`), which stays
+`ci`/`pre-push`-only there (Go's needs to fetch a module, Rust's takes cargo's build
+lock); Python and Bun's `arch` has neither constraint, so it runs inside `check` too —
+so a green `check` predicts a green `ci` for the gates it ran. `check` runs only the
+tests that map to the change set, so `check --all` (or `ci`) is the whole-suite run;
+`pre-push` has no test gate in any template.
 
 Core subcommands every template must expose (`CORE_COMMANDS` in `scripts/parity-gate.sh`,
 never allowlist-exempt): the seven stages plus `complexity`, `crap`, `acceptance`,
@@ -136,14 +145,26 @@ meant to have single-language templates copied inside it as subprojects
   review. Full design: `skills/harness/reference/behavior-contract.md`.
 
 **Brownfield adoption: the harness gates the change, not the codebase.** Findings with
-no natural count (lint, format, type errors) are diff-scoped to changed lines; findings
-with a natural count (coverage, complexity, CRAP, deadcode, suppressions) get a floor in
-`.harness-baseline` that starts where the repo already is, written by
-`suppressions --update-baseline` (all-or-nothing) and raised only via the `ratchet`
-skill. Today only `python/harness.py` implements the diff scoping (`--all`, `--base=<ref>`,
-`--whole-file`); `bun`, `go`, `rust` gate the whole tree. A scoped gate that widens to
-the whole tree on an empty scope is a defect, not a stricter variant. Audit procedure:
-`skills/harness/reference/adoption-checklist.md`.
+no natural count (lint, format, type errors, and which tests to run) are diff-scoped:
+local stages (`check`, `pre-commit`, `post-edit`) scope to the uncommitted set, anything
+with a resolved base ref (`--base=<ref>`, `HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`) to
+`git diff --name-only <base>...HEAD`; an empty scope warns and skips, never widens;
+`test` warns once per changed source file with no mapped test; `ci`, `pre-push`, and
+`--all` run the whole tree. Findings with a natural count get a floor in
+`.harness-baseline` that starts where the repo already is — seven families under fixed
+key names: `complexity.max_violations`, `duplication.max_blocks`,
+`crap.max_violations`, `arch.max_violations`, `mutation.min`, `coverage.min`,
+`deadcode.max_findings`, `suppressions.*` — written only by
+`suppressions --update-baseline` (all-or-nothing; drops an unmeasurable key with a
+warning; `mutation.min` only under `--with-mutation`), report-only while a key is
+missing, and raised only via the `ratchet` skill. `mutation` is advisory in `ci` after
+coverage and hard-fails only standalone with `--enforce`. Arch is adopted by deriving a
+contract from the real package tree and baselining its violations, never by deleting
+the config. `python/harness.py` is the reference implementation (it also has
+`--whole-file`, line- to file-level, which stays Python-only); `bun`, `go`, and `rust`
+gain the same flags and floors as each language's unit lands. A scoped gate that widens
+to the whole tree on an empty scope is a defect, not a stricter variant. Audit
+procedure: `skills/harness/reference/adoption-checklist.md`.
 
 **`AGENTS.md`/`CLAUDE.md` are byte-identical within each template**, enforced by that
 template's own `agents-md-drift` harness command and fixed by `sync-agents-md`

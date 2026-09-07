@@ -7,7 +7,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import fc from 'fast-check';
-import { crapScore, parseLcov, parseLineForSuppressions } from '../harness';
+import { crapScore, parseLcov, parseLineForSuppressions, pinnedBunVersion } from '../harness';
 
 const ccnArb = fc.integer({ min: 1, max: 100 });
 const covArb = fc.double({ min: 0, max: 1, noNaN: true });
@@ -128,6 +128,38 @@ describe('parseLcov properties', () => {
         return Object.values(result).every((lines) =>
           Object.values(lines).every((h) => typeof h === 'number'),
         );
+      }),
+    );
+  });
+});
+
+describe('pinnedBunVersion properties', () => {
+  const semverArb = fc.stringMatching(/^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/);
+
+  test('an exact bun pin round-trips', () => {
+    fc.assert(
+      fc.property(semverArb, (v) => pinnedBunVersion({ packageManager: `bun@${v}` }) === v),
+    );
+  });
+
+  test('an exact bun pin survives a build-metadata suffix', () => {
+    const metaArb = fc.stringMatching(/^[0-9A-Za-z.-]{1,20}$/);
+    fc.assert(
+      fc.property(
+        semverArb,
+        metaArb,
+        (v, meta) => pinnedBunVersion({ packageManager: `bun@${v}+${meta}` }) === v,
+      ),
+    );
+  });
+
+  test('total on arbitrary packageManager text: never throws, never invents a version', () => {
+    fc.assert(
+      fc.property(fc.string(), (field) => {
+        const parsed = pinnedBunVersion({ packageManager: field });
+        // Whatever comes back must be a literal prefix of the field, so the
+        // parser can drop a suffix but never fabricate or rewrite a version.
+        return parsed === undefined || field.trim().startsWith(`bun@${parsed}`);
       }),
     );
   });

@@ -119,9 +119,14 @@ func Scan(roots ...string) map[string][][]string {
 	return BucketByKind(ScanFindings(roots...))
 }
 
-// Counts returns baseline keys for the current suppression counts.
+// Counts returns baseline keys for the current suppression counts. Every
+// known kind is present, so a kind that vanished from the tree is recorded
+// as 0 and ratchets down instead of silently keeping its old floor.
 func Counts(results map[string][][]string) map[string]int {
 	counts := map[string]int{}
+	for _, sp := range patterns {
+		counts[suppressionBaselinePrefix+sp.kind] = 0
+	}
 	for kind, entries := range results {
 		counts[suppressionBaselinePrefix+kind] = len(entries)
 	}
@@ -153,25 +158,140 @@ func ReadBaseline(root string) (map[string]int, bool) {
 	return values, true
 }
 
-// WriteBaseline writes current suppression counts while preserving coverage.min.
-func WriteBaseline(root string, results map[string][][]string) error {
-	existing, _ := ReadBaseline(root)
-	coverageMin := 0
-	if existing != nil {
-		coverageMin = existing["coverage.min"]
+// BaselineFloor returns the committed floor for a ratcheted metric, or
+// ok=false when there is none — no .harness-baseline at all, or a file that
+// does not carry this key. Every gate reading a floor must then run
+// report-only: retrofitting the harness into an existing repo has to be
+// green on day one, and a floor of 0 inferred from a missing number is not a
+// floor, it is a demand that the repo already be perfect.
+func BaselineFloor(root, key string) (int, bool) {
+	baseline, ok := ReadBaseline(root)
+	if !ok {
+		return 0, false
 	}
-	counts := Counts(results)
-	keys := make([]string, 0, len(counts))
-	for key := range counts {
+	value, ok := baseline[key]
+	return value, ok
+}
+
+// Measurement is a ratcheted metric's value, or the reason there isn't one.
+// Three states, deliberately not collapsed into an optional int:
+//   - Measured: Value holds the number, including a legitimate 0.
+//   - Unavailable: the metric does not apply to this repo (no tests, no app
+//     sources). The baseline key is dropped, and the gate goes report-only.
+//   - Error: the measuring tool ran and failed. WriteBaseline aborts and
+//     writes nothing: a floor recorded from a broken run is worse than no
+//     floor, because every downstream gate trusts it.
+//
+// Build one with Measured, Unavailable, or Failed.
+type Measurement struct {
+	Value       int
+	Measured    bool
+	Unavailable string
+	Error       string
+}
+
+// Measured is a metric that was measured, including a legitimate 0.
+func Measured(value int) Measurement { return Measurement{Value: value, Measured: true} }
+
+// Unavailable is a metric that does not apply to this repo.
+func Unavailable(reason string) Measurement { return Measurement{Unavailable: reason} }
+
+// Failed is a metric whose measuring tool ran and failed.
+func Failed(reason string) Measurement { return Measurement{Error: reason} }
+
+// Measurer pairs a baseline key with the function that measures it. The
+// harness keeps a table of these; WriteBaseline rewrites every key in the
+// table and carries every other key through untouched.
+type Measurer struct {
+	Key     string
+	Measure func() Measurement
+}
+
+// KeyMeasurement is one measured baseline key, in measurement order.
+type KeyMeasurement struct {
+	Key string
+	Measurement
+}
+
+// MeasureRatcheted measures every key in order, stopping at the first one that
+// failed. Sequential and short-circuiting on purpose: a broken tool usually
+// breaks the metrics after it too (CRAP re-runs the coverage suite), so the
+// first failure is the one worth reporting, and the later ones would only be
+// noise.
+func MeasureRatcheted(measurers []Measurer) []KeyMeasurement {
+	var measured []KeyMeasurement
+	for _, m := range measurers {
+		result := m.Measure()
+		measured = append(measured, KeyMeasurement{Key: m.Key, Measurement: result})
+		if result.Error != "" {
+			break
+		}
+	}
+	return measured
+}
+
+// MeasurementError reports the metric WriteBaseline could not measure. Nothing
+// was written.
+type MeasurementError struct {
+	Key    string
+	Reason string
+}
+
+func (e *MeasurementError) Error() string {
+	return fmt.Sprintf("could not measure %s: %s", e.Key, e.Reason)
+}
+
+// WriteBaseline merges measured floors over the existing baseline; unknown
+// keys are preserved. Returns the baseline as written.
+//
+// Every key the harness measures is rewritten (so a metric that improved
+// ratchets down); every key it does not recognise is carried through
+// untouched. A metric that does not apply here has its key *removed*, never
+// carried forward: the shipped template's own numbers must not survive into
+// an adopting repo's first baseline. A metric that could not be measured
+// aborts the whole write with a *MeasurementError — see Measurement.
+func WriteBaseline(root string, results map[string][][]string, measurers []Measurer) (map[string]int, error) {
+	baseline, _ := ReadBaseline(root)
+	if baseline == nil {
+		baseline = map[string]int{}
+	}
+	for key, count := range Counts(results) {
+		baseline[key] = count
+	}
+
+	for _, m := range MeasureRatcheted(measurers) {
+		if m.Error != "" {
+			return nil, &MeasurementError{Key: m.Key, Reason: m.Error}
+		}
+		if !m.Measured {
+			if _, had := baseline[m.Key]; had {
+				fmt.Printf("  ⚠ %s: dropped — %s\n", m.Key, m.Unavailable)
+			}
+			delete(baseline, m.Key)
+			continue
+		}
+		baseline[m.Key] = m.Value
+	}
+
+	if err := os.WriteFile(filepath.Join(root, baselineFile), []byte(formatBaseline(baseline)), 0o600); err != nil {
+		return nil, err
+	}
+	return baseline, nil
+}
+
+// formatBaseline serialises a baseline as sorted `key value` lines. Sorted so a
+// regenerated file diffs cleanly against the committed one.
+func formatBaseline(baseline map[string]int) string {
+	keys := make([]string, 0, len(baseline))
+	for key := range baseline {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	var lines []string
+	lines := make([]string, 0, len(keys))
 	for _, key := range keys {
-		lines = append(lines, fmt.Sprintf("%s %d", key, counts[key]))
+		lines = append(lines, fmt.Sprintf("%s %d", key, baseline[key]))
 	}
-	lines = append(lines, fmt.Sprintf("coverage.min %d", coverageMin))
-	return os.WriteFile(filepath.Join(root, baselineFile), []byte(strings.Join(lines, "\n")+"\n"), 0o600)
+	return strings.Join(lines, "\n") + "\n"
 }
 
 // CheckBaseline compares current findings to .harness-baseline.

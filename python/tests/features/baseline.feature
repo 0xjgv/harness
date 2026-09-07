@@ -1,8 +1,9 @@
 Feature: The baseline is a ratchet, not a wall
   `.harness-baseline` records where the repo already is — coverage, complexity,
-  CRAP, dead code and suppressions — so adoption never starts on a red gate, and
-  each number may only move down. A metric with no recorded floor reports instead
-  of blocking; a metric that could not be measured is never recorded at all.
+  duplication, CRAP, dead code, mutation score and suppressions — so adoption never
+  starts on a red gate, and each number may only move toward better. A metric with no
+  recorded floor reports instead of blocking; a metric that could not be measured is
+  never recorded at all.
 
   Scenario: A repo with no baseline is report-only and passes
     Given a project with no baseline
@@ -16,9 +17,11 @@ Feature: The baseline is a ratchet, not a wall
     When I run "harness suppressions --update-baseline"
     Then the exit code is 0
     And the baseline file contains "complexity.max_violations"
+    And the baseline file contains "duplication.max_blocks"
     And the baseline file contains "deadcode.max_findings"
     But the baseline file does not contain "coverage.min"
     And the baseline file does not contain "crap.max_violations"
+    And the baseline file does not contain "mutation.min"
 
   Scenario: A shipped coverage floor never leaks into an adopting repo's baseline
     Given a project with a baseline line "coverage.min 100"
@@ -64,6 +67,36 @@ Feature: The baseline is a ratchet, not a wall
     Then the exit code is 0
     And the baseline file contains "custom.thing 7"
 
+  Scenario: The mutation floor survives an update that did not measure it
+    Given a project with a baseline line "mutation.min 94"
+    When I run "harness suppressions --update-baseline"
+    Then the exit code is 0
+    And the baseline file contains "mutation.min 94"
+
+  # Which of the two skip reasons a scoped run reports depends on whether a base
+  # ref was requested — GITHUB_BASE_REF is set for every pull_request CI run and is
+  # inherited by the harness this step launches — so the scenario asserts only what
+  # holds either way: it skipped, and it exited 0. The exact wording of each reason
+  # is pinned in tests/test_harness_targets.py and tests/test_suppressions.py.
+  Scenario: Mutation testing skips a change that touched no app source
+    Given a project with no baseline
+    When I run "harness mutation"
+    Then the exit code is 0
+    And the output contains "Mutation (mutmut)"
+    And the output contains "skipped"
+
+  Scenario: Mutation testing skips a repo that has not installed mutmut
+    Given a project with tests and no baseline
+    When I run "harness mutation --all"
+    Then the exit code is 0
+    And the output contains "mutmut is not installed"
+
+  Scenario: Mutation testing skips a repo with no tests at all
+    Given a project with no baseline
+    When I run "harness mutation --all"
+    Then the exit code is 0
+    And the output contains "no tests/test*.py files"
+
   Scenario: The complexity floor tolerates exactly the recorded violations
     Given a project with a CCN-21 function and a baseline line "complexity.max_violations 1"
     When I run "harness complexity"
@@ -75,3 +108,21 @@ Feature: The baseline is a ratchet, not a wall
     When I run "harness complexity"
     Then the exit code is 1
     And the output contains "Complexity (lizard)"
+
+  Scenario: Duplication is report-only until a floor is recorded
+    Given a project with a duplicate block and no baseline
+    When I run "harness complexity"
+    Then the exit code is 0
+    And the output contains "1 block(s), report-only"
+
+  Scenario: The duplication floor tolerates exactly the recorded blocks
+    Given a project with a duplicate block and a baseline line "duplication.max_blocks 1"
+    When I run "harness complexity"
+    Then the exit code is 0
+    And the output contains "Duplication (lizard): 1 (baseline 1)"
+
+  Scenario: The duplication floor blocks a new duplicate block
+    Given a project with a duplicate block and a baseline line "duplication.max_blocks 0"
+    When I run "harness complexity"
+    Then the exit code is 1
+    And the output contains "1 block(s) > baseline 0"

@@ -15,7 +15,9 @@ Opinionated Go project template with built-in quality guardrails: linting, forma
 ## Prerequisites
 
 - [Go](https://go.dev/dl/) 1.24+
-- [golangci-lint](https://golangci-lint.run/welcome/install/) v2+
+- [golangci-lint](https://golangci-lint.run/welcome/install/) `2.13.2` — the version the
+  harness pins (`golangciLintVersion` in `harness.go`; see `CLAUDE.md` → Pinned tools for
+  the install command). Any other version warns, never fails.
 - [uv](https://docs.astral.sh/uv/) on `PATH` — `uvx` runs `lizard@1.22.2` for the complexity and CRAP gates
 
 Everything else (godog, go-arch-lint, gremlins, govulncheck) is pulled on
@@ -67,7 +69,8 @@ Mutation testing is also advisory and is NOT wired into `ci` — invoke explicit
 
 `.github/workflows/ci.yml` runs `go run harness.go ci` on every push to `main`
 and every pull request — the same gate you run locally, so local gate == remote
-gate. It installs golangci-lint and `uv` (for the lizard gates). Copying the
+gate. It pins Go to `1.24.0` and installs golangci-lint `2.13.2` and `uv` (for
+the lizard gates). Copying the
 template into a repo brings CI along.
 
 All commands minimize output — only errors are shown. Add `--verbose` for full output:

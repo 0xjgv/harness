@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -30,7 +31,23 @@ var root = func() string {
 
 const (
 	lizard            = "lizard@1.22.2"
+	goArchLint        = "github.com/fe3dback/go-arch-lint@v1.18.0"
 	complexityMaxArgs = "8"
+	// golangciLintVersion is the golangci-lint release this template's
+	// .golangci.yaml is tuned for. Keep it in sync with the install step in
+	// .github/workflows/ci.yml. A different installed version only warns —
+	// adopters legitimately run their own.
+	golangciLintVersion = "2.13.2"
+	// reportOnlyLimit is a lizard `-i N` high enough that it never fails: the
+	// gate reports instead of blocking when no floor is recorded, and the
+	// baseline writer counts warnings from the summary row it still prints.
+	reportOnlyLimit = "1000000"
+	baselineFile    = ".harness-baseline"
+	updateBaseline  = "go run harness.go suppressions --update-baseline"
+	// updateBaselineMutation also measures mutation.min, which the automatic
+	// pass leaves alone because a mutation run costs minutes.
+	updateBaselineMutation = updateBaseline + " --with-mutation"
+	crapMaxDefault         = 30.0
 )
 
 // ── Output ──────────────────────────────────────────────────────────
@@ -63,6 +80,7 @@ type runResult struct {
 
 type runOpts struct {
 	extract func(output string) string
+	hint    string
 	noExit  bool
 	// stream inherits stdio for commands whose live output is part of the contract.
 	stream bool
@@ -73,7 +91,15 @@ type gate struct {
 	description string
 	cmd         []string
 	extract     func(output string) string
-	hint        string
+	// verdict decides pass/fail for a tool whose exit code does not
+	// (go-arch-lint reports, it does not judge: it exits 1 whenever it found
+	// anything, which is not the same as being over the floor; lizard's
+	// duplicate detector is the same shape). It sees the exit code too, so a
+	// gate counting findings out of the output still fails when the tool
+	// itself broke. Returns ok plus the detail shown after the ✓/✗ label, and
+	// supersedes extract; without it the exit code decides.
+	verdict func(output string, exitCode int) (bool, string)
+	hint    string
 }
 
 type gateResult struct {
@@ -93,15 +119,19 @@ func runCapture(g gate) gateResult {
 	c.Dir = root
 	out, err := c.CombinedOutput()
 	output := string(out)
-	ok := err == nil
-	detail := ""
 	code := 0
-	if ok {
-		if g.extract != nil {
-			detail = g.extract(output)
-		}
-	} else {
+	if err != nil {
 		code = exitCode(err)
+	}
+	ok := code == 0
+	detail := ""
+	if g.verdict != nil {
+		ok, detail = g.verdict(output, code)
+		if !ok && code == 0 {
+			code = 1
+		}
+	} else if ok && g.extract != nil {
+		detail = g.extract(output)
 	}
 	return gateResult{g.description, g.cmd, ok, code, output, detail, g.hint}
 }
@@ -115,16 +145,23 @@ func printGateResult(r gateResult, noExit bool) bool {
 			fmt.Print(r.output)
 		}
 	}
+	suffix := ""
+	if r.detail != "" {
+		suffix = fmt.Sprintf(" %s(%s)%s", dim, r.detail, reset)
+	}
 	if r.ok {
-		suffix := ""
-		if r.detail != "" {
-			suffix = fmt.Sprintf(" %s(%s)%s", dim, r.detail, reset)
-		}
 		fmt.Printf("  %s✓%s %s%s\n", green, reset, r.description, suffix)
 		return true
 	}
 	fmt.Printf("  %s✗%s %s\n", red, reset, r.description)
-	if !verbose && r.output != "" {
+	switch {
+	case r.detail != "":
+		// A verdict gate summarised the failure itself; its tool's own output
+		// is machine-readable (JSON), so print the summary instead.
+		for line := range strings.SplitSeq(r.detail, "\n") {
+			fmt.Printf("    %s\n", line)
+		}
+	case !verbose && r.output != "":
 		fmt.Print(r.output)
 	}
 	if r.hint != "" {
@@ -146,6 +183,9 @@ func run(description string, cmd []string, opts *runOpts) runResult {
 		err := c.Run()
 		if err != nil {
 			fmt.Printf("  %s✗%s %s\n", red, reset, description)
+			if opts != nil && opts.hint != "" {
+				fmt.Printf("  ↳ fix: %s\n", opts.hint)
+			}
 			if opts == nil || !opts.noExit {
 				os.Exit(exitCode(err))
 			}
@@ -158,6 +198,7 @@ func run(description string, cmd []string, opts *runOpts) runResult {
 	g := gate{description: description, cmd: cmd}
 	if opts != nil {
 		g.extract = opts.extract
+		g.hint = opts.hint
 	}
 	r := runCapture(g)
 	ok := printGateResult(r, opts != nil && opts.noExit)
@@ -263,23 +304,20 @@ func stagedPackages(files []string) []string {
 	return pkgs
 }
 
-func hasNonTestFiles(files []string) bool {
-	for _, f := range files {
-		if !strings.HasSuffix(f, "_test.go") {
-			return true
-		}
-	}
-	return false
-}
-
 // changedGoFiles returns .go files with uncommitted changes in this
 // template's subtree. `git status --porcelain` prints repo-root-relative
 // paths regardless of cwd, so the `-- .` pathspec scopes it to the current
 // template and PorcelainChangedGoPath rejects anything git still reports
 // outside that subtree (defense in depth) as well as deletions and renames'
 // old-side paths.
+//
+// `-uall` matters: porcelain collapses an untracked directory to a single
+// `?? newpkg/` entry by default, which ends in "/" and would drop every file
+// in a newly created package.  Only the trailing newline is trimmed — trimming
+// the whole blob would eat the leading status space of the first line and
+// mis-parse that one path.
 func changedGoFiles() []string {
-	c := exec.Command("git", "status", "--porcelain", "--", ".")
+	c := exec.Command("git", "status", "--porcelain", "-uall", "--", ".")
 	c.Dir = root
 	out, err := c.Output()
 	if err != nil {
@@ -288,7 +326,7 @@ func changedGoFiles() []string {
 
 	prefix := gitPrefix()
 	var files []string
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimRight(string(out), "\n"), "\n") {
 		if f, ok := suppressions.PorcelainChangedGoPath(line, prefix); ok {
 			files = append(files, f)
 		}
@@ -296,13 +334,161 @@ func changedGoFiles() []string {
 	return files
 }
 
+// ── Test scoping ────────────────────────────────────────────────────
+
+// warn prints a non-blocking warning line.
+func warn(message string) {
+	fmt.Printf("  %s⚠%s %s\n", green, reset, message)
+}
+
+// requestedTestBaseRef is the base ref someone explicitly asked the scoped
+// test gate to diff against — `--base=<ref>`, then HARNESS_ARCH_BASE, then
+// GITHUB_BASE_REF (set only on GitHub Actions `pull_request` events) — or ""
+// when nobody did.
+//
+// Deliberately no origin/HEAD fallback, unlike the arch config guard: the
+// local stages' change set is the uncommitted one, and quietly widening it to
+// "everything since main" would make a clean tree re-run tests for packages
+// this edit never touched. Work that is committed but not pushed is covered by
+// `ci`, which runs the whole suite under coverage.
+func requestedTestBaseRef() string {
+	if base := flagValue("base", ""); base != "" {
+		return base
+	}
+	if base := os.Getenv("HARNESS_ARCH_BASE"); base != "" {
+		return base
+	}
+	if githubBase := os.Getenv("GITHUB_BASE_REF"); githubBase != "" {
+		return "origin/" + githubBase
+	}
+	return ""
+}
+
+// changedGoFilesForTests is the scoped test gate's change set: the uncommitted
+// files, plus the diff against a base ref when one was explicitly requested.
+// A requested base only ever widens the scope — dropping the uncommitted set
+// for it would skip the very edit that triggered this run. Duplicates are
+// harmless; PackagesForChangedGoFiles dedupes by directory.
+//
+// The second return value is a requested base ref git cannot resolve: a typo
+// there warns instead of quietly looking like nothing changed.
+func changedGoFilesForTests() (files []string, unresolvedBase string) {
+	base := requestedTestBaseRef()
+	if base == "" {
+		return changedGoFiles(), ""
+	}
+	if len(gitLines("rev-parse", "--verify", base)) == 0 {
+		return nil, base
+	}
+	files = changedGoFiles()
+	prefix := gitPrefix()
+	for _, p := range gitLines("diff", "--name-only", "--diff-filter=d", base+"...HEAD", "--", ".") {
+		if f := normalizeChangedPath(p, prefix); strings.HasSuffix(f, ".go") {
+			files = append(files, f)
+		}
+	}
+	return files, ""
+}
+
+// presentFiles keeps the paths that exist under root. A change set can name a
+// file this template does not hold: a base diff lists paths the working tree
+// has since deleted, and git run from a hook resolves paths against the repo
+// root rather than the template. Mapping those to a package would hand
+// `go test` a directory that is not there, so they are dropped — worst case
+// the scope empties out and the gate warns and skips.
+func presentFiles(files []string) []string {
+	var present []string
+	for _, f := range files {
+		if _, err := os.Stat(filepath.Join(root, f)); err == nil {
+			present = append(present, f)
+		}
+	}
+	return present
+}
+
+// dirHasGoTests reports whether dir (template-relative) holds a *_test.go file.
+func dirHasGoTests(dir string) bool {
+	entries, err := os.ReadDir(filepath.Join(root, dir))
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), "_test.go") {
+			return true
+		}
+	}
+	return false
+}
+
+// runScopedTests runs the test gate over the packages this change touches:
+// one `./<dir>/...` per changed .go file's directory. An empty scope warns and
+// skips — it never widens to the whole tree, or adopting this harness into a
+// large existing repo would run that repo's whole suite after every edit. A
+// changed package with no tests warns too, and the packages that do have tests
+// still run. `--all` runs the whole suite here; `ci` runs it separately under
+// coverage (`pre-push` runs no tests at all — it is the lint/acceptance/arch
+// gate).
+func runScopedTests(files []string, unresolvedBase string, noExit bool) runResult {
+	opts := &runOpts{extract: extractTestSummary, noExit: noExit}
+	if hasFlag("all") {
+		return run("Tests", []string{"go", "test", "./..."}, opts)
+	}
+	if unresolvedBase != "" {
+		warn(fmt.Sprintf("Tests: skipped — diff base %q does not resolve, nothing tested", unresolvedBase))
+		return runResult{ok: true}
+	}
+	pkgs, untested := suppressions.PackagesForChangedGoFiles(presentFiles(files), dirHasGoTests)
+	for _, dir := range untested {
+		warn(fmt.Sprintf("Tests: no *_test.go in %s — nothing to run for that change", dir))
+	}
+	if len(pkgs) == 0 {
+		warn("Tests: no changed Go packages (use --all for the whole suite); skipped")
+		return runResult{ok: true}
+	}
+	return run("Tests", append([]string{"go", "test"}, pkgs...), opts)
+}
+
 // ── Commands ────────────────────────────────────────────────────────
+
+var golangciLintVersionOnce sync.Once
+
+// warnGolangciLintVersion prints one ⚠ line per process when the installed
+// golangci-lint reports a version other than the pinned golangciLintVersion.
+// Warn, never fail: a mismatch means different lint results, not a broken
+// tree, and adopters pin their own. A missing binary stays silent here — the
+// lint gate itself already fails on it.
+func warnGolangciLintVersion() {
+	golangciLintVersionOnce.Do(func() {
+		c := exec.Command("golangci-lint", "version")
+		c.Dir = root
+		// Output is parsed even on a non-zero exit: a binary that prints its
+		// banner and then errors still tells us its version, and a binary that
+		// prints nothing recognizable falls through to the silent branch below.
+		out, _ := c.CombinedOutput()
+		got := suppressions.GolangciLintVersion(string(out))
+		// Builds installed with `go install` report `v2.13.2`; release archives
+		// report `2.13.2`. Same version — compare without the tag prefix.
+		if got == "" || strings.TrimPrefix(got, "v") == golangciLintVersion {
+			return
+		}
+		fmt.Printf("  %s⚠%s golangci-lint %s installed, %s pinned\n",
+			green, reset, got, golangciLintVersion)
+		fmt.Printf("  ↳ fix: curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v%s/install.sh"+
+			" | sh -s -- -b \"$(go env GOPATH)/bin\" v%s\n", golangciLintVersion, golangciLintVersion)
+	})
+}
+
+// golangciLintCmd builds a golangci-lint command line, checking the pin first.
+func golangciLintCmd(args ...string) []string {
+	warnGolangciLintVersion()
+	return append([]string{"golangci-lint"}, args...)
+}
 
 func cmdFix(pkgs []string) {
 	if len(pkgs) == 0 {
 		pkgs = []string{"./..."}
 	}
-	run("Fix & format", append([]string{"golangci-lint", "run", "--fix"}, pkgs...), nil)
+	run("Fix & format", golangciLintCmd(append([]string{"run", "--fix"}, pkgs...)...), nil)
 }
 
 func lintGate(pkgs []string) gate {
@@ -311,7 +497,7 @@ func lintGate(pkgs []string) gate {
 	}
 	return gate{
 		description: "Lint & format check",
-		cmd:         append([]string{"golangci-lint", "run"}, pkgs...),
+		cmd:         golangciLintCmd(append([]string{"run"}, pkgs...)...),
 		hint:        "run `go run harness.go fix`",
 	}
 }
@@ -372,7 +558,7 @@ func cmdPostEdit() {
 	if len(changedGoFiles()) == 0 {
 		return
 	}
-	run("Fix & format", []string{"golangci-lint", "run", "--fix", "./..."}, &runOpts{noExit: true})
+	run("Fix & format", golangciLintCmd("run", "--fix", "./..."), &runOpts{noExit: true})
 }
 
 // cmdStopHook exits 2 (not 1) on failure: Claude Code treats a Stop hook's
@@ -385,7 +571,7 @@ func cmdStopHook() {
 	cmdPostEdit() // mutating — sequential, first
 	checkArchConfigGuard(true, false, false)
 	checkGherkinGuard(true, false, false)
-	allOk, failed := runGatesParallel([]gate{complexityGate()}) // read-only batch
+	allOk, failed := runGatesParallel([]gate{complexityGate(), duplicationGate()}) // read-only batch
 	if !allOk {
 		fmt.Fprintf(os.Stderr, "stop-hook: failed gate(s): %s\n", strings.Join(failed, ", "))
 		os.Exit(2)
@@ -483,21 +669,130 @@ func cmdAcceptance() {
 	}
 }
 
-// archGatesOrWarn builds the import/dependency-boundary gate, or warns + returns
-// nil when .go-arch-lint.yml is absent.
+// archArgv is the go-arch-lint invocation both the gate and the baseline
+// measurement run. `--max-warnings` caps the reported notice list (default
+// 100) and folds the rest into OmittedCount, which the count adds back;
+// 32768 is the tool's validated maximum, so the list stays complete.
+func archArgv() []string {
+	return []string{"go", "run", goArchLint, "check", "--json", "--max-warnings", "32768"}
+}
+
+// archWarning is the union of the fields go-arch-lint puts on a notice.
+// A bucket that does not carry one leaves it empty — the summary line drops
+// what is missing rather than demanding one struct per bucket.
+type archWarning struct {
+	ComponentName      string
+	FileRelativePath   string
+	ResolvedImportName string
+}
+
+// archCheck decodes `check --json` into a violation count plus one summary
+// line per notice. problem is non-empty when the run cannot be counted at all:
+// no decodable report (a crash, or a flag that stopped meaning what it meant),
+// or execution warnings — a component pointing at a directory that no longer
+// exists, a malformed rule — which make go-arch-lint skip the boundary check
+// and report empty warning arrays. Neither is the same as a clean tree, so
+// callers must treat a problem as a failure, never as zero violations. The
+// summary lines then describe the problem instead of the violations.
+func archCheck(output string) (int, []string, string) {
+	var report struct {
+		Payload struct {
+			ExecutionWarnings []struct {
+				Text string
+				File string
+				Line int
+			}
+			ArchWarningsDeps       []archWarning
+			ArchWarningsNotMatched []archWarning
+			ArchWarningsDeepScan   []archWarning
+			OmittedCount           int
+		}
+	}
+	// `go run` prefixes module-download chatter and appends `exit status 1`
+	// around the document, so decode the first JSON value and ignore the rest.
+	noReport := "go-arch-lint printed no JSON report to count violations from"
+	start := strings.Index(output, "{")
+	if start < 0 {
+		return 0, nil, noReport
+	}
+	if err := json.NewDecoder(strings.NewReader(output[start:])).Decode(&report); err != nil {
+		return 0, nil, noReport
+	}
+	payload := report.Payload
+	if len(payload.ExecutionWarnings) > 0 {
+		var lines []string
+		for _, w := range payload.ExecutionWarnings {
+			lines = append(lines, fmt.Sprintf("%s (%s:%d)", w.Text, filepath.Base(w.File), w.Line))
+		}
+		return 0, lines, fmt.Sprintf(
+			"go-arch-lint skipped the boundary check: %d problem(s) in %s — fix them and rerun; this is not a clean tree",
+			len(payload.ExecutionWarnings), archConfig)
+	}
+	count := len(payload.ArchWarningsDeps) + len(payload.ArchWarningsNotMatched) +
+		len(payload.ArchWarningsDeepScan) + payload.OmittedCount
+	var lines []string
+	for _, w := range payload.ArchWarningsDeps {
+		lines = append(lines, fmt.Sprintf("%s: %s may not import %s", w.FileRelativePath, w.ComponentName, w.ResolvedImportName))
+	}
+	for _, w := range payload.ArchWarningsNotMatched {
+		lines = append(lines, fmt.Sprintf("%s: not matched by any component", w.FileRelativePath))
+	}
+	for _, w := range payload.ArchWarningsDeepScan {
+		lines = append(lines, fmt.Sprintf("%s: %s reaches %s (deep scan)", w.FileRelativePath, w.ComponentName, w.ResolvedImportName))
+	}
+	if limit := min(len(lines), 10); limit < len(lines) {
+		lines = append(lines[:limit:limit], fmt.Sprintf("… and %d more", count-limit))
+	}
+	return count, lines, ""
+}
+
+// archGatesOrWarn builds the import/dependency-boundary gate, or warns +
+// returns nil when .go-arch-lint.yml is absent.
+//
+// go-arch-lint has no count ratchet of its own — it exits 1 whenever it finds
+// anything — so the gate counts the notices in its JSON report and compares
+// them to the committed floor. With no floor recorded the gate reports and
+// passes: a repo adopting the harness with a boundary already crossed has to
+// be green on day one, and only then may the number come down.
 func archGatesOrWarn() []gate {
 	if _, err := os.Stat(filepath.Join(root, archConfig)); err != nil {
 		fmt.Printf("  %s⚠%s Arch: no %s — skipped\n", green, reset, archConfig)
 		return nil
 	}
-	return []gate{{description: "Arch (go-arch-lint)", cmd: []string{
-		"go", "run", "github.com/fe3dback/go-arch-lint@v1.15.0", "check",
-	}, hint: "boundary crossed; surface the design decision to the human; don't edit arch config"}}
+	floor, hasFloor := suppressions.BaselineFloor(root, "arch.max_violations")
+	description := "Arch (go-arch-lint)"
+	hint := "boundary crossed; surface the design decision to the human; don't edit arch config"
+	switch {
+	case !hasFloor:
+		description = fmt.Sprintf("Arch (go-arch-lint, report-only: no %s floor)", baselineFile)
+		hint = fmt.Sprintf("run `%s` to record a floor", updateBaseline)
+	case floor > 0:
+		description = fmt.Sprintf("Arch (go-arch-lint, baseline %d)", floor)
+	}
+	return []gate{{
+		description: description,
+		cmd:         archArgv(),
+		hint:        hint,
+		verdict: func(output string, _ int) (bool, string) {
+			count, lines, problem := archCheck(output)
+			switch {
+			case problem != "":
+				return false, strings.Join(append([]string{problem}, lines...), "\n")
+			case hasFloor && count > floor:
+				summary := fmt.Sprintf("%d violation(s), baseline %d", count, floor)
+				return false, strings.Join(append([]string{summary}, lines...), "\n")
+			case count == 0:
+				return true, ""
+			default:
+				return true, fmt.Sprintf("%d violation(s)", count)
+			}
+		},
+	}}
 }
 
 func cmdArch() {
 	for _, g := range archGatesOrWarn() {
-		run(g.description, g.cmd, nil)
+		printGateResult(runCapture(g), false)
 	}
 }
 
@@ -736,44 +1031,335 @@ func cmdGherkinGuard() {
 	}
 }
 
-// mutationTarget is the package gremlins mutates. The template ships
-// `suppressions` as its sample library package — point this (or pass a path
-// argument) at your own source packages as the module grows.
-const mutationTarget = "./suppressions"
+// mutationTargets are the packages gremlins mutates when a run is not scoped
+// to a change set — `--all`, an explicit path argument, or the baseline
+// measurement. The template ships `suppressions` as its sample library
+// package; point this at your own source packages as the module grows.
+var mutationTargets = []string{"./suppressions"}
 
-// cmdMutation runs gremlins mutation testing. Advisory — not wired into ci.
+const (
+	gremlinsPkg = "github.com/go-gremlins/gremlins/cmd/gremlins@v0.5.0"
+	// mutationTimeout is generous on purpose. gremlins derives each mutant's
+	// budget from its own baseline test run and drops every mutant that
+	// overruns it out of *both* score counts, so a coefficient that is merely
+	// adequate silently shrinks the sample and inflates the score: on a loaded
+	// machine `=10` scored 100% off 8 mutants where `=30` scored 80% off 49,
+	// twice, with no timeouts. A floor is only worth recording if it reproduces.
+	mutationTimeout = "--timeout-coefficient=30"
+	// mutationReportGlob matches every per-target gremlins report `clean`
+	// removes and .gitignore keeps out of the tree.
+	mutationReportGlob = "gremlins-report*.json"
+)
+
+// mutationReport is the slice of gremlins' machine-readable report the gate
+// reads: counts, not percentages, so several scoped runs sum into one score
+// instead of averaging percentages.
 //
-// Two hard-won notes baked into this command:
-//   - gremlins derives each mutant's test timeout from the baseline test run.
-//     A cold build cache makes the first mutant compile blow that budget and
-//     every mutant reports TIMED OUT. Warming the cache with `go test` first,
-//     plus a generous --timeout-coefficient, makes results meaningful.
-//   - gremlins must be pointed at a concrete package. `./...` from this module
-//     gathers no coverage because the root file (harness.go) is build-ignored,
-//     so gremlins reports "No results". Target source packages explicitly.
-//
-// Output is printed unconditionally: an advisory report you cannot see is useless.
-func cmdMutation() {
-	target := mutationTarget
-	if args := filterFlags(os.Args[1:]); len(args) > 1 {
-		target = args[1]
+// gremlins leaves timed-out mutants out of both counts, so a machine loaded
+// enough to blow the mutant timeout shrinks the denominator instead of
+// scoring those mutants — one more reason this gate warns rather than blocks.
+type mutationReport struct {
+	Killed     int `json:"mutants_killed"`
+	Lived      int `json:"mutants_lived"`
+	NotCovered int `json:"mutants_not_covered"`
+}
+
+func (r mutationReport) add(other mutationReport) mutationReport {
+	return mutationReport{
+		Killed:     r.Killed + other.Killed,
+		Lived:      r.Lived + other.Lived,
+		NotCovered: r.NotCovered + other.NotCovered,
 	}
-	run("Warm test cache", []string{"go", "test", "-count=1", "./..."},
-		&runOpts{extract: extractTestSummary, noExit: true})
+}
 
-	fmt.Printf("  %s→%s gremlins unleash %s\n", dim, reset, target)
-	c := exec.Command("go", "run",
-		"github.com/go-gremlins/gremlins/cmd/gremlins@v0.5.0",
-		"unleash", "--timeout-coefficient=10", target)
-	c.Dir = root
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	if err := c.Run(); err != nil {
-		fmt.Printf("  %s⚠%s Mutation: gremlins exited non-zero (advisory — not blocking)\n", green, reset)
+// mutationReportPath names one target's report so several targets do not
+// overwrite each other's artifact: `./suppressions` → gremlins-report-suppressions.json.
+func mutationReportPath(target string) string {
+	name := strings.Trim(strings.ReplaceAll(strings.TrimPrefix(target, "./"), "/", "-"), ".")
+	if name == "" {
+		return "gremlins-report.json"
+	}
+	return "gremlins-report-" + name + ".json"
+}
+
+// readMutationReport decodes gremlins' `-o` report. A file that is valid JSON
+// but carries none of gremlins' fields is rejected rather than decoded to
+// all-zeros and scored as a run that killed nothing: `--report=` aimed at the
+// wrong file must not pass for a clean tree.
+func readMutationReport(reportPath string) (mutationReport, error) {
+	var report mutationReport
+	if !filepath.IsAbs(reportPath) {
+		reportPath = filepath.Join(root, reportPath)
+	}
+	data, err := os.ReadFile(reportPath)
+	if err != nil {
+		return report, fmt.Errorf("cannot read gremlins report: %w", err)
+	}
+	var probe struct {
+		Total *int `json:"mutants_total"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return report, fmt.Errorf("cannot parse gremlins report %s: %w", reportPath, err)
+	}
+	if probe.Total == nil {
+		return report, fmt.Errorf("%s is not a gremlins report: no mutants_total field", reportPath)
+	}
+	if err := json.Unmarshal(data, &report); err != nil {
+		return report, fmt.Errorf("cannot parse gremlins report %s: %w", reportPath, err)
+	}
+	return report, nil
+}
+
+// mutationBaseRef resolves the single ref the change set is diffed against.
+// Separate from changedPathsFromBase, which may diff against two bases at
+// once and so has no single ref to name.
+func mutationBaseRef() string {
+	candidates := []string{flagValue("base", ""), os.Getenv("HARNESS_ARCH_BASE")}
+	if githubBase := os.Getenv("GITHUB_BASE_REF"); githubBase != "" {
+		candidates = append(candidates, "origin/"+githubBase)
+	}
+	candidates = append(candidates, "origin/HEAD", "origin/main", "main")
+	for _, candidate := range candidates {
+		if candidate != "" && len(gitLines("rev-parse", "--verify", candidate)) > 0 {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// changedGoFilesSince lists the .go files this branch changed against a base
+// ref — the change-set source for every stage that has one, because a
+// `git status` on a fresh CI checkout is empty and would score a green gate
+// that tested nothing.
+func changedGoFilesSince(base string) []string {
+	prefix := gitPrefix()
+	var files []string
+	for _, p := range gitLines("diff", "--name-only", "--diff-filter=d", base+"...HEAD", "--", ".") {
+		files = append(files, normalizeChangedPath(p, prefix))
+	}
+	return files
+}
+
+// mutationScope resolves the packages to mutate. An explicit path argument or
+// `--all` pins the concrete targets; otherwise the scope is the package
+// directories of the changed .go files. workingTree is false in ci, where the
+// uncommitted set must never be the source (see changedGoFilesSince).
+//
+// Scoping is package-granular, not line-granular: gremlins' own `--diff` is
+// unusable with a concrete package target. It keys the diff on git's
+// repo-root-relative paths (internal/diff/parse.go:30) but matches them
+// against filenames walked from the target directory
+// (internal/engine/engine.go:68 builds `os.DirFS(module root + calling dir)`),
+// so `go/suppressions/suppressions.go` never matches `suppressions.go`: every
+// mutant comes back SKIPPED and the run reports zero mutants — a green gate
+// that tested nothing.
+func mutationScope(workingTree bool) []string {
+	if args := filterFlags(os.Args[1:]); len(args) > 1 {
+		return []string{args[1]}
+	}
+	if hasFlag("all") {
+		return mutationTargets
+	}
+	var changed []string
+	if base := mutationBaseRef(); base != "" {
+		changed = changedGoFilesSince(base)
+	}
+	// A local run unions the branch diff with the uncommitted set: a base ref
+	// almost always resolves, so treating the two as alternatives would leave
+	// the developer who just edited a file — and has not committed it — with an
+	// empty scope on the very change the gate exists to score.
+	if workingTree {
+		changed = append(changed, changedGoFiles()...)
+	}
+	return suppressions.MutationPackages(changed)
+}
+
+// dirHasTestFiles reports whether a gremlins target's own package directory
+// holds a test. gremlins can only kill a mutant a test reaches, so an
+// untested package scores nothing and would only dilute the run. A directory
+// that cannot be read is an error, never "no tests": a mistyped path argument
+// must not skip its way to a green gate.
+func dirHasTestFiles(target string) (bool, error) {
+	dir := filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(target, "./")))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), "_test.go") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func withTestFiles(targets []string) ([]string, error) {
+	var kept []string
+	for _, target := range targets {
+		hasTests, err := dirHasTestFiles(target)
+		if err != nil {
+			return nil, fmt.Errorf("%s is not a package directory: %w", target, err)
+		}
+		if hasTests {
+			kept = append(kept, target)
+			continue
+		}
+		fmt.Printf("  %s⚠%s Mutation: %s has no *_test.go — skipped\n", green, reset, target)
+	}
+	return kept, nil
+}
+
+// warmTestCache builds and runs the suite before gremlins does. gremlins
+// derives each mutant's test timeout from the baseline test run: a cold build
+// cache makes the first mutant's compile blow that budget and every mutant
+// reports TIMED OUT. mutationTimeout is the other half of the same fix.
+func warmTestCache(stream bool) {
+	if stream {
+		run("Warm test cache", []string{"go", "test", "-count=1", "./..."},
+			&runOpts{extract: extractTestSummary, noExit: true})
 		return
 	}
-	fmt.Printf("  %s✓%s Mutation (gremlins)\n", green, reset)
+	c := exec.Command("go", "test", "-count=1", "./...")
+	c.Dir = root
+	_, _ = c.CombinedOutput()
 }
+
+// gremlinsUnleash mutates one package and returns its report. gremlins takes
+// a single concrete package path — `./...` gathers no coverage from this
+// module because the root file (harness.go) is build-ignored — so several
+// targets mean several runs, aggregated by the caller.
+func gremlinsUnleash(target string, stream bool) (mutationReport, error) {
+	reportPath := mutationReportPath(target)
+	// Drop the previous run's report first: gremlins writes it only on
+	// success, so a leftover would be read back as this run's result and
+	// scored as fresh.
+	_ = os.Remove(filepath.Join(root, reportPath))
+	argv := []string{"go", "run", gremlinsPkg, "unleash", mutationTimeout, "-o", reportPath, target}
+
+	c := exec.Command(argv[0], argv[1:]...)
+	c.Dir = root
+	var captured bytes.Buffer
+	if stream {
+		fmt.Printf("  %s→ %s%s\n", dim, strings.Join(argv, " "), reset)
+		c.Stdout = os.Stdout
+		c.Stderr = os.Stderr
+	} else {
+		c.Stdout = &captured
+		c.Stderr = &captured
+	}
+	// A non-zero exit fails the target whatever it left on disk. gremlins exits
+	// non-zero both for a real failure and for its own efficacy/coverage
+	// thresholds, and a run it aborted part-way may still have written a
+	// report — scoring that would be a floor comparison against a partial run,
+	// which is worse than no comparison at all.
+	if err := c.Run(); err != nil {
+		if !stream && captured.Len() > 0 {
+			fmt.Print(captured.String())
+		}
+		return mutationReport{}, fmt.Errorf("gremlins exited %d", exitCode(err))
+	}
+	return readMutationReport(reportPath)
+}
+
+// mutateTargets runs every target and sums the reports. A target that failed
+// is a warning by default — mutation is advisory, and the packages that did
+// run still carry a score — but it is counted, because a score summed over
+// only the targets that survived is not the score the floor was measured
+// against, and `--enforce` must not pass on it.
+func mutateTargets(targets []string, stream bool) (total mutationReport, ran, failed int) {
+	for _, target := range targets {
+		report, err := gremlinsUnleash(target, stream)
+		if err != nil {
+			fmt.Printf("  %s⚠%s Mutation: %s — %v (advisory — not blocking)\n", green, reset, target, err)
+			failed++
+			continue
+		}
+		total = total.add(report)
+		ran++
+	}
+	return total, ran, failed
+}
+
+// reportMutationScore compares a run's kill rate to the `mutation.min` floor.
+// Mirrors cmdCrap exactly: advisory `⚠` by default, `✗` + exit 1 under
+// --enforce, and report-only — even under --enforce — when no floor is
+// recorded, because an absent key means the repo has never been measured,
+// not that it must already be perfect.
+func reportMutationScore(report mutationReport, enforce bool) {
+	score, scored := suppressions.MutationScore(report.Killed, report.Lived)
+	if !scored {
+		fmt.Printf("  %s⚠%s Mutation: no mutant was killed or survived (%d not covered) — nothing to score\n",
+			green, reset, report.NotCovered)
+		return
+	}
+	floor, hasFloor := suppressions.BaselineFloor(root, "mutation.min")
+	if !hasFloor {
+		fmt.Printf("  %s⚠%s Mutation: %d%% mutants killed (report-only: no %s floor)\n",
+			green, reset, score, baselineFile)
+		fmt.Printf("  ↳ fix: run `%s` to record a floor\n", updateBaselineMutation)
+		return
+	}
+	if score >= floor {
+		fmt.Printf("  %s✓%s Mutation: %d%% mutants killed (baseline %d)\n", green, reset, score, floor)
+		return
+	}
+	glyph, color := advisoryGlyphAndColor(enforce)
+	suffix := " (advisory)"
+	if enforce {
+		suffix = ""
+	}
+	fmt.Printf("  %s%s%s Mutation: %d%% mutants killed (baseline %d)%s\n",
+		color, glyph, reset, score, floor, suffix)
+	fmt.Println("  ↳ fix: add tests that kill the surviving mutants gremlins listed")
+	if enforce {
+		os.Exit(1)
+	}
+}
+
+// runMutation is the mutation gate: gremlins over the packages the change set
+// touches, scored against `mutation.min`. Advisory unless --enforce, and
+// wired into ci that way — a kill rate is too jittery a number to block a
+// pipeline on, and too useful to hide.
+//
+// Output is printed unconditionally: an advisory report you cannot see is useless.
+func runMutation(workingTree bool) {
+	enforce := hasFlag("enforce")
+	// --report scores a report that already exists instead of spending
+	// minutes producing a new one — the way to re-check a finished run
+	// against a changed floor. An unreadable path fails hard rather than
+	// scoring as "nothing to score": a typo must not pass for a clean tree.
+	if reportPath := flagValue("report", ""); reportPath != "" {
+		report, err := readMutationReport(reportPath)
+		if err != nil {
+			fmt.Printf("  %s✗%s Mutation: %v\n", red, reset, err)
+			os.Exit(1)
+		}
+		reportMutationScore(report, enforce)
+		return
+	}
+
+	targets, err := withTestFiles(mutationScope(workingTree))
+	if err != nil {
+		fmt.Printf("  %s✗%s Mutation: %v\n", red, reset, err)
+		os.Exit(1)
+	}
+	if len(targets) == 0 {
+		fmt.Printf("  %s⚠%s Mutation: no changed Go package with tests (skipped)\n", green, reset)
+		return
+	}
+	warmTestCache(true)
+	total, ran, failed := mutateTargets(targets, true)
+	if ran > 0 {
+		reportMutationScore(total, enforce)
+	}
+	// Nothing scored, or scored over an incomplete set: advisory by default,
+	// but a gate asked to enforce must not pass because the tool broke.
+	if failed > 0 && enforce {
+		os.Exit(1)
+	}
+}
+
+func cmdMutation() { runMutation(true) }
 
 // funcMetric pairs a function's location with its cyclomatic complexity.
 // Coverage is computed at join time in cmdCrap from per-line hit counts.
@@ -795,11 +1381,12 @@ var lizardLocRe = regexp.MustCompile(`"([^"@]*)@(\d+)-(\d+)@([^"]+)"`)
 // per-function coverage is the fraction of in-range tracked lines that ran.
 // Joining on file+line range, not name, sidesteps Go's "(*Foo).Bar" vs "Bar"
 // receiver-name mismatch between cover output and lizard output.
-// crapGlyphAndColor pairs CRAP's advisory/enforce output glyph with the
-// matching ANSI color used throughout this runner (⚠ prints green, ✗ prints
-// red, by convention here). The enforce→glyph mapping itself lives in
+// advisoryGlyphAndColor pairs an advisory gate's advisory/enforce output
+// glyph with the matching ANSI color used throughout this runner (⚠ prints
+// green, ✗ prints red, by convention here). Shared by CRAP and mutation, the
+// two gates that warn by default. The enforce→glyph mapping itself lives in
 // crap.AdvisoryGlyph — pure, unit tested — so this stays a one-line wrapper.
-func crapGlyphAndColor(enforce bool) (glyph, color string) {
+func advisoryGlyphAndColor(enforce bool) (glyph, color string) {
 	glyph = crap.AdvisoryGlyph(enforce)
 	color = green
 	if enforce {
@@ -808,18 +1395,29 @@ func crapGlyphAndColor(enforce bool) (glyph, color string) {
 	return glyph, color
 }
 
-func cmdCrap() {
-	maxCrap, _ := strconv.ParseFloat(flagValue("max", "30"), 64)
-	enforce := hasFlag("enforce")
+type crapOffender struct {
+	crap   float64
+	cov    float64
+	metric funcMetric
+}
 
+// crapMeasurement is one CRAP scoring pass: the offenders above the
+// threshold, or the reason a tool could not produce a score.
+type crapMeasurement struct {
+	offenders []crapOffender
+	problem   string
+}
+
+// crapMeasure scores every function's CRAP against maxCrap, refreshing
+// coverage if stale.
+func crapMeasure(maxCrap float64) crapMeasurement {
 	covPath := filepath.Join(root, "coverage.out")
 	if !coverageFresh(covPath) {
 		cmdTestCov()
 	}
 	covText, err := os.ReadFile(covPath)
 	if err != nil {
-		fmt.Printf("  %s✗%s CRAP: coverage.out not found after test-cov\n", red, reset)
-		os.Exit(1)
+		return crapMeasurement{problem: "coverage.out not found after test-cov"}
 	}
 
 	// coverprofile paths are module-qualified ("harness/suppressions/foo.go");
@@ -837,50 +1435,84 @@ func cmdCrap() {
 	if metrics == nil {
 		// Lizard produced no usable output (uvx missing, lizard crash, format
 		// drift). Reporting "all functions below max" would be a silent false-
-		// pass; surface the failure and degrade to advisory unless --enforce.
-		suffix := ""
-		if !enforce {
-			suffix = " (advisory)"
-		}
-		glyph, color := crapGlyphAndColor(enforce)
-		fmt.Printf("  %s%s%s CRAP: lizard failed to run%s\n", color, glyph, reset, suffix)
-		if enforce {
-			os.Exit(1)
-		}
-		return
+		// pass; surface the failure.
+		return crapMeasurement{problem: "lizard failed to run"}
 	}
 
-	type scored struct {
-		crap   float64
-		cov    float64
-		metric funcMetric
-	}
-	var offenders []scored
+	var offenders []crapOffender
 	for _, m := range metrics {
 		c := functionCoverage(cov[m.file], m.line, m.end)
 		score := crap.Score(m.ccn, c)
 		if score > maxCrap {
-			offenders = append(offenders, scored{score, c, m})
+			offenders = append(offenders, crapOffender{score, c, m})
 		}
 	}
-
-	if len(offenders) == 0 {
-		fmt.Printf("  %s✓%s CRAP: all functions below %.0f\n", green, reset, maxCrap)
-		return
-	}
 	sort.Slice(offenders, func(i, j int) bool { return offenders[i].crap > offenders[j].crap })
-	suffix := " (advisory)"
-	if enforce {
-		suffix = ""
-	}
-	glyph, color := crapGlyphAndColor(enforce)
-	fmt.Printf("  %s%s%s CRAP: %d function(s) exceed %.0f%s\n", color, glyph, reset, len(offenders), maxCrap, suffix)
+	return crapMeasurement{offenders: offenders}
+}
+
+// printCrapOffenders lists the worst offenders, capped so a legacy tree does
+// not bury the rest of the run.
+func printCrapOffenders(offenders []crapOffender) {
 	limit := min(len(offenders), 20)
 	for _, o := range offenders[:limit] {
 		m := o.metric
 		fmt.Printf("    CRAP=%6.1f  CCN=%3d  cov=%5.1f%%  %s@%d %s\n",
 			o.crap, m.ccn, o.cov*100, m.name, m.line, m.file)
 	}
+}
+
+func cmdCrap() {
+	maxCrap := crapMaxDefault
+	if raw := flagValue("max", ""); raw != "" {
+		value, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			fmt.Printf("  %s✗%s CRAP: invalid --max=%q (must be a number)\n", red, reset, raw)
+			os.Exit(1)
+		}
+		maxCrap = value
+	}
+	enforce := hasFlag("enforce")
+	suffix := " (advisory)"
+	if enforce {
+		suffix = ""
+	}
+	glyph, color := advisoryGlyphAndColor(enforce)
+
+	measurement := crapMeasure(maxCrap)
+	if measurement.problem != "" {
+		// Degrade to advisory unless --enforce.
+		fmt.Printf("  %s%s%s CRAP: %s%s\n", color, glyph, reset, measurement.problem, suffix)
+		if enforce {
+			os.Exit(1)
+		}
+		return
+	}
+
+	offenders := measurement.offenders
+	if len(offenders) == 0 {
+		fmt.Printf("  %s✓%s CRAP: all functions below %.0f\n", green, reset, maxCrap)
+		return
+	}
+	// The baseline is a count floor: a repo adopting the harness starts wherever
+	// it already is, and that number may only come down.
+	floor, hasFloor := suppressions.BaselineFloor(root, "crap.max_violations")
+	if !hasFloor {
+		// Nothing recorded is not a floor of 0; it is a repo that has never been
+		// measured. Report what is there and pass — `--enforce` included — so
+		// retrofitting the harness into a legacy tree is green on day one.
+		fmt.Printf("  %s⚠%s CRAP: %d function(s) exceed %.0f (report-only: no %s floor)\n",
+			green, reset, len(offenders), maxCrap, baselineFile)
+		printCrapOffenders(offenders)
+		fmt.Printf("  ↳ fix: run `%s` to record a floor\n", updateBaseline)
+		return
+	}
+	if len(offenders) <= floor {
+		fmt.Printf("  %s✓%s CRAP: %d function(s) exceed %.0f (baseline %d)\n", green, reset, len(offenders), maxCrap, floor)
+		return
+	}
+	fmt.Printf("  %s%s%s CRAP: %d function(s) exceed %.0f (baseline %d)%s\n", color, glyph, reset, len(offenders), maxCrap, floor, suffix)
+	printCrapOffenders(offenders)
 	if enforce {
 		os.Exit(1)
 	}
@@ -1094,9 +1726,10 @@ func cmdCheck() {
 	start := time.Now()
 	fmt.Printf("\n%s[check]%s Running pre-flight checks...\n\n", blue, reset)
 
+	changed, unresolvedBase := changedGoFilesForTests()
 	results := []runResult{
-		run("Fix & format", []string{"golangci-lint", "run", "--fix", "./..."}, &runOpts{noExit: true}),
-		run("Tests", []string{"go", "test", "./..."}, &runOpts{extract: extractTestSummary, noExit: true}),
+		run("Fix & format", golangciLintCmd("run", "--fix", "./..."), &runOpts{noExit: true}),
+		runScopedTests(changed, unresolvedBase, true),
 	}
 
 	// Read-only parallel batch, after the mutating fix step above. Invariant:
@@ -1107,7 +1740,7 @@ func cmdCheck() {
 	// stays ci/pre-push-only. Folded into `results` gate-by-gate (not as one
 	// combined entry) so the N passed/M failed summary below reflects each
 	// gate individually.
-	checkGates := []gate{complexityGate(), modTidyGate()}
+	checkGates := []gate{complexityGate(), duplicationGate(), modTidyGate()}
 	checkGates = append(checkGates, acceptanceGatesOrWarn()...)
 	_, failedCheckGates := runGatesParallel(checkGates)
 	failedCheckGateSet := make(map[string]bool, len(failedCheckGates))
@@ -1127,7 +1760,7 @@ func cmdCheck() {
 			root,
 			suppressions.ScanFindings(root),
 			true,
-			"go run harness.go suppressions --update-baseline",
+			updateBaseline,
 			true,
 		),
 	})
@@ -1175,10 +1808,7 @@ func cmdPreCommit() {
 	cmdFix(pkgs)
 	restageFixedFiles(files)
 	checkAgentsMdDrift(false)
-
-	if hasNonTestFiles(files) {
-		cmdTest()
-	}
+	runScopedTests(files, "", false)
 }
 
 // restageFixedFiles re-adds staged files after cmdFix rewrites the working
@@ -1211,19 +1841,20 @@ func cmdCi() {
 	fmt.Printf("\n%s[ci]%s\n\n", blue, reset)
 	// Read-only gates run as a parallel batch (captured, printed in submission
 	// order, run to completion). Coverage is captured and CRAP is advisory — after.
-	gates := []gate{lintGate(nil), auditGate(), complexityGate(), modTidyGate()}
+	gates := []gate{lintGate(nil), auditGate(), complexityGate(), duplicationGate(), modTidyGate()}
 	gates = append(gates, acceptanceGatesOrWarn()...)
 	gates = append(gates, archGatesOrWarn()...)
 	allOk, _ := runGatesParallel(gates)
-	cmdTestCov() // after the batch
-	cmdCrap()    // advisory unless --enforce
+	cmdTestCov()       // after the batch
+	cmdCrap()          // advisory unless --enforce
+	runMutation(false) // advisory unless --enforce; change set from the base ref only
 	archConfigOk := checkArchConfigGuard(false, false, false)
 	gherkinOk := checkGherkinGuard(false, false, false)
 	suppressionsOk := suppressions.CheckBaseline(
 		root,
 		suppressions.ScanFindings(root),
 		true,
-		"go run harness.go suppressions --update-baseline",
+		updateBaseline,
 		true,
 	)
 	if !allOk || !archConfigOk || !gherkinOk || !suppressionsOk {
@@ -1259,17 +1890,294 @@ func cmdPrePush() {
 // driven tests legitimately branch a lot) and `harness.go` (carries
 // `//go:build ignore`, not part of any production package). The cmdCrap join
 // applies the same exclusions so both gates target the same code set.
-func complexityGate() gate {
-	return gate{description: "Complexity (lizard)", cmd: []string{
+func complexityArgv(maxViolations string) []string {
+	// lizard's own `-i N` is the count ratchet: it exits 0 while the number of
+	// flagged functions stays at or below N, so lizard does the counting.
+	return []string{
 		"uvx", lizard, "-l", "go", ".",
-		"-C", "15", "-a", complexityMaxArgs, "-L", "100", "-i", "0",
+		"-C", "15", "-a", complexityMaxArgs, "-L", "100", "-i", maxViolations,
 		"-x", "*_test.go", "-x", "./harness.go",
-	}, hint: "extract helpers or flatten branches until CCN <= 15; do not raise the threshold"}
+	}
+}
+
+// complexityGate is the lizard gate at the committed floor, or report-only
+// when there is none. With no floor recorded, `-i 0` would demand a legacy
+// tree already be perfect — exactly the day-one red that stops the harness
+// being adopted. Measure instead.
+func complexityGate() gate {
+	floor, ok := suppressions.BaselineFloor(root, "complexity.max_violations")
+	if !ok {
+		return gate{
+			description: fmt.Sprintf("Complexity (lizard, report-only: no %s floor)", baselineFile),
+			cmd:         complexityArgv(reportOnlyLimit),
+			hint:        fmt.Sprintf("run `%s` to record a floor", updateBaseline),
+		}
+	}
+	description := "Complexity (lizard)"
+	if floor > 0 {
+		description = fmt.Sprintf("Complexity (lizard, baseline %d)", floor)
+	}
+	return gate{
+		description: description,
+		cmd:         complexityArgv(strconv.Itoa(floor)),
+		hint:        "extract helpers or flatten branches until CCN <= 15; do not raise the threshold",
+	}
 }
 
 func cmdComplexity() {
-	g := complexityGate()
-	run(g.description, g.cmd, nil)
+	if ok, _ := runGatesParallel([]gate{complexityGate(), duplicationGate()}); !ok {
+		os.Exit(1)
+	}
+}
+
+// duplicationArgv is lizard's copy-paste detector over the same target set and
+// the same exclusions as complexityArgv — the floor only reproduces against an
+// identical target set. A separate invocation because `-Eduplicate` composes
+// with the complexity thresholds but does not reach lizard's exit code: it
+// stays driven by CCN warnings alone, so `-i reportOnlyLimit` keeps this run
+// green and duplicationGate does the comparing.
+func duplicationArgv() []string {
+	return []string{
+		"uvx", lizard, "-l", "go", ".", "-Eduplicate", "-w", "-i", reportOnlyLimit,
+		"-x", "*_test.go", "-x", "./harness.go",
+	}
+}
+
+// duplicateBlockCount counts the `Duplicate block:` headers lizard prints, one
+// per group of copy-pasted code. Lizard only reports a block once it spans 70+
+// unified tokens, so this counts real duplication, not incidental repetition.
+func duplicateBlockCount(stdout string) int {
+	count := 0
+	for line := range strings.SplitSeq(stdout, "\n") {
+		if strings.TrimRight(line, "\r") == "Duplicate block:" {
+			count++
+		}
+	}
+	return count
+}
+
+// duplicationGate is the copy-paste gate at the committed floor, or
+// report-only when there is none — same rule as complexityGate: a floor of 0
+// inferred from an absent number is not a floor, it is a demand that the repo
+// already be perfect. Overlapping near-duplicates are reported separately, so
+// the count can jitter by one on a trivial edit; that is fine for a ratchet.
+func duplicationGate() gate {
+	floor, ok := suppressions.BaselineFloor(root, "duplication.max_blocks")
+	if !ok {
+		// The call to action rides on the ✓ line, not in `hint`: a report-only
+		// gate passes by construction, and printGateResult only shows a hint on
+		// failure — where the failure would be lizard itself breaking, not a
+		// missing floor.
+		return gate{
+			description: fmt.Sprintf("Duplication (lizard, report-only: no %s floor)", baselineFile),
+			cmd:         duplicationArgv(),
+			extract: func(output string) string {
+				return fmt.Sprintf("%s; run `%s` to record a floor",
+					duplicationDetail(duplicateBlockCount(output)), updateBaseline)
+			},
+		}
+	}
+	return gate{
+		description: fmt.Sprintf("Duplication (lizard, baseline %d)", floor),
+		cmd:         duplicationArgv(),
+		verdict: func(output string, exitCode int) (bool, string) {
+			if exitCode != 0 {
+				return false, fmt.Sprintf("lizard exited %d", exitCode)
+			}
+			count := duplicateBlockCount(output)
+			return count <= floor, duplicationDetail(count)
+		},
+		hint: "extract the duplicated code into one function; do not raise the floor",
+	}
+}
+
+func duplicationDetail(count int) string {
+	return fmt.Sprintf("%d duplicate block(s)", count)
+}
+
+// lizardWarningCount reads the `Warning cnt` column out of lizard's final
+// summary row. ok=false when there is no summary row to read.
+func lizardWarningCount(stdout string) (int, bool) {
+	lines := strings.Split(stdout, "\n")
+	for index, line := range lines {
+		if !strings.HasPrefix(line, "Total nloc") {
+			continue
+		}
+		for _, row := range lines[index+1:] {
+			fields := strings.Fields(row)
+			if len(fields) < 6 || strings.Trim(row, "- ") == "" {
+				continue
+			}
+			count, err := strconv.Atoi(fields[5])
+			return count, err == nil
+		}
+	}
+	return 0, false
+}
+
+// ── Ratcheted baseline ──────────────────────────────────────────────
+// Every key `suppressions --update-baseline` measures. Later gates append
+// their own {key, measure} entry here; suppressions.WriteBaseline rewrites
+// exactly these keys and carries every other key (`coverage.min`,
+// `mutation.min`, anything hand-written) through untouched.
+var ratcheted = []suppressions.Measurer{
+	{Key: "coverage.min", Measure: measuredCoverageMin},
+	{Key: "complexity.max_violations", Measure: measuredComplexityViolations},
+	{Key: "crap.max_violations", Measure: measuredCrapViolations},
+	{Key: "duplication.max_blocks", Measure: measuredDuplicationBlocks},
+	{Key: "arch.max_violations", Measure: measuredArchViolations},
+}
+
+// measuredCoverageMin is total coverage floored to an integer — the floor the
+// coverage gate then enforces. Measured first so the profile it writes is
+// still fresh when the CRAP measurement joins against it. Mirrors python's
+// _measured_coverage: refresh only a stale profile, and a tree with no tests
+// has no percentage to record.
+func measuredCoverageMin() suppressions.Measurement {
+	if !hasTestFiles() {
+		return suppressions.Unavailable("no *_test.go files")
+	}
+	if !coverageFresh(filepath.Join(root, "coverage.out")) {
+		c := exec.Command("go", "test", "-race", "-count=1", "-coverprofile=coverage.out", "./...")
+		c.Dir = root
+		if _, err := c.CombinedOutput(); err != nil {
+			return suppressions.Failed(fmt.Sprintf("the test run under coverage failed (exit %d)", exitCode(err)))
+		}
+	}
+	pct, ok := coveragePercent()
+	if !ok {
+		return suppressions.Failed("`go tool cover` produced no total")
+	}
+	// Truncate, never round up: a floor above the measured number fails the very
+	// next run.
+	return suppressions.Measured(int(pct))
+}
+
+// measuredComplexityViolations counts the functions lizard flags at the
+// template's thresholds.
+func measuredComplexityViolations() suppressions.Measurement {
+	argv := complexityArgv(reportOnlyLimit)
+	c := exec.Command(argv[0], argv[1:]...)
+	c.Dir = root
+	out, err := c.Output()
+	if err != nil {
+		return suppressions.Failed(fmt.Sprintf("lizard failed to run (exit %d)", exitCode(err)))
+	}
+	count, ok := lizardWarningCount(string(out))
+	if !ok {
+		return suppressions.Failed("lizard printed no summary row to count warnings from")
+	}
+	return suppressions.Measured(count)
+}
+
+// measuredArchViolations counts the boundary notices go-arch-lint reports, so
+// a repo with a crossed boundary can adopt the harness at its current number
+// and ratchet it down. Not applicable without an arch config; a run that
+// prints no JSON is a broken tool, not a clean tree.
+func measuredArchViolations() suppressions.Measurement {
+	if _, err := os.Stat(filepath.Join(root, archConfig)); err != nil {
+		return suppressions.Unavailable("no " + archConfig)
+	}
+	argv := archArgv()
+	c := exec.Command(argv[0], argv[1:]...)
+	c.Dir = root
+	// go-arch-lint exits 1 whenever it found anything to report — the count in
+	// the JSON is the measurement, so the exit code carries no extra signal.
+	out, _ := c.CombinedOutput()
+	count, _, problem := archCheck(string(out))
+	if problem != "" {
+		return suppressions.Failed(problem)
+	}
+	return suppressions.Measured(count)
+}
+
+// measuredDuplicationBlocks counts the copy-pasted blocks lizard reports over
+// the complexity gate's target set.
+func measuredDuplicationBlocks() suppressions.Measurement {
+	argv := duplicationArgv()
+	c := exec.Command(argv[0], argv[1:]...)
+	c.Dir = root
+	out, err := c.Output()
+	if err != nil {
+		return suppressions.Failed(fmt.Sprintf("lizard failed to run (exit %d)", exitCode(err)))
+	}
+	return suppressions.Measured(duplicateBlockCount(string(out)))
+}
+
+// measuredCrapViolations counts the functions above the default CRAP threshold.
+func measuredCrapViolations() suppressions.Measurement {
+	if !hasTestFiles() {
+		return suppressions.Unavailable("no *_test.go files")
+	}
+	measurement := crapMeasure(crapMaxDefault)
+	if measurement.problem != "" {
+		return suppressions.Failed(measurement.problem)
+	}
+	return suppressions.Measured(len(measurement.offenders))
+}
+
+// baselineMeasurers is the set `suppressions --update-baseline` measures.
+// `mutation.min` joins it only under `--with-mutation`: a mutation run costs
+// minutes, so the automatic pass carries the key through untouched instead of
+// making every baseline refresh pay for it.
+func baselineMeasurers() []suppressions.Measurer {
+	if !hasFlag("with-mutation") {
+		return ratcheted
+	}
+	return append(append([]suppressions.Measurer{}, ratcheted...),
+		suppressions.Measurer{Key: "mutation.min", Measure: measuredMutationMin})
+}
+
+// measuredMutationMin is the kill rate over the concrete package targets —
+// never over a change set. A floor derived from whatever happened to change
+// is not comparable to the next run's score, and would flap on every branch.
+//
+// The consequence, worth knowing: a whole-tree floor compared against a
+// scoped run can warn when the changed package is weaker than the module
+// average. That is why the gate is advisory unless `--enforce`.
+func measuredMutationMin() suppressions.Measurement {
+	targets, err := withTestFiles(mutationTargets)
+	if err != nil {
+		return suppressions.Failed(err.Error())
+	}
+	if len(targets) == 0 {
+		return suppressions.Unavailable("no package with *_test.go to mutate")
+	}
+	fmt.Printf("  %s→%s measuring mutation.min: gremlins on %s\n", dim, reset, strings.Join(targets, " "))
+	warmTestCache(verbose)
+	report, _, failed := mutateTargets(targets, verbose)
+	if failed > 0 {
+		return suppressions.Failed(fmt.Sprintf("gremlins failed on %d target package(s)", failed))
+	}
+	score, scored := suppressions.MutationScore(report.Killed, report.Lived)
+	if !scored {
+		return suppressions.Unavailable("gremlins killed no mutants and none survived")
+	}
+	return suppressions.Measured(score)
+}
+
+// hasTestFiles reports whether any *_test.go exists under root (vendor/ and
+// hidden directories excluded).
+func hasTestFiles() bool {
+	found := false
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == "vendor" || (strings.HasPrefix(name, ".") && path != root) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), "_test.go") {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
 }
 
 // ── Hook wiring (installed by `setup-hooks`) ────────────────────────
@@ -1448,7 +2356,12 @@ func cmdHooks() {
 
 func cmdClean() {
 	fmt.Printf("\n%s[clean]%s\n\n", blue, reset)
-	for _, name := range []string{"coverage.out"} {
+	names := []string{"coverage.out"}
+	matches, _ := filepath.Glob(filepath.Join(root, mutationReportGlob))
+	for _, match := range matches {
+		names = append(names, filepath.Base(match))
+	}
+	for _, name := range names {
 		p := filepath.Join(root, name)
 		if _, err := os.Stat(p); err == nil {
 			os.Remove(p)
@@ -1463,15 +2376,30 @@ func cmdSuppressions() {
 	findings := suppressions.ScanFindings(root)
 	results := suppressions.BucketByKind(findings)
 	if hasFlag("update-baseline") {
-		if err := suppressions.WriteBaseline(root, results); err != nil {
-			fmt.Printf("  %s✗%s .harness-baseline: %v\n", red, reset, err)
+		measurers := baselineMeasurers()
+		baseline, err := suppressions.WriteBaseline(root, results, measurers)
+		var unmeasured *suppressions.MeasurementError
+		if errors.As(err, &unmeasured) {
+			fmt.Printf("  %s✗%s %s not written — could not measure:\n", red, reset, baselineFile)
+			fmt.Printf("    %s: %s\n", unmeasured.Key, unmeasured.Reason)
+			fmt.Println("  ↳ fix: make the measurement pass, then rerun `suppressions --update-baseline`")
+			os.Exit(1)
+		}
+		if err != nil {
+			fmt.Printf("  %s✗%s %s: %v\n", red, reset, baselineFile, err)
 			os.Exit(1)
 		}
 		total := 0
 		for _, entries := range results {
 			total += len(entries)
 		}
-		fmt.Printf("  %s✓%s .harness-baseline: suppressions baseline set to %d\n", green, reset, total)
+		recorded := []string{fmt.Sprintf("suppressions %d", total)}
+		for _, m := range measurers {
+			if value, ok := baseline[m.Key]; ok {
+				recorded = append(recorded, fmt.Sprintf("%s %d", m.Key, value))
+			}
+		}
+		fmt.Printf("  %s✓%s %s: %s\n", green, reset, baselineFile, strings.Join(recorded, ", "))
 		return
 	}
 	suppressions.PrintReport(results)
@@ -1479,7 +2407,7 @@ func cmdSuppressions() {
 		root,
 		findings,
 		true,
-		"go run harness.go suppressions --update-baseline",
+		updateBaseline,
 		false,
 	) {
 		os.Exit(1)
@@ -1502,12 +2430,12 @@ var tasks = []task{
 	{"test-cov", cmdTestCov, "Run tests with race detector and coverage"},
 	{"coverage", cmdTestCov, "Run tests with race detector and coverage"},
 	{"audit", cmdAudit, "Audit dependencies for known vulnerabilities"},
-	{"complexity", cmdComplexity, "Cyclomatic complexity gate (lizard, CCN 15, args 8)"},
+	{"complexity", cmdComplexity, "Cyclomatic complexity + duplication gates (lizard, CCN 15, args 8)"},
 	{"acceptance", cmdAcceptance, "Run acceptance scenarios (godog)"},
 	{"arch", cmdArch, "Architecture checks (go-arch-lint)"},
 	{"arch-config-guard", cmdArchConfigGuard, "Block unreviewed arch config changes"},
 	{"gherkin-guard", cmdGherkinGuard, "Block production source changes with no accompanying .feature scenario"},
-	{"mutation", cmdMutation, "Mutation testing (gremlins, advisory)"},
+	{"mutation", cmdMutation, "Mutation testing on changed packages (gremlins, advisory)"},
 	{"crap", cmdCrap, "CRAP complexity x coverage gate (advisory)"},
 	{"suppressions", cmdSuppressions, "Show or update suppression baseline"},
 	{"pre-commit", cmdPreCommit, "Staged checks + tests"},

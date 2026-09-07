@@ -55,6 +55,8 @@ DO NOT COPY — template-only
   .importlinter               its layering is the worked example; see §3
   src/__init__.py  src/core/  src/adapters/
   tests/__init__.py  tests/test_init.py
+  tests/conftest.py           mutmut shim, needed only when the package is
+                              literally named `src` — see its docstring
   tests/test_crap.py  tests/test_harness_targets.py  tests/test_suppressions.py
   tests/test_properties.py
   tests/test_core_pricing.py  tests/test_adapters_formatting.py
@@ -174,12 +176,34 @@ The template's current list is `S404 S603 S607 S405 S314`. Adding the two
 missing codes turned that gate green. Diff the two lists; do not assume an
 existing entry is current.
 
-**`.importlinter`**: do not copy it. Its `layers = adapters / core` contract
-names the template's worked example. If the repo has a real layering, write it;
-otherwise **delete the file** — `_arch_gates_or_warn()` prints
-`⚠ Arch: no .importlinter — skipped` and passes. Measured on both repos.
-(fusion has no `__init__.py` anywhere, so import-linter has no root package to
-point at; deleting is the only correct answer there.)
+**`.importlinter`**: do not copy it — **derive it**. Its `layers = adapters /
+core` contract names the template's worked example, not the adopter's tree.
+Read the real package tree and write the contract it already implies:
+
+1. `root_packages` = the repo's top-level import package(s) — the directories
+   with an `__init__.py` that the code imports by name.
+2. `layers` = that package's own top-level subpackages, ordered high to low by
+   what already imports what (a `web`/`api`/`cli` entry point on top, a
+   `models`/`domain`/`core` package at the bottom). Leave `exhaustive` off on a
+   first pass; it turns every undeclared subpackage into its own violation.
+3. Run `<prefix> arch`. It prints the count and **passes**: `.harness-baseline`
+   is DO-NOT-COPY (§1), so there is no `arch.max_violations` key yet and the
+   gate is report-only.
+4. §5 step 1 records where the repo is. `suppressions --update-baseline` writes
+   the count as `arch.max_violations`, and the next *new* violation is the one
+   that fails. Nothing extra to run here — just do not skip that step, or the
+   contract you derived stays advisory forever.
+
+A contract written this way is red on day one by dozens of chains — that is the
+point of the floor. Never bend the contract to reach zero; a `layers` list
+edited to match the mess documents nothing, and `arch-config-guard` exists
+precisely to stop that edit passing unreviewed.
+
+**Delete the file only when no contract exists to write** — a flat package with
+no subpackages, or no import package at all. Then `arch` prints
+`⚠ Arch: no .importlinter — skipped` and passes. Measured: fusion has no
+`__init__.py` anywhere, so import-linter has no root package to point at, and
+deleting is the only correct answer there.
 
 **`Makefile`** is not verbatim: it hardcodes `HARNESS := uv run harness`. In a
 pip repo that resolves to whatever `harness` is first on `PATH` — measured on
@@ -324,6 +348,8 @@ Two mechanisms, and between them every gate is covered:
 - `fix`, `format`, `lint`, `typecheck` are **diff-scoped**, and scoped to
   changed *lines*, not whole files (see `python/CLAUDE.md` `## Scoping`). They
   skip with a warning on an empty scope and never widen to the whole tree.
+  `test` is diff-scoped too, at file level: in `check`/`pre-commit` it runs only
+  the test modules that map to the changed files.
 - `coverage`, `complexity`, `crap`, `deadcode`, `suppressions` are
   **count-ratcheted** and stay whole-tree — scoping a count makes it
   meaningless. Step 1 wrote each floor at the number the repo already has.
@@ -357,6 +383,12 @@ Two CI-specific requirements:
   `.venv` and warns-and-skips otherwise, precisely so `ci` never creates one.
   The cost, stated plainly: a dependency bumped in `pyproject.toml` but never
   installed goes unaudited.
+- **Pin the toolchain.** `astral-sh/setup-uv` takes `version:` (the uv
+  release) and `python-version:` (sets `UV_PYTHON`, which `uv python install`
+  and `uv sync` both honor); the template pins both, the Python one to the
+  `requires-python` floor. Without them the runner image decides which uv and
+  which interpreter the remote gate runs, and a gate that is green locally can
+  go red on a Tuesday for no change of yours.
 
 ---
 
@@ -368,7 +400,11 @@ Three tiers, in descending order of fidelity:
    `pyproject.toml` exists (`--no-sync` added for read-only gates).
 2. **`.venv/bin/<tool>`** — when the binary exists but there is no
    `pyproject.toml`: a pip-installed virtualenv, not a uv project.
-3. **`uvx <tool>`** — whenever `.venv/bin/<tool>` does not exist.
+3. **`uvx --from <dist>==<version> <tool>`** — whenever `.venv/bin/<tool>` does
+   not exist, pinned to the version `uv.lock` records for the tool's
+   distribution (`_lock_versions()`, stdlib `tomllib`). No lock, unreadable
+   lock, or no entry for the tool → plain `uvx <tool>`, unpinned, never a
+   failure.
 
 Tier 1 is gated on the **binary already existing**, not on `pyproject.toml`
 alone: `uv run` on a missing tool does not fall through — it exits 2 with
@@ -381,6 +417,11 @@ Two measured details:
 - Tier 3 resolves a **distribution** name, so a tool whose console script
   differs needs `--from`: `uvx --from import-linter lint-imports`
   (`TOOL_DISTRIBUTIONS` in `harness.py`).
+- Tier 3 reads the pin from `uv.lock`, not `pyproject.toml`: the project file
+  holds ranges (`ruff>=0.15.11`), the lock holds the exact release `uv run`
+  would use. A pip repo with no lock gets the unpinned fallback — the same
+  floating version it had before — so adoption never gets worse, only better
+  once a lock exists.
 - **Install `coverage` into the project's own venv.** If it falls through to
   `uvx coverage`, the isolated environment has no pytest and `coverage run -m
   pytest` dies. The same applies to `lint-imports` when the repo has a real
@@ -393,29 +434,56 @@ Two measured details:
 
 ---
 
-## `.harness-baseline` — five metrics, one writer
+## `.harness-baseline` — six metrics, one writer
 
 ```
+arch.max_violations 0
 complexity.max_violations 0
 coverage.min 100
 crap.max_violations 0
 deadcode.max_findings 0
+duplication.max_blocks 9
+mutation.min 94
 suppressions.noqa 8
 suppressions.pyright_ignore 2
 suppressions.type_ignore 4
 ```
 
-- **Five**, not four. `deadcode.max_findings` was added because vulture
-  produced 1,583 findings on doghouse with no floor and no escape.
+- **Eight**, not four. `deadcode.max_findings` was added because vulture produced
+  1,583 findings on doghouse with no floor and no escape; `arch.max_violations`
+  because a layering contract derived from a real tree (§3) is broken in dozens
+  of places the day it is written, and a pass/fail `arch` gate leaves an adopter
+  the single choice of deleting the contract; `mutation.min` because a coverage
+  floor says which lines ran, never whether a test would notice them changing;
+  `duplication.max_blocks` because the complexity gate scores each function alone
+  and never sees the same block written twice.
+- **`duplication.max_blocks` is lizard's `-Eduplicate` block count** — a second
+  lizard invocation over the *same* targets as the complexity gate
+  (`src` + `tests`), run `-w -i 1000000` so lizard stays quiet and green while
+  the runner counts lines equal to `Duplicate block:` and judges them itself
+  (lizard's exit code tracks CCN warnings only, never duplicates). Change the
+  target set and the recorded floor stops reproducing. Overlapping near-
+  duplicates are reported as separate blocks, so the count can move by one on a
+  trivial edit — harmless for a ratchet, which only asks that it never grow.
+  The template ships `9`, all of them in `tests/` where repeated setup is the
+  readable choice; a fresh adopter's step 1 overwrites it, same as
+  `coverage.min`.
 - **The only writer is `suppressions --update-baseline`.** Nobody guesses that
   from the name — say it out loud when handing the repo over. The name is a
   known wart, deliberately unfixed: `suppressions` sits in the parity gate's
   non-allowlistable `CORE_COMMANDS`, so a `baseline` command would have to land
   in all four templates. Deferred to the bun/go/rust port.
+- **`mutation.min` needs `--with-mutation` on top of it.** The ordinary pass
+  neither measures nor removes the key, it carries it through: one whole-tree
+  mutmut run costs minutes, and paying that on every baseline update would make
+  the update a thing adopters avoid. Everything else about the key is normal —
+  all-or-nothing, dropped when it cannot be measured, report-only when absent.
 - **A missing `.harness-baseline` is report-only and passes** — verified for
   every metric, complexity included:
   `✓ Complexity (lizard, report-only: no .harness-baseline floor)`,
-  `⚠ Dead code (vulture): 177 finding(s), report-only (no .harness-baseline floor)`.
+  `⚠ Dead code (vulture): 177 finding(s), report-only (no .harness-baseline floor)`,
+  `⚠ Arch (import-linter): 41 violation(s), report-only (no .harness-baseline floor)`,
+  `✓ Duplication (lizard): 9 block(s), report-only (no .harness-baseline floor)`.
 - `coverage.min` is the floor. `[tool.coverage.report] fail_under` is **not**
   read — the harness always passes an explicit `--fail-under=<n>` on the CLI.
 - **`coverage.min 100` ships in the committed template baseline.** Greenfield
@@ -429,7 +497,9 @@ suppressions.type_ignore 4
 ## Measured transcripts
 
 Both from a fresh `git clone` of the real repo into scratch, following §1–§5 of
-this file verbatim. Both originals verified untouched before and after.
+this file verbatim. Both originals verified untouched before and after. Both
+predate `duplication.max_blocks`, so neither transcript shows that gate; a rerun
+today would add one `✓ Duplication (lizard): …` line and one baseline key.
 
 **fusion** — 62k lines, no `pyproject.toml`, ruleset via `ruff.toml`,
 `TEST_COMMAND = ("-m", "pytest", "-q")`, no `.importlinter`, no `.feature`
@@ -605,18 +675,33 @@ it is found on purpose rather than discovered by accident.
 
 ## Known limitations
 
-- **`test` is the one gate with no adoption ramp.** `check` runs `TEST_COMMAND`
-  whole and unratcheted: if the suite is red in the environment where `check`
-  runs, `check` is red, and no baseline or scoping rescues it. A repo whose
-  suite needs a database, a service, or an API key must have it present.
-  Measured on fusion: `LLM_API_KEY` unset → 55 collection errors → red `check`;
-  set to any string → 1042 passed → green. Set `TEST_COMMAND` to the invocation
-  that genuinely passes in that environment, and tell the human what it needs.
-  The same on doghouse, in numbers: with no database, **735 passed, 1 skipped,
-  2,980 errors**; with one, **3,711 passed, 2 failed**; with the two
-  network-dependent tests deselected, green. Note what the deselection *is* — a
-  deliberate, commented narrowing of `TEST_COMMAND` to what the environment can
-  run, not a weakened gate. Write the comment.
+- **`test` in `check`/`pre-commit` is scoped, but the environment still has to
+  work.** `check` and `pre-commit` run only the test modules that map to the
+  changed files: a changed `tests/**/test*.py` runs itself, and a changed source
+  module runs every `tests/**/test_<stem>.py` / `tests/**/test_<stem>_*.py` for
+  its bare module name and its package path folded with underscores
+  (`src/core/pricing.py` → `pricing`, `core_pricing`). A changed source file that
+  maps to no test is one ⚠ line, never a failure; an empty scope skips and never
+  widens. `--all` and `ci` (through `coverage`) run the whole suite. This is the
+  adoption ramp — day one in a large repo touches a handful of modules, not the
+  whole suite — but it is a *narrower* run, not a ratcheted one: whatever the
+  scoped modules need must still be present. A repo whose suite needs a database,
+  a service, or an API key must have it present. Measured on fusion: `LLM_API_KEY`
+  unset → 55 collection errors → red `check`; set to any string → 1042 passed →
+  green. Set `TEST_COMMAND` to the invocation that genuinely passes in that
+  environment, and tell the human what it needs. The same on doghouse, in
+  numbers: with no database, **735 passed, 1 skipped, 2,980 errors**; with one,
+  **3,711 passed, 2 failed**; with the two network-dependent tests deselected,
+  green. Note what the deselection *is* — a deliberate, commented narrowing of
+  `TEST_COMMAND` to what the environment can run, not a weakened gate. Write the
+  comment.
+- **Scoping needs an `__init__.py` in every test package.** The scoped run names
+  modules dotted (`python -m unittest -q tests.test_core_pricing`) because
+  `unittest discover -p` takes a single pattern and cannot express a set. A
+  missing `__init__.py` anywhere on the way to a mapped module — `tests/` itself
+  or a subpackage like `tests/unit/` — makes the dotted name an ImportError, so
+  the gate warns and runs the whole suite instead. A pytest `TEST_COMMAND` needs
+  nothing: it takes the file paths appended directly.
 - **`--update-baseline` runs the suite up to three times** (coverage, then CRAP
   re-runs it). On fusion's 75-second suite that is a four-minute step; on
   doghouse's 32-minute suite it is an hour and a half. Run it in the background.
@@ -665,15 +750,33 @@ repo that did not have them.
 - Runner: `~/Code/harness-templates/python/harness.py`
 - Configuration constants: `harness.py` `# ── Configuration ──` block
 - Scoping + tool resolution: `harness.py` module docstring, `_tool()`,
-  `_lockfile_gate()`, `WHOLE_FILE_CODES`
+  `_lock_versions()`, `_lockfile_gate()`, `WHOLE_FILE_CODES`
 - Baseline writer: `harness.py` `_write_baseline()`, `RATCHETED_KEYS`
 - Hook JSON writer: `harness.py` `_install_stop_hook()`
 - Quiet-output `run()` pattern: `harness.py` `run()`
 - Tooling: uv, ruff (lint + format + bandit-style security), basedpyright,
   unittest/pytest via `TEST_COMMAND`, coverage, pip-audit, lizard (complexity,
   pinned `1.22.2`), vulture (dead code, pinned `2.16`), behave (acceptance),
-  hypothesis (property-based tests), import-linter (arch). Mutation testing is
-  not configured by default — `harness mutation` warns and exits 0.
+  hypothesis (property-based tests), import-linter (arch), mutmut (mutation,
+  `>=3.7`, configured under `[tool.mutmut]`).
+- Mutation: `harness mutation` runs mutmut over the app sources the change
+  touched (`--all` for the whole tree) and compares
+  `round(100 × (killed + timeout) / (killed + timeout + survived + suspicious))`
+  to `mutation.min`. Advisory unless `--enforce`; report-only with no floor.
+  Three things a port must carry: the floor is written **only** by
+  `suppressions --update-baseline --with-mutation` (a whole-tree run costs
+  minutes; the ordinary pass carries the key through untouched), mutmut has no
+  `uvx` fallback so the gate skips when `.venv/bin/mutmut` is missing, and
+  `mutants/` **must** reach the adopter's `.gitignore` (that file is on the
+  MERGE list in §1, so it is easy to half-merge) as well as `clean`.
+- Patterns mirror `get_mutant_name` *and* fnmatch: `src/core/pricing.py` selects
+  as `core.pricing.x*`. The `x*` anchor is not decoration — mutmut filters with
+  fnmatch, where `*` crosses dots, so the naive `core.*` for a changed
+  `__init__.py` would silently pull in every module in the package.
+- mutmut hardcodes `mutants/` for its working copy and the gate deletes that
+  directory before and after every run. If the adopter's repo already has a
+  git-tracked `mutants/`, the gate refuses instead of deleting it — tell them,
+  because there is no override.
 - Protected arch config: `.importlinter` (`<prefix> arch-config-guard`)
 - Dead-code allowlist: `vulture_allowlist.py`
 - Ratchet skill (moves the floors after adoption): `skills/ratchet/`

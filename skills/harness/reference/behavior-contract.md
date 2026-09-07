@@ -71,6 +71,17 @@ Stage wiring:
 - `ci`: strict mode. GitHub Actions checkout uses `fetch-depth: 0` so PR runs
   can compare `origin/$GITHUB_BASE_REF...HEAD`.
 
+The guard protects the config; the `arch` gate ratchets what the config
+finds. Violations reported by the arch tool are counted against
+`arch.max_violations` in `.harness-baseline` (report-only while the key is
+missing; written by `suppressions --update-baseline`), so a brownfield repo
+adopts its architecture the same way it adopts every other floor: **derive
+the contract from the real package tree, keep the config, baseline today's
+violation count, and let `/ratchet` or a human move it down.** Deleting the
+arch config, or editing it to silence a violation, is exactly the change the
+guard exists to surface — never do it to get a green first run. A repo with
+genuinely no module boundaries gets no config, and `arch` warns and skips.
+
 ## Gherkin-first guard
 
 Every language template exposes `gherkin-guard` through its runner. It
@@ -106,7 +117,9 @@ When the user asks for the behavior contract in an existing repo:
    `CLAUDE.md`. If only one exists, create the other with identical content.
 2. Add `agents-md-drift` and `sync-agents-md` so the two files stay identical.
 3. Add `arch-config-guard` for the repo's real architecture config path, or
-   skip it explicitly if the repo has no architecture config.
+   skip it explicitly if the repo has no architecture config. If the config
+   exists and reports violations, keep it and baseline them
+   (`arch.max_violations`); do not delete or loosen it.
 4. Add `gherkin-guard` for the repo's production-source scope, or skip it
    explicitly if the repo has no acceptance suite and the user does not want
    one yet — it self-skips anyway until the first `.feature` file lands.

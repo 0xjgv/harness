@@ -43,14 +43,17 @@ DA:10,0
 end_of_record
 ";
 
-/// Shared state for a single scenario. Smoke and crap fields coexist because
-/// cucumber-rs binds a single World type per binary.
+/// Shared state for a single scenario. Smoke, crap and mutation fields coexist
+/// because cucumber-rs binds a single World type per binary.
 #[derive(Debug, Default, World)]
 struct CrateWorld {
     // Smoke scenario.
     name: Option<&'static str>,
-    // Crap scenarios.
+    // Crap and mutation scenarios.
     tmp: Option<PathBuf>,
+    /// Environment the harness run inherits — how the mutation scenarios point
+    /// the runner at a fixture `outcomes.json` instead of paying for a real run.
+    env: Vec<(String, String)>,
     exit_code: Option<i32>,
     output: String,
 }
@@ -103,9 +106,114 @@ fn artifact_present(world: &mut CrateWorld) {
         .expect("write lcov.info");
 }
 
+#[given("a recorded CRAP floor of 0")]
+fn crap_floor_zero(world: &mut CrateWorld) {
+    let dir = world.tmp.clone().expect("tmp dir not initialised");
+    fs::write(dir.join(".harness-baseline"), "crap.max_violations 0\n")
+        .expect("write .harness-baseline");
+}
+
+#[given("a project with no .harness-baseline")]
+fn no_baseline(world: &mut CrateWorld) {
+    world.make_tmp();
+}
+
+// Both lizard floors in one fixture: `harness complexity` runs both gates, so a
+// baseline carrying only one of them leaves the other report-only.
+#[given("a project with complexity and duplication floors of 0")]
+fn lizard_floors_zero(world: &mut CrateWorld) {
+    let dir = world.make_tmp();
+    fs::write(
+        dir.join(".harness-baseline"),
+        "complexity.max_violations 0\nduplication.max_blocks 0\n",
+    )
+    .expect("write .harness-baseline");
+}
+
+/// Minimal, dependency-free crate so cargo-modules has a real `[lib]` target to
+/// analyze — without one it bails out and the arch gate skips, which would make
+/// the scenario below pass without ever reaching the report-only path.
+const MINIMAL_MANIFEST: &str = "[package]
+name = \"fixture\"
+version = \"0.1.0\"
+edition = \"2021\"
+
+[lib]
+name = \"fixture\"
+path = \"src/lib.rs\"
+";
+
+#[given("a project with an arch.toml and no .harness-baseline")]
+fn arch_config_no_baseline(world: &mut CrateWorld) {
+    let dir = world.make_tmp();
+    fs::write(dir.join("Cargo.toml"), MINIMAL_MANIFEST).expect("write Cargo.toml");
+    fs::write(dir.join("src").join("lib.rs"), "pub const N: u32 = 1;\n").expect("write lib.rs");
+    // Content is irrelevant: the arch gate only checks that this file exists
+    // before shelling out to cargo-modules, which reports against the crate.
+    fs::write(dir.join("arch.toml"), "[arch]\n").expect("write arch.toml");
+}
+
 #[given("no coverage artifact")]
 fn artifact_missing(world: &mut CrateWorld) {
     world.make_tmp();
+}
+
+/// Put a fake `cargo` first on PATH so the version the runner sees is controlled.
+/// `cargo <sub> --version` prints the given version; every other invocation is a
+/// silent success, which is enough for the mutation gate to run to completion.
+#[given(expr = "a cargo shim reporting cargo-mutants version {string}")]
+fn cargo_shim(world: &mut CrateWorld, version: String) {
+    let dir = tempdir();
+    world.tmp = Some(dir.clone());
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).expect("create shim bin/");
+    let shim = bin.join("cargo");
+    fs::write(
+        &shim,
+        format!("#!/bin/sh\nif [ \"$2\" = \"--version\" ]; then\n  echo \"cargo-$1 {version}\"\nfi\nexit 0\n"),
+    )
+    .expect("write cargo shim");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod cargo shim");
+    }
+}
+
+/// Write a cargo-mutants `outcomes.json` and point the runner at it.
+///
+/// Only the top-level totals matter to the scorer; the per-mutant `outcomes`
+/// array is left empty so the fixture stays readable.
+fn write_outcomes(world: &mut CrateWorld, caught: u32, missed: u32) {
+    let dir = world.make_tmp();
+    let path = dir.join("outcomes.json");
+    let total = caught + missed;
+    fs::write(
+        &path,
+        format!(
+            "{{\n  \"outcomes\": [],\n  \"total_mutants\": {total},\n  \"missed\": {missed},\n  \
+             \"caught\": {caught},\n  \"timeout\": 0,\n  \"unviable\": 0\n}}\n"
+        ),
+    )
+    .expect("write outcomes.json");
+    world.env.push(("HARNESS_MUTATION_OUTCOMES".to_string(), path.to_string_lossy().into_owned()));
+}
+
+#[given(expr = "a cargo-mutants outcomes file where {int} of {int} mutants are killed")]
+fn outcomes_with_kills(world: &mut CrateWorld, killed: u32, total: u32) {
+    write_outcomes(world, killed, total - killed);
+}
+
+#[given("a cargo-mutants outcomes file where no mutants were generated")]
+fn outcomes_without_mutants(world: &mut CrateWorld) {
+    write_outcomes(world, 0, 0);
+}
+
+#[given(expr = "a recorded mutation floor of {int}")]
+fn mutation_floor(world: &mut CrateWorld, floor: u32) {
+    let dir = world.tmp.clone().expect("tmp dir not initialised");
+    fs::write(dir.join(".harness-baseline"), format!("mutation.min {floor}\n"))
+        .expect("write .harness-baseline");
 }
 
 #[when(expr = "I run {string}")]
@@ -116,11 +224,17 @@ fn i_run(world: &mut CrateWorld, cmd: String) {
         argv.remove(0);
     }
     let tmp = world.tmp.as_ref().expect("tmp dir not initialised");
-    let output = Command::new(HARNESS_BIN)
+    let mut command = Command::new(HARNESS_BIN);
+    command
         .args(&argv)
-        .current_dir(tmp)
-        .output()
-        .expect("spawn harness binary");
+        .envs(world.env.iter().map(|(key, value)| (key.as_str(), value.as_str())))
+        .current_dir(tmp);
+    let shim = tmp.join("bin");
+    if shim.is_dir() {
+        let path = std::env::var("PATH").unwrap_or_default();
+        command.env("PATH", format!("{}:{path}", shim.display()));
+    }
+    let output = command.output().expect("spawn harness binary");
     world.exit_code = output.status.code();
     world.output = format!(
         "{}{}",

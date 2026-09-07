@@ -84,6 +84,7 @@ def step_run(context, cmd):
     result = subprocess.run(
         [sys.executable, str(HARNESS), *argv],
         cwd=str(context.tmp),
+        env=getattr(context, "env", None),
         capture_output=True,
         text=True,
         check=False,

@@ -24,6 +24,7 @@ dev = [
     "hypothesis>=6.131",
     "import-linter>=2.3",
     "lizard==1.22.2",
+    "mutmut>=3.7",
     "ruff>=0.15.11",
     "vulture==2.16",
 ]
@@ -120,3 +121,24 @@ exclude_lines = [
     "@abstractmethod",
 ]
 show_missing = true
+
+# ── Mutmut ─────────────────────────────────────────────────────────
+# mutmut 3 ships only pytest and hammett runners, no unittest runner — but it
+# depends on pytest, which collects `unittest.TestCase` classes fine, so a stdlib
+# test suite needs no changes. `harness mutation` scopes a run to the modules the
+# change touched; see `cmd_mutation`.
+
+[tool.mutmut]
+source_paths = ["src"]
+# mutmut re-runs the selected tests from a copy of the project under `mutants/`.
+# The harness's own self-tests do not belong in that selection: they exercise
+# `harness.py` (which mutmut does not copy) rather than `src`, and they shell out
+# to git and read `.harness-baseline`. A repo whose tests all cover its source
+# drops the `--ignore` lines; a new harness self-test has to be added to them.
+pytest_add_cli_args_test_selection = [
+    "tests",
+    "--ignore=tests/test_crap.py",
+    "--ignore=tests/test_harness_targets.py",
+    "--ignore=tests/test_properties.py",
+    "--ignore=tests/test_suppressions.py",
+]

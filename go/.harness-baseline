@@ -1,3 +1,8 @@
+arch.max_violations 0
+complexity.max_violations 0
+coverage.min 48
+crap.max_violations 1
+duplication.max_blocks 0
+mutation.min 80
 suppressions.lint_ignore 3
-suppressions.nolint 11
-coverage.min 0
+suppressions.nolint 12

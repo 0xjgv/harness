@@ -14,8 +14,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Pinned to match rust-toolchain.toml so the remote gate compiles with the
+      # same rustc as the local one.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy, rustfmt, llvm-tools-preview
 
@@ -25,13 +27,17 @@ jobs:
         with:
           enable-cache: true
 
-      # cargo-audit is required by ci's strict audit gate; cargo-llvm-cov and
-      # cargo-modules back the coverage/CRAP and arch gates (installed from
-      # prebuilt binaries so the run stays fast).
+      # Prebuilt binaries, so the install stays fast. cargo-audit is required by
+      # ci's strict audit gate; cargo-llvm-cov and cargo-modules back the
+      # coverage/CRAP and arch gates. cargo-mutants is NOT used by `harness ci`
+      # (mutation is advisory and explicitly invoked) — it is installed so this
+      # list is the single place all four pins are stated and `cargo harness
+      # mutation` is runnable in an added step. Keep the versions equal to the
+      # CARGO_*_VERSION constants in harness.rs; bump both together.
       - name: Install cargo tools
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit, cargo-llvm-cov, cargo-modules
+          tool: cargo-audit@0.22.1,cargo-llvm-cov@0.8.7,cargo-modules@0.26.0,cargo-mutants@27.0.0
 
       - name: Run CI gate
         run: cargo harness ci

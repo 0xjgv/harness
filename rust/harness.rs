@@ -32,8 +32,26 @@ const RESET: &str = "\x1b[0m";
 const BASELINE_FILE: &str = ".harness-baseline";
 const SUPPRESSION_BASELINE_PREFIX: &str = "suppressions.";
 const ARCH_CONFIG: &str = "arch.toml";
+/// lizard thresholds this template gates on. Shared by the gate and the
+/// `--update-baseline` measurement so a recorded floor reproduces exactly.
+const COMPLEXITY_MAX_CCN: u32 = 15;
+const COMPLEXITY_MAX_ARGS: u32 = 8;
+const COMPLEXITY_MAX_LENGTH: u32 = 100;
+/// `-i N` high enough that lizard never fails on count: how a gate is turned into
+/// a measuring tape, both when measuring a floor and when there is no floor yet.
+const REPORT_ONLY_LIMIT: u32 = 1_000_000;
+/// The CRAP threshold `crap` defaults to, and the one its floor is measured at.
+const CRAP_MAX_DEFAULT: f64 = 30.0;
 const ARCH_CONFIG_ALLOW_ENV: &str = "HARNESS_ALLOW_ARCH_CONFIG";
 const GHERKIN_ALLOW_ENV: &str = "HARNESS_ALLOW_NO_FEATURE";
+
+// Pinned cargo subcommand versions. CI installs exactly these
+// (.github/workflows/ci.yml, taiki-e/install-action); a local install that
+// differs only warns, so an adopter is never blocked by a tool version.
+const CARGO_AUDIT_VERSION: &str = "0.22.1";
+const CARGO_LLVM_COV_VERSION: &str = "0.8.7";
+const CARGO_MODULES_VERSION: &str = "0.26.0";
+const CARGO_MUTANTS_VERSION: &str = "27.0.0";
 
 // ── Runner ──────────────────────────────────────────────────────────
 
@@ -143,36 +161,49 @@ fn run(description: &str, cmd: &[&str], opts: Option<&RunOpts>) -> RunResult {
 
 /// A read-only gate's label + command, shared by the standalone cmd_* and the batch.
 struct Gate {
-    description: &'static str,
+    /// Owned, not `&'static str`: a ratcheted gate names its floor in its own
+    /// label (`Complexity (lizard, baseline 3)`), which is only known at runtime.
+    description: String,
     cmd: Vec<String>,
     extract: Option<fn(&str) -> Option<String>>,
-    hint: Option<&'static str>,
+    hint: Option<String>,
+    /// True when the gate has no recorded floor and therefore cannot fail. Its
+    /// hint then prints on the passing line too — "record a floor" is the whole
+    /// point of the message, and a gate that never fails would never show it.
+    report_only: bool,
 }
 
 impl Gate {
-    fn new(description: &'static str, cmd: &[&str]) -> Self {
+    fn new(description: impl Into<String>, cmd: &[&str]) -> Self {
         Self {
-            description,
+            description: description.into(),
             cmd: cmd.iter().map(|&s| s.to_string()).collect(),
             extract: None,
             hint: None,
+            report_only: false,
         }
     }
 
-    const fn with_hint(mut self, hint: &'static str) -> Self {
-        self.hint = Some(hint);
+    fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    const fn report_only(mut self) -> Self {
+        self.report_only = true;
         self
     }
 }
 
 struct GateResult {
-    description: &'static str,
+    description: String,
     cmd: Vec<String>,
     ok: bool,
     exit_code: i32,
     output: String,
     detail: Option<String>,
-    hint: Option<&'static str>,
+    hint: Option<String>,
+    report_only: bool,
 }
 
 /// Run a gate's command with output captured (no printing, no exit): the
@@ -196,23 +227,25 @@ fn run_capture(gate: &Gate) -> GateResult {
             let ok = output.status.success();
             let detail = if ok { gate.extract.and_then(|f| f(&combined)) } else { None };
             GateResult {
-                description: gate.description,
+                description: gate.description.clone(),
                 cmd: gate.cmd.clone(),
                 ok,
                 exit_code: output.status.code().unwrap_or(1),
                 output: combined,
                 detail,
-                hint: gate.hint,
+                hint: gate.hint.clone(),
+                report_only: gate.report_only,
             }
         }
         Err(e) => GateResult {
-            description: gate.description,
+            description: gate.description.clone(),
             cmd: gate.cmd.clone(),
             ok: false,
             exit_code: 1,
             output: format!("Failed to execute {program}: {e}"),
             detail: None,
-            hint: gate.hint,
+            hint: gate.hint.clone(),
+            report_only: gate.report_only,
         },
     }
 }
@@ -229,13 +262,16 @@ fn print_gate_result(result: &GateResult, no_exit: bool) -> bool {
         let suffix =
             result.detail.as_ref().map_or_else(String::new, |d| format!(" {DIM}({d}){RESET}"));
         println!("  {GREEN}\u{2713}{RESET} {}{suffix}", result.description);
+        if let Some(hint) = result.report_only.then_some(result.hint.as_ref()).flatten() {
+            println!("  ↳ fix: {hint}");
+        }
         return true;
     }
     println!("  {RED}\u{2717}{RESET} {}", result.description);
     if !is_verbose() && !result.output.is_empty() {
         print!("{}", result.output);
     }
-    if let Some(hint) = result.hint {
+    if let Some(hint) = &result.hint {
         println!("  ↳ fix: {hint}");
     }
     if !no_exit {
@@ -255,7 +291,7 @@ fn print_gate_result(result: &GateResult, no_exit: bool) -> bool {
 /// the descriptions of any that failed — empty means every gate passed.
 /// Split out from `run_gates_parallel` so `cmd_stop_hook` can name failed
 /// gates in its stderr summary without duplicating the execution/printing.
-fn run_gates_parallel_detailed(gates: &[Gate]) -> Vec<&'static str> {
+fn run_gates_parallel_detailed(gates: &[Gate]) -> Vec<String> {
     if gates.is_empty() {
         return Vec::new();
     }
@@ -271,7 +307,7 @@ fn run_gates_parallel_detailed(gates: &[Gate]) -> Vec<&'static str> {
     let mut failed = Vec::new();
     for result in &results {
         if !print_gate_result(result, true) {
-            failed.push(result.description);
+            failed.push(result.description.clone());
         }
     }
     failed
@@ -431,7 +467,7 @@ fn default_suppression_roots() -> Vec<PathBuf> {
     vec![root().join("src"), root().join("tests"), root().join("harness.rs")]
 }
 
-fn suppression_counts(results: &SuppressionCounts) -> BTreeMap<String, u32> {
+fn suppression_counts(results: &SuppressionCounts) -> BaselineMap {
     results
         .iter()
         .map(|(kind, entries)| {
@@ -443,8 +479,18 @@ fn suppression_counts(results: &SuppressionCounts) -> BTreeMap<String, u32> {
         .collect()
 }
 
-fn parse_baseline_str(text: &str) -> BTreeMap<String, u32> {
-    let mut values = BTreeMap::new();
+/// The ratcheted floors `.harness-baseline` carries, keyed by metric name.
+type BaselineMap = BTreeMap<String, u32>;
+
+/// How one ratcheted metric is measured. Named so `RATCHETED_KEYS` stays readable.
+type MeasureFn = fn() -> Measurement;
+
+/// A merged baseline plus the "dropped this key" warnings, or the metrics that
+/// failed to measure as (key, reason) pairs.
+type MergeOutcome = Result<(BaselineMap, Vec<String>), Vec<(String, String)>>;
+
+fn parse_baseline_str(text: &str) -> BaselineMap {
+    let mut values = BaselineMap::new();
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -460,7 +506,7 @@ fn parse_baseline_str(text: &str) -> BTreeMap<String, u32> {
     values
 }
 
-fn read_baseline() -> Option<BTreeMap<String, u32>> {
+fn read_baseline() -> Option<BaselineMap> {
     let text = fs::read_to_string(root().join(BASELINE_FILE)).ok()?;
     Some(parse_baseline_str(&text))
 }
@@ -486,13 +532,179 @@ fn coverage_min_default() -> u32 {
     read_baseline().and_then(|b| b.get("coverage.min").copied()).unwrap_or(0)
 }
 
-fn write_baseline(results: &SuppressionCounts) -> std::io::Result<()> {
-    let coverage_min = read_baseline().and_then(|b| b.get("coverage.min").copied()).unwrap_or(0);
-    let counts = suppression_counts(results);
-    let mut lines: Vec<String> =
-        counts.iter().map(|(key, count)| format!("{key} {count}")).collect();
-    lines.push(format!("coverage.min {coverage_min}"));
-    fs::write(root().join(BASELINE_FILE), format!("{}\n", lines.join("\n")))
+/// The committed floor for a ratcheted metric, or `None` when there is none.
+///
+/// `None` means "never measured here" — no `.harness-baseline` at all, or a file
+/// that does not carry this key. A gate reading a floor then runs report-only:
+/// retrofitting the harness into an existing repo has to be green on day one, and
+/// a floor of 0 inferred from a missing number is not a floor, it is a demand that
+/// the repo already be perfect.
+fn baseline_floor(key: &str) -> Option<u32> {
+    read_baseline()?.get(key).copied()
+}
+
+/// A metric's value, or the reason there isn't one.
+///
+/// Three states, deliberately not collapsed into `Option<u32>`:
+///   * `Value` — measured, including a legitimate 0.
+///   * `Unavailable` — the metric does not apply to this repo (no sources, tool not
+///     installed). The baseline key is dropped, and the gate goes report-only.
+///   * `Error` — the measuring tool ran and failed. `--update-baseline` aborts and
+///     writes nothing: a floor recorded from a broken run is worse than no floor,
+///     because every downstream gate trusts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Measurement {
+    Value(u32),
+    Unavailable(String),
+    Error(String),
+}
+
+/// Every metric `suppressions --update-baseline` measures, paired with how to
+/// measure it. Add a line here to ratchet a new metric: the writer, the
+/// abort-on-error rule and the drop-when-unavailable rule are all generic over
+/// this table.
+///
+/// `coverage.min` is measured first so the instrumented run it needs is the one
+/// CRAP then reuses. `mutation.min` is deliberately absent: it costs a full
+/// mutation run, minutes the automatic pass must not silently pay for, so it is
+/// carried through untouched (see `merge_baseline`) unless `--with-mutation`
+/// explicitly asks for it — see `ratcheted_keys`.
+const RATCHETED_KEYS: &[(&str, MeasureFn)] = &[
+    ("coverage.min", measured_coverage_min),
+    ("complexity.max_violations", measured_complexity_violations),
+    ("crap.max_violations", measured_crap_violations),
+    ("duplication.max_blocks", measured_duplication_blocks),
+    ("arch.max_violations", measured_arch_violations),
+];
+
+/// The metrics to measure for this `--update-baseline` run.
+///
+/// `mutation.min` joins the list only under `--with-mutation`. Opt-in because it
+/// is the one metric whose measurement is measured in minutes rather than
+/// seconds — and note the merge rules still apply to it: a `--with-mutation` pass
+/// that cannot measure a score *removes* the recorded floor rather than keeping a
+/// number nothing verified.
+fn ratcheted_keys(with_mutation: bool) -> Vec<(&'static str, MeasureFn)> {
+    let mut keys = RATCHETED_KEYS.to_vec();
+    if with_mutation {
+        keys.push(("mutation.min", measured_mutation_min));
+    }
+    keys
+}
+
+/// Measure every ratcheted metric, stopping at the first one that failed.
+///
+/// Sequential and short-circuiting on purpose: a broken tool usually breaks the
+/// metrics after it too (CRAP re-runs the coverage suite), so the first failure is
+/// the one worth reporting and the later ones would only be noise.
+fn measure_ratcheted(keys: &[(&'static str, MeasureFn)]) -> Vec<(&'static str, Measurement)> {
+    let mut measured = Vec::with_capacity(keys.len());
+    for (key, measure) in keys {
+        let value = measure();
+        let failed = matches!(value, Measurement::Error(_));
+        measured.push((*key, value));
+        if failed {
+            break;
+        }
+    }
+    measured
+}
+
+/// Merge measured floors over the existing baseline; unknown keys are preserved.
+///
+/// Every key the harness measures is rewritten (so a metric that improved ratchets
+/// down); every key it does not recognise — `coverage.min`, `mutation.min`, a key a
+/// newer harness wrote — is carried through untouched.
+///
+/// A metric that does not apply here has its key *removed*, never carried forward:
+/// the shipped template's own numbers must not survive into an adopting repo's
+/// first baseline. A metric that could not be measured aborts the whole write, so
+/// this returns `Err` before building anything — see `Measurement`.
+///
+/// Pure on purpose: `write_baseline` owns the I/O and the printing, this owns the
+/// merge rules, and the rules are unit-tested without touching the filesystem.
+fn merge_baseline(
+    existing: &BaselineMap,
+    suppressions: &BaselineMap,
+    measurements: &[(&str, Measurement)],
+) -> MergeOutcome {
+    let broken: Vec<(String, String)> = measurements
+        .iter()
+        .filter_map(|(key, measurement)| match measurement {
+            Measurement::Error(reason) => Some(((*key).to_string(), reason.clone())),
+            Measurement::Value(_) | Measurement::Unavailable(_) => None,
+        })
+        .collect();
+    if !broken.is_empty() {
+        return Err(broken);
+    }
+
+    let mut merged = existing.clone();
+    // Seed every known suppression kind at 0 before applying the scan: a kind that
+    // ratcheted to zero stops appearing in the scan entirely, and without the seed
+    // its stale count would survive as an unrecognised key, tolerating suppressions
+    // that are already gone.
+    for (kind, _) in SUPPRESSION_PREFIXES {
+        merged.insert(format!("{SUPPRESSION_BASELINE_PREFIX}{kind}"), 0);
+    }
+    for (key, count) in suppressions {
+        merged.insert(key.clone(), *count);
+    }
+
+    let mut dropped = Vec::new();
+    for (key, measurement) in measurements {
+        match measurement {
+            Measurement::Value(value) => {
+                merged.insert((*key).to_string(), *value);
+            }
+            Measurement::Unavailable(reason) => {
+                if merged.remove(*key).is_some() {
+                    dropped.push(format!("{key}: dropped — {reason}"));
+                }
+            }
+            // Filtered and returned above; reaching here would mean the two
+            // passes disagree about what an error is.
+            Measurement::Error(_) => unreachable!("measurement errors short-circuit above"),
+        }
+    }
+    Ok((merged, dropped))
+}
+
+/// Render a baseline map as the `key value` lines the file stores, sorted.
+fn serialize_baseline(baseline: &BaselineMap) -> String {
+    let lines: Vec<String> = baseline.iter().map(|(key, value)| format!("{key} {value}")).collect();
+    if lines.is_empty() { String::new() } else { format!("{}\n", lines.join("\n")) }
+}
+
+/// Measure, merge and write `.harness-baseline`.
+///
+/// All-or-nothing: when any ratcheted metric fails to measure, nothing is written
+/// and the process exits 1. The write is the last statement for exactly that
+/// reason — an abort can never leave a half-updated floor behind.
+fn write_baseline(results: &SuppressionCounts, with_mutation: bool) -> std::io::Result<()> {
+    let existing = read_baseline().unwrap_or_default();
+    let measurements = measure_ratcheted(&ratcheted_keys(with_mutation));
+    let (merged, dropped) =
+        match merge_baseline(&existing, &suppression_counts(results), &measurements) {
+            Ok(outcome) => outcome,
+            Err(broken) => {
+                println!(
+                    "  {RED}\u{2717}{RESET} {BASELINE_FILE} not written \u{2014} could not measure:"
+                );
+                for (key, reason) in &broken {
+                    println!("    {key}: {reason}");
+                }
+                println!(
+                    "  ↳ fix: make the measurement pass, then rerun \
+                     `cargo harness suppressions --update-baseline`"
+                );
+                std::process::exit(1);
+            }
+        };
+    for line in &dropped {
+        println!("  {GREEN}\u{26a0}{RESET} {line}");
+    }
+    fs::write(root().join(BASELINE_FILE), serialize_baseline(&merged))
 }
 
 fn print_suppressions_breakdown(results: &SuppressionCounts) {
@@ -578,7 +790,7 @@ fn cmd_suppressions() {
     let findings = scan_suppression_findings(&default_suppression_roots());
     let results = bucket_suppressions(&findings);
     if arg_flag("--update-baseline") {
-        if let Err(e) = write_baseline(&results) {
+        if let Err(e) = write_baseline(&results, arg_flag("--with-mutation")) {
             println!("  {RED}\u{2717}{RESET} {BASELINE_FILE}: {e}");
             std::process::exit(1);
         }
@@ -645,21 +857,28 @@ fn parse_porcelain_line(line: &str) -> Option<&str> {
 /// subtree belongs to a sibling template (or another crate in a monorepo)
 /// and must be dropped rather than normalized — normalizing it would strip
 /// nothing and let it pass the extension filter unchanged.
-fn parse_changed_rs_files(porcelain: &str, prefix: &str) -> Vec<String> {
+fn parse_changed_paths(porcelain: &str, prefix: &str) -> Vec<String> {
     porcelain
         .lines()
         .filter_map(parse_porcelain_line)
         .filter(|p| prefix.is_empty() || p.starts_with(&format!("{prefix}/")))
         .map(|p| normalize_changed_path(p, prefix))
-        .filter(|f| Path::new(f).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rs")))
         .collect()
 }
 
-fn changed_rs_files() -> Vec<String> {
-    // `-- .` scopes the porcelain output to this template's subtree, same
-    // idiom the arch-config-guard helpers below already use — without it, a
-    // sibling template's change (or another crate in a monorepo) reads as
-    // "this template changed" and triggers a repo-wide reformat.
+fn parse_changed_rs_files(porcelain: &str, prefix: &str) -> Vec<String> {
+    parse_changed_paths(porcelain, prefix).into_iter().filter(|f| is_rs(f)).collect()
+}
+
+fn is_rs(path: &str) -> bool {
+    Path::new(path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+}
+
+/// `git status --porcelain` for this template's subtree. `-- .` scopes the
+/// output, same idiom the arch-config-guard helpers below already use —
+/// without it, a sibling template's change (or another crate in a monorepo)
+/// reads as "this template changed" and triggers a repo-wide reformat.
+fn git_status_porcelain() -> String {
     let output = Command::new("git")
         .args(["status", "--porcelain", "--", "."])
         .current_dir(root())
@@ -667,11 +886,239 @@ fn changed_rs_files() -> Vec<String> {
         .stderr(Stdio::piped())
         .output();
 
-    let Ok(output) = output else {
+    output.map_or_else(|_| String::new(), |o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+fn changed_rs_files() -> Vec<String> {
+    parse_changed_rs_files(&git_status_porcelain(), &git_prefix())
+}
+
+// ── Test scoping ────────────────────────────────────────────────────
+
+/// Base ref for the scoped test gate: `--base=<ref>`, else `HARNESS_ARCH_BASE`,
+/// else `origin/$GITHUB_BASE_REF`; the first one git resolves wins.
+///
+/// Deliberately without the `origin/HEAD`/`origin/main`/`main` fallback the
+/// arch and gherkin guards use: those ask "did this branch touch a protected
+/// file", the test gate asks "what did I just edit". Falling back would make
+/// every local `check` re-run the whole branch's tests.
+fn test_base_ref() -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(base) = arg_value("--base")
+        && !base.is_empty()
+    {
+        candidates.push(base);
+    }
+    if let Ok(base) = env::var("HARNESS_ARCH_BASE")
+        && !base.is_empty()
+    {
+        candidates.push(base);
+    }
+    if let Ok(github_base) = env::var("GITHUB_BASE_REF")
+        && !github_base.is_empty()
+    {
+        candidates.push(format!("origin/{github_base}"));
+    }
+    candidates.into_iter().find(|base| !git_lines(&["rev-parse", "--verify", base]).is_empty())
+}
+
+/// The change set the scoped test gate maps from, template-relative and with
+/// deletions excluded.
+///
+/// `staged` (pre-commit) wins outright: that stage is contractually about what
+/// is being committed, so a `HARNESS_ARCH_BASE` left in the environment must
+/// not silently replace it. Otherwise a resolved base ref diffs
+/// `<base>...HEAD`, and failing that the local uncommitted set — never the
+/// whole tree, which would green a gate that tested nothing.
+fn test_scope_paths(staged: bool) -> Vec<String> {
+    if staged {
+        return git_lines(&["diff", "--cached", "--name-only", "--diff-filter=d", "--relative"]);
+    }
+    if let Some(base) = test_base_ref() {
+        let range = format!("{base}...HEAD");
+        return git_lines(&["diff", "--name-only", "--diff-filter=d", "--relative", &range]);
+    }
+    parse_changed_paths(&git_status_porcelain(), &git_prefix())
+}
+
+/// What `cargo test` must run to cover one changed file.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TestTarget {
+    /// The whole lib target (or, in a crate without one, every bin).
+    Lib,
+    /// A libtest name filter.
+    LibFilter(String),
+    /// Every `[[bin]]` target's unit tests.
+    Bins,
+    /// One integration target, `tests/<name>.rs`.
+    Integration(String),
+}
+
+/// True when a source file carries its own `#[cfg(test)]` block.
+fn has_unit_tests(path: &str) -> bool {
+    fs::read_to_string(root().join(path)).is_ok_and(|text| text.contains("#[cfg(test)]"))
+}
+
+/// Map a changed file to the test targets that cover it.
+///
+/// `src/lib.rs` → the whole lib target; `src/foo/bar.rs` → the libtest filter
+/// `foo::bar`; `src/foo/mod.rs` → `foo`; `src/main.rs` and `src/bin/*.rs` →
+/// `--bins`; `tests/<name>.rs` → `--test <name>`; any `.feature` file → the
+/// cucumber target, which is what executes it; the runner itself → `--bins`
+/// plus that same cucumber target, since the scenarios drive its binary.
+///
+/// A `src` module with no `#[cfg(test)]` block maps to nothing — its filter
+/// would match no test and libtest exits 0 on an empty match, so the caller
+/// warns about the file instead of printing a green tick for nothing.
+///
+/// Two conventions are assumed, both true of this template: an integration
+/// target is named after its file stem (`[[test]] name` can rename it), and
+/// the cucumber target is called `acceptance`. `has_tests` is lazy so the
+/// mapping stays a pure function of the path in every other case.
+fn test_targets_for(path: &str, has_tests: impl FnOnce() -> bool) -> Vec<TestTarget> {
+    if path.ends_with(".feature") {
+        return vec![TestTarget::Integration("acceptance".to_string())];
+    }
+    if path == "harness.rs" {
+        return vec![TestTarget::Bins, TestTarget::Integration("acceptance".to_string())];
+    }
+    if let Some(rest) = path.strip_prefix("tests/") {
+        let name = rest.strip_suffix(".rs").unwrap_or(rest);
+        // A nested helper (tests/common/mod.rs) belongs to whichever target
+        // includes it, which cargo does not tell us — warn rather than guess.
+        if name.contains('/') || !is_rs(rest) {
+            return Vec::new();
+        }
+        return vec![TestTarget::Integration(name.to_string())];
+    }
+    let Some(rest) = path.strip_prefix("src/") else {
         return Vec::new();
     };
+    if !is_rs(rest) {
+        return Vec::new();
+    }
+    if rest == "lib.rs" {
+        return vec![TestTarget::Lib];
+    }
+    // `src/bin/*.rs` are separate bin targets, not lib modules: filtering on
+    // `bin::name` would match nothing and pass.
+    if rest == "main.rs" || rest.starts_with("bin/") {
+        return vec![TestTarget::Bins];
+    }
+    if !has_tests() {
+        return Vec::new();
+    }
+    let stem = rest.strip_suffix(".rs").unwrap_or(rest);
+    let module = stem.strip_suffix("/mod").unwrap_or(stem);
+    vec![TestTarget::LibFilter(module.replace('/', "::"))]
+}
 
-    parse_changed_rs_files(&String::from_utf8_lossy(&output.stdout), &git_prefix())
+/// Turn mapped targets into cargo argv lists, one per invocation.
+///
+/// Filters never run bare: `cargo test -- <filter>` forwards the filter to
+/// `tests/acceptance.rs` too, which is `harness = false` and does not accept
+/// libtest arguments. They run under `--lib`, or under `--bins` in a crate
+/// with no lib target (`cargo test --lib` there is a hard error). Several
+/// filters after `--` are OR'd by libtest, so one run covers every changed
+/// module.
+fn scoped_test_commands(targets: &BTreeSet<TestTarget>, has_lib: bool) -> Vec<Vec<String>> {
+    let cargo_test = |args: &[&str]| {
+        let mut cmd = vec!["cargo".to_string(), "test".to_string()];
+        cmd.extend(args.iter().map(|a| (*a).to_string()));
+        cmd
+    };
+    let host = if has_lib { "--lib" } else { "--bins" };
+    let filters: Vec<&str> = targets
+        .iter()
+        .filter_map(|t| match t {
+            TestTarget::LibFilter(f) => Some(f.as_str()),
+            _ => None,
+        })
+        .collect();
+    let whole_host =
+        targets.contains(&TestTarget::Lib) || (!has_lib && targets.contains(&TestTarget::Bins));
+
+    let mut cmds: Vec<Vec<String>> = Vec::new();
+    if whole_host {
+        cmds.push(cargo_test(&[host]));
+    } else if !filters.is_empty() {
+        let mut args = vec![host, "--"];
+        args.extend(filters);
+        cmds.push(cargo_test(&args));
+    }
+    if has_lib && targets.contains(&TestTarget::Bins) {
+        cmds.push(cargo_test(&["--bins"]));
+    }
+    for target in targets {
+        if let TestTarget::Integration(name) = target {
+            cmds.push(cargo_test(&["--test", name]));
+        }
+    }
+    cmds
+}
+
+/// Run the test gate scoped to the changed modules (`check`, `pre-commit`).
+///
+/// `--all` runs the whole suite, as `ci` does. An empty change set warns and
+/// skips instead of widening: a scoped gate that falls back to the whole tree
+/// stops being a scope. A changed source that maps to no test warns once and
+/// never fails — the tests that do map still run.
+fn run_scoped_tests(staged: bool, no_exit: bool) -> Vec<RunResult> {
+    let opts = || RunOpts { extract: Some(extract_test_summary), no_exit, ..RunOpts::default() };
+    if arg_flag("--all") {
+        return vec![run("Tests (incl. acceptance)", &["cargo", "test"], Some(&opts()))];
+    }
+
+    // An explicitly requested base that git cannot resolve (an unfetched ref
+    // on a shallow checkout, a typo) must be loud: falling through to the
+    // uncommitted set would print a green gate that tested nothing.
+    if let Some(base) = arg_value("--base")
+        && git_lines(&["rev-parse", "--verify", &base]).is_empty()
+    {
+        println!("  {RED}\u{2717}{RESET} Tests: --base={base} does not resolve");
+        println!("  \u{21b3} fix: fetch that ref, or pass one this checkout has");
+        if !no_exit {
+            std::process::exit(1);
+        }
+        return vec![RunResult { ok: false, output: String::new() }];
+    }
+
+    let changed: Vec<String> = test_scope_paths(staged)
+        .into_iter()
+        .filter(|p| is_rs(p) || p.ends_with(".feature"))
+        .collect();
+    if changed.is_empty() {
+        println!(
+            "  {GREEN}\u{26a0}{RESET} Tests: no changed Rust or .feature files \u{2014} skipped \
+             (use --all for the whole suite)"
+        );
+        return vec![RunResult { ok: true, output: String::new() }];
+    }
+
+    let mut targets: BTreeSet<TestTarget> = BTreeSet::new();
+    let mut unmapped: Vec<&String> = Vec::new();
+    for path in &changed {
+        let mapped = test_targets_for(path, || has_unit_tests(path));
+        if mapped.is_empty() {
+            unmapped.push(path);
+        } else {
+            targets.extend(mapped);
+        }
+    }
+    for path in unmapped {
+        println!("  {GREEN}\u{26a0}{RESET} Tests: no test maps to {path}");
+    }
+
+    let cmds = scoped_test_commands(&targets, root().join("src").join("lib.rs").exists());
+    if cmds.is_empty() {
+        return vec![RunResult { ok: true, output: String::new() }];
+    }
+    cmds.iter()
+        .map(|cmd| {
+            let argv: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            run(&format!("Tests ({})", cmd[2..].join(" ")), &argv, Some(&opts()))
+        })
+        .collect()
 }
 
 // ── Commands ────────────────────────────────────────────────────────
@@ -716,14 +1163,7 @@ fn cmd_audit() {
 /// non-blocking skip. Strict callers run with `no_exit` so a vuln folds into the batch
 /// result instead of short-circuiting the rest of ci.
 fn cmd_audit_inner(strict: bool) -> bool {
-    let installed = Command::new("cargo")
-        .args(["audit", "--version"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .status()
-        .is_ok_and(|s| s.success());
-
-    if installed {
+    if tool_installed("audit", CARGO_AUDIT_VERSION) {
         let result = run(
             "Dep audit",
             &["cargo", "audit"],
@@ -739,7 +1179,9 @@ fn cmd_audit_inner(strict: bool) -> bool {
         println!("  {RED}\u{2717}{RESET} Dep audit (cargo-audit not installed)");
         return false;
     }
-    println!("  {DIM}\u{2298} Dep audit skipped (install: cargo install cargo-audit){RESET}");
+    println!(
+        "  {DIM}\u{2298} Dep audit skipped (install: cargo install cargo-audit --version {CARGO_AUDIT_VERSION}){RESET}"
+    );
     true
 }
 
@@ -763,7 +1205,11 @@ fn cmd_stop_hook() {
     cmd_post_edit(); // mutating — sequential, first
     check_arch_config_guard(true, false, false); // warn-only in stop-hook, never fails it
     check_gherkin_guard(true, false, false); // warn-only in stop-hook, never fails it
-    let failed = run_gates_parallel_detailed(&[complexity_gate()]); // read-only batch
+    let mut failed = run_gates_parallel_detailed(&[complexity_gate()]); // read-only batch
+    let duplication = duplication_result();
+    if !print_gate_result(&duplication, true) {
+        failed.push(duplication.description);
+    }
     if !failed.is_empty() {
         eprintln!("Stop hook failed: {}", failed.join(", "));
         std::process::exit(2);
@@ -827,8 +1273,10 @@ fn has_feature_files(dir: &Path) -> bool {
 fn cmd_coverage() {
     let min_pct = coverage_min_default();
 
-    if !tool_installed("llvm-cov") {
-        println!("  {DIM}\u{2298} Coverage skipped (install: cargo install cargo-llvm-cov){RESET}");
+    if !tool_installed("llvm-cov", CARGO_LLVM_COV_VERSION) {
+        println!(
+            "  {DIM}\u{2298} Coverage skipped (install: cargo install cargo-llvm-cov --version {CARGO_LLVM_COV_VERSION}){RESET}"
+        );
         return;
     }
 
@@ -897,57 +1345,584 @@ fn llvm_tools_env() -> Vec<(String, String)> {
     Vec::new()
 }
 
-/// Run cargo-mutants. Advisory — NOT wired into `ci`.
+// ── Mutation ────────────────────────────────────────────────────────
+
+/// Production sources cargo-mutants is pointed at.
 ///
-/// Mutation testing injects small bugs and checks whether the test suite
-/// catches them. It is slow and noisy by nature, so it stays an explicit
-/// opt-in rather than a blocking gate. Absent → warn + skip.
-fn cmd_mutation() {
-    if !tool_installed("mutants") {
-        println!("  {DIM}\u{2298} Mutation skipped (install: cargo install cargo-mutants){RESET}");
-        return;
-    }
-    run(
-        "Mutation (cargo-mutants)",
-        &["cargo", "mutants", "--no-shuffle"],
-        Some(&RunOpts { no_exit: true, ..RunOpts::default() }),
-    );
+/// `harness.rs` is a `[[bin]]` of this crate but it is the task runner, not the
+/// product — the same reason the complexity gate targets `src tests`, python
+/// mutates `source_paths = ["src"]` and bun mutates `src/`. Including it would
+/// also make the gate unusable: 461 mutants at roughly two minutes each.
+const MUTATION_SOURCES: &str = "src";
+
+/// Scoring-input override: a finished `outcomes.json` to read instead of running.
+///
+/// A mutation pass costs minutes, so `HARNESS_MUTATION_OUTCOMES=<path>` re-scores
+/// a run that already happened — the acceptance scenarios use it, and so can a CI
+/// job that produced the file in an earlier step.
+const MUTATION_OUTCOMES_ENV: &str = "HARNESS_MUTATION_OUTCOMES";
+
+fn mutation_outcomes_override() -> Option<String> {
+    env::var(MUTATION_OUTCOMES_ENV).ok().filter(|path| !path.is_empty())
 }
 
-/// Run architecture checks via cargo-modules against `arch.toml`.
+/// The ref mutation diffs against: `--base=<ref>` wins, then `HARNESS_ARCH_BASE`,
+/// then `GITHUB_BASE_REF`, then whichever default branch resolves. `None` when
+/// none of them do — a local branch with no upstream and no `main`.
 ///
-/// Rust's compiler enforces visibility and crate layering but NOT freedom
-/// from circular dependencies between modules of one crate, nor the absence
-/// of orphaned (unlinked) source files. Those are the invariants this gate
-/// checks. `arch.toml` is guarded by `arch-config-guard`, which blocks
-/// integration until the change is reviewed. Absent config → skip.
-fn arch_gates_or_warn() -> Vec<Gate> {
-    if !root().join("arch.toml").exists() {
-        println!("  {GREEN}\u{26a0}{RESET} Arch: no arch.toml \u{2014} skipped");
-        return Vec::new();
+/// An explicit `--base=` that does not resolve is fatal rather than skipped: the
+/// fallbacks would silently mutate a scope nobody asked for. The env vars keep
+/// falling through, because they are ambient rather than typed on this command
+/// line (`GITHUB_BASE_REF` names a branch that need not be fetched locally).
+fn mutation_base_ref() -> Option<String> {
+    if let Some(explicit) = arg_value("--base") {
+        if git_lines(&["rev-parse", "--verify", &explicit]).is_empty() {
+            println!("  {RED}\u{2717}{RESET} Mutation: --base={explicit} is not a git ref");
+            std::process::exit(1);
+        }
+        return Some(explicit);
     }
-    if !tool_installed("modules") {
-        println!("  {DIM}\u{2298} Arch skipped (install: cargo install cargo-modules){RESET}");
-        return Vec::new();
+    let candidates = [
+        env::var("HARNESS_ARCH_BASE").ok().filter(|value| !value.is_empty()),
+        env::var("GITHUB_BASE_REF")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|branch| format!("origin/{branch}")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|candidate| !git_lines(&["rev-parse", "--verify", candidate]).is_empty())
+        .or_else(default_base_ref)
+}
+
+/// The changed-source diff cargo-mutants scopes to.
+///
+/// `--relative` is load-bearing: `--in-diff` matches paths against the crate root,
+/// and from a template subdirectory an unrelativised diff names `rust/src/main.rs`,
+/// which matches no mutant at all — a green gate that tested nothing.
+///
+/// Against a resolved base ref this is `<base>...HEAD`; with none it falls back to
+/// the uncommitted diff, the same change-set rule the other local-stage gates use.
+fn mutation_diff() -> String {
+    let range =
+        mutation_base_ref().map_or_else(|| "HEAD".to_string(), |base| format!("{base}...HEAD"));
+    git_output(&["diff", "--relative", &range, "--", MUTATION_SOURCES])
+}
+
+/// A finished cargo-mutants run: its `outcomes.json`, and whether the tool itself
+/// exited 0.
+///
+/// The exit code cannot simply be ignored, even though cargo-mutants exits
+/// non-zero whenever a mutant survives (a finding to score, not a failed run).
+/// When the *unmutated* tree's tests fail it exits 4 and still writes a
+/// well-formed `outcomes.json` with every total at zero — indistinguishable, from
+/// the file alone, from a diff that generated nothing to mutate. See
+/// `mutation_measurement`.
+struct MutationRun {
+    outcomes_json: String,
+    completed: bool,
+}
+
+/// Run cargo-mutants and return its `outcomes.json`.
+///
+/// `diff` scopes the run to changed lines; `None` mutates all of
+/// `MUTATION_SOURCES`. The scratch output directory lives under the system temp
+/// dir, not the repo: nothing to gitignore, and nothing for `clean` to sweep.
+fn mutation_run(diff: Option<&str>) -> Result<MutationRun, String> {
+    let output_dir = env::temp_dir().join(format!("harness-mutants-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&output_dir);
+    fs::create_dir_all(&output_dir)
+        .map_err(|e| format!("cannot create {}: {e}", output_dir.display()))?;
+
+    let mut argv: Vec<String> =
+        ["cargo", "mutants", "--no-shuffle", "--output"].iter().map(|s| (*s).to_string()).collect();
+    argv.push(output_dir.to_string_lossy().into_owned());
+    let scoped = if let Some(text) = diff {
+        let path = output_dir.join("changed.diff");
+        argv.push("--in-diff".to_string());
+        argv.push(path.to_string_lossy().into_owned());
+        fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    } else {
+        argv.push("--file".to_string());
+        argv.push(format!("{MUTATION_SOURCES}/**"));
+        Ok(())
+    };
+    let outcomes = scoped.and_then(|()| execute_mutants(&argv, &output_dir));
+    let _ = fs::remove_dir_all(&output_dir);
+    outcomes
+}
+
+/// Spawn cargo-mutants and read the `outcomes.json` it leaves behind.
+fn execute_mutants(argv: &[String], output_dir: &Path) -> Result<MutationRun, String> {
+    let verbose = is_verbose();
+    if verbose {
+        println!("  {DIM}\u{2192} {}{RESET}", argv.join(" "));
     }
-    vec![
-        Gate::new(
-            "Arch: no module cycles",
-            &["cargo", "modules", "dependencies", "--lib", "--no-externs", "--acyclic"],
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]).current_dir(root());
+    let (completed, captured) = if verbose {
+        command.status().map(|status| (status.success(), String::new()))
+    } else {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped()).output().map(|out| {
+            (
+                out.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr),
+                ),
+            )
+        })
+    }
+    .map_err(|e| format!("cargo mutants failed to start: {e}"))?;
+
+    fs::read_to_string(output_dir.join("mutants.out").join("outcomes.json"))
+        .map(|outcomes_json| MutationRun { outcomes_json, completed })
+        .map_err(|e| {
+            let mut tail: Vec<&str> = captured.lines().rev().take(10).collect();
+            tail.reverse();
+            format!("cargo mutants produced no outcomes.json ({e})\n{}", tail.join("\n"))
+        })
+}
+
+/// The `outcomes.json` to score: the `HARNESS_MUTATION_OUTCOMES` override when it
+/// is set, otherwise a fresh run.
+fn mutation_outcomes(diff: Option<&str>) -> Result<MutationRun, String> {
+    mutation_outcomes_override().map_or_else(
+        || mutation_run(diff),
+        |path| {
+            // An override names a run that already finished; there is no exit
+            // status left to consult, so take the file at its word.
+            fs::read_to_string(&path)
+                .map(|outcomes_json| MutationRun { outcomes_json, completed: true })
+                .map_err(|e| format!("{MUTATION_OUTCOMES_ENV}={path}: {e}"))
+        },
+    )
+}
+
+/// `round(100 * killed / total)` in integer arithmetic — halves round up, and no
+/// float ever reaches a number that gets written into `.harness-baseline`.
+/// `total` must be non-zero; `mutation_score` is the only caller and checks it.
+fn kill_percent(killed: u32, total: u32) -> u32 {
+    let (killed, total) = (u64::from(killed), u64::from(total));
+    u32::try_from((200 * killed + total) / (2 * total)).unwrap_or(100)
+}
+
+/// Kill rate from a cargo-mutants `outcomes.json`, as an integer percentage.
+///
+/// `round(100 * (caught + timeout) / (caught + timeout + missed))` — the same
+/// definition every template in this repo uses, so the four numbers are
+/// comparable. `unviable` (did not compile) and `total_mutants` are excluded from
+/// both sides: a mutant that never ran is evidence of nothing.
+///
+/// A run with nothing to kill (a tests-only diff) is `Unavailable`, not 0%, so the
+/// gate degrades to report-only instead of recording a floor it never measured.
+/// A missing field is `Error`: cargo-mutants documents this file's layout as
+/// subject to change, and scoring a half-understood file is worse than failing.
+fn mutation_score(outcomes_json: &str) -> Measurement {
+    let (Some(caught), Some(timeout), Some(missed)) = (
+        json_top_level_u32(outcomes_json, "caught"),
+        json_top_level_u32(outcomes_json, "timeout"),
+        json_top_level_u32(outcomes_json, "missed"),
+    ) else {
+        return Measurement::Error(
+            "outcomes.json has no caught/timeout/missed totals — cargo-mutants 27.0.0 \
+             writes them at the top level"
+                .to_string(),
+        );
+    };
+    let killed = caught.saturating_add(timeout);
+    let total = killed.saturating_add(missed);
+    if total == 0 {
+        return Measurement::Unavailable("no mutants were generated".to_string());
+    }
+    Measurement::Value(kill_percent(killed, total))
+}
+
+/// Score a finished run, telling "nothing to mutate" apart from "the run broke".
+///
+/// cargo-mutants writes a well-formed `outcomes.json` with every total at zero in
+/// two very different situations: a diff that generated no mutants, and a tree
+/// whose *unmutated* tests fail (exit 4, `cargo test failed in an unmutated
+/// tree`). Only the exit status separates them, and calling the second one
+/// `Unavailable` would be a lie with teeth — `merge_baseline` *drops* an
+/// unavailable key, so `--update-baseline --with-mutation` against a red suite
+/// would silently delete the recorded floor instead of aborting the write.
+fn mutation_measurement(run: &MutationRun) -> Measurement {
+    let measured = mutation_score(&run.outcomes_json);
+    if run.completed || !matches!(measured, Measurement::Unavailable(_)) {
+        return measured;
+    }
+    Measurement::Error(
+        "cargo mutants exited non-zero without testing a mutant — the unmutated tree's \
+         tests have to pass before mutants mean anything"
+            .to_string(),
+    )
+}
+
+/// Read a top-level integer field out of a JSON object, ignoring nested ones.
+///
+/// `outcomes.json` opens with an `outcomes` array whose per-mutant entries repeat
+/// the summary field names, so a plain substring scan reads the wrong number.
+/// Depth- and string-aware, and no JSON dependency — the runner has none.
+fn json_top_level_u32(text: &str, key: &str) -> Option<u32> {
+    let bytes = text.as_bytes();
+    let mut depth = 0u32;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' | b'[' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            b'"' => {
+                let (token, next) = json_string_at(text, index)?;
+                index = next;
+                if depth != 1 || token != key {
+                    continue;
+                }
+                return json_u32_after_colon(text, index);
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// The string literal starting at `start` (a `"`), plus the index past its close.
+///
+/// Escapes are stepped over, not decoded: the only tokens compared here are plain
+/// ASCII field names, and an escaped key simply fails to match.
+fn json_string_at(text: &str, start: usize) -> Option<(&str, usize)> {
+    let bytes = text.as_bytes();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'"' => return Some((text.get(start + 1..index)?, index + 1)),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Parse `: <digits>` starting at `index`, or `None` when the value is not a
+/// plain non-negative integer.
+fn json_u32_after_colon(text: &str, index: usize) -> Option<u32> {
+    let bytes = text.as_bytes();
+    let mut cursor = index;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b':') {
+        return None;
+    }
+    cursor += 1;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    let start = cursor;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+    }
+    text.get(start..cursor)?.parse().ok()
+}
+
+/// Print the verdict for a measured kill rate. False only on an enforced miss.
+fn report_mutation(measurement: &Measurement, enforce: bool) -> bool {
+    let (color, symbol, suffix) = crap_status_glyph(enforce);
+    let score = match measurement {
+        Measurement::Unavailable(reason) => {
+            println!("  {GREEN}\u{26a0}{RESET} Mutation: {reason} (report-only)");
+            return true;
+        }
+        Measurement::Error(message) => {
+            println!("  {color}{symbol}{RESET} Mutation: {message}{suffix}");
+            return !enforce;
+        }
+        Measurement::Value(score) => *score,
+    };
+    let Some(floor) = baseline_floor("mutation.min") else {
+        // Nothing recorded is not a floor of 0; it is a repo that was never
+        // measured. Report and pass, `--enforce` included.
+        println!(
+            "  {GREEN}\u{26a0}{RESET} Mutation: {score}% of mutants killed \
+             (report-only: no {BASELINE_FILE} floor)"
+        );
+        println!(
+            "  ↳ fix: run `cargo harness suppressions --update-baseline --with-mutation` \
+             to record a floor"
+        );
+        return true;
+    };
+    if score >= floor {
+        println!(
+            "  {GREEN}\u{2713}{RESET} Mutation: {score}% of mutants killed (baseline {floor}%)"
+        );
+        return true;
+    }
+    println!(
+        "  {color}{symbol}{RESET} Mutation: {score}% of mutants killed \
+         (baseline {floor}%){suffix}"
+    );
+    println!("  ↳ fix: add tests that fail when the surviving mutants are applied");
+    !enforce
+}
+
+/// Mutation kill rate over changed sources, against the `mutation.min` floor.
+///
+/// Advisory by default, and always advisory from `ci` (`enforce: false`): mutation
+/// is the slowest and noisiest signal in the harness, so it informs without ever
+/// turning a build red. `--enforce` on the standalone command is where it fails.
+///
+/// Returns false only when the floor is missed, or the run broke, under `enforce`.
+fn run_mutation(enforce: bool, all: bool) -> bool {
+    // Resolve the tool before the scope, but act on it after: the pinned-version
+    // warning belongs to the command, not to the change set — a drifting
+    // cargo-mutants is worth saying even when this diff has nothing to mutate —
+    // while the "nothing changed" message must still win over "not installed".
+    let installed =
+        mutation_outcomes_override().is_some() || tool_installed("mutants", CARGO_MUTANTS_VERSION);
+
+    // Scope next: a run with nothing to mutate needs no scratch directory, and
+    // its message must not depend on one being there.
+    let diff = if all {
+        None
+    } else {
+        let text = mutation_diff();
+        if text.trim().is_empty() {
+            println!(
+                "  {GREEN}\u{26a0}{RESET} Mutation skipped: no changed sources under \
+                 {MUTATION_SOURCES}/ (use --all for the whole tree)"
+            );
+            return true;
+        }
+        Some(text)
+    };
+
+    if !installed {
+        println!(
+            "  {DIM}\u{2298} Mutation skipped (install: cargo install cargo-mutants --version {CARGO_MUTANTS_VERSION}){RESET}"
+        );
+        return true;
+    }
+
+    let measurement = match mutation_outcomes(diff.as_deref()) {
+        Ok(run) => mutation_measurement(&run),
+        Err(message) => Measurement::Error(message),
+    };
+    report_mutation(&measurement, enforce)
+}
+
+/// Whole-tree kill rate, for `suppressions --update-baseline --with-mutation`.
+///
+/// Deliberately not the diff-scoped run the gate does: a floor only reproduces if
+/// it is measured over a fixed target set, and one recorded from a branch's diff
+/// would mean something different on the next branch.
+fn measured_mutation_min() -> Measurement {
+    if mutation_outcomes_override().is_none() && !tool_installed("mutants", CARGO_MUTANTS_VERSION) {
+        return Measurement::Unavailable(format!(
+            "cargo-mutants is not installed (install: cargo install cargo-mutants --version {CARGO_MUTANTS_VERSION})"
+        ));
+    }
+    match mutation_outcomes(None) {
+        Ok(run) => mutation_measurement(&run),
+        Err(message) => Measurement::Error(message),
+    }
+}
+
+/// Mutation testing: inject small bugs, check the suite notices.
+///
+/// Scoped to sources changed against the base ref (`--all` widens it to all of
+/// `src/`), advisory by default (`--enforce` to hard-fail), compared to the
+/// `mutation.min` floor in `.harness-baseline` when one is recorded. `ci` runs it
+/// advisory after coverage; no other stage does, because it costs minutes.
+fn cmd_mutation() {
+    if !run_mutation(arg_flag("--enforce"), arg_flag("--all")) {
+        std::process::exit(1);
+    }
+}
+
+/// The two cargo-modules passes that make up the arch gate.
+///
+/// Kept as constants because the gate, the baseline measurement and the
+/// `--verbose` echo must all name the same commands: a floor measured from a
+/// different invocation does not reproduce.
+const ARCH_CYCLES_CMD: &[&str] =
+    &["cargo", "modules", "dependencies", "--lib", "--no-externs", "--acyclic"];
+const ARCH_ORPHANS_CMD: &[&str] = &["cargo", "modules", "orphans", "--lib"];
+
+const ARCH_HINT: &str =
+    "boundary crossed; surface the design decision to the human; don't edit arch config";
+
+/// The orphan count cargo-modules reports, or `None` when its output does not say.
+///
+/// cargo-modules prints a plain `N orphans found:` header before the per-orphan
+/// blocks (the blocks themselves are ANSI-colored, the header is not), and a
+/// colored `No orphans found.` line when there are none — matched by substring
+/// because the phrase itself is contiguous between the escape sequences.
+fn parse_orphan_count(stdout: &str) -> Option<u32> {
+    let counted = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_suffix(" orphans found:")?.parse::<u32>().ok());
+    counted.or_else(|| stdout.contains("No orphans found.").then_some(0))
+}
+
+/// Architectural violations as one number: `orphan_count + cycle_flag`.
+///
+/// cargo-modules 0.26.0 exposes no JSON and no aggregate count — `dependencies
+/// --acyclic` is pass/fail and `orphans` reports one block per file — so the
+/// count is *defined* here, and this definition is what the `arch.max_violations`
+/// floor ratchets:
+///
+/// * `cycle_flag` is 1 when `ARCH_CYCLES_CMD` exits non-zero. A cycle exists but
+///   the tool never says how many, so the whole condition counts once.
+/// * `orphan_count` is the `N orphans found:` header, via `parse_orphan_count`.
+///   A run that printed no header at all measured nothing; `ArchScan::analyzed`
+///   catches that before this arithmetic is ever consulted.
+///
+/// Both conditions share one budget: a floor recorded from N orphans also
+/// tolerates a cycle introduced later. That follows from there being one
+/// `arch.max_violations` key, and is stated in CLAUDE.md so it is a known
+/// trade-off rather than a surprise.
+///
+/// The dot graph is deliberately not parsed — it renders the module tree, not the
+/// violations, and reconstructing cycles from it would put a graph algorithm in a
+/// task runner that must stay dependency-free.
+///
+/// Pure so the arithmetic is unit-tested without invoking cargo.
+fn arch_violation_count(cycles_ok: bool, orphan_count: u32) -> u32 {
+    u32::from(!cycles_ok) + orphan_count
+}
+
+/// Both cargo-modules passes, reduced to what the gate and the baseline need.
+struct ArchScan {
+    /// `orphan_count + cycle_flag` — see `arch_violation_count`.
+    count: u32,
+    /// False when the orphans pass printed no count at all. cargo-modules
+    /// always states one (`N orphans found:` or `No orphans found.`) when it
+    /// analyzed the crate, so its absence means it could not — no `[lib]`
+    /// target, no manifest, a crash. `count` is then a statement about the
+    /// tool, not about the code, and must never become a floor.
+    analyzed: bool,
+    /// The failing passes' output, each under its own label, for the ✗ body.
+    output: String,
+}
+
+/// Run both cargo-modules passes.
+fn arch_scan() -> ArchScan {
+    let cycles = run_capture(&Gate::new("Arch: no module cycles", ARCH_CYCLES_CMD));
+    let orphans = run_capture(&Gate::new("Arch: no orphan files", ARCH_ORPHANS_CMD));
+    let orphan_count = parse_orphan_count(&orphans.output);
+    ArchScan {
+        count: arch_violation_count(cycles.ok, orphan_count.unwrap_or(0)),
+        analyzed: orphan_count.is_some(),
+        output: [&cycles, &orphans]
+            .into_iter()
+            .filter(|pass| !pass.ok)
+            .map(|pass| format!("--- {} ---\n{}", pass.description, pass.output))
+            .collect::<Vec<_>>()
+            .concat(),
+    }
+}
+
+/// Why cargo-modules cannot check this repo, or `None` when it can.
+///
+/// One rule, two renderings: the gate prints it as a skip, the baseline writer
+/// turns it into `Measurement::Unavailable`. Kept together so the two cannot
+/// drift into disagreeing about when arch applies.
+fn arch_unavailable() -> Option<String> {
+    if !root().join(ARCH_CONFIG).exists() {
+        return Some(format!("no {ARCH_CONFIG}"));
+    }
+    (!tool_installed("modules", CARGO_MODULES_VERSION)).then(|| {
+        format!(
+            "cargo-modules is not installed (install: cargo install cargo-modules --version {CARGO_MODULES_VERSION})"
         )
-        .with_hint(
-            "boundary crossed; surface the design decision to the human; don't edit arch config",
-        ),
-        Gate::new("Arch: no orphan files", &["cargo", "modules", "orphans", "--lib"]).with_hint(
-            "boundary crossed; surface the design decision to the human; don't edit arch config",
-        ),
-    ]
+    })
+}
+
+/// The arch gate's label: names the floor it is held to, or says there is none.
+fn arch_description(floor: Option<u32>, count: u32) -> String {
+    match floor {
+        None => format!("Arch (cargo-modules, report-only: no {BASELINE_FILE} floor)"),
+        Some(floor) if count > floor => {
+            format!("Arch (cargo-modules): {count} violations exceed baseline {floor}")
+        }
+        Some(0) => "Arch (cargo-modules)".to_string(),
+        Some(floor) => format!("Arch (cargo-modules, baseline {floor})"),
+    }
+}
+
+/// Check architecture via cargo-modules against `arch.toml`; `false` when the
+/// violation count is over the recorded floor.
+///
+/// Rust's compiler enforces visibility and crate layering but NOT freedom from
+/// circular dependencies between modules of one crate, nor the absence of
+/// orphaned (unlinked) source files. Those are the invariants this gate counts —
+/// see `arch_violation_count` for the definition. `arch.toml` is guarded by
+/// `arch-config-guard`, which blocks integration until the change is reviewed.
+///
+/// With no `arch.max_violations` floor recorded the gate is report-only: it
+/// prints the count and passes. A legacy crate full of orphans has to be green on
+/// day one, and a floor of 0 inferred from a missing number is not a floor.
+fn arch_check(no_exit: bool) -> bool {
+    if let Some(reason) = arch_unavailable() {
+        println!("  {DIM}\u{2298} Arch skipped: {reason}{RESET}");
+        return true;
+    }
+    let scan = arch_scan();
+    if !scan.analyzed {
+        // Not a failure: a crate cargo-modules cannot read has no arch metric,
+        // and blocking on that would make the harness unadoptable. Print what
+        // the tool said, though — silence here reads as a clean crate.
+        println!("  {DIM}\u{2298} Arch skipped: cargo-modules could not analyze this crate{RESET}");
+        print!("{}", scan.output);
+        return true;
+    }
+    let floor = baseline_floor("arch.max_violations");
+    let hint = if floor.is_none() {
+        "run `cargo harness suppressions --update-baseline` to record a floor".to_string()
+    } else {
+        ARCH_HINT.to_string()
+    };
+    let result = GateResult {
+        description: arch_description(floor, scan.count),
+        cmd: vec![ARCH_CYCLES_CMD.join(" "), "&&".to_string(), ARCH_ORPHANS_CMD.join(" ")],
+        ok: floor.is_none_or(|floor| scan.count <= floor),
+        exit_code: 1,
+        output: scan.output,
+        detail: (scan.count > 0).then(|| format!("{} violations", scan.count)),
+        hint: Some(hint),
+        report_only: floor.is_none(),
+    };
+    print_gate_result(&result, no_exit)
+}
+
+/// Count of architectural violations, for the baseline writer.
+///
+/// A crate cargo-modules could not analyze is `Unavailable`, never a `Value`:
+/// recording the fallback count as a floor would tolerate that many real
+/// violations forever, on the strength of a tool error.
+fn measured_arch_violations() -> Measurement {
+    if let Some(reason) = arch_unavailable() {
+        return Measurement::Unavailable(reason);
+    }
+    let scan = arch_scan();
+    if scan.analyzed {
+        Measurement::Value(scan.count)
+    } else {
+        Measurement::Unavailable("cargo-modules could not analyze this crate".to_string())
+    }
 }
 
 fn cmd_arch() {
-    for gate in arch_gates_or_warn() {
-        print_gate_result(&run_capture(&gate), false);
-    }
+    arch_check(false);
 }
 
 fn git_lines(args: &[&str]) -> Vec<String> {
@@ -963,6 +1938,18 @@ fn git_lines(args: &[&str]) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// Raw stdout of a git command; empty on any failure. `git_lines`'s sibling for
+/// the one caller that needs the text itself (a diff) rather than a path list.
+fn git_output(args: &[&str]) -> String {
+    let Ok(output) = Command::new("git").args(args).current_dir(root()).output() else {
+        return String::new();
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 fn git_prefix() -> String {
@@ -1220,32 +2207,266 @@ fn cmd_gherkin_guard() {
     }
 }
 
-/// Run lizard as a cyclomatic-complexity gate. Mirrors bun/python invocation.
-fn complexity_gate() -> Gate {
-    Gate::new(
-        "Complexity (lizard)",
-        &[
-            "uvx",
-            "lizard@1.22.2",
-            "-l",
-            "rust",
-            "src",
-            "tests",
-            "-C",
-            "15",
-            "-a",
-            "8",
-            "-L",
-            "100",
-            "-i",
-            "0",
-        ],
-    )
-    .with_hint("extract helpers or flatten branches until CCN <= 15; do not raise the threshold")
+/// lizard argv at this template's thresholds, tolerating `max_violations` warnings.
+///
+/// lizard's own `-i N` is the count ratchet: it exits 0 while the number of flagged
+/// functions stays at or below N, so lizard does the counting. Single-sourced
+/// because a floor measured against a different target set does not reproduce —
+/// the gate and the measurement must pass byte-identical arguments.
+fn complexity_argv(max_violations: u32) -> Vec<String> {
+    lizard_argv(&[
+        "-C",
+        &COMPLEXITY_MAX_CCN.to_string(),
+        "-a",
+        &COMPLEXITY_MAX_ARGS.to_string(),
+        "-L",
+        &COMPLEXITY_MAX_LENGTH.to_string(),
+        "-i",
+        &max_violations.to_string(),
+    ])
 }
 
+/// `uvx lizard` over this template's sources, plus one run's own flags.
+///
+/// The target set lives here and nowhere else: complexity and duplication are two
+/// invocations of the same tool over the same files, and a floor measured over a
+/// different file set does not reproduce.
+fn lizard_argv(flags: &[&str]) -> Vec<String> {
+    ["uvx", "lizard@1.22.2", "-l", "rust", "src", "tests"]
+        .iter()
+        .chain(flags.iter())
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+/// The lizard gate at the committed floor, or report-only when there is none.
+///
+/// With no floor recorded, `-i 0` would demand a legacy tree already be perfect —
+/// exactly the day-one red that stops the harness being adopted. Measure instead:
+/// `-i` goes high enough that lizard always exits 0, and the label says why.
+fn complexity_gate_for(floor: Option<u32>) -> Gate {
+    let argv = complexity_argv(floor.unwrap_or(REPORT_ONLY_LIMIT));
+    let cmd: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let Some(floor) = floor else {
+        return Gate::new(
+            format!("Complexity (lizard, report-only: no {BASELINE_FILE} floor)"),
+            &cmd,
+        )
+        .with_hint("run `cargo harness suppressions --update-baseline` to record a floor")
+        .report_only();
+    };
+    let description = if floor == 0 {
+        "Complexity (lizard)".to_string()
+    } else {
+        format!("Complexity (lizard, baseline {floor})")
+    };
+    Gate::new(description, &cmd).with_hint(format!(
+        "extract helpers or flatten branches until CCN <= {COMPLEXITY_MAX_CCN}; \
+         do not raise the threshold"
+    ))
+}
+
+fn complexity_gate() -> Gate {
+    complexity_gate_for(baseline_floor("complexity.max_violations"))
+}
+
+/// Both lizard gates: per-function complexity, then duplicate blocks.
+///
+/// Neither short-circuits the other — one run reports every offender — and the
+/// command exits 1 when either failed.
 fn cmd_complexity() {
-    print_gate_result(&run_capture(&complexity_gate()), false);
+    let complexity_ok = print_gate_result(&run_capture(&complexity_gate()), true);
+    let duplication_ok = print_gate_result(&duplication_result(), true);
+    if !complexity_ok || !duplication_ok {
+        std::process::exit(1);
+    }
+}
+
+/// Read the `Warning cnt` column out of lizard's final summary row.
+///
+/// The summary is the only place lizard states the count as a number; every other
+/// rendering would have to be counted line by line, which changes shape with the
+/// `-w`/`--csv` flags.
+fn lizard_warning_count(stdout: &str) -> Option<u32> {
+    let lines: Vec<&str> = stdout.lines().collect();
+    let header = lines.iter().position(|line| line.starts_with("Total nloc"))?;
+    for row in &lines[header + 1..] {
+        let trimmed = row.trim();
+        if trimmed.is_empty() || trimmed.chars().all(|c| c == '-') {
+            continue;
+        }
+        let fields: Vec<&str> = row.split_whitespace().collect();
+        if fields.len() < 6 {
+            continue;
+        }
+        return fields[5].parse::<u32>().ok();
+    }
+    None
+}
+
+/// Count of functions lizard flags at the template's thresholds.
+fn measured_complexity_violations() -> Measurement {
+    if !root().join("src").is_dir() {
+        return Measurement::Unavailable("no src/ sources".to_string());
+    }
+    let argv = complexity_argv(REPORT_ONLY_LIMIT);
+    let output = Command::new(&argv[0]).args(&argv[1..]).current_dir(root()).output();
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => return Measurement::Error(format!("lizard failed to run: {e}")),
+    };
+    if !output.status.success() {
+        return Measurement::Error(format!(
+            "lizard failed to run (exit {:?})",
+            output.status.code()
+        ));
+    }
+    lizard_warning_count(&String::from_utf8_lossy(&output.stdout)).map_or_else(
+        || Measurement::Error("lizard printed no summary row to count warnings from".to_string()),
+        Measurement::Value,
+    )
+}
+
+/// lizard argv for the duplicate-block scan over the complexity target set.
+///
+/// A second invocation on purpose: `-Eduplicate` composes with the complexity
+/// thresholds, but lizard's exit code still tracks CCN warnings only, so a
+/// duplicate block could never fail the shared run. Here lizard is a measuring
+/// tape: `-w` is warnings-only mode, which drops the per-function and summary
+/// tables this run does not read, and `-i` goes high enough that lizard always
+/// exits 0. The floor is enforced in the runner, from the block count in the
+/// report. Any warning line `-w` does print is scored at lizard's own defaults,
+/// not this template's thresholds — the complexity gate owns those, and nothing
+/// here reads them.
+fn duplication_argv() -> Vec<String> {
+    lizard_argv(&["-Eduplicate", "-w", "-i", &REPORT_ONLY_LIMIT.to_string()])
+}
+
+/// Count the duplicate blocks in lizard's `-Eduplicate` report.
+///
+/// lizard heads every block with a bare `Duplicate block:` line, so the headers
+/// are the count; the `file:line ~ line` rows below them vary per block and the
+/// trailing `Total duplicate rate` is a percentage, not a count.
+fn count_duplicate_blocks(stdout: &str) -> u32 {
+    let count = stdout.lines().filter(|line| line.trim() == "Duplicate block:").count();
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+/// Run the duplicate scan once: the block count plus lizard's report, or why not.
+fn scan_duplicate_blocks() -> Result<(u32, String), String> {
+    let argv = duplication_argv();
+    let output = Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(root())
+        .output()
+        .map_err(|e| format!("lizard failed to run: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("lizard failed to run (exit {:?})", output.status.code()));
+    }
+    let report = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok((count_duplicate_blocks(&report), report))
+}
+
+/// Number of duplicate blocks lizard reports over this template's sources.
+fn measured_duplication_blocks() -> Measurement {
+    if !root().join("src").is_dir() {
+        return Measurement::Unavailable("no src/ sources".to_string());
+    }
+    scan_duplicate_blocks().map_or_else(Measurement::Error, |(count, _)| Measurement::Value(count))
+}
+
+/// The duplicate-block gate at the committed floor, or report-only without one.
+///
+/// Built as a `GateResult` rather than a `Gate`: lizard exits 0 whatever it finds
+/// here, so the verdict is the count-versus-floor comparison, not an exit code.
+/// Reusing the struct keeps the ✓/✗ line, the `--verbose` echo, the hint and the
+/// report-only rule identical to every other gate.
+///
+/// Takes the scan as an argument so the verdict is testable without lizard: the
+/// over-the-floor path is the one a green tree never exercises.
+fn duplication_gate_result(scan: Result<(u32, String), String>, floor: Option<u32>) -> GateResult {
+    let cmd = duplication_argv();
+    let (count, report) = match scan {
+        Ok(scan) => scan,
+        Err(reason) => {
+            return GateResult {
+                description: "Duplication (lizard)".to_string(),
+                cmd,
+                ok: false,
+                exit_code: 1,
+                output: reason,
+                detail: None,
+                hint: None,
+                report_only: false,
+            };
+        }
+    };
+    let detail = Some(format!("duplicate blocks: {count}"));
+    let Some(floor) = floor else {
+        return GateResult {
+            description: format!("Duplication (lizard, report-only: no {BASELINE_FILE} floor)"),
+            cmd,
+            ok: true,
+            exit_code: 0,
+            output: report,
+            detail,
+            hint: Some(
+                "run `cargo harness suppressions --update-baseline` to record a floor".to_string(),
+            ),
+            report_only: true,
+        };
+    };
+    let ok = count <= floor;
+    let description = if floor == 0 {
+        "Duplication (lizard)".to_string()
+    } else {
+        format!("Duplication (lizard, baseline {floor})")
+    };
+    GateResult {
+        description,
+        cmd,
+        ok,
+        exit_code: i32::from(!ok),
+        output: if ok {
+            report
+        } else {
+            format!("{report}\nduplicate blocks: {count} > baseline {floor}\n")
+        },
+        detail,
+        hint: (!ok).then(|| {
+            "extract the repeated code into a shared helper; do not raise the floor".to_string()
+        }),
+        report_only: false,
+    }
+}
+
+/// Scan for duplicates and judge the count against the recorded floor, if any.
+fn duplication_result() -> GateResult {
+    duplication_gate_result(scan_duplicate_blocks(), baseline_floor("duplication.max_blocks"))
+}
+
+/// Selects the CRAP gate's status glyph/color and the `(advisory)` suffix.
+/// `✗`/red is reserved for `--enforce` runs, which actually exit 1; the
+/// default advisory mode always exits 0, so it gets `⚠`/green even when it
+/// lists offenders or a lizard failure — a red ✗ that still exits 0 tells the
+/// human the build failed when it did not.
+const fn crap_status_glyph(enforce: bool) -> (&'static str, &'static str, &'static str) {
+    if enforce { (RED, "\u{2717}", "") } else { (GREEN, "\u{26a0}", " (advisory)") }
+}
+
+/// What scoring CRAP produced: the offenders, or why there are none to report.
+enum CrapOutcome {
+    /// cargo-llvm-cov is not installed. Nothing to score, and not a failure —
+    /// the measurement is `unavailable`, not an error.
+    Skipped(String),
+    /// Coverage data could not be produced or read. Fatal even in advisory mode:
+    /// scoring against absent data would print a green ✓ that means nothing.
+    Fatal(String),
+    /// lizard itself failed. Advisory mode degrades this to a warning; reporting
+    /// "all functions below max" instead would be a silent false pass.
+    ToolFailure { message: String, detail: String, code: i32 },
+    /// Functions whose CRAP exceeds the threshold, worst first.
+    Scored(Vec<CrapFn>),
 }
 
 /// Compute CRAP = CCN² × (1-cov)³ + CCN per function. Advisory by default.
@@ -1258,87 +2479,139 @@ fn cmd_complexity() {
 /// `target/llvm-cov/lcov.info`; this command reuses it. Standalone runs (or
 /// runs where `src/` is newer than the existing LCOV) trigger a full test
 /// re-execution to avoid scoring against stale coverage.
-/// Selects the CRAP gate's status glyph/color and the `(advisory)` suffix.
-/// `✗`/red is reserved for `--enforce` runs, which actually exit 1; the
-/// default advisory mode always exits 0, so it gets `⚠`/green even when it
-/// lists offenders or a lizard failure — a red ✗ that still exits 0 tells the
-/// human the build failed when it did not.
-const fn crap_status_glyph(enforce: bool) -> (&'static str, &'static str, &'static str) {
-    if enforce { (RED, "\u{2717}", "") } else { (GREEN, "\u{26a0}", " (advisory)") }
+///
+/// Score every function's CRAP against `max_crap`, refreshing coverage if stale.
+///
+/// Split out from `cmd_crap` so `--update-baseline` can measure the same number
+/// the gate reports without the printing or the `exit()` calls — a floor recorded
+/// from a different code path is a floor that does not reproduce.
+/// Whether `target/llvm-cov/lcov.info` is usable, and why not when it is not.
+///
+/// The reasons are deliberately gate-neutral: they surface both as CRAP's own
+/// failure line and as the `coverage.min` measurement's reason, and a coverage
+/// key dropped "because CRAP skipped" reads like a bug.
+enum LcovStatus {
+    Ready(PathBuf),
+    /// cargo-llvm-cov is not installed. Not a failure — nothing can be measured.
+    Skipped(String),
+    /// The run happened and could not produce readable coverage data.
+    Fatal(String),
 }
 
-fn cmd_crap() {
-    let max_crap: f64 = arg_value("--max").and_then(|v| v.parse::<f64>().ok()).unwrap_or(30.0);
-    let enforce = arg_flag("--enforce");
-
-    if !tool_installed("llvm-cov") {
-        println!("  {DIM}\u{2298} CRAP skipped (install: cargo install cargo-llvm-cov){RESET}");
-        return;
+/// Ensure the LCOV artifact exists and is newer than the sources it scores.
+///
+/// Shared by `crap_measure` and the `coverage.min` measurement so both read one
+/// instrumented run: regenerating it twice would double the slowest step of
+/// `suppressions --update-baseline` for no new information.
+fn ensure_lcov() -> LcovStatus {
+    if !tool_installed("llvm-cov", CARGO_LLVM_COV_VERSION) {
+        return LcovStatus::Skipped(format!(
+            "cargo-llvm-cov is not installed (install: cargo install cargo-llvm-cov --version {CARGO_LLVM_COV_VERSION})"
+        ));
     }
-
     let lcov_path = root().join("target").join("llvm-cov").join("lcov.info");
-    if !lcov_path.exists() || !lcov_is_fresh(&lcov_path, &["src", "tests"]) {
-        if let Some(parent) = lcov_path.parent()
-            && let Err(e) = fs::create_dir_all(parent)
-        {
-            println!("  {RED}\u{2717}{RESET} CRAP: cannot create {}: {e}", parent.display());
-            std::process::exit(1);
-        }
-        let env = llvm_tools_env();
-        let lcov_str = lcov_path.to_string_lossy().into_owned();
-        let run_result = run(
-            "CRAP: running tests under llvm-cov",
-            &["cargo", "llvm-cov", "--no-report"],
-            Some(&RunOpts { env: env.clone(), no_exit: true, ..RunOpts::default() }),
-        );
-        let report_result = if run_result.ok {
-            run(
-                "CRAP: emit LCOV",
-                &["cargo", "llvm-cov", "report", "--lcov", "--output-path", &lcov_str],
-                Some(&RunOpts { env, no_exit: true, ..RunOpts::default() }),
-            )
-        } else {
-            run_result
-        };
-        if !report_result.ok || !lcov_path.exists() {
-            println!("  {RED}\u{2717}{RESET} CRAP: could not produce {}", lcov_path.display());
-            std::process::exit(1);
-        }
+    if lcov_path.exists() && lcov_is_fresh(&lcov_path, &["src", "tests", "harness.rs"]) {
+        return LcovStatus::Ready(lcov_path);
     }
+    if let Some(parent) = lcov_path.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        return LcovStatus::Fatal(format!("cannot create {}: {e}", parent.display()));
+    }
+    let env = llvm_tools_env();
+    let lcov_str = lcov_path.to_string_lossy().into_owned();
+    let run_result = run(
+        "CRAP: running tests under llvm-cov",
+        &["cargo", "llvm-cov", "--no-report"],
+        Some(&RunOpts { env: env.clone(), no_exit: true, ..RunOpts::default() }),
+    );
+    let report_result = if run_result.ok {
+        run(
+            "CRAP: emit LCOV",
+            &["cargo", "llvm-cov", "report", "--lcov", "--output-path", &lcov_str],
+            Some(&RunOpts { env, no_exit: true, ..RunOpts::default() }),
+        )
+    } else {
+        run_result
+    };
+    if !report_result.ok || !lcov_path.exists() {
+        return LcovStatus::Fatal(format!("could not produce {}", lcov_path.display()));
+    }
+    LcovStatus::Ready(lcov_path)
+}
 
+/// Total line coverage from the LCOV artifact, truncated to an integer.
+///
+/// Truncated, never rounded: 53.9% recorded as 54 would fail the very gate that
+/// measured it. LCOV `DA:` records are the same lines cargo-llvm-cov counts as its
+/// line coverage, so the floor written here is the number
+/// `coverage --fail-under-lines` compares against.
+fn measured_coverage_min() -> Measurement {
+    let lcov_path = match ensure_lcov() {
+        LcovStatus::Ready(path) => path,
+        LcovStatus::Skipped(reason) => return Measurement::Unavailable(reason),
+        LcovStatus::Fatal(reason) => return Measurement::Error(reason),
+    };
     let Some(cov_map) = parse_lcov(&lcov_path) else {
-        println!("  {RED}\u{2717}{RESET} CRAP: failed to read {}", lcov_path.display());
-        std::process::exit(1);
+        return Measurement::Error(format!("failed to read {}", lcov_path.display()));
+    };
+    lcov_line_coverage(&cov_map).map_or_else(
+        || Measurement::Unavailable("no line coverage data".to_string()),
+        Measurement::Value,
+    )
+}
+
+/// Percent of tracked lines that were hit, truncated toward zero.
+///
+/// `None` when nothing is tracked at all — a repo with no instrumented lines has
+/// no coverage to floor, which is different from 0% coverage.
+fn lcov_line_coverage(cov_map: &HashMap<String, HashMap<u32, u32>>) -> Option<u32> {
+    let mut tracked: u64 = 0;
+    let mut covered: u64 = 0;
+    for lines in cov_map.values() {
+        tracked += lines.len() as u64;
+        covered += lines.values().filter(|&&hits| hits > 0).count() as u64;
+    }
+    if tracked == 0 {
+        return None;
+    }
+    u32::try_from(covered * 100 / tracked).ok()
+}
+
+fn crap_measure(max_crap: f64) -> CrapOutcome {
+    let lcov_path = match ensure_lcov() {
+        LcovStatus::Ready(path) => path,
+        LcovStatus::Skipped(reason) => return CrapOutcome::Skipped(reason),
+        LcovStatus::Fatal(reason) => return CrapOutcome::Fatal(reason),
     };
 
+    let Some(cov_map) = parse_lcov(&lcov_path) else {
+        return CrapOutcome::Fatal(format!("failed to read {}", lcov_path.display()));
+    };
+
+    // `-i` high: here lizard is a measuring tape, not a gate. Left at its default
+    // it exits 1 on any function over CCN 15, and CRAP would report "lizard
+    // exited" for exactly the repos that most need scoring.
     let lz_output = Command::new("uvx")
-        .args(["lizard@1.22.2", "-l", "rust", "src", "--csv"])
+        .args(["lizard@1.22.2", "-l", "rust", "src", "--csv", "-i", &REPORT_ONLY_LIMIT.to_string()])
         .current_dir(root())
         .output();
 
     let lz_stdout = match lz_output {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
         Ok(o) => {
-            // Lizard ran but exited non-zero. Trusting partial output would
-            // print a green ✓ while leaving high-CCN functions unscored;
-            // surface the failure and degrade to advisory unless --enforce.
-            let (color, symbol, suffix) = crap_status_glyph(enforce);
-            println!("  {color}{symbol}{RESET} CRAP: lizard exited {:?}{suffix}", o.status.code());
-            if !o.stderr.is_empty() {
-                print!("{}", String::from_utf8_lossy(&o.stderr));
-            }
-            if enforce {
-                std::process::exit(o.status.code().unwrap_or(1));
-            }
-            return;
+            return CrapOutcome::ToolFailure {
+                message: format!("lizard exited {:?}", o.status.code()),
+                detail: String::from_utf8_lossy(&o.stderr).into_owned(),
+                code: o.status.code().unwrap_or(1),
+            };
         }
         Err(e) => {
-            let (color, symbol, suffix) = crap_status_glyph(enforce);
-            println!("  {color}{symbol}{RESET} CRAP: failed to run lizard: {e}{suffix}");
-            if enforce {
-                std::process::exit(1);
-            }
-            return;
+            return CrapOutcome::ToolFailure {
+                message: format!("failed to run lizard: {e}"),
+                detail: String::new(),
+                code: 1,
+            };
         }
     };
 
@@ -1377,17 +2650,93 @@ fn cmd_crap() {
             });
         }
     }
+    offenders.sort_by(|a, b| b.crap.partial_cmp(&a.crap).unwrap_or(std::cmp::Ordering::Equal));
+    CrapOutcome::Scored(offenders)
+}
+
+/// Count of functions above the default CRAP threshold, for the baseline writer.
+fn measured_crap_violations() -> Measurement {
+    match crap_measure(CRAP_MAX_DEFAULT) {
+        CrapOutcome::Skipped(reason) => Measurement::Unavailable(reason),
+        CrapOutcome::Fatal(message) | CrapOutcome::ToolFailure { message, .. } => {
+            Measurement::Error(message)
+        }
+        CrapOutcome::Scored(offenders) => {
+            Measurement::Value(u32::try_from(offenders.len()).unwrap_or(u32::MAX))
+        }
+    }
+}
+
+fn cmd_crap() {
+    let max_crap: f64 =
+        arg_value("--max").and_then(|v| v.parse::<f64>().ok()).unwrap_or(CRAP_MAX_DEFAULT);
+    let enforce = arg_flag("--enforce");
+
+    let offenders = match crap_measure(max_crap) {
+        CrapOutcome::Skipped(reason) => {
+            println!("  {DIM}\u{2298} CRAP skipped ({reason}){RESET}");
+            return;
+        }
+        CrapOutcome::Fatal(message) => {
+            println!("  {RED}\u{2717}{RESET} CRAP: {message}");
+            std::process::exit(1);
+        }
+        CrapOutcome::ToolFailure { message, detail, code } => {
+            let (color, symbol, suffix) = crap_status_glyph(enforce);
+            println!("  {color}{symbol}{RESET} CRAP: {message}{suffix}");
+            if !detail.is_empty() {
+                print!("{detail}");
+            }
+            if enforce {
+                std::process::exit(code);
+            }
+            return;
+        }
+        CrapOutcome::Scored(offenders) => offenders,
+    };
 
     if offenders.is_empty() {
         println!("  {GREEN}\u{2713}{RESET} CRAP: all functions below {max_crap:.0}");
         return;
     }
-    offenders.sort_by(|a, b| b.crap.partial_cmp(&a.crap).unwrap_or(std::cmp::Ordering::Equal));
+
+    // The baseline is a count floor: a repo adopting the harness starts wherever it
+    // already is, and that number may only come down.
+    let count = u32::try_from(offenders.len()).unwrap_or(u32::MAX);
+    let Some(floor) = baseline_floor("crap.max_violations") else {
+        // Nothing recorded is not a floor of 0; it is a repo that has never been
+        // measured. Report what is there and pass — `--enforce` included — so
+        // retrofitting the harness into a legacy tree is green on day one.
+        println!(
+            "  {GREEN}\u{26a0}{RESET} CRAP: {count} function(s) exceed \
+             {max_crap:.0} (report-only: no {BASELINE_FILE} floor)"
+        );
+        print_crap_offenders(&offenders);
+        println!("  ↳ fix: run `cargo harness suppressions --update-baseline` to record a floor");
+        return;
+    };
+    if count <= floor {
+        println!(
+            "  {GREEN}\u{2713}{RESET} CRAP: {count} function(s) exceed \
+             {max_crap:.0} (baseline {floor})"
+        );
+        return;
+    }
+
     let (color, symbol, suffix) = crap_status_glyph(enforce);
     println!(
-        "  {color}{symbol}{RESET} CRAP: {} function(s) exceed {max_crap:.0}{suffix}",
-        offenders.len()
+        "  {color}{symbol}{RESET} CRAP: {count} function(s) exceed \
+         {max_crap:.0} (baseline {floor}){suffix}"
     );
+    print_crap_offenders(&offenders);
+    if enforce {
+        std::process::exit(1);
+    }
+}
+
+/// List the worst offenders under a CRAP verdict line. Capped at 20: past that the
+/// list stops being something anyone reads and starts being a wall.
+fn print_crap_offenders(offenders: &[CrapFn]) {
     for o in offenders.iter().take(20) {
         println!(
             "    CRAP={:6.1}  CCN={:3}  cov={:5.1}%  {}",
@@ -1397,9 +2746,6 @@ fn cmd_crap() {
             o.location
         );
     }
-    if enforce {
-        std::process::exit(1);
-    }
 }
 
 /// True when `lcov_path` is at least as new as every `.rs` file under `src_dirs`.
@@ -1408,12 +2754,21 @@ fn cmd_crap() {
 /// staleness: scoring fresh complexity data against an old LCOV silently
 /// misattributes coverage. Returns false (force regeneration) on any I/O or
 /// metadata error so the safe path is to re-run, not to trust stale data.
-fn lcov_is_fresh(lcov_path: &Path, src_dirs: &[&str]) -> bool {
+fn lcov_is_fresh(lcov_path: &Path, targets: &[&str]) -> bool {
     let Ok(lcov_meta) = fs::metadata(lcov_path) else { return false };
     let Ok(lcov_mtime) = lcov_meta.modified() else { return false };
-    for dir in src_dirs {
-        let dir_path = root().join(dir);
-        let mut stack = vec![dir_path];
+    for target in targets {
+        let target_path = root().join(target);
+        // A target may be a single file (`harness.rs`): `read_dir` silently
+        // skips those, which would make every harness-only edit look fresh —
+        // and harness.rs is nearly every tracked line in this crate.
+        if target_path.is_file() {
+            if newer_than(&target_path, lcov_mtime) {
+                return false;
+            }
+            continue;
+        }
+        let mut stack = vec![target_path];
         while let Some(p) = stack.pop() {
             let Ok(entries) = fs::read_dir(&p) else { continue };
             for entry in entries.flatten() {
@@ -1423,17 +2778,20 @@ fn lcov_is_fresh(lcov_path: &Path, src_dirs: &[&str]) -> bool {
                     stack.push(path);
                     continue;
                 }
-                if path.extension().is_some_and(|e| e == "rs")
-                    && let Ok(meta) = path.metadata()
-                    && let Ok(mtime) = meta.modified()
-                    && mtime > lcov_mtime
-                {
+                if path.extension().is_some_and(|e| e == "rs") && newer_than(&path, lcov_mtime) {
                     return false;
                 }
             }
         }
     }
     true
+}
+
+/// True when `path` was modified after `mtime`. An unreadable mtime counts as
+/// "not newer": the caller's other targets still decide, and the fallback for a
+/// path we cannot stat is to keep looking rather than to force a rebuild.
+fn newer_than(path: &Path, mtime: std::time::SystemTime) -> bool {
+    path.metadata().and_then(|meta| meta.modified()).is_ok_and(|m| m > mtime)
 }
 
 /// CRAP score = CCN² × (1-cov)³ + CCN. `cov` is in [0,1].
@@ -1509,15 +2867,56 @@ fn parse_lizard_csv_row(row: &str) -> Option<(u32, String, u32, u32, String)> {
     Some((ccn, name, start, end, path))
 }
 
-/// True when `cargo <subcommand> --version` succeeds (the subcommand is installed).
-fn tool_installed(subcommand: &str) -> bool {
-    Command::new("cargo")
+/// Version reported by `cargo <subcommand> --version`, or `None` when the
+/// subcommand is not installed. `Some("")` means installed but unparseable.
+fn tool_version(subcommand: &str) -> Option<String> {
+    let out = Command::new("cargo")
         .args([subcommand, "--version"])
         .current_dir(root())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(parse_tool_version(
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    ))
+}
+
+/// Every cargo tool prints `<name> <version> [build metadata]` on its first line, so
+/// the version is the first token starting with a digit (`cargo-audit-audit 0.22.1`
+/// -> `0.22.1`); trailing build metadata is ignored. Falls back to stderr for tools
+/// that report there, and to `""` when nothing is parseable — an unrecognised format
+/// stays silent rather than warning about a version it did not read.
+fn parse_tool_version(stdout: &str, stderr: &str) -> String {
+    let text = if stdout.trim().is_empty() { stderr } else { stdout };
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| {
+            line.split_whitespace()
+                .map(|token| token.trim_start_matches('v'))
+                .find(|token| token.starts_with(|c: char| c.is_ascii_digit()))
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// True when `cargo <subcommand> --version` succeeds (the subcommand is installed).
+/// A version other than `pinned` warns and never fails: adopters run whatever they
+/// have, while CI installs the pin, so a drifting local tool stays visible but
+/// non-blocking. A missing tool keeps its existing skip/fail handling at the caller.
+fn tool_installed(subcommand: &str, pinned: &str) -> bool {
+    let Some(found) = tool_version(subcommand) else { return false };
+    if !found.is_empty() && found != pinned {
+        println!(
+            "  {GREEN}\u{26a0}{RESET} cargo-{subcommand} {found} != pinned {pinned} \
+             (install: cargo install cargo-{subcommand} --version {pinned})"
+        );
+    }
+    true
 }
 
 /// Return the value of a `--name=value` CLI argument, if present.
@@ -1620,26 +3019,20 @@ fn cmd_check() {
             Some(&RunOpts { no_exit: true, ..RunOpts::default() }),
         ),
         run("Format", &["cargo", "fmt"], Some(&RunOpts { no_exit: true, ..RunOpts::default() })),
-        run(
-            // `[[test]]` targets (Cargo.toml) always run under plain `cargo
-            // test`, including the `acceptance` binary (harness = false,
-            // tests/acceptance.rs) — so this one line already exercises the
-            // Gherkin/cucumber scenarios too. No separate acceptance gate
-            // here: see the `ci` minus `check` invariant documented in
-            // CLAUDE.md.
-            "Tests (incl. acceptance)",
-            &["cargo", "test"],
-            Some(&RunOpts {
-                extract: Some(extract_test_summary),
-                no_exit: true,
-                ..RunOpts::default()
-            }),
-        ),
-        check_agents_md_drift(true),
     ];
+    // Tests are scoped to the changed modules (`--all` for the whole suite).
+    // `[[test]]` targets (Cargo.toml) run under plain `cargo test`, including
+    // the `acceptance` binary (harness = false, tests/acceptance.rs) — so a
+    // changed `.feature` (or `harness.rs`) still exercises the Gherkin
+    // scenarios here, and `--all` always does. No separate acceptance gate:
+    // see the `ci` minus `check` invariant documented in CLAUDE.md.
+    results.extend(run_scoped_tests(false, true));
+    results.push(check_agents_md_drift(true));
 
     let complexity_failed = run_gates_parallel_detailed(&[complexity_gate()]);
     results.push(RunResult { ok: complexity_failed.is_empty(), output: String::new() });
+    let duplication_ok = print_gate_result(&duplication_result(), true);
+    results.push(RunResult { ok: duplication_ok, output: String::new() });
 
     check_stop_hooks_present();
     check_arch_config_guard(true, false, false);
@@ -1681,7 +3074,8 @@ fn cmd_pre_commit() {
     cmd_fix();
     restage_fixed_files(&files);
     check_agents_md_drift(false);
-    cmd_test();
+    // Staged files only: the tests that map to what is about to be committed.
+    run_scoped_tests(true, false);
 }
 
 /// Paths from `files` that still exist under `base` — the cheap, testable
@@ -1721,13 +3115,19 @@ fn cmd_ci() {
     // acceptance, and arch all invoke cargo, which takes an exclusive lock on
     // target/ per invocation, so they run sequentially below instead of
     // queuing behind each other under the illusion of concurrency — see
-    // run_gates_sequential.
+    // run_gates_sequential, and `arch_check` right after it.
     let parallel_ok = run_gates_parallel(&[format_check_gate(), complexity_gate()]);
+    // Not in that batch: lizard exits 0 whatever it finds here, so this gate's
+    // verdict is a count comparison the runner makes — see duplication_gate_result.
+    let duplication_ok = print_gate_result(&duplication_result(), true);
 
     let mut cargo_gates = vec![lint_gate()];
     cargo_gates.extend(acceptance_gates_or_warn());
-    cargo_gates.extend(arch_gates_or_warn());
     let cargo_ok = run_gates_sequential(&cargo_gates);
+    // Arch runs after the batch, not inside it: it is two cargo-modules passes
+    // summed into one count and compared to a floor, which no single-command
+    // Gate can express. It still takes cargo's build lock, so it stays here.
+    let arch_ok = arch_check(true);
 
     // Bind each result before combining: every step must run (no &&-short-circuit)
     // so one pass surfaces every failure. Audit is install-aware and strict in ci.
@@ -1738,18 +3138,26 @@ fn cmd_ci() {
     // Only run it when llvm-cov is absent, so ci still exercises the suite
     // either way (cmd_coverage's own run already surfaces test failures —
     // see its `run()` calls, which are not `no_exit`).
-    let tests_ok = if tool_installed("llvm-cov") {
+    // `tool_version` rather than `tool_installed`: this is a routing decision, and
+    // cmd_coverage/cmd_crap below already report a version drift for llvm-cov.
+    let tests_ok = if tool_version("llvm-cov").is_some() {
         true
     } else {
         run("Tests", &["cargo", "test"], Some(&RunOpts { no_exit: true, ..RunOpts::default() })).ok
     };
     cmd_coverage();
     cmd_crap();
+    // Advisory always, and scoped to the changed sources: mutation is the slowest
+    // signal here, so `enforce: false` keeps it out of the exit-code chain below.
+    // Argv is not consulted for `--enforce`/`--all` on purpose — `ci` decides.
+    run_mutation(false, false);
     let arch_config_ok = check_arch_config_guard(false, false, false);
     let gherkin_ok = check_gherkin_guard(false, false, false);
     let suppressions_ok = check_suppressions_baseline(true);
     if !parallel_ok
+        || !duplication_ok
         || !cargo_ok
+        || !arch_ok
         || !audit_ok
         || !tests_ok
         || !arch_config_ok
@@ -1769,7 +3177,8 @@ fn cmd_ci() {
 ///
 /// Format check is the only gate here that doesn't shell out to cargo, so it
 /// runs on its own; clippy, acceptance, and arch all take cargo's exclusive
-/// target/ lock and run sequentially instead — see `run_gates_sequential`.
+/// target/ lock and run one at a time instead — see `run_gates_sequential`, and
+/// `arch_check`, which runs right after it for the reason noted there.
 fn cmd_pre_push() {
     println!("\n{BLUE}[pre-push]{RESET}\n");
     let arch_config_ok = check_arch_config_guard(false, false, true);
@@ -1778,10 +3187,10 @@ fn cmd_pre_push() {
 
     let mut cargo_gates = vec![lint_gate()];
     cargo_gates.extend(acceptance_gates_or_warn());
-    cargo_gates.extend(arch_gates_or_warn());
     let cargo_ok = run_gates_sequential(&cargo_gates);
+    let arch_ok = arch_check(true);
 
-    if !format_ok || !cargo_ok || !arch_config_ok || !gherkin_ok {
+    if !format_ok || !cargo_ok || !arch_ok || !arch_config_ok || !gherkin_ok {
         std::process::exit(1);
     }
 }
@@ -2033,6 +3442,78 @@ mod tests {
     }
 
     #[test]
+    fn count_duplicate_blocks_counts_block_headers() {
+        let report = "Duplicates\n\
+                      ===================================\n\
+                      Duplicate block:\n\
+                      --------------------------\n\
+                      src/a.rs:10 ~ 42\n\
+                      src/b.rs:60 ~ 92\n\
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\
+                      \n\
+                      Duplicate block:\n\
+                      --------------------------\n\
+                      src/c.rs:1 ~ 30\n\
+                      src/d.rs:5 ~ 34\n\
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\
+                      \n\
+                      Total duplicate rate: 2.64%\n";
+        assert_eq!(count_duplicate_blocks(report), 2);
+    }
+
+    #[test]
+    fn count_duplicate_blocks_is_zero_on_a_clean_report() {
+        let report = "Duplicates\n\
+                      ===================================\n\
+                      Total duplicate rate: 0.00%\n\
+                      Total unique rate: 100.00%\n";
+        assert_eq!(count_duplicate_blocks(report), 0);
+    }
+
+    #[test]
+    fn duplication_scans_the_complexity_target_set() {
+        // The floor only reproduces while both lizard runs read the same files,
+        // so both argvs must start with the shared target set and add only flags.
+        let targets = lizard_argv(&[]);
+        assert!(complexity_argv(0).starts_with(&targets), "complexity moved off lizard_argv");
+        assert!(duplication_argv().starts_with(&targets), "duplication moved off lizard_argv");
+        assert!(duplication_argv().contains(&"-Eduplicate".to_string()));
+    }
+
+    #[test]
+    fn duplication_gate_is_report_only_without_a_floor() {
+        // Report-only never fails, and says why on the passing line.
+        let result = duplication_gate_result(Ok((7, String::new())), None);
+        assert!(result.ok);
+        assert!(result.report_only);
+        assert!(result.description.contains("report-only"), "{}", result.description);
+    }
+
+    #[test]
+    fn duplication_gate_passes_at_the_floor() {
+        let result = duplication_gate_result(Ok((3, String::new())), Some(3));
+        assert!(result.ok);
+        assert!(!result.report_only);
+        assert_eq!(result.description, "Duplication (lizard, baseline 3)");
+    }
+
+    #[test]
+    fn duplication_gate_fails_over_the_floor() {
+        let result = duplication_gate_result(Ok((4, "report".to_string())), Some(3));
+        assert!(!result.ok);
+        assert_eq!(result.exit_code, 1);
+        assert!(result.output.contains("4 > baseline 3"), "{}", result.output);
+        assert!(result.hint.is_some());
+    }
+
+    #[test]
+    fn duplication_gate_fails_when_lizard_fails() {
+        let result = duplication_gate_result(Err("lizard failed to run".to_string()), Some(0));
+        assert!(!result.ok);
+        assert_eq!(result.output, "lizard failed to run");
+    }
+
+    #[test]
     fn parse_lizard_csv_row_extracts_location_field() {
         let row =
             r#"7,16,45,2,20,"risky@12-31@src/lib.rs",src/lib.rs,risky,"fn risky(a, b)",12,31"#;
@@ -2048,6 +3529,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_tool_version_takes_first_numeric_token_of_first_line() {
+        assert_eq!(parse_tool_version("cargo-audit-audit 0.22.1\n", ""), "0.22.1");
+        assert_eq!(parse_tool_version("cargo-modules 0.26.0\n", ""), "0.26.0");
+        assert_eq!(parse_tool_version("cargo-mutants 27.0.0\nextra\n", ""), "27.0.0");
+    }
+
+    #[test]
+    fn parse_tool_version_ignores_build_metadata_and_v_prefix() {
+        assert_eq!(parse_tool_version("cargo-foo v1.2.3 (abc1234 2026-01-01)\n", ""), "1.2.3");
+    }
+
+    #[test]
+    fn parse_tool_version_empty_when_no_numeric_token() {
+        assert_eq!(parse_tool_version("cargo-foo unknown\n", ""), "");
+    }
+
+    #[test]
+    fn parse_tool_version_falls_back_to_stderr() {
+        assert_eq!(parse_tool_version("  \n", "cargo-llvm-cov 0.8.7\n"), "0.8.7");
+    }
+
+    #[test]
+    fn parse_tool_version_empty_when_unparseable() {
+        assert_eq!(parse_tool_version("", ""), "");
+    }
+
+    #[test]
     fn parse_baseline_str_reads_key_values() {
         let parsed = parse_baseline_str(
             "\n# comment\nsuppressions.allow 2\ncoverage.min 50\nmalformed\nbad nope\n",
@@ -2055,6 +3563,316 @@ mod tests {
         assert_eq!(parsed.get("suppressions.allow"), Some(&2));
         assert_eq!(parsed.get("coverage.min"), Some(&50));
         assert!(!parsed.contains_key("bad"));
+    }
+
+    // ── Ratcheted baseline merge ─────────────────────────────────────────
+
+    fn baseline_of(pairs: &[(&str, u32)]) -> BaselineMap {
+        pairs.iter().map(|(key, value)| ((*key).to_string(), *value)).collect()
+    }
+
+    #[test]
+    fn merge_baseline_preserves_unknown_keys() {
+        let existing = baseline_of(&[("coverage.min", 80), ("mutation.min", 42)]);
+        let (merged, dropped) = merge_baseline(
+            &existing,
+            &baseline_of(&[("suppressions.allow", 3)]),
+            &[("complexity.max_violations", Measurement::Value(7))],
+        )
+        .expect("measurable");
+        assert_eq!(merged.get("coverage.min"), Some(&80));
+        assert_eq!(merged.get("mutation.min"), Some(&42));
+        assert_eq!(merged.get("complexity.max_violations"), Some(&7));
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn merge_baseline_records_ratcheted_to_zero_kinds_as_zero() {
+        // `allow_crate` was 3 and is now gone from the scan: it must be recorded
+        // as 0, not carried forward as a stale tolerance.
+        let existing = baseline_of(&[("suppressions.allow", 5), ("suppressions.allow_crate", 3)]);
+        let (merged, _) =
+            merge_baseline(&existing, &baseline_of(&[("suppressions.allow", 2)]), &[])
+                .expect("measurable");
+        assert_eq!(merged.get("suppressions.allow"), Some(&2));
+        assert_eq!(merged.get("suppressions.allow_crate"), Some(&0));
+    }
+
+    #[test]
+    fn merge_baseline_drops_unavailable_keys() {
+        let existing = baseline_of(&[("crap.max_violations", 4)]);
+        let (merged, dropped) = merge_baseline(
+            &existing,
+            &BaselineMap::new(),
+            &[("crap.max_violations", Measurement::Unavailable("no coverage tool".to_string()))],
+        )
+        .expect("measurable");
+        assert!(!merged.contains_key("crap.max_violations"));
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].contains("crap.max_violations"), "{dropped:?}");
+        assert!(dropped[0].contains("no coverage tool"), "{dropped:?}");
+    }
+
+    #[test]
+    fn merge_baseline_is_all_or_nothing_on_a_measurement_error() {
+        let existing = baseline_of(&[("coverage.min", 80)]);
+        let broken = merge_baseline(
+            &existing,
+            &baseline_of(&[("suppressions.allow", 9)]),
+            &[
+                ("complexity.max_violations", Measurement::Value(1)),
+                ("crap.max_violations", Measurement::Error("lizard exited 2".to_string())),
+            ],
+        )
+        .expect_err("a measurement error must abort the merge");
+        assert_eq!(broken.len(), 1);
+        assert_eq!(broken[0].0, "crap.max_violations");
+        assert!(broken[0].1.contains("lizard exited 2"));
+    }
+
+    #[test]
+    fn serialize_baseline_writes_sorted_key_value_lines() {
+        let text = serialize_baseline(&baseline_of(&[("coverage.min", 80), ("arch.max", 1)]));
+        assert_eq!(text, "arch.max 1\ncoverage.min 80\n");
+    }
+
+    // ── Arch violation count ─────────────────────────────────────────────
+
+    const ORPHANS_HEADER: &str = "\n2 orphans found:\n\nwarning: orphaned module `a` at src/a.rs\n";
+
+    #[test]
+    fn arch_counts_orphans_from_the_header_line() {
+        assert_eq!(parse_orphan_count(ORPHANS_HEADER), Some(2));
+    }
+
+    #[test]
+    fn arch_counts_zero_orphans_from_the_empty_line() {
+        // The phrase is contiguous between cargo-modules' ANSI escapes.
+        assert_eq!(parse_orphan_count("\n\u{1b}[1mNo orphans found.\u{1b}[0m\n"), Some(0));
+    }
+
+    #[test]
+    fn arch_count_is_orphans_plus_one_per_cycle_condition() {
+        // Clean tree.
+        assert_eq!(arch_violation_count(true, 0), 0);
+        // A cycle counts once: cargo-modules never says how many there are.
+        assert_eq!(arch_violation_count(false, 0), 1);
+        // Both conditions share the one budget.
+        assert_eq!(arch_violation_count(true, 2), 2);
+        assert_eq!(arch_violation_count(false, 2), 3);
+    }
+
+    #[test]
+    fn arch_analysis_is_recognised_by_the_count_line_alone() {
+        // `analyzed` in `arch_scan` is exactly this predicate: cargo-modules
+        // always states a count when it read the crate, so its absence means
+        // the tool failed and the fallback count must not become a floor.
+        assert!(parse_orphan_count(ORPHANS_HEADER).is_some());
+        assert!(parse_orphan_count("No orphans found.").is_some());
+        assert!(parse_orphan_count("Error: No library target found.").is_none());
+    }
+
+    #[test]
+    fn arch_gate_without_a_floor_is_report_only() {
+        let label = arch_description(None, 4);
+        assert!(label.contains("report-only: no .harness-baseline floor"), "{label}");
+    }
+
+    #[test]
+    fn arch_gate_names_the_floor_it_exceeded() {
+        assert_eq!(arch_description(Some(0), 0), "Arch (cargo-modules)");
+        assert_eq!(arch_description(Some(3), 2), "Arch (cargo-modules, baseline 3)");
+        assert_eq!(
+            arch_description(Some(1), 4),
+            "Arch (cargo-modules): 4 violations exceed baseline 1"
+        );
+    }
+
+    #[test]
+    fn ratcheted_keys_are_unique() {
+        let mut keys: Vec<&str> = RATCHETED_KEYS.iter().map(|(key, _)| *key).collect();
+        keys.sort_unstable();
+        let count = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), count, "duplicate key in RATCHETED_KEYS");
+    }
+
+    #[test]
+    fn ratcheted_keys_add_mutation_only_when_asked() {
+        let automatic: Vec<&str> = ratcheted_keys(false).iter().map(|(key, _)| *key).collect();
+        let with_mutation: Vec<&str> = ratcheted_keys(true).iter().map(|(key, _)| *key).collect();
+        assert!(!automatic.contains(&"mutation.min"), "{automatic:?}");
+        assert_eq!(with_mutation.last(), Some(&"mutation.min"), "{with_mutation:?}");
+        assert_eq!(with_mutation.len(), automatic.len() + 1);
+    }
+
+    // ── Mutation score ───────────────────────────────────────────────────
+
+    /// A cut-down `outcomes.json`: an `outcomes` array whose entries repeat the
+    /// summary field names, then the top-level totals that actually count.
+    fn outcomes_json(caught: u32, timeout: u32, missed: u32) -> String {
+        format!(
+            r#"{{
+  "outcomes": [
+    {{"scenario": "Baseline", "summary": "Success", "caught": 999, "missed": 999}},
+    {{"scenario": {{"Mutant": {{"name": "src/lib.rs:1:1: replace f with ()"}}}},
+     "summary": "MissedMutant", "timeout": 999}}
+  ],
+  "total_mutants": 12,
+  "missed": {missed},
+  "caught": {caught},
+  "timeout": {timeout},
+  "unviable": 4,
+  "cargo_mutants_version": "27.0.0"
+}}
+"#
+        )
+    }
+
+    #[test]
+    fn json_top_level_u32_ignores_nested_fields() {
+        // The nested 999s come first in the text; only the top-level totals count.
+        let text = outcomes_json(3, 0, 1);
+        assert_eq!(json_top_level_u32(&text, "caught"), Some(3));
+        assert_eq!(json_top_level_u32(&text, "missed"), Some(1));
+        assert_eq!(json_top_level_u32(&text, "timeout"), Some(0));
+        assert_eq!(json_top_level_u32(&text, "absent"), None);
+    }
+
+    #[test]
+    fn json_top_level_u32_skips_escaped_quotes_in_strings() {
+        let text = r#"{"name": "a \" }} brace", "caught": 7}"#;
+        assert_eq!(json_top_level_u32(text, "caught"), Some(7));
+    }
+
+    #[test]
+    fn json_top_level_u32_rejects_non_integer_values() {
+        assert_eq!(json_top_level_u32(r#"{"caught": null}"#, "caught"), None);
+        assert_eq!(json_top_level_u32(r#"{"caught": "3"}"#, "caught"), None);
+    }
+
+    #[test]
+    fn mutation_score_counts_timeouts_as_killed() {
+        // (2 + 1) killed of (2 + 1 + 1) run = 75%. `unviable` is excluded.
+        assert_eq!(mutation_score(&outcomes_json(2, 1, 1)), Measurement::Value(75));
+    }
+
+    #[test]
+    fn mutation_score_rounds_to_the_nearest_percent() {
+        // 2/3 = 66.66… → 67.
+        assert_eq!(mutation_score(&outcomes_json(2, 0, 1)), Measurement::Value(67));
+    }
+
+    #[test]
+    fn mutation_score_without_mutants_is_unavailable() {
+        // A tests-only diff generates nothing to kill: no evidence, not 0%.
+        let Measurement::Unavailable(reason) = mutation_score(&outcomes_json(0, 0, 0)) else {
+            panic!("an empty run must be unavailable, not a score");
+        };
+        assert!(reason.contains("no mutants"), "{reason}");
+    }
+
+    #[test]
+    fn mutation_score_missing_field_is_an_error_not_a_zero() {
+        let Measurement::Error(message) = mutation_score(r#"{"caught": 3, "missed": 1}"#) else {
+            panic!("a layout change must abort, not score");
+        };
+        assert!(message.contains("caught/timeout/missed"), "{message}");
+    }
+
+    #[test]
+    fn mutation_measurement_zero_totals_after_a_failed_run_is_an_error() {
+        // cargo-mutants exits 4 when the unmutated tree's own tests fail, and
+        // still writes zero totals. Scoring that `Unavailable` would make
+        // `--update-baseline --with-mutation` delete the floor instead of abort.
+        let run = MutationRun { outcomes_json: outcomes_json(0, 0, 0), completed: false };
+        let Measurement::Error(message) = mutation_measurement(&run) else {
+            panic!("a run that tested no mutant and exited non-zero must be an error");
+        };
+        assert!(message.contains("unmutated tree"), "{message}");
+    }
+
+    #[test]
+    fn mutation_measurement_zero_totals_after_a_clean_run_is_unavailable() {
+        let run = MutationRun { outcomes_json: outcomes_json(0, 0, 0), completed: true };
+        assert!(matches!(mutation_measurement(&run), Measurement::Unavailable(_)));
+    }
+
+    #[test]
+    fn mutation_measurement_keeps_a_score_from_a_non_zero_exit() {
+        // Exit 2 ("some mutants were missed") is the normal reporting path, not
+        // a broken run: the totals are real and must still be scored.
+        let run = MutationRun { outcomes_json: outcomes_json(3, 0, 1), completed: false };
+        assert_eq!(mutation_measurement(&run), Measurement::Value(75));
+    }
+
+    #[test]
+    fn kill_percent_rounds_halves_up() {
+        assert_eq!(kill_percent(1, 8), 13); // 12.5 → 13
+        assert_eq!(kill_percent(1, 3), 33); // 33.3 → 33
+        assert_eq!(kill_percent(0, 5), 0);
+        assert_eq!(kill_percent(5, 5), 100);
+    }
+
+    // ── Coverage floor ───────────────────────────────────────────────────
+
+    #[test]
+    fn lcov_line_coverage_truncates_never_rounds() {
+        // 2 of 3 lines hit is 66.6%: recorded as 66, because a floor of 67 would
+        // fail the very gate that measured it.
+        let map =
+            HashMap::from([("src/a.rs".to_string(), HashMap::from([(1, 1), (2, 4), (3, 0)]))]);
+        assert_eq!(lcov_line_coverage(&map), Some(66));
+    }
+
+    #[test]
+    fn lcov_line_coverage_without_tracked_lines_is_none() {
+        assert_eq!(lcov_line_coverage(&HashMap::new()), None);
+    }
+
+    // ── Complexity floor ─────────────────────────────────────────────────
+
+    #[test]
+    fn lizard_warning_count_reads_the_summary_row() {
+        let stdout = "Total nloc   Avg.NLOC  AvgCCN  Avg.token   Fun Cnt  Warning cnt   Fun Rt   nloc Rt\n                      ---------------------------------------------------------------\n\
+                      133       5.9     1.2       47.8       14            3      0.00    0.00\n";
+        assert_eq!(lizard_warning_count(stdout), Some(3));
+    }
+
+    #[test]
+    fn lizard_warning_count_without_a_summary_row_is_none() {
+        assert_eq!(lizard_warning_count("nothing to see here\n"), None);
+    }
+
+    #[test]
+    fn complexity_gate_without_a_floor_is_report_only() {
+        let gate = complexity_gate_for(None);
+        assert!(gate.description.contains("report-only"), "{}", gate.description);
+        assert!(gate.cmd.iter().any(|a| a == &REPORT_ONLY_LIMIT.to_string()));
+    }
+
+    #[test]
+    fn complexity_gate_passes_the_floor_to_lizard() {
+        let gate = complexity_gate_for(Some(4));
+        assert!(gate.description.contains("baseline 4"), "{}", gate.description);
+        let i_index = gate.cmd.iter().position(|a| a == "-i").expect("-i flag");
+        assert_eq!(gate.cmd[i_index + 1], "4");
+    }
+
+    #[test]
+    fn complexity_gate_at_zero_keeps_the_plain_label() {
+        let gate = complexity_gate_for(Some(0));
+        assert_eq!(gate.description, "Complexity (lizard)");
+    }
+
+    #[test]
+    fn complexity_argv_is_identical_apart_from_the_tolerance() {
+        let floor = complexity_argv(3);
+        let report_only = complexity_argv(REPORT_ONLY_LIMIT);
+        assert_eq!(floor.len(), report_only.len());
+        let differing: Vec<usize> =
+            (0..floor.len()).filter(|&i| floor[i] != report_only[i]).collect();
+        assert_eq!(differing.len(), 1, "only `-i N` may differ: {floor:?} vs {report_only:?}");
     }
 
     #[test]
@@ -2381,6 +4199,141 @@ mod tests {
     #[test]
     fn crap_status_glyph_enforce_uses_red_cross_glyph() {
         assert_eq!(crap_status_glyph(true), (RED, "\u{2717}", ""));
+    }
+
+    // ── Test scoping ─────────────────────────────────────────────────────
+
+    fn targets(path: &str, has_tests: bool) -> Vec<TestTarget> {
+        test_targets_for(path, || has_tests)
+    }
+
+    fn cargo_test(args: &[&str]) -> Vec<String> {
+        let mut cmd = vec!["cargo".to_string(), "test".to_string()];
+        cmd.extend(args.iter().map(|a| (*a).to_string()));
+        cmd
+    }
+
+    #[test]
+    fn lib_root_maps_to_the_whole_lib_target() {
+        assert_eq!(targets("src/lib.rs", false), vec![TestTarget::Lib]);
+    }
+
+    #[test]
+    fn nested_module_maps_to_a_libtest_filter() {
+        assert_eq!(
+            targets("src/foo/bar.rs", true),
+            vec![TestTarget::LibFilter("foo::bar".to_string())]
+        );
+    }
+
+    #[test]
+    fn mod_rs_maps_to_its_parent_module() {
+        assert_eq!(targets("src/foo/mod.rs", true), vec![TestTarget::LibFilter("foo".to_string())]);
+    }
+
+    #[test]
+    fn module_without_unit_tests_maps_to_nothing() {
+        assert!(targets("src/foo/bar.rs", false).is_empty());
+    }
+
+    #[test]
+    fn bin_sources_map_to_the_bin_targets_not_a_lib_filter() {
+        assert_eq!(targets("src/main.rs", true), vec![TestTarget::Bins]);
+        assert_eq!(targets("src/bin/extra.rs", true), vec![TestTarget::Bins]);
+    }
+
+    #[test]
+    fn integration_test_maps_to_its_own_target() {
+        assert_eq!(
+            targets("tests/smoke.rs", false),
+            vec![TestTarget::Integration("smoke".to_string())]
+        );
+    }
+
+    #[test]
+    fn nested_test_helper_maps_to_nothing() {
+        assert!(targets("tests/common/mod.rs", true).is_empty());
+    }
+
+    #[test]
+    fn feature_file_maps_to_the_cucumber_target() {
+        assert_eq!(
+            targets("tests/features/smoke.feature", false),
+            vec![TestTarget::Integration("acceptance".to_string())]
+        );
+    }
+
+    #[test]
+    fn runner_maps_to_the_bins_and_the_cucumber_target() {
+        assert_eq!(
+            targets("harness.rs", true),
+            vec![TestTarget::Bins, TestTarget::Integration("acceptance".to_string())]
+        );
+    }
+
+    #[test]
+    fn unrelated_path_maps_to_nothing() {
+        assert!(targets("build.rs", true).is_empty());
+        assert!(targets("Cargo.toml", true).is_empty());
+    }
+
+    #[test]
+    fn filters_run_under_lib_and_are_ord_stable() {
+        let targets: BTreeSet<TestTarget> = [
+            TestTarget::LibFilter("foo::bar".to_string()),
+            TestTarget::LibFilter("baz".to_string()),
+        ]
+        .into();
+        assert_eq!(
+            scoped_test_commands(&targets, true),
+            vec![cargo_test(&["--lib", "--", "baz", "foo::bar"])]
+        );
+    }
+
+    #[test]
+    fn filters_run_under_bins_when_the_crate_has_no_lib() {
+        let targets: BTreeSet<TestTarget> = [TestTarget::LibFilter("foo".to_string())].into();
+        assert_eq!(
+            scoped_test_commands(&targets, false),
+            vec![cargo_test(&["--bins", "--", "foo"])]
+        );
+    }
+
+    #[test]
+    fn whole_lib_subsumes_filters() {
+        let targets: BTreeSet<TestTarget> =
+            [TestTarget::Lib, TestTarget::LibFilter("foo".to_string())].into();
+        assert_eq!(scoped_test_commands(&targets, true), vec![cargo_test(&["--lib"])]);
+    }
+
+    #[test]
+    fn whole_bins_subsumes_filters_without_a_lib() {
+        let targets: BTreeSet<TestTarget> =
+            [TestTarget::Bins, TestTarget::LibFilter("foo".to_string())].into();
+        assert_eq!(scoped_test_commands(&targets, false), vec![cargo_test(&["--bins"])]);
+    }
+
+    #[test]
+    fn integration_targets_get_their_own_invocations() {
+        let targets: BTreeSet<TestTarget> = [
+            TestTarget::Bins,
+            TestTarget::Integration("acceptance".to_string()),
+            TestTarget::Integration("smoke".to_string()),
+        ]
+        .into();
+        assert_eq!(
+            scoped_test_commands(&targets, true),
+            vec![
+                cargo_test(&["--bins"]),
+                cargo_test(&["--test", "acceptance"]),
+                cargo_test(&["--test", "smoke"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_targets_means_no_invocations() {
+        assert!(scoped_test_commands(&BTreeSet::new(), true).is_empty());
     }
 }
 

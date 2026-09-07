@@ -15,6 +15,8 @@ Count-ratcheted gates (complexity, CRAP, coverage, dead code, suppressions) stay
 whole-tree on purpose: scoping them would make their counts meaningless. Each
 reads its floor from `.harness-baseline`; with no floor recorded they report
 instead of blocking, so retrofitting into an existing repo is green on day one.
+`mutation` is the one ratcheted gate that *is* scoped — one whole-tree run costs
+minutes — so it reports rather than blocks unless asked to `--enforce`.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import difflib
+import functools
 import json
 import os
 import re
@@ -29,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -45,9 +49,17 @@ TEST_DIR = "tests"
 # (`python <TEST_COMMAND>`) and to coverage (`coverage run <TEST_COMMAND>`) alike,
 # so both stay one edit apart. Defaults to stdlib unittest so a repo with no test
 # dependencies still runs. A pytest repo edits this one line and nothing else, to
-# the tuple ("-m", "pytest", "-q").
+# the tuple ("-m", "pytest", "-q") — with no test target, because the scoped run
+# in `check`/`pre-commit` appends the changed test files to it.
 TEST_COMMAND = ("-m", "unittest", "discover", "-s", TEST_DIR, "-q")
 LIZARD = "lizard"
+MUTMUT = "mutmut"
+# mutmut's working copy of the project, rewritten on every run: gitignored, and
+# removed by `clean`.
+MUTATION_DIR = "mutants"
+MUTATION_STATS_FILE = "mutmut-cicd-stats.json"
+# The whole sentence mutmut asserts with when a mutant filter selects nothing.
+MUTMUT_EMPTY_FILTER = "Filtered for specific mutants, but nothing matches"
 VULTURE = "vulture"
 VULTURE_MIN_CONFIDENCE = "60"
 VULTURE_ALLOWLIST = "vulture_allowlist.py"
@@ -101,6 +113,9 @@ RESET = "\033[0m"
 VERBOSE = "--verbose" in sys.argv
 ALL_FILES = "--all" in sys.argv
 WHOLE_FILE = "--whole-file" in sys.argv
+# A whole-tree mutation run costs minutes, so `suppressions --update-baseline`
+# measures `mutation.min` only when asked to; otherwise it carries the key through.
+WITH_MUTATION = "--with-mutation" in sys.argv
 BASE_OVERRIDE = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--base=")), None)
 
 # Ruff codes a line-scoped filter would hide, because the change that causes them
@@ -136,14 +151,42 @@ def _tool(name: str, *, read_only: bool = False) -> list[str]:
        `uv sync` cannot install dev dependencies at all, so tier 1 would fail
        forever. `uvx` resolves a distribution name, so tools whose console script
        differs from their distribution (see TOOL_DISTRIBUTIONS) get `--from`.
+       When `uv.lock` records the distribution, `--from <dist>==<version>` pins
+       the fallback to the release `uv run` would have used, so the gate reports
+       the same findings whether or not the venv happens to be synced. No lock,
+       or no entry for the tool, means unpinned — never a failure.
     """
     local = Path(".venv", "bin", name)
     if not local.exists():
-        distribution = TOOL_DISTRIBUTIONS.get(name)
-        return ["uvx", *(["--from", distribution] if distribution else []), name]
+        distribution = TOOL_DISTRIBUTIONS.get(name, name)
+        version = _lock_versions().get(distribution)
+        spec = f"{distribution}=={version}" if version else distribution
+        pin = ["--from", spec] if version or distribution != name else []
+        return ["uvx", *pin, name]
     if Path("pyproject.toml").exists():
         return ["uv", "run", *(["--no-sync"] if read_only else []), name]
     return [str(local)]
+
+
+def _lock_versions() -> dict[str, str]:
+    """`{distribution: version}` from `uv.lock`, or `{}` when it is absent or unreadable.
+
+    The lock holds exact versions where `pyproject.toml` holds ranges, so it is the
+    only place the uvx fallback can learn what `uv run` would have run. Any failure
+    to read it — no file, bad TOML, no `package` table — yields `{}`: the pin is a
+    fidelity gain, never a reason for the runner to stop starting.
+    """
+    return _read_lock_versions(Path("uv.lock").resolve())
+
+
+@functools.cache
+def _read_lock_versions(lock: Path) -> dict[str, str]:
+    """Parse one lock file once per run; keyed on the path so a cwd change re-reads."""
+    try:
+        packages = tomllib.loads(lock.read_text(encoding="utf-8"))["package"]
+        return {package["name"]: package["version"] for package in packages}
+    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError):
+        return {}
 
 
 def _python(*, read_only: bool = False) -> list[str]:
@@ -601,6 +644,33 @@ def _measured_complexity_violations() -> Measurement:
     return Measurement(value=count)
 
 
+def _duplicate_block_count(stdout: str) -> int:
+    """Count the `Duplicate block:` headers in lizard's `-Eduplicate` report."""
+    return sum(1 for line in stdout.splitlines() if line == "Duplicate block:")
+
+
+def _run_duplication() -> tuple[Measurement, str]:
+    """Run lizard's duplicate finder once; the block count and the report it printed.
+
+    Overlapping near-duplicates are reported as separate blocks, so the count can
+    move by one on a trivial edit — fine for a ratchet, which only asks that the
+    number never grow. Stable across repeated runs on an unchanged tree.
+    """
+    if not _app_targets(include_tests=True):
+        return Measurement(unavailable="no app sources"), ""
+    res = subprocess.run(_duplication_argv(), capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+        return Measurement(error=f"lizard failed to run (exit {res.returncode})"), (
+            res.stdout + res.stderr
+        )
+    return Measurement(value=_duplicate_block_count(res.stdout)), res.stdout
+
+
+def _measured_duplicate_blocks() -> Measurement:
+    """Count of duplicate blocks lizard reports over the complexity gate's targets."""
+    return _run_duplication()[0]
+
+
 def _measured_crap_violations() -> Measurement:
     """Count of functions above the default CRAP threshold."""
     if not _has_tests():
@@ -637,11 +707,205 @@ def _measured_deadcode_findings() -> Measurement:
     return _run_deadcode()[0]
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_ARCH_CHAIN_RE = re.compile(r"^-\s")
+
+
+def _broken_contracts_section(lines: list[str]) -> list[str]:
+    """The lines import-linter printed under its `Broken contracts` banner.
+
+    Blank lines and the `----` underlines are dropped so the section reads as the
+    failure detail; the `- importer -> imported (l.N)` chain lines are kept verbatim.
+    Matched on the stripped line, because the banner is a centred heading and a
+    trailing space in it would otherwise hide every violation under it.
+    """
+    banner = next((i for i, line in enumerate(lines) if line.strip() == "Broken contracts"), None)
+    if banner is None:
+        return []
+    body = lines[banner + 1 :]
+    return [line for line in body if line.strip() and set(line.strip()) != {"-"}]
+
+
+def _import_linter_broken_count(output: str) -> int:
+    """Number of illegal import chains import-linter reported.
+
+    import-linter 2.x has no machine-readable output, so this counts the lines
+    matching `^-\\s` after the `Broken contracts` banner: every renderer (layers,
+    independence, forbidden, exhaustive) prints exactly one such line per illegal
+    chain and indents continuations by two spaces. Two imports of the same module
+    are one chain (`(l.1, l.2)`), so the count is module pairs, not statements.
+    """
+    lines = [_ANSI_RE.sub("", line) for line in output.splitlines()]
+    return sum(1 for line in _broken_contracts_section(lines) if _ARCH_CHAIN_RE.match(line))
+
+
+def _run_arch() -> tuple[Measurement, list[str]]:
+    """Run import-linter once, returning its violation count and the broken section.
+
+    The exit code is deliberately ignored: import-linter exits 1 both for broken
+    contracts (a number, ratcheted) and for a bad config (a tool failure). What
+    separates them is the `Contracts: N kept, M broken.` summary, printed only when
+    the analysis ran; without it the run is an error, never a zero.
+    """
+    if not Path(".importlinter").exists():
+        return Measurement(unavailable="no .importlinter"), []
+    res = subprocess.run(
+        _tool("lint-imports", read_only=True), capture_output=True, text=True, check=False
+    )
+    output = res.stdout + res.stderr
+    lines = [_ANSI_RE.sub("", line) for line in output.splitlines()]
+    if not any(line.strip().startswith("Contracts:") for line in lines):
+        detail = [line for line in lines if line.strip()]
+        reason = f": {detail[-1]}" if detail else ""
+        return Measurement(error=f"lint-imports failed to run (exit {res.returncode}){reason}"), []
+    return Measurement(value=_import_linter_broken_count(output)), _broken_contracts_section(lines)
+
+
+def _measured_arch_violations() -> Measurement:
+    """Count of illegal import chains against `.importlinter`."""
+    return _run_arch()[0]
+
+
+def _mutation_blocker() -> Measurement | None:
+    """Why this repo cannot run mutation testing at all, or None when it can.
+
+    Three reasons, none of them a failure of the change under test:
+      * no test suite — every mutant would come back `no_tests`, after minutes;
+      * no mutmut. It is the one tool here with no `uvx` fallback, because it
+        imports the project's own modules and test suite and so has to run from
+        the venv those live in;
+      * git tracks a `mutants/` directory. mutmut hardcodes that path for its
+        working copy and this gate deletes it around every run, so a *tracked*
+        one is the adopter's and must not be touched. An untracked one is a
+        killed run's residue, and clearing it is the point.
+    """
+    if not _has_tests():
+        return Measurement(unavailable=f"no {TEST_DIR}/test*.py files")
+    if not Path(".venv", "bin", MUTMUT).exists():
+        return Measurement(unavailable=f"{MUTMUT} is not installed in .venv/bin")
+    if _git_lines(["ls-files", "--", MUTATION_DIR]):
+        return Measurement(
+            error=f"git tracks {MUTATION_DIR}/, the directory mutmut overwrites — move it aside"
+        )
+    return None
+
+
+def _mutation_patterns(files: Iterable[str]) -> list[str]:
+    """mutmut mutant-key globs selecting the given source files.
+
+    mutmut names a mutant `<dotted module>.<mangled function>` after stripping a
+    literal leading `src.` and collapsing `.__init__.` (mutmut 3.7,
+    `mutmut/utils/format_utils.py:get_mutant_name`), so `src/core/pricing.py`
+    selects as `core.pricing.x*`, never `src.core.pricing.*`.
+
+    The trailing `x*` matters as much as the prefix rule. mutmut filters with
+    `fnmatch`, where `*` crosses dots — so `core.*` (the glob a naive reading of
+    `src/core/__init__.py` produces) would also select every mutant in
+    `core.pricing`, quietly widening a scoped run to the whole package. Mangled
+    function names always start `x_` or `xǁ`, so anchoring on `x` selects the
+    module's own mutants and nothing below it.
+    """
+    patterns: dict[str, None] = {}
+    for path in files:
+        dotted = path.removesuffix(".py").replace("/", ".").removeprefix("src.")
+        patterns.setdefault(f"{dotted.removesuffix('.__init__')}.x*", None)
+    return list(patterns)
+
+
+def _mutation_score(stats: dict[str, Any]) -> Measurement:
+    """Percent of the mutants the suite actually exercised that it killed.
+
+    killed = caught + timeout; survived = ran undetected, plus `suspicious`
+    (a verdict the run could not reproduce is not a kill). Mutants that never ran
+    — `no_tests`, `skipped` — are excluded from *both* sides, so the number never
+    silently rewards code the tests do not reach; coverage is the gate for that.
+    """
+    killed = stats.get("killed", 0) + stats.get("timeout", 0)
+    survived = stats.get("survived", 0) + stats.get("suspicious", 0)
+    if killed + survived == 0:
+        return Measurement(unavailable="no mutants ran")
+    return Measurement(value=round(100 * killed / (killed + survived)))
+
+
+def _mutation_stats(path: Path) -> Measurement:
+    """Score the file `mutmut export-cicd-stats` just wrote, or say why it cannot be.
+
+    A stats file the harness cannot read has to be louder than a low score: a
+    silently zeroed count would ratchet the recorded floor down to nothing on the
+    next `--update-baseline --with-mutation`.
+    """
+    try:
+        stats = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return Measurement(error=f"could not read {path}: {exc}")
+    if not isinstance(stats, dict):
+        return Measurement(error=f"{path} is not a JSON object")
+    return _mutation_score(stats)
+
+
+def _run_mutation(patterns: list[str] | None) -> Measurement:
+    """Run mutmut over `patterns` (None = the whole tree) and score the result.
+
+    `mutants/` is cleared on the way in *and* on the way out. In: mutmut keeps
+    every previous verdict in `<file>.py.meta` there and `export-cicd-stats`
+    totals the whole store, so a scoped run layered on a previous, differently
+    scoped one would score files this change never touched (measured: a run
+    filtered to one module reported the other module's survivors). Out: the copy
+    contains `mutants/tests/`, and leaving it behind makes a pytest suite abort
+    collection on duplicate module names the next time `test` runs.
+    """
+    blocker = _mutation_blocker()
+    if blocker is not None:
+        return blocker
+    argv = _tool(MUTMUT, read_only=True)
+    shutil.rmtree(MUTATION_DIR, ignore_errors=True)
+    try:
+        res = subprocess.run(
+            [*argv, "run", *(patterns or [])], capture_output=True, text=True, check=False
+        )
+        if res.returncode != 0:
+            # mutmut asserts rather than exiting cleanly when a filter matches no
+            # mutant (mutmut 3.7, `__main__.py:1247`). A change confined to files
+            # with nothing mutable — an empty `__init__.py`, constants — is not a
+            # broken tool. Matched on stderr only, and on the whole sentence: the
+            # captured stdout carries every mutant's pytest output, so a looser
+            # match would let a project's own test text fake this verdict.
+            if MUTMUT_EMPTY_FILTER in res.stderr:
+                return Measurement(unavailable="the changed sources contain no mutable code")
+            detail = (res.stderr.strip() or res.stdout.strip()).splitlines()
+            reason = f": {detail[-1]}" if detail else ""
+            return Measurement(error=f"`mutmut run` failed (exit {res.returncode}){reason}")
+        export = subprocess.run(
+            [*argv, "export-cicd-stats"], capture_output=True, text=True, check=False
+        )
+        if export.returncode != 0:
+            return Measurement(
+                error=f"`mutmut export-cicd-stats` failed (exit {export.returncode})"
+            )
+        return _mutation_stats(Path(MUTATION_DIR, MUTATION_STATS_FILE))
+    finally:
+        shutil.rmtree(MUTATION_DIR, ignore_errors=True)
+
+
+def _measured_mutation_score() -> Measurement:
+    """Whole-tree mutation score, for `--update-baseline --with-mutation`.
+
+    Whole-tree on purpose: a floor measured from one change's scope would move
+    with the next change's scope, and a moving floor is not a floor.
+    """
+    if not _app_targets():
+        return Measurement(unavailable="no app sources")
+    return _run_mutation(None)
+
+
 RATCHETED_KEYS = (
     "coverage.min",
     "complexity.max_violations",
+    "duplication.max_blocks",
     "crap.max_violations",
     "deadcode.max_findings",
+    "arch.max_violations",
+    "mutation.min",
 )
 
 
@@ -651,13 +915,21 @@ def _measure_ratcheted() -> dict[str, Measurement]:
     Sequential and short-circuiting on purpose: a broken tool usually breaks the
     metrics after it too (CRAP re-runs the coverage suite), so the first failure is
     the one worth reporting, and the later ones would only be noise.
+
+    `mutation.min` is measured last and only under `--with-mutation`: it re-runs the
+    whole suite once per mutant, which turns a seconds-long baseline update into a
+    minutes-long one. Left out, its key is neither measured nor removed — the merge
+    in `_write_baseline` carries it through untouched.
     """
     measured: dict[str, Measurement] = {}
     for key, measure in (
         ("coverage.min", _measured_coverage),
         ("complexity.max_violations", _measured_complexity_violations),
+        ("duplication.max_blocks", _measured_duplicate_blocks),
         ("crap.max_violations", _measured_crap_violations),
         ("deadcode.max_findings", _measured_deadcode_findings),
+        ("arch.max_violations", _measured_arch_violations),
+        *((("mutation.min", _measured_mutation_score),) if WITH_MUTATION else ()),
     ):
         measured[key] = measure()
         if measured[key].error:
@@ -1343,15 +1615,128 @@ def cmd_typecheck(files: list[str] | None = None, *, no_exit: bool = False) -> b
     return run(gate.description, gate.cmd, no_exit=no_exit, hint=gate.hint, runner=gate.runner)
 
 
-def cmd_test(*, no_exit: bool = False) -> bool:
-    if _has_tests():
-        return run("Tests", [*_python(), *TEST_COMMAND], no_exit=no_exit)
+def _test_stems(path: str) -> list[str]:
+    """Candidate `test_<stem>` stems for a source module.
 
-    files = [str(path) for path in _iter_python_files(_quality_targets(include_tests=False))]
-    if not files:
+    `src/core/pricing.py` yields `pricing` and `core_pricing`: the bare module name
+    and the name with its package path folded in, the two schemes a test tree
+    commonly uses. `__init__.py` maps by its package name.
+    """
+    parts = list(Path(path).with_suffix("").parts)
+    if len(parts) > 1 and parts[-1] == "__init__":
+        parts.pop()
+    if len(parts) > 1 and parts[0] in APP_SOURCES:
+        parts.pop(0)
+    return list(dict.fromkeys([parts[-1], "_".join(parts)]))
+
+
+def _test_modules() -> list[str]:
+    """Every test module unittest discovery would collect, walked once per run."""
+    return sorted(str(path) for path in Path(TEST_DIR).rglob("test*.py"))
+
+
+def _is_test_module(path: str) -> bool:
+    """True for a file unittest discovery would collect: `tests/**/test*.py`."""
+    return path.startswith(f"{TEST_DIR}/") and Path(path).name.startswith("test")
+
+
+def _mapped_test_files(files: Iterable[str]) -> tuple[list[str], list[str]]:
+    """Test modules to run for the changed files, and the source files none maps to.
+
+    A changed test module runs itself. A changed source module runs every
+    `tests/**/test_<stem>.py` and `tests/**/test_<stem>_*.py` for its stems. Other
+    changed files under `tests/` (`__init__.py`, step definitions) map to nothing
+    and are not reported: they are not source.
+    """
+    index = _test_modules()
+    tests: dict[str, None] = {}
+    unmapped: list[str] = []
+    for path in files:
+        if _is_test_module(path):
+            tests.setdefault(path, None)
+            continue
+        if not _is_quality_python_file(path):
+            continue
+        names = {f"test_{stem}.py" for stem in _test_stems(path)}
+        prefixes = tuple(name.removesuffix(".py") + "_" for name in names)
+        matches = [
+            test
+            for test in index
+            if Path(test).name in names or Path(test).name.startswith(prefixes)
+        ]
+        if not matches:
+            unmapped.append(path)
+        for match in matches:
+            tests.setdefault(match, None)
+    return sorted(tests), unmapped
+
+
+def _is_importable(test: str) -> bool:
+    """True when every package directory on the way to `test` has an `__init__.py`.
+
+    `tests/unit/test_x.py` needs both `tests/__init__.py` and `tests/unit/__init__.py`;
+    a repo missing either has a tree `discover` walks but a dotted name cannot reach.
+    """
+    packages = Path(test).parts[:-1]
+    return all(
+        Path(*packages[: depth + 1], "__init__.py").is_file() for depth in range(len(packages))
+    )
+
+
+def _scoped_test_command(tests: list[str]) -> list[str] | None:
+    """Argv tail that runs only `tests`, or None when the runner cannot be scoped.
+
+    unittest takes dotted module names, which import only through the `__init__.py`
+    of every package on the path (`discover -p` takes a single pattern, so it cannot
+    scope either). Any other TEST_COMMAND (pytest) takes file paths.
+    """
+    if TEST_COMMAND[:2] != ("-m", "unittest"):
+        return [*TEST_COMMAND, *tests]
+    if not all(_is_importable(test) for test in tests):
+        return None
+    return ["-m", "unittest", "-q", *(t.removesuffix(".py").replace("/", ".") for t in tests)]
+
+
+def _whole_suite(*, no_exit: bool) -> bool:
+    return run("Tests", [*_python(), *TEST_COMMAND], no_exit=no_exit)
+
+
+def _syntax_check(*, no_exit: bool) -> bool:
+    """The stand-in gate for a repo with no tests: every source file must import-compile."""
+    sources = [str(path) for path in _iter_python_files(_quality_targets(include_tests=False))]
+    if not sources:
         warn("Syntax check: no Python files found; skipped")
         return True
-    return run("Syntax check", [*_python(), "-m", "py_compile", *files], no_exit=no_exit)
+    return run("Syntax check", [*_python(), "-m", "py_compile", *sources], no_exit=no_exit)
+
+
+def cmd_test(files: list[str] | None = None, *, no_exit: bool = False) -> bool:
+    """Run the test modules that map to the changed files; `--all` runs the whole suite.
+
+    An empty scope skips with a warning, never widens. A changed source file that
+    maps to no test gets one `⚠` line and is not a failure: the tests that do map
+    still run. `ci` runs the whole suite through `coverage` instead.
+    """
+    if not _has_tests():
+        return _syntax_check(no_exit=no_exit)
+
+    if files is None and ALL_FILES:
+        return _whole_suite(no_exit=no_exit)
+    targets = _resolve_targets(files, "Tests")
+    if targets is None:
+        return True
+    tests, unmapped = _mapped_test_files(targets)
+    for path in unmapped:
+        warn(f"Tests: {path} maps to no {TEST_DIR}/**/test_<mod>.py; not covered by this run")
+    if not tests:
+        warn("Tests: no test module maps to the changed files (use --all for the suite); skipped")
+        return True
+    scoped = _scoped_test_command(tests)
+    if scoped is None:
+        warn(f"Tests: {TEST_DIR}/ has no __init__.py to import by name; running the whole suite")
+        return _whole_suite(no_exit=no_exit)
+    label = f"Tests ({len(tests)}/{len(_test_modules())} test modules)"
+    return run(label, [*_python(), *scoped], no_exit=no_exit)
 
 
 def cmd_coverage() -> None:
@@ -1405,23 +1790,135 @@ def cmd_acceptance() -> None:
         run(gate.description, gate.cmd)
 
 
+MUTATION_LABEL = "Mutation (mutmut)"
+MUTATION_HINT = (
+    "kill the surviving mutants with a test, or record the floor with "
+    "`harness suppressions --update-baseline --with-mutation`"
+)
+
+
+def _mutation_patterns_for_change() -> list[str] | None:
+    """Mutant globs for the app sources this change touched, or None to skip.
+
+    Scoped, never widened: mutation is the most expensive signal the harness has,
+    and an empty scope that quietly became a whole-tree run is how `ci` ends up
+    minutes slower for a docs commit.
+    """
+    changed = [path for path in _scoped_py_files() if _matches_python_target(path, APP_SOURCES)]
+    if changed:
+        return _mutation_patterns(changed)
+    unresolved = _unresolved_requested_base()
+    reason = (
+        f"diff base {unresolved!r} does not resolve, nothing checked"
+        if unresolved is not None
+        else "no changed app sources (use --all for the whole tree)"
+    )
+    warn(f"{MUTATION_LABEL}: {reason}; skipped")
+    return None
+
+
 def cmd_mutation() -> None:
-    """Mutation testing. Not configured by default — warn and skip."""
-    warn("Mutation testing not configured — add mutmut to your dev dependencies to enable")
+    """Mutation score over the app sources this change touched (--all: whole tree).
+
+    Advisory unless `--enforce`, mirroring `crap`, and for a sharper reason than
+    cost: the `mutation.min` floor is whole-tree while this gate is scoped, so a
+    change confined to one weakly-tested module can land under the floor with
+    nothing having regressed. That is a thing to report, not to block on.
+
+    Read-only in the sense `ci` needs — it never rewrites source — but it does
+    clear and repopulate the gitignored `mutants/` working copy, the same way
+    `coverage run` writes `.coverage`. `ci --enforce` makes it blocking, exactly
+    as it already does for CRAP.
+    """
+    patterns: list[str] | None = None
+    if not ALL_FILES:
+        patterns = _mutation_patterns_for_change()
+        if patterns is None:
+            return
+
+    enforce = "--enforce" in sys.argv
+    measured = _run_mutation(patterns)
+    if measured.error:
+        suffix = "" if enforce else " (advisory)"
+        print(f"  {_advisory_glyph(enforce=enforce)} {MUTATION_LABEL}: {measured.error}{suffix}")
+        if enforce:
+            sys.exit(1)
+        return
+    if measured.value is None:
+        warn(f"{MUTATION_LABEL}: {measured.unavailable}; skipped")
+        return
+
+    score = measured.value
+    floor = _baseline_floor("mutation.min")
+    if floor is None:
+        warn(f"{MUTATION_LABEL}: {score}% killed, report-only (no {BASELINE_FILE} floor)")
+        return
+    if score >= floor:
+        suffix = " — run `harness suppressions --update-baseline --with-mutation` to ratchet up"
+        print(
+            f"  {GREEN}✓{RESET} {MUTATION_LABEL}: {score}% killed "
+            f"(baseline {floor}){suffix if score > floor else ''}"
+        )
+        return
+
+    mode_suffix = "" if enforce else " (advisory)"
+    print(
+        f"  {_advisory_glyph(enforce=enforce)} {MUTATION_LABEL}: {score}% killed "
+        f"< baseline {floor}{mode_suffix}"
+    )
+    print(f"  ↳ fix: {MUTATION_HINT}")
+    if enforce:
+        sys.exit(1)
 
 
-def _arch_gates_or_warn() -> list[Gate]:
-    """Build the import-linter gate, or warn + return [] when no .importlinter exists."""
-    if not Path(".importlinter").exists():
-        warn("Arch: no .importlinter — skipped")
-        return []
-    return [Gate("Arch (import-linter)", _tool("lint-imports", read_only=True))]
+ARCH_LABEL = "Arch (import-linter)"
+ARCH_HINT = "restore the layering; editing .importlinter is a design decision for the human"
+
+
+def _check_arch(*, no_exit: bool = False) -> bool:
+    """Count-ratcheted arch gate: illegal import chains may never exceed the floor.
+
+    import-linter is pass/fail with no threshold flag, so like dead code this sits
+    outside the `Gate` batch and prints its own line. Without a recorded floor it is
+    report-only: a real layers contract written over a legacy tree breaks in dozens
+    of places on day one, and the point of the floor is to stop the 41st, not to
+    demand the first 40 be fixed before the harness is allowed in.
+    """
+    measured, section = _run_arch()
+    if measured.error:
+        print(f"  {RED}✗{RESET} {ARCH_LABEL}: {measured.error}")
+        if not no_exit:
+            sys.exit(1)
+        return False
+    if measured.value is None:
+        warn(f"Arch: {measured.unavailable} — skipped")
+        return True
+
+    violations = measured.value
+    floor = _baseline_floor("arch.max_violations")
+    if floor is None:
+        warn(f"{ARCH_LABEL}: {violations} violation(s), report-only (no {BASELINE_FILE} floor)")
+        return True
+    if violations <= floor:
+        suffix = " — run `harness suppressions --update-baseline` to ratchet down"
+        print(
+            f"  {GREEN}✓{RESET} {ARCH_LABEL}: {violations} "
+            f"(baseline {floor}){suffix if violations < floor else ''}"
+        )
+        return True
+
+    print(f"  {RED}✗{RESET} {ARCH_LABEL}: {violations} violation(s) > baseline {floor}")
+    for line in section[:40]:
+        print(f"    {line}")
+    print(f"  ↳ fix: {ARCH_HINT}")
+    if not no_exit:
+        sys.exit(1)
+    return False
 
 
 def cmd_arch() -> None:
-    """Run import-linter against .importlinter."""
-    for gate in _arch_gates_or_warn():
-        run(gate.description, gate.cmd)
+    """Run import-linter against .importlinter, ratcheted by `arch.max_violations`."""
+    _check_arch()
 
 
 def _git_lines(args: list[str]) -> list[str]:
@@ -1960,9 +2457,64 @@ def _complexity_gate() -> Gate:
     )
 
 
+def _duplication_argv() -> list[str]:
+    """lizard argv for the duplicate-block report over the complexity gate's targets.
+
+    A separate lizard run on purpose: `-Eduplicate` composes with the CCN flags, but
+    lizard's exit code still tracks CCN warnings only, so the block count has to be
+    judged here. `-w -i N` keeps that run silent and green; the target set must stay
+    identical to `_complexity_argv`'s, or the recorded floor stops reproducing.
+    """
+    return [
+        *_tool(LIZARD, read_only=True),
+        *_app_targets(include_tests=True),
+        "-Eduplicate",
+        "-w",
+        "-i",
+        str(REPORT_ONLY_LIMIT),
+    ]
+
+
+DUPLICATION_LABEL = "Duplication (lizard)"
+DUPLICATION_HINT = "extract the repeated block into one helper; do not raise the floor"
+
+
+def _duplication_gate() -> Gate:
+    """Count-ratcheted duplicate-block gate: blocks may never exceed the committed floor.
+
+    Count-based like dead code, but a `Gate` with its own `runner` so it rides the
+    same parallel batch as complexity — the verdict is computed from lizard's report,
+    not its exit code. Without a recorded floor it is report-only: a legacy tree
+    carries duplicates by the hundred, and blocking on that is the day-one red that
+    gets the harness deleted instead of adopted.
+    """
+    floor = _baseline_floor("duplication.max_blocks")
+    argv = _duplication_argv()
+
+    def runner() -> GateResult:
+        measured, report = _run_duplication()
+        if measured.error:
+            return GateResult(f"{DUPLICATION_LABEL}: {measured.error}", argv, 1, report, "")
+        if measured.value is None:
+            label = f"{measured.unavailable}; skipped"
+            return GateResult(f"{DUPLICATION_LABEL}: {label}", argv, 0, "", "")
+        blocks = measured.value
+        if floor is None:
+            label = f"{blocks} block(s), report-only (no {BASELINE_FILE} floor)"
+            return GateResult(f"{DUPLICATION_LABEL}: {label}", argv, 0, "", "")
+        if blocks <= floor:
+            suffix = " — run `harness suppressions --update-baseline` to ratchet down"
+            label = f"{blocks} (baseline {floor}){suffix if blocks < floor else ''}"
+            return GateResult(f"{DUPLICATION_LABEL}: {label}", argv, 0, "", "")
+        label = f"{blocks} block(s) > baseline {floor}"
+        return GateResult(f"{DUPLICATION_LABEL}: {label}", argv, 1, report, "", DUPLICATION_HINT)
+
+    return Gate(DUPLICATION_LABEL, argv, DUPLICATION_HINT, runner)
+
+
 def cmd_complexity() -> None:
-    gate = _complexity_gate()
-    run(gate.description, gate.cmd)
+    all_ok, _failed = run_gates_parallel([_complexity_gate(), _duplication_gate()])
+    _exit_if_failed(all_ok)
 
 
 def _deadcode_argv() -> list[str]:
@@ -2053,7 +2605,7 @@ def cmd_stop_hook() -> None:
     cmd_post_edit()  # mutating — sequential, first
     _check_arch_config_guard(warn_only=True)
     _check_gherkin_guard(warn_only=True)
-    all_ok, failed = run_gates_parallel([_complexity_gate()])  # read-only batch
+    all_ok, failed = run_gates_parallel([_complexity_gate(), _duplication_gate()])  # read-only
     if not _check_deadcode(no_exit=True):  # count-ratcheted, so outside the Gate batch
         all_ok = False
         failed.append(DEADCODE_LABEL)
@@ -2222,11 +2774,11 @@ def cmd_check() -> None:
     """Lockfile check, fix, format, typecheck, test, and every offline read-only gate.
 
     Invariant: `check` runs every gate that is offline, fast, and takes no build
-    lock — `ci` adds only the network dependency audit, coverage, and CRAP
-    (advisory). Arch (import-linter) qualifies here: it is a local dev dependency,
-    runs offline, and takes no build lock, so it joins the read-only parallel batch
-    below alongside complexity and acceptance, so a green `check`
-    predicts a green `ci`. Accumulates every step's pass/fail instead of failing
+    lock — `ci` adds only the network dependency audit, coverage, and the two
+    advisory gates, CRAP and mutation. Arch (import-linter) qualifies here: it is a
+    local dev dependency, runs offline, and takes no build lock, so it runs after the
+    read-only parallel batch below alongside dead code (both count-ratcheted), so a
+    green `check` predicts a green `ci`. Accumulates every step's pass/fail instead of failing
     fast, so one run surfaces every problem — matching the bun/go/rust harnesses'
     `check` behavior — and ends with an `OK`/`FAIL` summary line.
     """
@@ -2243,13 +2795,14 @@ def cmd_check() -> None:
         cmd_typecheck(no_exit=True),
         cmd_test(no_exit=True),
     ]
-    batch = [_complexity_gate(), *_acceptance_gates_or_warn(), *_arch_gates_or_warn()]
+    batch = [_complexity_gate(), _duplication_gate(), *_acceptance_gates_or_warn()]
     _batch_ok, batch_failed = run_gates_parallel(batch)
     # One entry per gate, not one for the whole batch: collapsing the batch into a
     # single boolean makes the summary under-report by (failures - 1).
     results.extend([False] * len(batch_failed))
     results.extend([True] * (len(batch) - len(batch_failed)))
     results.append(_check_deadcode(no_exit=True))  # count-ratcheted; outside the Gate batch
+    results.append(_check_arch(no_exit=True))  # count-ratcheted; outside the Gate batch
     _check_stop_hooks_present()
     results.append(_check_arch_config_guard(warn_only=True))
     results.append(_check_gherkin_guard(warn_only=True))
@@ -2267,7 +2820,7 @@ def cmd_check() -> None:
 
 
 def cmd_pre_commit() -> None:
-    """Staged checks + tests if source files staged.
+    """Staged checks, then the tests that map to the staged files.
 
     The arch-config and gherkin-first guards run before the staged-files early
     return: both are staged-mode and cheap, and a commit that stages only a
@@ -2291,18 +2844,18 @@ def cmd_pre_commit() -> None:
     cmd_typecheck(files)
     _check_agents_md_drift()
 
-    if any(_is_quality_python_file(f) for f in files):
-        cmd_test()
+    cmd_test(files)
 
 
 def cmd_ci() -> None:
     """Run full read-only verification.
 
     Read-only gates run as a parallel batch (lint, format check, typecheck, audit,
-    complexity, acceptance, arch) — captured and printed in submission order, run to
+    complexity, acceptance) — captured and printed in submission order, run to
     completion so one pass surfaces every failure. The count-ratcheted gates run after
-    it, sequentially: dead code, then coverage (captured) and CRAP (advisory unless
-    --enforce).
+    it, sequentially: dead code and arch, then coverage (captured), CRAP and
+    mutation (both advisory unless --enforce). Mutation is scoped to this change's
+    app sources, so it costs nothing on a commit that touched none.
     """
     print("\n=== CI Checks ===\n")
     base_ok = _check_base_ref(no_exit=True)
@@ -2312,14 +2865,16 @@ def cmd_ci() -> None:
         _typecheck_gate(),
         _audit_gate_or_warn(),
         _complexity_gate(),
+        _duplication_gate(),
         *_acceptance_gates_or_warn(),
-        *_arch_gates_or_warn(),
     ])
     all_ok, _failed = run_gates_parallel(gates)
     all_ok = all_ok and base_ok
     all_ok = _check_deadcode(no_exit=True) and all_ok  # count-ratcheted; outside the batch
+    all_ok = _check_arch(no_exit=True) and all_ok  # count-ratcheted; outside the batch
     cmd_coverage()  # self-skips; sequential, after the batch
     cmd_crap()  # reads .coverage/coverage.xml; advisory unless --enforce
+    cmd_mutation()  # scoped to the change's app sources; advisory unless --enforce
     all_ok = _check_arch_config_guard() and all_ok
     all_ok = _check_gherkin_guard() and all_ok
     all_ok = _check_suppressions_baseline(no_exit=True) and all_ok
@@ -2333,7 +2888,8 @@ def cmd_pre_push() -> None:
     complexity. This fills the gap with the deterministic, offline gates none of them
     run — lint, format check, acceptance, arch — validating the whole pushed tree
     (after merges/rebases/--no-verify, which pre-commit may never have seen) before it
-    leaves the machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
+    leaves the machine. Network (audit) and advisory (coverage/CRAP/mutation) gates
+    stay in ci.
     """
     print("\n=== Pre-push Checks ===\n")
     base_ok = _check_base_ref(no_exit=True)
@@ -2343,10 +2899,10 @@ def cmd_pre_push() -> None:
         _lint_gate(),
         _format_check_gate(),
         *_acceptance_gates_or_warn(),
-        *_arch_gates_or_warn(),
     ])
     gates_ok, _failed = run_gates_parallel(gates)
-    _exit_if_failed(gates_ok and base_ok and arch_config_ok and gherkin_ok)
+    arch_ok = _check_arch(no_exit=True)  # count-ratcheted; outside the Gate batch
+    _exit_if_failed(gates_ok and arch_ok and base_ok and arch_config_ok and gherkin_ok)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -2503,7 +3059,7 @@ TASKS: dict[str, tuple[Callable[..., object], str]] = {
     "format": (cmd_format, "Format code with ruff"),
     "lint": (cmd_lint, "Lint code with ruff (read-only)"),
     "typecheck": (cmd_typecheck, "Type-check with basedpyright"),
-    "test": (cmd_test, "Run tests, or syntax check when no tests exist"),
+    "test": (cmd_test, "Run the tests mapping to changed files (--all for the suite)"),
     "check": (
         cmd_check,
         "Fix + format + typecheck on changed files (--all for the whole tree), test, every gate",
@@ -2514,12 +3070,15 @@ TASKS: dict[str, tuple[Callable[..., object], str]] = {
     "audit": (cmd_audit, "Audit dependencies for known vulnerabilities"),
     "acceptance": (cmd_acceptance, "Run acceptance scenarios (behave)"),
     "coverage": (cmd_coverage, "Tests with coverage threshold (--min=N)"),
-    "mutation": (cmd_mutation, "Mutation testing (not configured by default; warns and skips)"),
+    "mutation": (
+        cmd_mutation,
+        "Mutation score for changed app sources (--all, --enforce); advisory",
+    ),
     "crap": (cmd_crap, "CRAP complexity x coverage gate (advisory)"),
     "suppressions": (cmd_suppressions, "Show or update suppression baseline"),
     "complexity": (cmd_complexity, "Cyclomatic complexity gate (lizard, CCN 15, args 8)"),
     "deadcode": (cmd_deadcode, "Detect unused (dead) code with vulture (app sources only)"),
-    "arch": (cmd_arch, "Architecture checks (import-linter)"),
+    "arch": (cmd_arch, "Architecture checks (import-linter, ratcheted by the baseline)"),
     "arch-config-guard": (cmd_arch_config_guard, "Block unreviewed arch config changes"),
     "gherkin-guard": (
         cmd_gherkin_guard,

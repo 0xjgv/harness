@@ -21,7 +21,7 @@ task runner:
 | `post-edit` | Stop hook helper | Format if source files changed | Yes |
 | `stop-hook` | Agent Stop hook | Run `post-edit`, then complexity (+ deadcode where shipped); **exits 2 with a failure summary on stderr** | Yes |
 
-**`check`** is the one you run constantly. It auto-fixes what it can so you stay in flow, then runs every other gate that doesn't need the network or a build lock. It also ratchets suppression comments (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`, etc.) against `.harness-baseline`: new suppressions fail unless a human signs off on `suppressions --update-baseline`. Invariant: `ci` minus `check` is only the network dependency audit, coverage, and advisory CRAP — plus, in Go and Rust only, the architecture boundary check itself (`arch`), which stays `ci`/`pre-push`-only there (Go's needs to fetch a module, Rust's takes cargo's build lock); Python and Bun's `arch` has neither constraint, so it runs inside `check` too — so a green `check` predicts a green `ci`.
+**`check`** is the one you run constantly. It auto-fixes what it can so you stay in flow, then runs every other gate that doesn't need the network or a build lock. It also ratchets suppression comments (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`, etc.) against `.harness-baseline`: new suppressions fail unless a human signs off on `suppressions --update-baseline`. Invariant: `ci` minus `check` is only the network dependency audit, coverage over the whole test suite (where `check` ran only the tests mapped to the change set), advisory CRAP, and advisory mutation — plus, in Go and Rust only, the architecture boundary check itself (`arch`), which stays `ci`/`pre-push`-only there (Go's needs to fetch a module, Rust's takes cargo's build lock); Python and Bun's `arch` has neither constraint, so it runs inside `check` too — so a green `check` predicts a green `ci` for the gates it ran. `check` runs only the tests that map to the change set, so `check --all` (or `ci`) is the whole-suite run; `pre-push` has no test gate in any template.
 **`pre-commit`** runs the same checks scoped to staged files, installed as a git hook. It re-stages whatever it fixes, so the commit records the fixed content — the same trade-off `lint-staged` makes: a partially staged file gets its unstaged hunks staged too.
 **`pre-push`** is the read-only push gate — lint, format check, acceptance, arch over the whole pushed tree (the offline checks `pre-commit` and `stop-hook` skip), run in parallel. Installed as a git pre-push hook.
 For Go and Bun, the lint gate subsumes format checking.
@@ -148,9 +148,11 @@ statically checks that the four templates' command surfaces stay in sync: every
 runner-dispatched command appears in that template's Makefile
 `HARNESS_TARGETS`, every command a template's `CLAUDE.md` documents exists in
 its runner, every `bun run <x>` in `bun/CLAUDE.md` has a matching
-`bun/package.json` script, all four templates expose the same core 19
-commands, and any other cross-template command divergence is either present
-in all four or explicitly allowlisted with a reason in the script.
+`bun/package.json` script, all four templates expose the same core 20
+commands, any other cross-template command divergence is either present
+in all four or explicitly allowlisted with a reason in the script, and all
+four templates pin the same lizard release (`lizard@<ver>` in the bun/go/rust
+runners, `lizard==<ver>` in `python/pyproject.toml`).
 
 This repo root dogfoods the same Stop-hook shape: `.claude/settings.json` runs
 `make stop-hook`, and `.codex/hooks.json` runs the Codex JSON wrapper around

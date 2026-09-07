@@ -25,6 +25,18 @@ def step_project_without_baseline(context):
     _make_project(context)
 
 
+@given("a project with tests and no baseline")
+def step_project_with_tests_no_baseline(context):
+    root = _make_project(context)
+    (root / "tests").mkdir()
+    (root / "tests" / "test_stub.py").write_text(
+        "import unittest\n\n"
+        "class TestStub(unittest.TestCase):\n"
+        "    def test_smoke(self):\n"
+        "        self.assertTrue(True)\n"
+    )
+
+
 @given('a project with a baseline line "{line}"')
 def step_project_with_baseline_line(context, line):
     (_make_project(context) / BASELINE).write_text(f"{line}\n")
@@ -38,6 +50,29 @@ def step_project_with_complex_function(context, line):
 @given("a project with a CCN-21 function and no baseline")
 def step_project_with_complex_function_no_baseline(context):
     _make_project(context, source=COMPLEX_PY)
+
+
+# Two identical bodies of ~85 tokens each: lizard's duplicate finder needs a run of
+# at least 70 unified tokens (`min_duplicate_tokens`) before it reports a block, so a
+# short repeated snippet would not trip it. Reports exactly one `Duplicate block:`.
+_DUPLICATE_BODY = (
+    "    total = order.base\n"
+    + "".join(f"    total += order.part_{i}\n" for i in range(16))
+    + "    return total\n"
+)
+DUPLICATE_PY = (
+    "\n\n".join(f"def total_{name}(order):\n{_DUPLICATE_BODY}" for name in ("a", "b")) + "\n"
+)
+
+
+@given("a project with a duplicate block and no baseline")
+def step_project_with_duplicate_block(context):
+    _make_project(context, source=DUPLICATE_PY)
+
+
+@given('a project with a duplicate block and a baseline line "{line}"')
+def step_project_with_duplicate_block_and_baseline(context, line):
+    (_make_project(context, source=DUPLICATE_PY) / BASELINE).write_text(f"{line}\n")
 
 
 def _dead_functions(count: int) -> str:

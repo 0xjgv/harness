@@ -1,0 +1,9 @@
+# Pin the toolchain so local runs and CI compile with the same rustc.
+# CI installs the same version via dtolnay/rust-toolchain@1.98.0
+# (.github/workflows/ci.yml). rustup reads this file automatically; a cargo
+# installed another way (Homebrew, distro package) ignores it. rustup honours
+# this file on every cargo invocation and overrides whatever the action
+# installed, so bump the channel and the action tag together.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt", "llvm-tools-preview"]

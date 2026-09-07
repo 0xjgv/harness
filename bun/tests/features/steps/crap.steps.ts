@@ -2,7 +2,13 @@ import assert from 'node:assert/strict';
 import { copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { After, Given, Then, When } from '@cucumber/cucumber';
+import { After, Given, setDefaultTimeout, Then, When } from '@cucumber/cucumber';
+
+// Every `When I run` step spawns a whole harness subprocess, and some of them
+// cold-start a Node tool (lizard, dependency-cruiser) while `check`/`ci` are
+// running the rest of the parallel batch on the same machine. Cucumber's 5s
+// default is under that worst case, so the suite would flake rather than fail.
+setDefaultTimeout(60_000);
 
 interface CrapWorld {
   tmp: string;
@@ -44,15 +50,16 @@ DA:11,0
 end_of_record
 `;
 
-async function makeTmp(): Promise<string> {
+const STUB_TEST_TS =
+  "import { test, expect } from 'bun:test';\nimport { stub } from '../src/stub';\ntest('stub', () => expect(stub(0)).toBe(0));\n";
+
+/** An isolated project (src/stub.ts + one test + a copy of harness.ts) for the baseline and mutation steps too. */
+export async function makeTmp(source = STUB_TS, testSource = STUB_TEST_TS): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'crap-'));
   await mkdir(join(dir, 'src'));
   await mkdir(join(dir, 'tests'));
-  await writeFile(join(dir, 'src', 'stub.ts'), STUB_TS);
-  await writeFile(
-    join(dir, 'tests', 'stub.test.ts'),
-    "import { test, expect } from 'bun:test';\nimport { stub } from '../src/stub';\ntest('stub', () => expect(stub(0)).toBe(0));\n",
-  );
+  await writeFile(join(dir, 'src', 'stub.ts'), source);
+  await writeFile(join(dir, 'tests', 'stub.test.ts'), testSource);
   await copyFile(HARNESS_TS, join(dir, 'harness.ts'));
   return dir;
 }
@@ -70,7 +77,9 @@ Given('no coverage artifact', async function (this: CrapWorld) {
   this.tmp = await makeTmp();
 });
 
-When('I run {string}', async function (this: CrapWorld, cmd: string) {
+// 60s, not cucumber's default 5s: this step shells out to a real harness run,
+// and the mutation scenarios drive a real Stryker run through it.
+When('I run {string}', { timeout: 60_000 }, async function (this: CrapWorld, cmd: string) {
   // Drop leading "harness" — the rest is forwarded to `bun harness.ts`.
   const argv = cmd.split(/\s+/).slice(1);
   const proc = Bun.spawn(['bun', 'harness.ts', ...argv], {

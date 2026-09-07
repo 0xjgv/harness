@@ -4,13 +4,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   appTargets,
+  bunVersionDrift,
   existingTargets,
   type Gate,
   hasTests,
   isProjectTsFile,
   isQualityTsFile,
   isTestFile,
+  mapChangedToTests,
   normalizeChangedPath,
+  pinnedBunVersion,
   porcelainPath,
   qualityTargets,
   resolveFallbackArchBase,
@@ -160,5 +163,84 @@ describe('parallel gate runner', () => {
 
   test('empty batch passes', async () => {
     expect(await runGatesParallel([])).toBe(true);
+  });
+});
+
+describe('bun runtime pin', () => {
+  test('reads an exact bun pin from packageManager', () => {
+    expect(pinnedBunVersion({ packageManager: 'bun@1.4.1' })).toBe('1.4.1');
+    expect(pinnedBunVersion({ packageManager: ' bun@1.4.1 ' })).toBe('1.4.1');
+    expect(pinnedBunVersion({ packageManager: 'bun@1.4.1-canary.3' })).toBe('1.4.1-canary.3');
+  });
+
+  test("drops corepack's build-metadata suffix", () => {
+    // `corepack use bun@1.4.1` rewrites the field with an integrity hash; the
+    // hash is metadata, not part of the version, so the pin must survive it.
+    expect(pinnedBunVersion({ packageManager: 'bun@1.4.1+sha512.abc123' })).toBe('1.4.1');
+    expect(pinnedBunVersion({ packageManager: 'bun@1.4.1-canary.3+sha512.abc' })).toBe(
+      '1.4.1-canary.3',
+    );
+  });
+
+  test('ignores a missing or foreign pin, and refuses an unparseable one', () => {
+    expect(pinnedBunVersion({})).toBeUndefined();
+    expect(pinnedBunVersion(null)).toBeUndefined();
+    expect(pinnedBunVersion('not an object')).toBeUndefined();
+    expect(pinnedBunVersion({ packageManager: 'pnpm@10.0.0' })).toBeUndefined();
+    // a range is not a pin, and a typo must not become one
+    expect(pinnedBunVersion({ packageManager: 'bun@^1.4' })).toBeUndefined();
+    expect(pinnedBunVersion({ packageManager: 'bun@1.4.1_typo' })).toBeUndefined();
+  });
+
+  test('drift is reported only when a pin exists and differs', () => {
+    expect(bunVersionDrift(undefined, '1.4.1')).toBeUndefined();
+    expect(bunVersionDrift('1.4.1', '1.4.1')).toBeUndefined();
+    expect(bunVersionDrift('1.4.1', '1.3.0')).toContain('Bun 1.3.0');
+    expect(bunVersionDrift('1.4.1', '1.3.0')).toContain('pinned bun@1.4.1');
+  });
+});
+
+describe('change-set mapping', () => {
+  // src/index.ts re-exports src/core.ts, so only a transitive walk connects a
+  // src/core.ts edit to the test that imports src/index.ts.
+  function importProject(): string {
+    const root = mkdtempSync(join(tmpdir(), 'bun-scope-'));
+    mkdirSync(join(root, 'src'));
+    mkdirSync(join(root, 'tests'));
+    writeFileSync(join(root, 'harness.ts'), 'export const version = 1;\n');
+    writeFileSync(join(root, 'src', 'core.ts'), 'export const core = 1;\n');
+    writeFileSync(join(root, 'src', 'index.ts'), "export * from './core';\n");
+    writeFileSync(join(root, 'src', 'orphan.ts'), 'export const orphan = 1;\n');
+    writeFileSync(join(root, 'tests', 'smoke.test.ts'), "import '../src/index';\n");
+    writeFileSync(join(root, 'tests', 'harness.test.ts'), "import '../harness';\n");
+    writeFileSync(join(root, 'tests', 'steps.ts'), 'export const step = 1;\n');
+    roots.push(root);
+    return root;
+  }
+
+  test('a changed source maps to the tests that reach it transitively', async () => {
+    const root = importProject();
+    expect(await mapChangedToTests(['src/core.ts'], root)).toEqual({
+      tests: ['tests/smoke.test.ts'],
+      unmapped: [],
+    });
+  });
+
+  test('a changed source no test imports is reported, never failed', async () => {
+    const root = importProject();
+    // tests/steps.ts is test code no test imports: nothing to run, nothing to report.
+    const changed = ['src/orphan.ts', 'harness.ts', 'tests/steps.ts'];
+    expect(await mapChangedToTests(changed, root)).toEqual({
+      tests: ['tests/harness.test.ts'],
+      unmapped: ['src/orphan.ts'],
+    });
+  });
+
+  test('a changed test file maps to itself', async () => {
+    const root = importProject();
+    expect(await mapChangedToTests(['tests/smoke.test.ts'], root)).toEqual({
+      tests: ['tests/smoke.test.ts'],
+      unmapped: [],
+    });
   });
 });

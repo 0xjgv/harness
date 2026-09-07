@@ -193,8 +193,12 @@ class TestNoTestBehavior(unittest.TestCase):
         self.assertIn("harness.py", command)
         self.assertIn("src/app.py", command)
 
-    def test_test_command_runs_unittest_when_tests_exist(self):
-        with temp_project(with_tests=True), mock.patch.object(harness, "run") as run_mock:
+    def test_test_command_runs_the_whole_suite_with_all(self):
+        with (
+            temp_project(with_tests=True),
+            mock.patch.object(harness, "ALL_FILES", True),
+            mock.patch.object(harness, "run") as run_mock,
+        ):
             harness.cmd_test()
             expected = [*harness._python(), *harness.TEST_COMMAND]
 
@@ -204,7 +208,7 @@ class TestNoTestBehavior(unittest.TestCase):
         """A pytest repo swaps TEST_COMMAND; both the test run and the coverage run
         follow, with no function body touched."""
         pytest_argv = ("-m", "pytest", "-q")
-        with temp_project(with_tests=True):
+        with temp_project(with_tests=True), mock.patch.object(harness, "ALL_FILES", True):
             with (
                 mock.patch.object(harness, "TEST_COMMAND", pytest_argv),
                 mock.patch.object(harness, "run") as run_mock,
@@ -253,22 +257,25 @@ class TestNoTestBehavior(unittest.TestCase):
                 run_mock.assert_not_called()
                 subprocess_run.assert_not_called()
 
-    def test_mutation_warns_and_skips_when_not_configured(self):
-        # Mutation is unconfigured by default: it must warn and exit 0 without
-        # shelling out, whether or not tests exist.
+    def test_mutation_skips_an_empty_scope_without_launching_mutmut(self):
+        # Mutation is scoped, not test-gated: a change that touched no app source
+        # warns and exits 0 without paying for a run, whether or not tests exist.
         for with_tests in (False, True):
             with self.subTest(with_tests=with_tests), temp_project(with_tests=with_tests):
                 output = io.StringIO()
                 with (
                     redirect_stdout(output),
-                    mock.patch.object(harness, "run") as run_mock,
-                    mock.patch.object(harness.subprocess, "run") as subprocess_run,
+                    mock.patch.object(harness, "ALL_FILES", False),
+                    mock.patch.object(harness, "_scoped_py_files", return_value=[]),
+                    # Pinned so a CI run with GITHUB_BASE_REF set does not swap in the
+                    # unresolvable-base message; that path has its own tests above.
+                    mock.patch.object(harness, "_unresolved_requested_base", return_value=None),
+                    mock.patch.object(harness, "_run_mutation") as run_mutation,
                 ):
                     harness.cmd_mutation()
 
-                self.assertIn("Mutation testing not configured", output.getvalue())
-                run_mock.assert_not_called()
-                subprocess_run.assert_not_called()
+                self.assertIn("no changed app sources", output.getvalue())
+                run_mutation.assert_not_called()
 
 
 class TestStopHook(unittest.TestCase):
@@ -292,9 +299,13 @@ class TestStopHook(unittest.TestCase):
         ):
             harness.cmd_stop_hook()
 
-        # Mutating fix/format runs first and alone; the read-only complexity gate runs
-        # through the parallel batch, then the count-ratcheted dead-code check.
-        self.assertEqual(calls, ["post-edit", "batch:Complexity (lizard)", "deadcode"])
+        # Mutating fix/format runs first and alone; the read-only complexity and
+        # duplication gates run through the parallel batch (both are lizard runs, so
+        # they overlap), then the count-ratcheted dead-code check.
+        self.assertEqual(
+            calls,
+            ["post-edit", "batch:Complexity (lizard),Duplication (lizard)", "deadcode"],
+        )
 
     def test_stop_hook_exits_2_and_names_failed_gates_on_stderr(self):
         # Claude Code only treats exit code 2 as blocking, and only stderr is fed
@@ -432,16 +443,16 @@ class TestCmdCheckSummary(unittest.TestCase):
             mock.patch.object(harness, "cmd_typecheck", return_value=typecheck_ok),
             mock.patch.object(harness, "cmd_test", return_value=True),
             mock.patch.object(harness, "run_gates_parallel", return_value=(True, [])),
-            # Pin the parallel batch to exactly one gate (complexity) so the summary
-            # count is deterministic: `check` now tallies one result per gate.
+            # Pin the parallel batch to exactly two gates (complexity, duplication) so
+            # the summary count is deterministic: `check` tallies one result per gate.
             mock.patch.object(harness, "_acceptance_gates_or_warn", return_value=[]),
-            mock.patch.object(harness, "_arch_gates_or_warn", return_value=[]),
             mock.patch.object(harness, "_check_stop_hooks_present"),
             mock.patch.object(harness, "_check_arch_config_guard", return_value=True),
             mock.patch.object(harness, "_check_gherkin_guard", return_value=True),
             mock.patch.object(harness, "_check_agents_md_drift", return_value=True),
             mock.patch.object(harness, "_check_suppressions_baseline", return_value=True),
             mock.patch.object(harness, "_check_deadcode", return_value=True),
+            mock.patch.object(harness, "_check_arch", return_value=True),
         ]
 
     def test_check_prints_ok_summary_when_everything_passes(self):
@@ -453,7 +464,7 @@ class TestCmdCheckSummary(unittest.TestCase):
                 harness.cmd_check()  # must not raise
 
         self.assertIn("OK", output.getvalue())
-        self.assertIn("11 passed", output.getvalue())
+        self.assertIn("13 passed", output.getvalue())
 
     def test_check_exits_1_and_prints_fail_summary_on_gate_failure(self):
         output = io.StringIO()
@@ -465,13 +476,13 @@ class TestCmdCheckSummary(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("FAIL", output.getvalue())
-        self.assertIn("10 passed, 1 failed", output.getvalue())
+        self.assertIn("12 passed, 1 failed", output.getvalue())
 
-    def test_check_runs_complexity_acceptance_arch_as_parallel_batch(self):
-        # check must run every offline, fast, no-build-lock gate — complexity,
-        # acceptance, and arch (import-linter: local dev dependency, offline, no
-        # build lock) all run through the same read-only parallel batch stop-hook
-        # uses. Dead code is count-ratcheted, so it runs outside the Gate batch.
+    def test_check_runs_complexity_duplication_and_acceptance_as_parallel_batch(self):
+        # check must run every offline, fast, no-build-lock gate. Complexity,
+        # duplication and acceptance go through the read-only parallel batch
+        # stop-hook uses; dead code and arch are count-ratcheted (a number against
+        # a baseline floor, not an exit code), so they run outside the Gate batch.
         captured_gates = []
 
         def record_batch(gates):
@@ -485,15 +496,10 @@ class TestCmdCheckSummary(unittest.TestCase):
                 mock.patch.object(harness, "run_gates_parallel", side_effect=record_batch)
             )
             stack.enter_context(
-                mock.patch.object(harness, "_acceptance_gates_or_warn", return_value=[])
-            )
-            stack.enter_context(
                 mock.patch.object(
                     harness,
-                    "_arch_gates_or_warn",
-                    return_value=[
-                        harness.Gate("Arch (import-linter)", ["uv", "run", "lint-imports"])
-                    ],
+                    "_acceptance_gates_or_warn",
+                    return_value=[harness.Gate("Acceptance (behave)", ["behave"])],
                 )
             )
             with redirect_stdout(io.StringIO()):
@@ -501,8 +507,23 @@ class TestCmdCheckSummary(unittest.TestCase):
 
         self.assertEqual(
             captured_gates,
-            [["Complexity (lizard)", "Arch (import-linter)"]],
+            [["Complexity (lizard)", "Duplication (lizard)", "Acceptance (behave)"]],
         )
+
+    def test_check_runs_arch_outside_the_batch(self):
+        # Arch (import-linter: local dev dependency, offline, no build lock) still
+        # runs in check — it just reports a count against `arch.max_violations`
+        # instead of an exit code, so it cannot ride in the Gate batch.
+        with contextlib.ExitStack() as stack:
+            for patcher in self._patch_check_steps():
+                stack.enter_context(patcher)
+            check_arch = stack.enter_context(
+                mock.patch.object(harness, "_check_arch", return_value=True)
+            )
+            with redirect_stdout(io.StringIO()):
+                harness.cmd_check()
+
+        check_arch.assert_called_once_with(no_exit=True)
 
 
 class TestGherkinGuardDecision(unittest.TestCase):
@@ -818,12 +839,142 @@ class TestEmptyScopeSkipsRatherThanWideningToWholeTree(unittest.TestCase):
             self.assertTrue(harness.cmd_typecheck(no_exit=True))
         run_mock.assert_not_called()
 
+    def test_test_skips_without_running_the_whole_suite(self):
+        with (
+            temp_project(with_tests=True),
+            self._empty_scope() as output,
+            mock.patch.object(harness, "run") as run_mock,
+        ):
+            self.assertTrue(harness.cmd_test(no_exit=True))
+        run_mock.assert_not_called()
+        self.assertIn("Tests: no changed Python files", output.getvalue())
+
     def test_explicit_empty_file_list_also_skips(self):
         # pre-commit passes its staged set verbatim; an empty one must skip too,
         # not silently become a whole-tree run.
         with redirect_stdout(io.StringIO()):
             self.assertIsNone(harness._lint_gate([]))
             self.assertIsNone(harness._typecheck_gate([]))
+
+
+class TestScopedTests(unittest.TestCase):
+    """`check`/`pre-commit` run only the test modules that map to the changed files."""
+
+    @contextmanager
+    def _project(self, *test_files: str, init: bool = True):
+        with temp_project(with_tests=True) as root:
+            if init:
+                (root / "tests" / "__init__.py").write_text("", encoding="utf-8")
+            for name in test_files:
+                (root / "tests" / name).write_text("import unittest\n", encoding="utf-8")
+            with (
+                mock.patch.object(harness, "ALL_FILES", False),
+                mock.patch.object(harness, "run", return_value=True) as run_mock,
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                yield run_mock, output
+
+    def _scope(self, *files: str):
+        return mock.patch.object(harness, "_scoped_py_files", return_value=list(files))
+
+    def test_stems_are_the_module_name_and_the_folded_package_path(self):
+        self.assertEqual(harness._test_stems("src/core/pricing.py"), ["pricing", "core_pricing"])
+        self.assertEqual(harness._test_stems("src/core/__init__.py"), ["core"])
+        self.assertEqual(harness._test_stems("src/__init__.py"), ["src"])
+        self.assertEqual(harness._test_stems("harness.py"), ["harness"])
+
+    def test_source_maps_to_bare_folded_and_prefixed_test_files(self):
+        names = ("test_core_pricing.py", "test_pricing_rules.py", "test_other.py")
+        with self._project(*names):
+            (Path("src") / "core").mkdir()
+            tests, unmapped = harness._mapped_test_files(["src/core/pricing.py", "src/app.py"])
+
+        self.assertEqual(
+            tests,
+            ["tests/test_app.py", "tests/test_core_pricing.py", "tests/test_pricing_rules.py"],
+        )
+        self.assertEqual(unmapped, [])
+
+    def test_changed_test_module_runs_itself_and_orphan_source_is_reported(self):
+        with self._project("test_other.py"):
+            tests, unmapped = harness._mapped_test_files([
+                "tests/test_other.py",
+                "src/orphan.py",
+                "tests/__init__.py",
+                "README.md",
+            ])
+
+        self.assertEqual(tests, ["tests/test_other.py"])
+        self.assertEqual(unmapped, ["src/orphan.py"])
+
+    def test_scoped_run_names_only_the_mapped_modules(self):
+        with self._project("test_other.py") as (run_mock, _), self._scope("src/app.py"):
+            self.assertTrue(harness.cmd_test(no_exit=True))
+            prefix = harness._python()
+
+        run_mock.assert_called_once_with(
+            "Tests (1/2 test modules)",
+            [*prefix, "-m", "unittest", "-q", "tests.test_app"],
+            no_exit=True,
+        )
+
+    def test_explicit_file_list_is_honoured_verbatim(self):
+        # pre-commit hands over its staged set; a staged test module runs itself.
+        with self._project() as (run_mock, _):
+            harness.cmd_test(["tests/test_app.py"])
+
+        self.assertEqual(run_mock.call_args.args[1][-1], "tests.test_app")
+
+    def test_unmapped_source_warns_but_mapped_tests_still_run(self):
+        with (
+            self._project() as (run_mock, output),
+            self._scope("src/app.py", "src/orphan.py"),
+        ):
+            self.assertTrue(harness.cmd_test(no_exit=True))
+
+        self.assertIn("Tests: src/orphan.py maps to no tests/**/test_<mod>.py", output.getvalue())
+        self.assertEqual(run_mock.call_args.args[1][-1], "tests.test_app")
+
+    def test_only_unmapped_source_skips_without_widening(self):
+        with self._project() as (run_mock, output), self._scope("src/orphan.py"):
+            self.assertTrue(harness.cmd_test(no_exit=True))
+
+        run_mock.assert_not_called()
+        self.assertIn("no test module maps to the changed files", output.getvalue())
+        self.assertIn("skipped", output.getvalue())
+
+    def test_missing_tests_init_warns_and_runs_the_whole_suite(self):
+        with self._project(init=False) as (run_mock, output), self._scope("src/app.py"):
+            harness.cmd_test(no_exit=True)
+
+        self.assertIn("has no __init__.py", output.getvalue())
+        self.assertEqual(
+            run_mock.call_args.args[1][-len(harness.TEST_COMMAND) :], list(harness.TEST_COMMAND)
+        )
+
+    def test_a_subpackage_without_init_also_falls_back_to_the_whole_suite(self):
+        # `tests/__init__.py` alone is not enough: `tests.unit.test_app` needs one in
+        # every package on the way down, or the dotted name is an ImportError.
+        with self._project() as (run_mock, output), self._scope("src/app.py"):
+            (Path("tests") / "unit").mkdir()
+            (Path("tests") / "unit" / "test_app.py").write_text("import unittest\n")
+            harness.cmd_test(no_exit=True)
+
+        self.assertIn("has no __init__.py", output.getvalue())
+        self.assertEqual(
+            run_mock.call_args.args[1][-len(harness.TEST_COMMAND) :], list(harness.TEST_COMMAND)
+        )
+
+    def test_pytest_runner_takes_file_paths(self):
+        pytest_argv = ("-m", "pytest", "-q")
+        with (
+            self._project(init=False) as (run_mock, _),
+            self._scope("src/app.py"),
+            mock.patch.object(harness, "TEST_COMMAND", pytest_argv),
+        ):
+            harness.cmd_test(no_exit=True)
+
+        self.assertEqual(run_mock.call_args.args[1][-4:], [*pytest_argv, "tests/test_app.py"])
 
 
 class TestAllFilesWidensScopedGates(unittest.TestCase):
@@ -960,6 +1111,61 @@ class TestToolResolution(unittest.TestCase):
             self.assertEqual(
                 harness._tool("lint-imports"), [str(Path(".venv", "bin", "lint-imports"))]
             )
+
+    @staticmethod
+    def _lock(*packages: tuple[str, str]) -> None:
+        body = "".join(
+            f'[[package]]\nname = "{name}"\nversion = "{version}"\n\n'
+            for name, version in packages
+        )
+        Path("uv.lock").write_text(f"version = 1\n\n{body}", encoding="utf-8")
+
+    def test_tier3_pins_the_locked_version_with_from(self):
+        # The lock holds the exact release `uv run` would use; the fallback runs
+        # the same one, so a gate reports the same findings with or without a venv.
+        with temp_project():
+            self._lock(("ruff", "0.15.11"), ("lizard", "1.22.2"))
+            self.assertEqual(harness._tool("ruff"), ["uvx", "--from", "ruff==0.15.11", "ruff"])
+            self.assertEqual(
+                harness._tool("lizard", read_only=True),
+                ["uvx", "--from", "lizard==1.22.2", "lizard"],
+            )
+
+    def test_tier3_pins_the_distribution_of_a_renamed_console_script(self):
+        with temp_project():
+            self._lock(("import-linter", "2.11"))
+            self.assertEqual(
+                harness._tool("lint-imports"),
+                ["uvx", "--from", "import-linter==2.11", "lint-imports"],
+            )
+
+    def test_tier3_stays_unpinned_when_the_lock_has_no_entry(self):
+        with temp_project():
+            self._lock(("coverage", "7.13.5"))
+            self.assertEqual(harness._tool("ruff"), ["uvx", "ruff"])
+            self.assertEqual(
+                harness._tool("lint-imports"), ["uvx", "--from", "import-linter", "lint-imports"]
+            )
+
+    def test_tier3_stays_unpinned_when_the_lock_is_unreadable(self):
+        # A pin is a fidelity gain, never a reason for the runner to stop starting.
+        for body in ("version = [\n", "version = 1\n", '[[package]]\nname = "ruff"\n'):
+            with self.subTest(body=body), temp_project():
+                Path("uv.lock").write_text(body, encoding="utf-8")
+                self.assertEqual(harness._tool("ruff"), ["uvx", "ruff"])
+
+    def test_lock_versions_are_read_once_per_run(self):
+        with temp_project():
+            self._lock(("ruff", "0.15.11"))
+            self.assertEqual(harness._lock_versions(), {"ruff": "0.15.11"})
+            self._lock(("ruff", "9.9.9"))
+            self.assertEqual(harness._lock_versions(), {"ruff": "0.15.11"})
+
+    def test_a_local_binary_still_wins_over_the_lock_pin(self):
+        with temp_project() as root:
+            self._lock(("ruff", "0.15.11"))
+            self._install(root)
+            self.assertEqual(harness._tool("ruff"), [str(Path(".venv", "bin", "ruff"))])
 
 
 class TestLockfileGate(unittest.TestCase):
@@ -1184,7 +1390,7 @@ class TestCheckSummaryCountsEveryGate(unittest.TestCase):
                 mock.patch.object(harness, "cmd_test", return_value=True),
                 mock.patch.object(harness, "_complexity_gate", return_value=batch[0]),
                 mock.patch.object(harness, "_acceptance_gates_or_warn", return_value=batch[1:]),
-                mock.patch.object(harness, "_arch_gates_or_warn", return_value=[]),
+                mock.patch.object(harness, "_check_arch", return_value=True),
                 mock.patch.object(
                     harness,
                     "run_gates_parallel",
@@ -1201,9 +1407,10 @@ class TestCheckSummaryCountsEveryGate(unittest.TestCase):
             with redirect_stdout(output), self.assertRaises(SystemExit):
                 harness.cmd_check()
 
-        # 3 of the 4 batch gates failed; the old code reported 1.
+        # 3 of the 5 batch gates failed (4 mocked + the real duplication gate); the
+        # old code reported 1.
         self.assertIn("3 failed", output.getvalue())
-        self.assertIn("11 passed", output.getvalue())
+        self.assertIn("13 passed", output.getvalue())
 
 
 class TestVerboseStillPrintsGlyphs(unittest.TestCase):
