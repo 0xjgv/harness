@@ -2141,6 +2141,38 @@ class TestPostEditHookStdin(unittest.TestCase):
         self.assertIsNone(harness._hook_target({}))
 
 
+class TestHookWiringCheck(unittest.TestCase):
+    """`check`'s wiring lines are the only warning a repo gets when a hook was never
+    installed — and an uninstalled PostToolUse hook is invisible otherwise, because
+    nothing fails."""
+
+    def _wiring_output(self, settings):
+        with temp_project() as root:
+            claude = root / ".claude"
+            claude.mkdir()
+            (claude / "settings.json").write_text(settings, encoding="utf-8")
+            output = io.StringIO()
+            with redirect_stdout(output):
+                harness._check_stop_hooks_present()
+            return output.getvalue()
+
+    def test_missing_post_tool_use_wiring_warns(self):
+        stop_only = '{"hooks":{"Stop":[{"hooks":[{"command":"harness stop-hook"}]}]}}'
+        text = self._wiring_output(stop_only)
+        self.assertIn("Stop hook wiring (.claude/settings.json)", text)
+        self.assertIn("Missing PostToolUse hook wiring: .claude/settings.json", text)
+
+    def test_both_wired_reports_both(self):
+        both = (
+            '{"hooks":{"Stop":[{"hooks":[{"command":"harness stop-hook"}]}],'
+            '"PostToolUse":[{"matcher":"Edit|Write",'
+            '"hooks":[{"command":"harness post-edit --hook"}]}]}}'
+        )
+        text = self._wiring_output(both)
+        self.assertIn("PostToolUse hook wiring (.claude/settings.json)", text)
+        self.assertNotIn("Missing PostToolUse", text)
+
+
 class TestCoverageResolvesOneWay(unittest.TestCase):
     def test_every_coverage_invocation_is_read_only(self):
         # One tool, one resolution. Coverage resolving two ways in this file is what
