@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -279,54 +280,113 @@ class TestNoTestBehavior(unittest.TestCase):
 
 
 class TestStopHook(unittest.TestCase):
-    def test_stop_hook_runs_post_edit_then_parallel_batch(self):
+    def test_stop_hook_runs_post_edit_then_the_delta_gates(self):
         calls: list[str] = []
 
         def record_batch(gates: list[harness.Gate]) -> tuple[bool, list[str]]:
             calls.append("batch:" + ",".join(gate.description for gate in gates))
             return True, []
 
+        def record_post_edit() -> tuple[bool, list[str]]:
+            calls.append("post-edit")
+            return True, []
+
         with (
-            mock.patch.object(
-                harness, "cmd_post_edit", side_effect=lambda: calls.append("post-edit")
-            ),
+            mock.patch.object(harness, "cmd_post_edit", side_effect=record_post_edit),
             mock.patch.object(harness, "run_gates_parallel", side_effect=record_batch),
             mock.patch.object(
                 harness,
-                "_check_deadcode",
-                side_effect=lambda **_: calls.append("deadcode") is None,
+                "_check_complexity_delta",
+                side_effect=lambda **_: (calls.append("complexity-delta") or True, []),
+            ),
+            mock.patch.object(
+                harness,
+                "_check_deadcode_delta",
+                side_effect=lambda **_: (calls.append("deadcode-delta") or True, []),
             ),
         ):
             harness.cmd_stop_hook()
 
-        # Mutating fix/format runs first and alone; the read-only complexity and
-        # duplication gates run through the parallel batch (both are lizard runs, so
-        # they overlap), then the count-ratcheted dead-code check.
+        # Mutating fix/format runs first and alone; then the two delta gates, which
+        # report what this change made worse rather than what the tree already carries,
+        # with the (unchanged) duplication gate between them.
         self.assertEqual(
             calls,
-            ["post-edit", "batch:Complexity (lizard),Duplication (lizard)", "deadcode"],
+            ["post-edit", "complexity-delta", "batch:Duplication (lizard)", "deadcode-delta"],
         )
 
-    def test_stop_hook_exits_2_and_names_failed_gates_on_stderr(self):
-        # Claude Code only treats exit code 2 as blocking, and only stderr is fed
-        # back to the model — exit 1 / stdout-only output is silently swallowed.
-        def failing_batch(gates: list[harness.Gate]) -> tuple[bool, list[str]]:
-            return False, ["Complexity (lizard)"]
+    def _patch_stop_hook_steps(self, **overrides):
+        """Every stop-hook step green, so a test only names the one it changes."""
+        steps = {
+            "cmd_post_edit": (True, []),
+            "_check_arch_config_guard": True,
+            "_check_gherkin_guard": True,
+            "run_gates_parallel": (True, []),
+            "_check_complexity_delta": (True, []),
+            "_check_deadcode_delta": (True, []),
+        }
+        steps.update(overrides)
+        return [mock.patch.object(harness, name, return_value=v) for name, v in steps.items()]
 
-        stdout, stderr = io.StringIO(), io.StringIO()
+    @contextmanager
+    def _stop_hook(self, **overrides):
+        """Run `stop-hook` with those steps patched; yields the captured stderr."""
+        stderr = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for patcher in self._patch_stop_hook_steps(**overrides):
+                stack.enter_context(patcher)
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            stack.enter_context(redirect_stderr(stderr))
+            yield stderr
+
+    def test_stop_hook_does_not_run_the_whole_tree_complexity_or_deadcode_gates(self):
+        # The whole-tree, count-ratcheted pair belongs to `check`/`ci`. Running it here
+        # hands the model the repository's standing violations after every single turn.
         with (
-            mock.patch.object(harness, "cmd_post_edit"),
-            mock.patch.object(harness, "_check_arch_config_guard", return_value=True),
-            mock.patch.object(harness, "_check_gherkin_guard", return_value=True),
-            mock.patch.object(harness, "run_gates_parallel", side_effect=failing_batch),
-            redirect_stdout(stdout),
-            redirect_stderr(stderr),
+            self._stop_hook(),
+            mock.patch.object(harness, "_complexity_gate") as complexity,
+            mock.patch.object(harness, "_check_deadcode") as deadcode,
+        ):
+            harness.cmd_stop_hook()
+
+        complexity.assert_not_called()
+        deadcode.assert_not_called()
+
+    def test_stop_hook_exits_2_and_puts_the_findings_on_stderr(self):
+        # Claude Code only treats exit code 2 as blocking, and only stderr is fed
+        # back to the model — exit 1 / stdout-only output is silently swallowed. The
+        # gate names alone say a gate is red without saying what to fix, so the
+        # findings ride out on the same stream.
+        finding = "src/a.py:3: f CCN new→22 (limit 15)"
+        with (
+            self._stop_hook(_check_complexity_delta=(False, [finding])) as stderr,
             self.assertRaises(SystemExit) as ctx,
         ):
             harness.cmd_stop_hook()
 
         self.assertEqual(ctx.exception.code, 2)
-        self.assertIn("stop-hook failed: Complexity (lizard)", stderr.getvalue())
+        self.assertEqual(
+            stderr.getvalue().strip().splitlines(),
+            ["stop-hook failed: Complexity delta (lizard)", finding],
+        )
+
+    def test_unfixable_lint_from_post_edit_is_a_stop_hook_failure(self):
+        finding = "src/a.py:2:12: F821 Undefined name `x`"
+        with (
+            self._stop_hook(cmd_post_edit=(False, [finding])) as stderr,
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            harness.cmd_stop_hook()
+
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertEqual(
+            stderr.getvalue().strip().splitlines(), ["stop-hook failed: Lint", finding]
+        )
+
+    def test_a_clean_stop_hook_writes_nothing_to_stderr(self):
+        with self._stop_hook() as stderr:
+            harness.cmd_stop_hook()
+        self.assertEqual(stderr.getvalue(), "")
 
 
 class TestParallelGates(unittest.TestCase):
@@ -453,6 +513,8 @@ class TestCmdCheckSummary(unittest.TestCase):
             mock.patch.object(harness, "_check_suppressions_baseline", return_value=True),
             mock.patch.object(harness, "_check_deadcode", return_value=True),
             mock.patch.object(harness, "_check_arch", return_value=True),
+            mock.patch.object(harness, "_check_complexity_delta", return_value=(True, [])),
+            mock.patch.object(harness, "_check_deadcode_delta", return_value=(True, [])),
         ]
 
     def test_check_prints_ok_summary_when_everything_passes(self):
@@ -464,7 +526,25 @@ class TestCmdCheckSummary(unittest.TestCase):
                 harness.cmd_check()  # must not raise
 
         self.assertIn("OK", output.getvalue())
-        self.assertIn("13 passed", output.getvalue())
+        self.assertIn("15 passed", output.getvalue())
+
+    def test_check_runs_the_delta_gates_as_well_as_the_whole_tree_pair(self):
+        # A green stop-hook must predict a green check, so check runs the delta gates
+        # too — without giving up the count-ratcheted floors that make the tree improve.
+        with contextlib.ExitStack() as stack:
+            for patcher in self._patch_check_steps():
+                stack.enter_context(patcher)
+            complexity_delta = stack.enter_context(
+                mock.patch.object(harness, "_check_complexity_delta", return_value=(True, []))
+            )
+            deadcode_delta = stack.enter_context(
+                mock.patch.object(harness, "_check_deadcode_delta", return_value=(True, []))
+            )
+            with redirect_stdout(io.StringIO()):
+                harness.cmd_check()
+
+        complexity_delta.assert_called_once()
+        deadcode_delta.assert_called_once()
 
     def test_check_exits_1_and_prints_fail_summary_on_gate_failure(self):
         output = io.StringIO()
@@ -476,7 +556,7 @@ class TestCmdCheckSummary(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("FAIL", output.getvalue())
-        self.assertIn("12 passed, 1 failed", output.getvalue())
+        self.assertIn("14 passed, 1 failed", output.getvalue())
 
     def test_check_runs_complexity_duplication_and_acceptance_as_parallel_batch(self):
         # check must run every offline, fast, no-build-lock gate. Complexity,
@@ -1402,6 +1482,8 @@ class TestCheckSummaryCountsEveryGate(unittest.TestCase):
                 mock.patch.object(harness, "_check_agents_md_drift", return_value=True),
                 mock.patch.object(harness, "_check_suppressions_baseline", return_value=True),
                 mock.patch.object(harness, "_check_deadcode", return_value=True),
+                mock.patch.object(harness, "_check_complexity_delta", return_value=(True, [])),
+                mock.patch.object(harness, "_check_deadcode_delta", return_value=(True, [])),
             ):
                 stack.enter_context(patcher)
             with redirect_stdout(output), self.assertRaises(SystemExit):
@@ -1410,7 +1492,7 @@ class TestCheckSummaryCountsEveryGate(unittest.TestCase):
         # 3 of the 5 batch gates failed (4 mocked + the real duplication gate); the
         # old code reported 1.
         self.assertIn("3 failed", output.getvalue())
-        self.assertIn("13 passed", output.getvalue())
+        self.assertIn("15 passed", output.getvalue())
 
 
 class TestVerboseStillPrintsGlyphs(unittest.TestCase):
@@ -1873,6 +1955,190 @@ class TestAuditGateIsReadOnly(unittest.TestCase):
                 harness.cmd_audit()
         ran.assert_not_called()
         self.assertIn("skipped", out.getvalue())
+
+
+def _metrics(name, *, ccn=1, args=0, length=1, start=1):
+    return harness.FunctionMetrics(name=name, ccn=ccn, args=args, length=length, start=start)
+
+
+class TestFindingsPayload(unittest.TestCase):
+    """What the Stop hook puts on stderr is the only thing the model ever reads."""
+
+    def test_only_path_and_line_prefixed_lines_survive_extraction(self):
+        text = (
+            "Command failed: uv run ruff check\n"
+            "src/a.py:4:1: F821 Undefined name `x`\n"
+            "  src/b.py:12: unused function 'f' (60% confidence)\n"
+            "==============================\n"
+            "Total nloc  Avg.NLOC  AvgCCN\n"
+            "not/a/finding.py: no line number\n"
+        )
+        self.assertEqual(
+            harness._finding_lines(text),
+            [
+                "src/a.py:4:1: F821 Undefined name `x`",
+                "src/b.py:12: unused function 'f' (60% confidence)",
+            ],
+        )
+
+    def test_findings_under_the_limit_pass_through_untouched(self):
+        lines = [f"src/a.py:{n}: finding" for n in range(harness.HOOK_FINDING_LIMIT)]
+        self.assertEqual(harness._capped_findings(lines, "run it"), lines)
+
+    def test_overflow_is_capped_and_says_how_much_was_dropped(self):
+        lines = [f"src/a.py:{n}: finding" for n in range(harness.HOOK_FINDING_LIMIT + 3)]
+        capped = harness._capped_findings(lines, "run `uv run harness stop-hook`")
+        self.assertEqual(len(capped), harness.HOOK_FINDING_LIMIT + 1)
+        self.assertEqual(capped[-1], "… +3 more — run `uv run harness stop-hook`")
+
+    def test_a_hard_line_budget_drops_the_overflow_line_too(self):
+        # The PostToolUse block reason has no room for a 21st line.
+        lines = [f"src/a.py:{n}: finding" for n in range(harness.HOOK_FINDING_LIMIT + 3)]
+        self.assertEqual(len(harness._capped_findings(lines)), harness.HOOK_FINDING_LIMIT)
+
+    def test_payload_names_the_gates_then_the_findings(self):
+        payload = harness._stop_hook_payload(
+            ["Lint", "Complexity delta (lizard)"], ["src/a.py:1: x"]
+        )
+        self.assertEqual(
+            payload.splitlines(),
+            ["stop-hook failed: Lint, Complexity delta (lizard)", "src/a.py:1: x"],
+        )
+
+
+class TestLizardCsv(unittest.TestCase):
+    def test_long_name_commas_do_not_break_the_row(self):
+        row = '4,2,38,2,8,"loc","src/p.py","apply","apply( a : float , b : float )",23,30\n'
+        parsed = harness._parse_lizard_csv(row)
+        self.assertEqual(
+            parsed,
+            {
+                "src/p.py": {
+                    "apply( a : float , b : float )": _metrics(
+                        "apply", ccn=2, args=2, length=8, start=23
+                    )
+                }
+            },
+        )
+
+    def test_unparsable_rows_are_skipped_rather_than_crashing_the_gate(self):
+        self.assertEqual(harness._parse_lizard_csv("NLOC,CCN,token\nnot,a,row\n"), {})
+
+
+class TestComplexityDelta(unittest.TestCase):
+    """The delta rule: over the limit now AND new or worse than the base version."""
+
+    def test_a_function_this_change_introduced_over_the_limit_is_reported(self):
+        current = {"src/a.py": {"worse( x )": _metrics("worse", ccn=16, start=3)}}
+        self.assertEqual(
+            harness._complexity_delta_findings(current, {}),
+            ["src/a.py:3: worse CCN new→16 (limit 15)"],
+        )
+
+    def test_a_pre_existing_violation_this_change_did_not_touch_is_not_reported(self):
+        functions = {"legacy( )": _metrics("legacy", ccn=22, start=9)}
+        self.assertEqual(
+            harness._complexity_delta_findings({"src/a.py": functions}, {"src/a.py": functions}),
+            [],
+        )
+
+    def test_a_pre_existing_violation_made_worse_is_reported_with_both_numbers(self):
+        base = {"src/a.py": {"legacy( )": _metrics("legacy", ccn=22, start=9)}}
+        current = {"src/a.py": {"legacy( )": _metrics("legacy", ccn=23, start=9)}}
+        self.assertEqual(
+            harness._complexity_delta_findings(current, base),
+            ["src/a.py:9: legacy CCN 22→23 (limit 15)"],
+        )
+
+    def test_an_improved_violation_still_over_the_limit_is_not_reported(self):
+        base = {"src/a.py": {"legacy( )": _metrics("legacy", ccn=27, start=9)}}
+        current = {"src/a.py": {"legacy( )": _metrics("legacy", ccn=16, start=9)}}
+        self.assertEqual(harness._complexity_delta_findings(current, base), [])
+
+    def test_a_function_under_every_limit_is_never_reported(self):
+        current = {"src/a.py": {"fine( )": _metrics("fine", ccn=15, args=8, length=100)}}
+        self.assertEqual(harness._complexity_delta_findings(current, {}), [])
+
+    def test_args_and_length_are_reported_with_their_own_limits(self):
+        current = {
+            "src/a.py": {"wide( )": _metrics("wide", args=9, start=2)},
+            "src/b.py": {"long( )": _metrics("long", length=101, start=4)},
+        }
+        self.assertEqual(
+            harness._complexity_delta_findings(current, {}),
+            [
+                "src/a.py:2: wide args new→9 (limit 8)",
+                "src/b.py:4: long length new→101 (limit 100)",
+            ],
+        )
+
+    def test_matching_is_by_signature_so_a_moved_function_is_not_new(self):
+        base = {"src/a.py": {"legacy( )": _metrics("legacy", ccn=22, start=9)}}
+        current = {"src/a.py": {"legacy( )": _metrics("legacy", ccn=22, start=91)}}
+        self.assertEqual(harness._complexity_delta_findings(current, base), [])
+
+
+class TestDeadcodeDelta(unittest.TestCase):
+    def test_only_findings_on_changed_lines_survive(self):
+        lines = [
+            "src/a.py:3: unused function 'old' (60% confidence)",
+            "src/a.py:40: unused function 'new' (60% confidence)",
+            "src/untouched.py:2: unused function 'other' (60% confidence)",
+        ]
+        kept = harness._deadcode_delta_findings(lines, {"src/a.py": [(38, 42)]})
+        self.assertEqual(kept, ["src/a.py:40: unused function 'new' (60% confidence)"])
+
+    def test_a_file_with_no_base_version_is_entirely_in_scope(self):
+        lines = ["src/new.py:1: unused function 'f' (60% confidence)"]
+        self.assertEqual(harness._deadcode_delta_findings(lines, {"src/new.py": None}), lines)
+
+    def test_a_deletion_only_file_has_nothing_in_scope(self):
+        lines = ["src/a.py:1: unused function 'f' (60% confidence)"]
+        self.assertEqual(harness._deadcode_delta_findings(lines, {"src/a.py": []}), [])
+
+    def test_a_line_vulture_did_not_number_is_ignored(self):
+        self.assertEqual(harness._deadcode_delta_findings(["garbage"], {"src/a.py": None}), [])
+
+
+class TestPostEditHookStdin(unittest.TestCase):
+    """`post-edit --hook` reads Claude Code's PostToolUse event; bad input must be a
+    silent no-op, never a crash the agent is shown instead of its own work."""
+
+    def _event(self, text):
+        return mock.patch.object(harness.sys, "stdin", io.StringIO(text))
+
+    def test_a_well_formed_event_yields_the_edited_file(self):
+        with temp_project():
+            event = '{"tool_name":"Edit","tool_input":{"file_path":"src/app.py"}}'
+            with self._event(event):
+                self.assertEqual(harness._hook_target(harness._hook_event()), "src/app.py")
+
+    def test_an_absolute_path_inside_the_template_is_made_relative(self):
+        with temp_project() as root:
+            target = str((root / "src" / "app.py").resolve())
+            with self._event(f'{{"tool_input":{{"file_path":{json.dumps(target)}}}}}'):
+                self.assertEqual(harness._hook_target(harness._hook_event()), "src/app.py")
+
+    def test_a_file_outside_the_template_is_not_ours_to_format(self):
+        with temp_project(), self._event('{"tool_input":{"file_path":"/etc/hosts"}}'):
+            self.assertIsNone(harness._hook_target(harness._hook_event()))
+
+    def test_a_non_python_file_is_skipped(self):
+        with temp_project(), self._event('{"tool_input":{"file_path":"src/notes.md"}}'):
+            self.assertIsNone(harness._hook_target(harness._hook_event()))
+
+    def test_unparsable_stdin_is_an_empty_event(self):
+        with self._event("not json at all"):
+            self.assertEqual(harness._hook_event(), {})
+
+    def test_a_json_scalar_is_an_empty_event(self):
+        with self._event('"a string"'):
+            self.assertEqual(harness._hook_event(), {})
+
+    def test_an_event_with_no_file_path_has_no_target(self):
+        self.assertIsNone(harness._hook_target({"tool_input": {}}))
+        self.assertIsNone(harness._hook_target({"tool_input": "not an object"}))
+        self.assertIsNone(harness._hook_target({}))
 
 
 class TestCoverageResolvesOneWay(unittest.TestCase):

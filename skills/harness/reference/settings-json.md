@@ -12,9 +12,13 @@ Code's hook runtime. Codex hooks run inside Codex's hook runtime and are
 trust-gated per project. The contract text in `AGENTS.md`/`CLAUDE.md` applies
 as instruction to any agent reading the file.
 
-The templates wire only `Stop` hooks. The Stop hook runs `stop-hook`, which
+Every template wires a `Stop` hook. The Stop hook runs `stop-hook`, which
 formats changed files, then runs complexity plus deadcode where the language
 ships a separate deadcode gate.
+
+The **python** template additionally wires a `PostToolUse` hook (reference
+implementation; divergence to close during the port). See "Claude PostToolUse
+hook" below.
 
 ## Claude Stop hook
 
@@ -100,6 +104,51 @@ prints human status lines to stdout.
 | Rust | `cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh cargo harness stop-hook` |
 | Monorepo | `cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh make stop-hook` |
 
+## Claude PostToolUse hook (python only, for now)
+
+A Stop hook arrives a whole turn after the edit. `PostToolUse` arrives
+immediately after every `Edit`/`Write`, which is the only moment the harness
+can fix a file while the agent still has it in mind — and the only moment a
+"you must re-read this file" message is cheap rather than confusing. Claude
+only; Codex has no equivalent event, so `.codex/hooks.json` keeps just the
+Stop wiring.
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd $CLAUDE_PROJECT_DIR && uv run harness post-edit --hook"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`post-edit --hook` reads the event on stdin, takes `tool_input.file_path`,
+and acts only when that is a project `.py` file inside the template: it runs
+`ruff check --fix` then `ruff format` on that one file. Anything else — a
+file in another subproject, a non-Python file, unparsable stdin — is a silent
+no-op. It **always exits 0** and speaks through exactly one compact JSON
+object on stdout:
+
+- nothing at all when the file did not change and lints clean;
+- `{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"harness: reformatted <path>; re-read it before editing it again"}}`
+  when formatting rewrote the file — the agent's in-memory copy is now stale,
+  and this is the only way to say so;
+- `{"decision":"block","reason":"<findings>"}` when ruff left violations on
+  lines this change wrote — `block` is the one channel that reaches the model
+  as an instruction rather than as context. Findings are line-scoped and
+  capped at 20 lines.
+
+A block and a reformat notice cannot both be sent; block wins.
+
 ## Adapting to a different runner
 
 If the repo uses `just`, `make`, or npm scripts instead of the template
@@ -110,4 +159,6 @@ array shape.
 
 Do not add SessionStart, UserPromptSubmit, or PreToolUse behavior gates. The
 current behavior contract is enforced through instructions plus
-`arch-config-guard` in the runner.
+`arch-config-guard` in the runner. `PostToolUse` is the one exception, and it
+is not a behavior gate: it formats the file that was just written and reports
+what the formatter could not fix.

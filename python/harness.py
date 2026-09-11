@@ -22,6 +22,7 @@ minutes — so it reports rather than blocks unless asked to `--enforce`.
 from __future__ import annotations
 
 import concurrent.futures
+import csv
 import dataclasses
 import difflib
 import functools
@@ -31,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import xml.etree.ElementTree as ET
@@ -65,6 +67,11 @@ VULTURE_MIN_CONFIDENCE = "60"
 VULTURE_ALLOWLIST = "vulture_allowlist.py"
 COMPLEXITY_MAX_ARGS = 8
 COMPLEXITY_MAX_CCN = 15
+COMPLEXITY_MAX_LENGTH = 100
+# How many finding lines a hook payload carries. The Stop hook's stderr and the
+# PostToolUse block reason are read by a model, not a terminal: past twenty lines
+# a wall of findings buries the one that matters instead of naming it.
+HOOK_FINDING_LIMIT = 20
 CRAP_MAX_DEFAULT = 30.0
 BASELINE_FILE = ".harness-baseline"
 # A tolerance so high the gate can never trip: how a count-ratcheted gate runs when
@@ -98,6 +105,17 @@ CODEX_STOP_COMMAND = (
     ".codex/hooks/codex-stop-hook.sh uv run harness stop-hook"
 )
 CLAUDE_STOP_HOOK: dict[str, Any] = {"type": "command", "command": CLAUDE_STOP_COMMAND}
+# PostToolUse fires after every Edit/Write, which is the only moment the harness can
+# fix a file while the agent still has it in mind — a Stop hook arrives a whole turn
+# later. Claude-only: Codex has no equivalent event, so `.codex/hooks.json` keeps
+# just the Stop wiring.
+CLAUDE_POST_EDIT_COMMAND = "cd $CLAUDE_PROJECT_DIR && uv run harness post-edit --hook"
+CLAUDE_POST_EDIT_MATCHER = "Edit|Write"
+CLAUDE_POST_EDIT_HOOK: dict[str, Any] = {"type": "command", "command": CLAUDE_POST_EDIT_COMMAND}
+# What marks a handler as ours, per event, so re-running `setup-hooks` replaces it
+# instead of appending a second copy.
+STOP_HOOK_MARKER = "stop-hook"
+POST_EDIT_HOOK_MARKER = "post-edit --hook"
 CODEX_STOP_HOOK: dict[str, Any] = {
     "type": "command",
     "command": CODEX_STOP_COMMAND,
@@ -116,6 +134,10 @@ WHOLE_FILE = "--whole-file" in sys.argv
 # A whole-tree mutation run costs minutes, so `suppressions --update-baseline`
 # measures `mutation.min` only when asked to; otherwise it carries the key through.
 WITH_MUTATION = "--with-mutation" in sys.argv
+# `post-edit --hook` reads a Claude Code hook event on stdin and answers on stdout
+# instead of printing human status lines. Read from argv like every other flag,
+# because `main` drops anything starting with `-` before dispatching.
+HOOK_MODE = "--hook" in sys.argv
 BASE_OVERRIDE = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--base=")), None)
 
 # Ruff codes a line-scoped filter would hide, because the change that causes them
@@ -2242,6 +2264,44 @@ class CrapMeasurement:
     """0 with a `problem` set means a benign skip; nonzero means a tool failed."""
 
 
+# Function name capture allows the empty string so we can detect (and skip)
+# anonymous functions explicitly rather than silently dropping them.
+_LIZARD_ROW_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s+\d+\s+\d+\s+\d+\s+([^@\s]*)@(\d+)-(\d+)@(.+)$")
+
+
+def _crap_offenders(
+    report: str, cov_map: dict[str, dict[int, int]], max_crap: float
+) -> list[tuple[float, int, float, str]]:
+    """Join lizard's per-function rows to line coverage and keep those above `max_crap`.
+
+    Pure over its inputs, so the scoring law is testable without running lizard or
+    coverage. Keyed by location: lizard lists a flagged function twice — once in the
+    per-file table and once in its warnings table — and counting it twice would
+    inflate the ratchet count.
+    """
+    scored: dict[str, tuple[float, int, float, str]] = {}
+    for out_line in report.splitlines():
+        m = _LIZARD_ROW_RE.match(out_line)
+        if not m:
+            continue
+        _, ccn_s, func, start_s, end_s, path = m.groups()
+        # Anonymous functions: lizard emits an empty name. Coverage in cobertura
+        # is attributed to the enclosing scope, so a per-function join would
+        # mis-score — skip rather than silently misattribute.
+        if not func:
+            continue
+        ccn = int(ccn_s)
+        start, end = int(start_s), int(end_s)
+        lines = cov_map.get(path) or cov_map.get(path.lstrip("./")) or {}
+        in_range = [n for n in range(start, end + 1) if n in lines]
+        cov = (sum(1 for n in in_range if lines[n] > 0) / len(in_range)) if in_range else 0.0
+        crap = _crap_score(ccn, cov)
+        loc = f"{func}@{start}-{end}@{path}"
+        if crap > max_crap:
+            scored[loc] = (crap, ccn, cov, loc)
+    return sorted(scored.values(), reverse=True)
+
+
 def _crap_measure(max_crap: float) -> CrapMeasurement:
     """Score every function's CRAP against `max_crap`, refreshing coverage if stale."""
     cov_data = Path(".coverage")
@@ -2282,33 +2342,7 @@ def _crap_measure(max_crap: float) -> CrapMeasurement:
             lizard_res.stderr.strip(),
             lizard_res.returncode,
         )
-    # Function name capture allows the empty string so we can detect (and skip)
-    # anonymous functions explicitly rather than silently dropping them.
-    line_re = re.compile(r"^\s*(\d+)\s+(\d+)\s+\d+\s+\d+\s+\d+\s+([^@\s]*)@(\d+)-(\d+)@(.+)$")
-    # Keyed by location: lizard lists a flagged function twice — once in the
-    # per-file table and once in its warnings table — and counting it twice would
-    # inflate the ratchet count.
-    scored: dict[str, tuple[float, int, float, str]] = {}
-    for out_line in lizard_res.stdout.splitlines():
-        m = line_re.match(out_line)
-        if not m:
-            continue
-        _, ccn_s, func, start_s, end_s, path = m.groups()
-        # Anonymous functions: lizard emits an empty name. Coverage in cobertura
-        # is attributed to the enclosing scope, so a per-function join would
-        # mis-score — skip rather than silently misattribute.
-        if not func:
-            continue
-        ccn = int(ccn_s)
-        start, end = int(start_s), int(end_s)
-        lines = cov_map.get(path) or cov_map.get(path.lstrip("./")) or {}
-        in_range = [n for n in range(start, end + 1) if n in lines]
-        cov = (sum(1 for n in in_range if lines[n] > 0) / len(in_range)) if in_range else 0.0
-        crap = _crap_score(ccn, cov)
-        loc = f"{func}@{start}-{end}@{path}"
-        if crap > max_crap:
-            scored[loc] = (crap, ccn, cov, loc)
-    return CrapMeasurement(sorted(scored.values(), reverse=True))
+    return CrapMeasurement(_crap_offenders(lizard_res.stdout, cov_map, max_crap))
 
 
 def cmd_crap() -> None:
@@ -2430,7 +2464,7 @@ def _complexity_argv(max_violations: int) -> list[str]:
         "-a",
         str(COMPLEXITY_MAX_ARGS),
         "-L",
-        "100",
+        str(COMPLEXITY_MAX_LENGTH),
         "-i",
         str(max_violations),
     ]
@@ -2584,13 +2618,399 @@ def cmd_deadcode() -> None:
     _check_deadcode()
 
 
-def cmd_post_edit() -> None:
-    """Format if source files have uncommitted changes."""
+# ── Agent feedback ────────────────────────────────────────────────
+# Everything below exists so an agent's edit loop closes on its own. Two halves:
+#
+#   1. The *payload*. A Stop hook that exits 2 blocks the agent and feeds its
+#      stderr to the model — and nothing else. Printing "stop-hook failed:
+#      Complexity" there tells the model a gate is red without telling it what to
+#      fix, so it re-runs the command it just ran. The findings go on stderr too.
+#   2. The *scope*. A whole-tree lizard table at every stop reports the state of
+#      the repository, not the consequence of this change, so the model reads 24 KB
+#      of pre-existing debt it must not touch. The delta gates below report only
+#      what this change introduced or worsened — the same "gate the change, not the
+#      codebase" rule the line-scoped lint gates already follow.
+
+# A finding worth handing back names a file and a line: ruff's
+# `path:line:col: CODE message`, vulture's `path:line: unused ...`, and the
+# complexity delta's own `path:line: name CCN a→b`. Anything else a tool printed
+# (banners, tables, summary rows) is terminal furniture, not an instruction.
+_FINDING_RE = re.compile(r"^\S+:\d+:")
+
+
+def _finding_lines(text: str) -> list[str]:
+    """The `path:line:`-prefixed lines of a gate's output, in order."""
+    stripped = (line.strip() for line in text.splitlines())
+    return [line for line in stripped if _FINDING_RE.match(line)]
+
+
+def _capped_findings(lines: list[str], more: str | None = None) -> list[str]:
+    """At most HOOK_FINDING_LIMIT findings, with `more` naming what was dropped.
+
+    `more` is None where the consumer's contract is a hard line budget (the
+    PostToolUse block reason); the Stop hook can afford the extra line and uses it
+    to say the rest are one command away.
+    """
+    if len(lines) <= HOOK_FINDING_LIMIT:
+        return list(lines)
+    kept = list(lines[:HOOK_FINDING_LIMIT])
+    if more is not None:
+        kept.append(f"… +{len(lines) - HOOK_FINDING_LIMIT} more — {more}")
+    return kept
+
+
+def _stop_hook_payload(failed: list[str], findings: list[str]) -> str:
+    """The stderr block Claude Code feeds back: which gates failed, then why."""
+    header = f"stop-hook failed: {', '.join(failed)}"
+    return "\n".join([header, *_capped_findings(findings, "run `uv run harness stop-hook`")])
+
+
+# ── Complexity delta ──────────────────────────────────────────────
+
+
+@dataclasses.dataclass(frozen=True)
+class FunctionMetrics:
+    """One function as lizard measured it."""
+
+    name: str
+    ccn: int
+    args: int
+    length: int
+    start: int
+
+
+# lizard --csv columns, in order: nloc, ccn, token, param, length, location, file,
+# name, long_name, start, end. Parsed with the csv module, not split(","), because
+# long_name embeds the argument list and its commas.
+_LIZARD_CSV_FIELDS = 11
+
+
+def _parse_lizard_csv(text: str) -> dict[str, dict[str, FunctionMetrics]]:
+    """`{file: {long_name: metrics}}` from a `lizard --csv` run.
+
+    Keyed by `long_name` — the signature — because that is what survives a function
+    moving down a file: matching on start line would call every function below an
+    inserted block "new".
+    """
+    parsed: dict[str, dict[str, FunctionMetrics]] = {}
+    for row in csv.reader(text.splitlines()):
+        if len(row) < _LIZARD_CSV_FIELDS:
+            continue
+        try:
+            ccn, args, length, start = int(row[1]), int(row[3]), int(row[4]), int(row[9])
+        except ValueError:
+            continue  # lizard emitted a header or a malformed row
+        parsed.setdefault(row[6], {})[row[8]] = FunctionMetrics(row[7], ccn, args, length, start)
+    return parsed
+
+
+# The metrics the complexity gate enforces, as (label, attribute, limit). The
+# labels are what the delta line says, so they read as the flag names lizard takes.
+_COMPLEXITY_METRICS = (
+    ("CCN", "ccn", COMPLEXITY_MAX_CCN),
+    ("args", "args", COMPLEXITY_MAX_ARGS),
+    ("length", "length", COMPLEXITY_MAX_LENGTH),
+)
+
+
+def _complexity_delta_findings(
+    current: dict[str, dict[str, FunctionMetrics]],
+    base: dict[str, dict[str, FunctionMetrics]],
+) -> list[str]:
+    """Functions this change pushed over a threshold, or pushed further over one.
+
+    Two conditions, both required: the function is over the limit *now*, and it is
+    either new or worse than the base version on that same metric. A legacy function
+    already at CCN 30 that this change did not touch is not this change's problem;
+    the same function at CCN 31 is.
+    """
+    findings: list[str] = []
+    for path in sorted(current):
+        base_file = base.get(path, {})
+        for long_name, now in sorted(current[path].items(), key=lambda item: item[1].start):
+            was = base_file.get(long_name)
+            for label, attribute, limit in _COMPLEXITY_METRICS:
+                value = getattr(now, attribute)
+                if value <= limit:
+                    continue
+                before = getattr(was, attribute) if was is not None else None
+                if before is not None and value <= before:
+                    continue
+                shown = "new" if before is None else str(before)
+                findings.append(
+                    f"{path}:{now.start}: {now.name} {label} {shown}→{value} (limit {limit})"
+                )
+    return findings
+
+
+def _lizard_csv(files: list[str]) -> tuple[str, str]:
+    """Run `lizard --csv` over `files`; returns (csv, error)."""
+    if not files:
+        return "", ""
+    cmd = [*_tool(LIZARD, read_only=True), "--csv", *files]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+        return "", f"lizard failed to run (exit {res.returncode}): {res.stderr.strip()}"
+    return res.stdout, ""
+
+
+def _delta_base_rev() -> str | None:
+    """The commit this change's "before" images come from, or None when there is none.
+
+    The merge base, not the base ref itself: on a branch behind `origin/main`,
+    diffing against the tip would attribute other people's commits to this change.
+    Falls back to HEAD (the base ref did not resolve — a shallow clone), then to
+    None (a repository with no commits at all).
+    """
+    base = _resolved_base_ref()
+    if base is not None:
+        merge_base = _git_lines(["merge-base", base, "HEAD"])
+        if merge_base:
+            return merge_base[0]
+    return "HEAD" if _git_lines(["rev-parse", "--verify", "HEAD"]) else None
+
+
+def _base_versions(files: list[str], rev: str | None, root: Path) -> dict[str, str]:
+    """Write each file's `rev` content under `root`; returns {absolute temp path: file}.
+
+    lizard measures files on disk, not strings, so the base image has to become real
+    files somewhere. A file `git show` cannot produce did not exist at `rev` — it is
+    new, and every function in it is new.
+    """
+    written: dict[str, str] = {}
+    if rev is None:
+        return written
+    prefix = _git_prefix()
+    for path in files:
+        repo_path = f"{prefix}/{path}" if prefix else path
+        result = subprocess.run(
+            ["git", "show", f"{rev}:{repo_path}"], capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            continue
+        destination = root / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(result.stdout, encoding="utf-8")
+        written[str(destination.resolve())] = path
+    return written
+
+
+def _rekey_base(
+    parsed: dict[str, dict[str, FunctionMetrics]], written: dict[str, str]
+) -> dict[str, dict[str, FunctionMetrics]]:
+    """Map lizard's temp-dir paths back onto the paths the working tree uses."""
+    return {
+        written[key]: functions
+        for path, functions in parsed.items()
+        if (key := str(Path(path).resolve())) in written
+    }
+
+
+COMPLEXITY_DELTA_LABEL = "Complexity delta (lizard)"
+COMPLEXITY_DELTA_HINT = (
+    "extract a helper so the function you changed lands back under the limit; "
+    "pre-existing complexity elsewhere is not yours to fix"
+)
+
+
+def _measure_complexity_delta(files: list[str]) -> tuple[list[str], str]:
+    """Findings for the changed files, or the reason lizard could not produce them."""
+    current_csv, problem = _lizard_csv(files)
+    if problem:
+        return [], problem
+    current = {
+        _norm_path(path): functions for path, functions in _parse_lizard_csv(current_csv).items()
+    }
+    with tempfile.TemporaryDirectory(prefix="harness-base-") as tmp:
+        written = _base_versions(files, _delta_base_rev(), Path(tmp))
+        base_csv, problem = _lizard_csv(sorted(written))
+        if problem:
+            return [], problem
+        base = _rekey_base(_parse_lizard_csv(base_csv), written)
+    return _complexity_delta_findings(current, base), ""
+
+
+def _check_complexity_delta(*, no_exit: bool = False) -> tuple[bool, list[str]]:
+    """Report only the complexity this change introduced or worsened.
+
+    Unlike `_complexity_gate`, this is not count-ratcheted and not whole-tree: there
+    is no floor to beat, only a before and an after. Returns (ok, findings) so the
+    Stop hook can put the findings where the model will actually read them.
+    """
+    files = _scoped_py_files()
+    if not files:
+        warn(f"{COMPLEXITY_DELTA_LABEL}: no changed Python files; skipped")
+        return True, []
+
+    findings, problem = _measure_complexity_delta(files)
+    if problem:
+        print(f"  {RED}✗{RESET} {COMPLEXITY_DELTA_LABEL}: {problem}")
+        if not no_exit:
+            sys.exit(1)
+        return False, []
+    if not findings:
+        print(f"  {GREEN}✓{RESET} {COMPLEXITY_DELTA_LABEL}: {len(files)} changed file(s)")
+        return True, []
+
+    print(f"  {RED}✗{RESET} {COMPLEXITY_DELTA_LABEL}: {len(findings)} function(s) worse")
+    for line in _capped_findings(findings):
+        print(f"    {line}")
+    print(f"  ↳ fix: {COMPLEXITY_DELTA_HINT}")
+    if not no_exit:
+        sys.exit(1)
+    return False, findings
+
+
+# ── Dead-code delta ───────────────────────────────────────────────
+
+DEADCODE_DELTA_LABEL = "Dead code delta (vulture)"
+
+
+def _deadcode_delta_findings(lines: list[str], ranges_by_file: dict[str, LineRanges]) -> list[str]:
+    """Keep the vulture findings that sit on a line this change wrote.
+
+    vulture stays whole-tree — it has to be, since what makes code dead is the
+    absence of a reference anywhere — and the filter happens here, on its output.
+    """
+    kept: list[str] = []
+    for line in lines:
+        path, _, rest = line.partition(":")
+        number, _, _ = rest.partition(":")
+        try:
+            row = int(number)
+        except ValueError:
+            continue
+        ranges = ranges_by_file.get(_norm_path(path), ())
+        if ranges is None or (ranges and _in_ranges(row, row, list(ranges))):
+            kept.append(line)
+    return kept
+
+
+def _check_deadcode_delta(*, no_exit: bool = False) -> tuple[bool, list[str]]:
+    """Report only the dead code this change wrote. Returns (ok, findings)."""
+    measured, lines = _run_deadcode()
+    if measured.error:
+        print(f"  {RED}✗{RESET} {DEADCODE_DELTA_LABEL}: {measured.error}")
+        if not no_exit:
+            sys.exit(1)
+        return False, []
+    if measured.value is None:
+        warn(f"{DEADCODE_DELTA_LABEL}: {measured.unavailable}; skipped")
+        return True, []
+
+    findings = _deadcode_delta_findings(lines, _scoped_ranges(_scoped_py_files()))
+    if not findings:
+        print(f"  {GREEN}✓{RESET} {DEADCODE_DELTA_LABEL}: 0 on changed lines")
+        return True, []
+
+    print(f"  {RED}✗{RESET} {DEADCODE_DELTA_LABEL}: {len(findings)} on changed lines")
+    for line in _capped_findings(findings):
+        print(f"    {line}")
+    print(f"  ↳ fix: {DEADCODE_HINT.format(VULTURE_ALLOWLIST)}")
+    if not no_exit:
+        sys.exit(1)
+    return False, findings
+
+
+# ── PostToolUse hook ──────────────────────────────────────────────
+
+POST_EDIT_REREAD = "harness: reformatted {}; re-read it before editing it again"
+
+
+def _hook_event() -> dict[str, Any]:
+    """Claude Code's hook JSON from stdin, or `{}` when there is none to read.
+
+    Never raises and never blocks on a terminal: a hook that dies on unexpected
+    input is worse than one that does nothing, because the agent is not watching.
+    """
+    if sys.stdin.isatty():
+        return {}
+    try:
+        event = json.loads(sys.stdin.read())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return {}
+    return event if isinstance(event, dict) else {}
+
+
+def _hook_target(event: dict[str, Any]) -> str | None:
+    """The project `.py` file a PostToolUse event edited, relative to this template."""
+    tool_input = event.get("tool_input")
+    file_path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
+    if not isinstance(file_path, str) or not file_path:
+        return None
+    path = _norm_path(file_path)
+    if Path(path).is_absolute() or path.startswith(".."):
+        return None  # outside this template — another subproject's harness owns it
+    if not _is_project_python_file(path) or not Path(path).is_file():
+        return None
+    return path
+
+
+def _post_edit_hook() -> tuple[bool, list[str]]:
+    """Fix and format the one file a PostToolUse event just wrote, and answer on stdout.
+
+    Whole-file `ruff format`, deliberately unlike `_format_scoped`: the agent wrote
+    this file seconds ago in this session, and the reply tells it to re-read the
+    result, so reformatting beyond the edited lines costs a re-read rather than an
+    unreviewed rewrite of somebody else's code. The *lint report* stays line-scoped —
+    a legacy violation this edit did not write is still not this edit's to answer for.
+
+    Always exits 0: a PostToolUse hook speaks through its stdout JSON, and a non-zero
+    exit is an error the agent is shown instead of the message.
+    """
+    target = _hook_target(_hook_event())
+    if target is None:
+        return True, []
+    path = Path(target)
+    before = path.read_bytes()
+    for argv in (
+        [*_tool("ruff"), "check", "--fix", "--force-exclude", target],
+        [*_tool("ruff"), "format", "--force-exclude", target],
+    ):
+        subprocess.run(argv, capture_output=True, text=True, check=False)
+
+    findings = _finding_lines(_scoped_lint_result("Lint", [target], None).stdout)
+    if findings:
+        # `block` is the one channel that reaches the model as an instruction rather
+        # than as context, which is what an unfixable violation needs to be.
+        _print_hook_json({"decision": "block", "reason": "\n".join(_capped_findings(findings))})
+    elif path.read_bytes() != before:
+        _print_hook_json({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": POST_EDIT_REREAD.format(target),
+            }
+        })
+    return True, []
+
+
+def _print_hook_json(payload: dict[str, Any]) -> None:
+    """Print exactly one compact JSON object — the whole of a hook's stdout contract."""
+    print(json.dumps(payload, separators=(",", ":")))
+
+
+def cmd_post_edit() -> tuple[bool, list[str]]:
+    """Fix and format changed source files. Returns (ok, the lint findings left over).
+
+    `--hook` switches to the PostToolUse contract: one file, named on stdin, answered
+    on stdout. Without it this is the Stop hook's mutating first step, over every file
+    with uncommitted changes.
+
+    Fix is now judged, not just run: `ruff check --fix` leaving a violation on a line
+    this change wrote is the single most common thing an agent should have been told
+    about and was not.
+    """
+    if HOOK_MODE:
+        return _post_edit_hook()
     files = _changed_py_files()
     if not files:
-        return
-    cmd_fix(files, no_exit=True)
+        return True, []
+    fixed = cmd_fix(files, no_exit=True)
     cmd_format(files, no_exit=True)
+    if fixed:
+        return True, []
+    # Re-lint after formatting: the format pass moved the lines the fix pass reported.
+    return False, _finding_lines(_scoped_lint_result("Lint", files, None).stdout)
 
 
 def cmd_stop_hook() -> None:
@@ -2600,31 +3020,57 @@ def cmd_stop_hook() -> None:
     to the model; any other non-zero exit is a non-blocking error the model never
     sees. Codex's wrapper already turns any non-zero exit into a block, so only the
     Claude path needs the stderr failure summary here.
+
+    The complexity and dead-code gates here are the *delta* ones: a Stop hook fires
+    after every turn, so reporting the whole tree's standing violations would hand the
+    model the same pre-existing table every time and ask it to fix code the change
+    never touched. `check` and `ci` still run the whole-tree, count-ratcheted pair.
     """
     print("\n=== Stop Hook Checks ===\n")
-    cmd_post_edit()  # mutating — sequential, first
+    failed: list[str] = []
+    findings: list[str] = []
+
+    def record(label: str, outcome: tuple[bool, list[str]]) -> None:
+        ok, lines = outcome
+        if not ok:
+            failed.append(label)
+            findings.extend(lines)
+
+    record("Lint", cmd_post_edit())  # mutating — sequential, first
     _check_arch_config_guard(warn_only=True)
     _check_gherkin_guard(warn_only=True)
-    all_ok, failed = run_gates_parallel([_complexity_gate(), _duplication_gate()])  # read-only
-    if not _check_deadcode(no_exit=True):  # count-ratcheted, so outside the Gate batch
-        all_ok = False
-        failed.append(DEADCODE_LABEL)
-    if not all_ok:
-        print(f"stop-hook failed: {', '.join(failed)}", file=sys.stderr)
+    record(COMPLEXITY_DELTA_LABEL, _check_complexity_delta(no_exit=True))
+    _duplication_ok, duplication_failed = run_gates_parallel([_duplication_gate()])
+    failed.extend(duplication_failed)
+    record(DEADCODE_DELTA_LABEL, _check_deadcode_delta(no_exit=True))
+
+    if failed:
+        print(_stop_hook_payload(failed, findings), file=sys.stderr)
         sys.exit(2)
 
 
 # ── Stages ────────────────────────────────────────────────────────
 
 
+# (label, settings file, the two strings that have to be in it). PostToolUse is
+# Claude-only and is checked separately from Stop, because wiring one and not the
+# other is the likely failure: an agent that formats on edit but never blocks on
+# stop, or the reverse.
+HOOK_WIRING = (
+    ("Stop hook wiring", ".claude/settings.json", ("Stop", STOP_HOOK_MARKER)),
+    ("Stop hook wiring", ".codex/hooks.json", ("Stop", STOP_HOOK_MARKER)),
+    ("PostToolUse hook wiring", ".claude/settings.json", ("PostToolUse", POST_EDIT_HOOK_MARKER)),
+)
+
+
 def _check_stop_hooks_present() -> None:
-    """Warn when Claude/Codex Stop hook wiring is missing."""
-    for rel in (".claude/settings.json", ".codex/hooks.json"):
+    """Warn when Claude/Codex Stop or PostToolUse hook wiring is missing."""
+    for label, rel, needles in HOOK_WIRING:
         text = Path(rel).read_text(encoding="utf-8") if Path(rel).exists() else ""
-        if "Stop" in text and "stop-hook" in text:
-            print(f"  {GREEN}✓{RESET} Stop hook wiring ({rel})")
+        if all(needle in text for needle in needles):
+            print(f"  {GREEN}✓{RESET} {label} ({rel})")
         else:
-            print(f"  {RED}⚠{RESET} Missing Stop hook wiring: {rel}")
+            print(f"  {RED}⚠{RESET} Missing {label}: {rel}")
 
 
 def _first_diff_line(a: str, b: str) -> int:
@@ -2803,6 +3249,11 @@ def cmd_check() -> None:
     results.extend([True] * (len(batch) - len(batch_failed)))
     results.append(_check_deadcode(no_exit=True))  # count-ratcheted; outside the Gate batch
     results.append(_check_arch(no_exit=True))  # count-ratcheted; outside the Gate batch
+    # The delta pair the Stop hook runs. `check` keeps the whole-tree gates above as
+    # well: the floors answer "is the repo getting better", these answer "did this
+    # change make it worse", and a green stop-hook must predict a green check.
+    results.append(_check_complexity_delta(no_exit=True)[0])
+    results.append(_check_deadcode_delta(no_exit=True)[0])
     _check_stop_hooks_present()
     results.append(_check_arch_config_guard(warn_only=True))
     results.append(_check_gherkin_guard(warn_only=True))
@@ -2942,28 +3393,38 @@ def _json_list_child(data: dict[str, Any], key: str, path: Path) -> list[Any]:
     return child
 
 
-def _is_stop_hook_handler(handler: object) -> bool:
-    """True for a command handler that already runs our stop-hook (any form)."""
+def _is_stop_hook_handler(handler: object, marker: str = STOP_HOOK_MARKER) -> bool:
+    """True for a command handler that already runs our hook (any form)."""
     return (
         isinstance(handler, dict)
         and handler.get("type") == "command"
         and isinstance(handler.get("command"), str)
-        and "stop-hook" in handler["command"]
+        and marker in handler["command"]
     )
 
 
-def _install_stop_hook(path: Path, hook: dict[str, Any], *, claude_settings: bool = False) -> None:
-    """Inject/refresh the Stop hook in a settings file, preserving every other hook.
+def _install_stop_hook(
+    path: Path,
+    hook: dict[str, Any],
+    *,
+    claude_settings: bool = False,
+    event: str = "Stop",
+    marker: str = STOP_HOOK_MARKER,
+    matcher: str | None = None,
+) -> None:
+    """Inject/refresh one hook in a settings file, preserving every other hook.
 
-    Idempotent: an existing stop-hook handler (current or legacy) is replaced in
-    place and any duplicates are dropped, so re-running never accumulates entries.
+    Idempotent: an existing handler carrying `marker` (current or legacy) is replaced
+    in place and any duplicates are dropped, so re-running never accumulates entries.
+    `marker` is what distinguishes the events from each other — a PostToolUse handler
+    must not be mistaken for the Stop one and overwritten.
     """
     data = _read_json_object(path)
     if claude_settings and "$schema" not in data:
         data["$schema"] = CLAUDE_SETTINGS_SCHEMA
 
     hooks = _json_object_child(data, "hooks", path)
-    stop_groups = _json_list_child(hooks, "Stop", path)
+    stop_groups = _json_list_child(hooks, event, path)
     installed = False
 
     for group in stop_groups:
@@ -2974,7 +3435,7 @@ def _install_stop_hook(path: Path, hook: dict[str, Any], *, claude_settings: boo
             continue
         next_group_hooks: list[Any] = []
         for handler in group_hooks:
-            if _is_stop_hook_handler(handler):
+            if _is_stop_hook_handler(handler, marker):
                 if not installed:
                     next_group_hooks.append(dict(hook))
                     installed = True
@@ -2983,7 +3444,10 @@ def _install_stop_hook(path: Path, hook: dict[str, Any], *, claude_settings: boo
         group["hooks"] = next_group_hooks
 
     if not installed:
-        stop_groups.append({"hooks": [dict(hook)]})
+        group_entry: dict[str, Any] = {"hooks": [dict(hook)]}
+        if matcher is not None:
+            group_entry = {"matcher": matcher, **group_entry}
+        stop_groups.append(group_entry)
 
     _write_json_object(path, data)
 
@@ -3022,7 +3486,15 @@ def cmd_hooks() -> None:
     _install_git_hook("pre-push")
     _install_stop_hook(Path(".codex/hooks.json"), CODEX_STOP_HOOK)
     _install_stop_hook(Path(".claude/settings.json"), CLAUDE_STOP_HOOK, claude_settings=True)
-    print("Installed pre-commit, pre-push, and Claude/Codex Stop hooks")
+    _install_stop_hook(
+        Path(".claude/settings.json"),
+        CLAUDE_POST_EDIT_HOOK,
+        claude_settings=True,
+        event="PostToolUse",
+        marker=POST_EDIT_HOOK_MARKER,
+        matcher=CLAUDE_POST_EDIT_MATCHER,
+    )
+    print("Installed pre-commit, pre-push, and Claude/Codex Stop + PostToolUse hooks")
 
 
 def cmd_clean() -> None:
@@ -3084,8 +3556,8 @@ TASKS: dict[str, tuple[Callable[..., object], str]] = {
         cmd_gherkin_guard,
         "Block production-source changes with no matching `.feature`",
     ),
-    "post-edit": (cmd_post_edit, "Format if source files changed"),
-    "stop-hook": (cmd_stop_hook, "Format changed files, then run stop-hook checks"),
+    "post-edit": (cmd_post_edit, "Format changed files (--hook: one file, from a hook event)"),
+    "stop-hook": (cmd_stop_hook, "Format changed files, then run the delta stop-hook checks"),
     "agents-md-drift": (cmd_agents_md_drift, "Fail if AGENTS.md differs from CLAUDE.md"),
     "sync-agents-md": (cmd_sync_agents_md, "Overwrite AGENTS.md from CLAUDE.md"),
     "setup-hooks": (

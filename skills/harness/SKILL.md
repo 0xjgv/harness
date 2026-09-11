@@ -82,6 +82,31 @@ is silently swallowed and the agent never sees the failure.** Every Claude
 Stop-hook command ends in `|| exit 2` to re-assert this (`go run` otherwise
 collapses a failing child's exit code to 1) — see settings-json.md above for
 the exact hook JSON.
+
+**Closing the loop (python only for now — reference implementation;
+divergence to close during the port, the same boundary line-level scoping
+already sits on).** Three things make the Stop hook an instruction the model
+can act on rather than a red light it re-runs:
+
+1. **The failure payload reaches the model.** Naming the failed gates on
+   stderr says a gate is red without saying what to fix. Python's
+   `stop-hook` writes `stop-hook failed: <gate names>` and then up to 20
+   finding lines (`<path>:<line>: <message>`, the tools' own rendering),
+   plus one `… +N more` line when it truncated. Human output — the ✓/✗
+   lines, full tool output — stays on stdout.
+2. **The stop-time gates are deltas, not whole-tree tables.** A Stop hook
+   fires every turn, so a whole-tree lizard/vulture report hands the model
+   the repository's standing debt over and over and invites it to "fix"
+   code the change never touched. Python's `stop-hook` runs a **complexity
+   delta** (a function is reported only if it is over a limit now *and* new
+   or worse than its version at the diff base's merge base, matched by
+   lizard's `long_name`) and a **dead-code delta** (vulture still runs
+   whole-tree — absence of a reference is a whole-tree fact — but only
+   findings on changed lines are reported). `check`/`ci` keep the
+   whole-tree, count-ratcheted pair, and also run the delta pair so a green
+   `stop-hook` predicts a green `check`.
+3. **A `PostToolUse` hook fixes the file while the agent still has it in
+   mind.** See settings-json.md.
 Behavior contract: [behavior-contract.md](reference/behavior-contract.md).
 
 ## Layer 1 — the seven-stage contract
@@ -93,8 +118,8 @@ Behavior contract: [behavior-contract.md](reference/behavior-contract.md).
 | `pre-push` | Before push | read-only push gate: lint + format check + acceptance + arch over the whole tree, in parallel; strict `arch-config-guard` + `gherkin-guard` | no |
 | `ci` | CI pipeline | read-only gates (lint + typecheck + dep audit + complexity + deadcode + acceptance + arch) **run in parallel**, captured and printed in submission order; then the whole test suite under coverage + crap (advisory) + mutation (advisory, scoped to the base-ref diff); strict `arch-config-guard` + `gherkin-guard` | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
-| `post-edit` | Stop hook helper | format if source files changed | yes |
-| `stop-hook` | Agent Stop hook | post-edit + complexity + deadcode (python/bun); **exits 2 with a stderr failure summary on failure** | yes |
+| `post-edit` | Stop hook helper / `PostToolUse` hook (python: `--hook`) | format if source files changed; python also fails the stop hook on unfixable lint on changed lines | yes |
+| `stop-hook` | Agent Stop hook | post-edit + complexity + deadcode (python/bun; python runs the **delta** form of both); **exits 2 with a stderr failure summary — python adds the findings themselves** | yes |
 
 Invariant every runner documents: `ci` minus `check` is only the network
 dependency audit, coverage (which runs the whole suite where `check` ran the

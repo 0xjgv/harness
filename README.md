@@ -18,8 +18,8 @@ task runner:
 | `pre-push` | Git pre-push hook | Read-only push gate: lint, format check, acceptance, arch over the whole tree, in parallel; strict `arch-config-guard` + `gherkin-guard` | No |
 | `ci` | CI pipeline | Read-only gates (lint, typecheck, dep audit, complexity, deadcode where shipped, acceptance, arch) run in parallel, then coverage + advisory CRAP; strict `arch-config-guard` + `gherkin-guard` | No |
 | `audit` | CI pipeline | Audit dependencies for known vulnerabilities | No |
-| `post-edit` | Stop hook helper | Format if source files changed | Yes |
-| `stop-hook` | Agent Stop hook | Run `post-edit`, then complexity (+ deadcode where shipped); **exits 2 with a failure summary on stderr** | Yes |
+| `post-edit` | Stop hook helper; in Python also the `PostToolUse(Edit\|Write)` hook via `--hook` | Format if source files changed (Python: unfixable lint on changed lines then fails `stop-hook` as `Lint`) | Yes |
+| `stop-hook` | Agent Stop hook | Run `post-edit`, then complexity (+ deadcode where shipped); **exits 2 with a failure summary on stderr** — Python reports the *delta* form of complexity/deadcode and puts the findings themselves on stderr | Yes |
 
 **`check`** is the one you run constantly. It auto-fixes what it can so you stay in flow, then runs every other gate that doesn't need the network or a build lock. It also ratchets suppression comments (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`, etc.) against `.harness-baseline`: new suppressions fail unless a human signs off on `suppressions --update-baseline`. Invariant: `ci` minus `check` is only the network dependency audit, coverage over the whole test suite (where `check` ran only the tests mapped to the change set), advisory CRAP, and advisory mutation — plus, in Go and Rust only, the architecture boundary check itself (`arch`), which stays `ci`/`pre-push`-only there (Go's needs to fetch a module, Rust's takes cargo's build lock); Python and Bun's `arch` has neither constraint, so it runs inside `check` too — so a green `check` predicts a green `ci` for the gates it ran. `check` runs only the tests that map to the change set, so `check --all` (or `ci`) is the whole-suite run; `pre-push` has no test gate in any template.
 **`pre-commit`** runs the same checks scoped to staged files, installed as a git hook. It re-stages whatever it fixes, so the commit records the fixed content — the same trade-off `lint-staged` makes: a partially staged file gets its unstaged hunks staged too.
@@ -27,8 +27,8 @@ task runner:
 For Go and Bun, the lint gate subsumes format checking.
 **`ci`** is the read-only gate — no fixes, just verification. Its read-only gates run in parallel (captured, printed in submission order, run to completion), then coverage streams and CRAP runs advisory.
 **`audit`** audits dependencies for known vulnerabilities.
-**`post-edit`** formats source files if changed by an agent, using repo-root-relative paths so it also works when the harness lives in a subdirectory (e.g. a `monorepo/` subproject).
-**`stop-hook`** is the Stop hook entrypoint: it runs `post-edit`, then complexity and deadcode where the language ships a separate deadcode gate.
+**`post-edit`** formats source files if changed by an agent, using repo-root-relative paths so it also works when the harness lives in a subdirectory (e.g. a `monorepo/` subproject). In Python, `post-edit --hook` is additionally wired as a Claude `PostToolUse(Edit|Write)` hook: it fixes and formats the one file just written and answers on stdout with a re-read notice or a `block` carrying the violations ruff could not fix.
+**`stop-hook`** is the Stop hook entrypoint: it runs `post-edit`, then complexity and deadcode where the language ships a separate deadcode gate. In Python those two are **delta** gates — a function or a dead-code finding is reported only when this change introduced or worsened it — because a whole-tree table reprinted after every agent turn is the repository's standing debt, not this change's consequence.
 
 ### Stop hook failures now reach the agent
 
@@ -38,7 +38,13 @@ failure summary to stderr, and every Claude Stop-hook command ends in
 code **2** as blocking — it feeds the hook's stderr back to the model so the
 agent has to address the failure before stopping. Any other non-zero exit is
 a non-blocking error the model never sees, so a runner that failed with exit 1
-used to fail silently. The `|| exit 2` suffix is required because `go run`
+used to fail silently. Python goes one step further and writes the findings
+themselves under that summary — up to 20 `<path>:<line>: <message>` lines, then
+one `… +N more` line — because naming the failed gate tells the model a gate is
+red without telling it what to fix, and it re-runs the command to find out. The
+✓/✗ lines and full tool output stay on stdout, for the human.
+
+The `|| exit 2` suffix is required because `go run`
 collapses its child process's exit code (it prints `exit status N` to stderr,
 then exits 1 itself, no matter what the compiled program returned) — measured,
 not theoretical. For runners where propagation already worked (Python, Bun,

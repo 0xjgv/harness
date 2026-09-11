@@ -103,6 +103,7 @@ TEST_DIR     = "tests"
 TEST_COMMAND = ("-m", "unittest", "discover", "-s", TEST_DIR, "-q")
 CLAUDE_STOP_COMMAND = "cd $CLAUDE_PROJECT_DIR && uv run harness stop-hook || exit 2"
 CODEX_STOP_COMMAND  = '… .codex/hooks/codex-stop-hook.sh uv run harness stop-hook'
+CLAUDE_POST_EDIT_COMMAND = "cd $CLAUDE_PROJECT_DIR && uv run harness post-edit --hook"
 ```
 
 - **`TEST_COMMAND`** is the argv tail handed to the interpreter *and* to
@@ -111,8 +112,8 @@ CODEX_STOP_COMMAND  = '… .codex/hooks/codex-stop-hook.sh uv run harness stop-h
   `("-m", "pytest", "-q")` is the one-line edit that makes a pytest suite run
   at all. Measured on doghouse: 735 passed with no `ImportError`, versus a
   collection-time abort before the edit.
-- **`CLAUDE_STOP_COMMAND` / `CODEX_STOP_COMMAND` are the real knobs for the
-  hook JSON.** Editing `.claude/settings.json` by hand does not survive:
+- **`CLAUDE_STOP_COMMAND` / `CODEX_STOP_COMMAND` / `CLAUDE_POST_EDIT_COMMAND`
+  are the real knobs for the hook JSON.** Editing `.claude/settings.json` by hand does not survive:
   `setup-hooks` → `_install_stop_hook()` replaces any existing stop-hook
   handler with these constants. Measured: a hand-adapted
   `.venv/bin/python harness.py stop-hook` was silently reverted to
@@ -353,6 +354,17 @@ Two mechanisms, and between them every gate is covered:
 - `coverage`, `complexity`, `crap`, `deadcode`, `suppressions` are
   **count-ratcheted** and stay whole-tree — scoping a count makes it
   meaningless. Step 1 wrote each floor at the number the repo already has.
+- At **stop time** complexity and dead code are neither: `stop-hook` runs a
+  *delta* form of each (`Complexity delta (lizard)`, `Dead code delta
+  (vulture)`). Complexity re-measures each changed file at the merge base
+  (`git show <merge-base>:<path>`) and reports a function only when it is over
+  a limit now *and* new or worse than it was, matched by lizard's `long_name`.
+  Dead code still runs vulture whole-tree and then keeps only the findings on
+  changed lines. This is what makes the Stop hook readable: the whole-tree
+  table is the repository's standing debt, and reprinting it after every agent
+  turn asks the model to fix code the change never touched. `check` runs the
+  delta pair as well as the whole-tree pair, so a green `stop-hook` still
+  predicts a green `check`.
 
 Nothing asks the repo to be better than it is; it asks the *change* to be no
 worse. Then hand the crank to `/ratchet` (`skills/ratchet/`), which raises the
@@ -706,9 +718,24 @@ it is found on purpose rather than discovered by accident.
   re-runs it). On fusion's 75-second suite that is a four-minute step; on
   doghouse's 32-minute suite it is an hour and a half. Run it in the background.
 - **The `✓ Stop hook wiring` gate cannot verify the hook works** — it only greps
-  the settings file for `Stop` and `stop-hook`, so it is green on a command that
+  the settings file for `Stop` and `stop-hook` (and, for the third line,
+  `PostToolUse` and `post-edit --hook`), so it is green on a command that
   cannot execute. Run the command verbatim once yourself (§5 step 6). Verified
   by doing exactly that: `stop-hook exit=0`, five gates printed.
+- **A failing Stop hook now carries its findings.** `stop-hook` writes
+  `stop-hook failed: <gate names>` to stderr and then up to 20 finding lines
+  (`<path>:<line>: <message>`), plus one `… +N more` line when truncated.
+  Exit 2 is what makes Claude Code read that stream at all; stdout is for the
+  human. `post-edit`'s unfixable lint is part of it, under the gate name
+  `Lint`.
+- **`post-edit --hook` is the `PostToolUse(Edit|Write)` entry point.** It reads
+  the hook event on stdin, fixes and formats the single file named by
+  `tool_input.file_path`, and answers with one compact JSON object: a
+  `hookSpecificOutput.additionalContext` re-read notice when formatting
+  rewrote the file, or `{"decision":"block","reason":…}` carrying the
+  line-scoped violations ruff could not fix. It always exits 0. This is the
+  one place the harness formats lines the change did not write — the agent
+  authored the file seconds earlier and is told to re-read it.
 - **`git status` is not a reliable adoption checklist when `CLAUDE.md` is a
   symlink.** On fusion, appending to `CLAUDE.md` showed up as `M AGENTS.md` and
   `CLAUDE.md` unchanged. Read the modes (`git ls-files -s`), not the names.
