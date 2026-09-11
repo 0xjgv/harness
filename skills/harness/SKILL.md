@@ -3,8 +3,8 @@ name: harness
 description: >
   Bootstrap or align a repo with the harness-templates contract: the
   seven-stage quality harness (check, pre-commit, pre-push, ci, audit,
-  post-edit, stop-hook) plus the behavior contract (task sizing, human-owned
-  commits, Gherkin-first, arch-config integration guard). Use when starting a
+  post-edit, stop-hook) plus the behavior contract (human-owned commits,
+  Gherkin-first, arch-config integration guard). Use when starting a
   new python/bun/go/rust/monorepo project, adding a quality harness to an
   existing repo, or asked to match ~/Code/harness-templates conventions.
   Triggers: "add a harness", "set up check/ci/pre-commit", "align with
@@ -229,14 +229,14 @@ For an existing repo, wire it **only when the user opts in**. Full porting + onb
   `.feature` files anywhere, so wiring it into a repo with no acceptance
   suite yet never blocks.
 
-Of the four behavior-contract rules, two are mechanically enforced
-(`arch-config-guard`, `gherkin-guard`) and two are instruction-only (task
-sizing, human-owned commits) — see the table in
+Of the three behavior-contract rules, two are mechanically enforced
+(`arch-config-guard`, `gherkin-guard`) and one is instruction-only
+(human-owned commits) — see the table in
 [behavior-contract.md](reference/behavior-contract.md).
 
 After wiring Layer 2, **onboard the user** — state plainly that commit/push
-ownership and task sizing are instruction-only, while arch-config changes and
-Gherkin-first are blocked by the runner gates until reviewed.
+ownership is instruction-only, while arch-config changes and Gherkin-first
+are blocked by the runner gates until reviewed.
 
 ## Adapt rules (existing repos)
 
@@ -380,6 +380,6 @@ Layer 1:
 Layer 2 (only if wired):
 
 11. `AGENTS.md` and `CLAUDE.md` include the same full behavior contract text.
-12. Commit/push ownership and task-sizing rules are present as instructions;
-    Gherkin-first and arch-config review are present as instructions **and**
-    enforced by `gherkin-guard`/`arch-config-guard`.
+12. Commit/push ownership is present as an instruction; Gherkin-first and
+    arch-config review are present as instructions **and** enforced by
+    `gherkin-guard`/`arch-config-guard`.

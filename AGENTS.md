@@ -137,8 +137,8 @@ meant to have single-language templates copied inside it as subprojects
 **Two-layer contract, shipped per template:**
 - **Layer 1 — quality harness** (always on): the seven-stage contract above.
 - **Layer 2 — behavior contract** (greenfield: automatic; ported into an existing repo:
-  opt-in only): instruction text in `AGENTS.md` and `CLAUDE.md` for task-sizing,
-  human-owned commits, and Gherkin-first behavior changes, plus two portable,
+  opt-in only): instruction text in `AGENTS.md` and `CLAUDE.md` for human-owned
+  commits and Gherkin-first behavior changes, plus two portable,
   mechanically enforced guards — `arch-config-guard` and `gherkin-guard` — that warn
   during `check`/`stop-hook` and block `pre-commit`/`pre-push`/`ci` unless
   `HARNESS_ALLOW_ARCH_CONFIG=1` / `HARNESS_ALLOW_NO_FEATURE=1` is set after
@@ -186,12 +186,6 @@ not code that runs here. Both skills tell the agent to read files under
 `~/Code/harness-templates/` and never edit them.
 
 ## Behavior contract
-
-<important if="you accept a new task">
-- Restate the task as at most 5 sub-tasks. Each sub-task MUST touch ≤1 non-test file and ≤1 test.
-- If the task cannot be decomposed within that bound, STOP and return a decomposition proposal. Do NOT edit code in the same turn.
-- If a proposed sub-task would edit more than one non-test file, split it further before writing code.
-</important>
 
 <important>
 ## Role

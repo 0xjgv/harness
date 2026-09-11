@@ -16,7 +16,7 @@ Source files:
 
 The contract lives in three places that must agree:
 
-- `AGENTS.md` and `CLAUDE.md` `## Behavior contract` — four `<important>`
+- `AGENTS.md` and `CLAUDE.md` `## Behavior contract` — three `<important>`
   blocks the agent reads as instructions. Both files hold the same content
   byte-for-byte. The templates' `agents-md-drift` check enforces no drift,
   and `sync-agents-md` writes `AGENTS.md <- CLAUDE.md` after edits.
@@ -33,7 +33,6 @@ The contract lives in three places that must agree:
 
 | Rule | Contract says | Mechanical enforcement |
 |---|---|---|
-| Task sizing | <=5 sub-tasks, each <=1 non-test file + <=1 test | instruction only |
 | Human owns commits | no `git commit`/`push` unless the prompt asked | instruction only |
 | Gherkin-first | `.feature` -> approval -> step defs -> impl for behavior changes | `gherkin-guard` blocks integration |
 | Arch config review | no silent arch-config changes | `arch-config-guard` blocks integration |

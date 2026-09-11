@@ -74,7 +74,6 @@ The Makefile fans out `<cmd>` to each matching subproject, continues past failur
 
 `AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract at the monorepo root. Agents that read either file receive the same instructions across every subproject:
 
-- **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
 - **Human-is-engineer**: do not `git commit` / `git push` unless the user's current prompt explicitly asked.
 - **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
 - **Arch config guard**: edits to any subproject's arch config (`.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, `arch.toml`) warn during `check`/`stop-hook` and fail `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.

@@ -120,7 +120,6 @@ harness.go           Development task runner (zero dependencies; //go:build igno
 
 `AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract. Agents that read either file receive the same instructions.
 
-- **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
 - **Human-is-engineer**: do not `git commit` / `git push` unless the user's current prompt explicitly asked.
 - **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
 - **Arch config guard**: `.go-arch-lint.yml` changes warn during `check`/`stop-hook` and fail `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. Note `.golangci.yaml` is deliberately *not* protected — it is the general lint config, and protecting it would block all lint-config edits.

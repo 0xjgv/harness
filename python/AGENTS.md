@@ -98,12 +98,6 @@ did not touch is not this change's problem; the same function at CCN 31 is.
 
 ## Behavior contract
 
-<important if="you accept a new task">
-- Restate the task as at most 5 sub-tasks. Each sub-task MUST touch ≤1 non-test file and ≤1 test.
-- If the task cannot be decomposed within that bound, STOP and return a decomposition proposal. Do NOT edit code in the same turn.
-- If a proposed sub-task would edit more than one non-test file, split it further before writing code.
-</important>
-
 <important>
 ## Role
 

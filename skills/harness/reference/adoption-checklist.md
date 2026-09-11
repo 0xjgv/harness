@@ -663,7 +663,7 @@ Must verify:
 - `sync-agents-md` writes `AGENTS.md <- CLAUDE.md`.
 - Layer 2 contract text appears in both files when complete adoption is the
   target.
-- Commit/push ownership and task-sizing rules are present as instructions.
+- Commit/push ownership rule is present as an instruction.
 - Gherkin-first is present as instructions **and** mechanically enforced via
   `gherkin-guard`.
 - Arch config review is present as instructions **and** mechanically enforced
