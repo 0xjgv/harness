@@ -2141,6 +2141,154 @@ class TestPostEditHookStdin(unittest.TestCase):
         self.assertIsNone(harness._hook_target({}))
 
 
+GIT = shutil.which("git") or "git"
+REAL_RUFF = Path(harness.__file__).resolve().parent / ".venv" / "bin" / "ruff"
+
+# Never formatted, and carrying a violation ruff cannot fix on a line this change
+# will not write. Both halves matter: reformatting it whole would rewrite four
+# untouched lines, and reporting its F821 would blame this change for it.
+LEGACY_SOURCE = (
+    '"""Legacy module nobody ever formatted."""\n'
+    "def legacy(  x ):\n"
+    "    y  =  x+1\n"
+    "    z=[1,2,   3]\n"
+    "    return   y , z , already_broken\n"
+)
+CLEAN_SOURCE = '"""Already formatted, and clean."""\n\n\ndef fine(x):\n    return x + 1\n'
+UNFORMATTED_SOURCE = '"""Written by this change."""\ndef fresh(  x ):\n    return  x+1\n'
+
+
+@contextmanager
+def hook_project():
+    """A throwaway git repo running the *real* ruff, cwd'd into.
+
+    Real ruff on purpose: stubbing it would make every assertion below about line
+    scoping vacuous — the whole question is which lines the formatter actually
+    rewrote. No `pyproject.toml`, so `_tool` resolves the `.venv/bin/ruff` tier and
+    ruff runs on its own default rules, which keeps the expected findings stable.
+
+    `GIT_*` is stripped for the same reason `tests/features/environment.py` strips
+    it: a git hook exports `GIT_DIR` into everything it runs, and `git init` here
+    would otherwise operate on the developer's own worktree.
+    """
+    assert REAL_RUFF.exists(), "ruff is not installed — run `uv sync` in the template"
+    old_cwd = Path.cwd()
+    old_git_env = {key: value for key, value in os.environ.items() if key.startswith("GIT_")}
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        bin_dir = root / ".venv" / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "ruff").symlink_to(REAL_RUFF)
+        (root / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "legacy.py").write_text(LEGACY_SOURCE, encoding="utf-8")
+        (root / "src" / "clean.py").write_text(CLEAN_SOURCE, encoding="utf-8")
+
+        for name in list(old_git_env):
+            del os.environ[name]
+        os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
+        os.environ["GIT_CONFIG_SYSTEM"] = os.devnull
+        os.chdir(root)
+        try:
+            for argv in (
+                ["init", "-b", "main"],
+                ["config", "user.email", "harness@example.invalid"],
+                ["config", "user.name", "Harness Test"],
+                ["add", "-A"],
+                ["commit", "-m", "base"],
+            ):
+                subprocess.run([GIT, *argv], check=True, capture_output=True)
+            yield Path.cwd()  # resolved, so absolute hook paths relativize cleanly
+        finally:
+            os.chdir(old_cwd)
+            for name in [key for key in os.environ if key.startswith("GIT_")]:
+                del os.environ[name]
+            os.environ.update(old_git_env)
+
+
+class TestPostEditHookStdout(unittest.TestCase):
+    """The hook's whole contract is one JSON object on stdout, or silence.
+
+    Driven end to end against a real git repo and a real ruff, because the property
+    worth protecting — the hook rewrites only the lines this change wrote — cannot be
+    asserted against a stub.
+    """
+
+    def _run_hook(self, relative, *, via_command=False):
+        """Feed the hook a PostToolUse event naming `relative`; return its stdout."""
+        event = json.dumps({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": str(Path(relative).resolve())},
+        })
+        out = io.StringIO()
+        with (
+            mock.patch.object(harness.sys, "stdin", io.StringIO(event)),
+            mock.patch.object(harness, "ALL_FILES", False),
+            mock.patch.object(harness, "WHOLE_FILE", False),
+            mock.patch.object(harness, "BASE_OVERRIDE", None),
+            mock.patch.object(harness, "HOOK_MODE", True),
+            redirect_stdout(out),
+        ):
+            if via_command:
+                harness.cmd_post_edit()
+            else:
+                harness._post_edit_hook()
+        return out.getvalue()
+
+    def test_an_untouched_clean_file_says_nothing(self):
+        with hook_project():
+            self.assertEqual(self._run_hook("src/clean.py"), "")
+
+    def test_a_legacy_file_keeps_its_untouched_lines_and_its_untouched_violation(self):
+        # The regression this branch exists to prevent: three lines edited in a
+        # never-formatted file must not come back as a whole-file diff, and the
+        # violation already sitting in it is not this change's to answer for.
+        with hook_project():
+            legacy = Path("src/legacy.py")
+            legacy.write_text(
+                legacy.read_text(encoding="utf-8") + "\n\nLEGACY_LIMIT = 10\n", encoding="utf-8"
+            )
+
+            self.assertEqual(self._run_hook("src/legacy.py"), "")
+            self.assertEqual(
+                legacy.read_text(encoding="utf-8"), LEGACY_SOURCE + "\n\nLEGACY_LIMIT = 10\n"
+            )
+
+    def test_a_file_this_change_created_is_formatted_whole_and_announced(self):
+        # No base version means every line is new, so the whole file is in scope —
+        # and the agent's in-memory copy is now stale, which is what the reply says.
+        with hook_project():
+            fresh = Path("src/fresh.py")
+            fresh.write_text(UNFORMATTED_SOURCE, encoding="utf-8")
+
+            self.assertEqual(
+                self._run_hook("src/fresh.py"),
+                '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":'
+                '"harness: reformatted src/fresh.py; re-read it before editing it again"}}\n',
+            )
+            self.assertEqual(
+                fresh.read_text(encoding="utf-8"),
+                '"""Written by this change."""\n\n\ndef fresh(x):\n    return x + 1\n',
+            )
+
+    def test_an_unfixable_violation_on_a_written_line_blocks(self):
+        with hook_project():
+            clean = Path("src/clean.py")
+            clean.write_text(
+                clean.read_text(encoding="utf-8") + "\n\nVALUE = missing_name\n", encoding="utf-8"
+            )
+
+            payload = json.loads(self._run_hook("src/clean.py"))
+
+        self.assertEqual(payload["decision"], "block")
+        self.assertEqual(payload["reason"], "src/clean.py:8:9: F821 Undefined name `missing_name`")
+
+    def test_the_post_edit_command_routes_to_the_hook_under_hook_mode(self):
+        with hook_project():
+            self.assertEqual(self._run_hook("src/clean.py", via_command=True), "")
+
+
 class TestHookWiringCheck(unittest.TestCase):
     """`check`'s wiring lines are the only warning a repo gets when a hook was never
     installed — and an uninstalled PostToolUse hook is invisible otherwise, because
