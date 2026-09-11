@@ -733,9 +733,11 @@ it is found on purpose rather than discovered by accident.
   `tool_input.file_path`, and answers with one compact JSON object: a
   `hookSpecificOutput.additionalContext` re-read notice when formatting
   rewrote the file, or `{"decision":"block","reason":…}` carrying the
-  line-scoped violations ruff could not fix. It always exits 0. This is the
-  one place the harness formats lines the change did not write — the agent
-  authored the file seconds earlier and is told to re-read it.
+  line-scoped violations ruff could not fix. It always exits 0. Fix and format
+  are line-scoped, like `harness fix`/`format`: a three-line edit to a
+  never-formatted legacy file produces a three-line diff, not a whole-file
+  rewrite the reviewer cannot read. Only a file with no base version is
+  reformatted end to end.
 - **`git status` is not a reliable adoption checklist when `CLAUDE.md` is a
   symlink.** On fusion, appending to `CLAUDE.md` showed up as `M AGENTS.md` and
   `CLAUDE.md` unchanged. Read the modes (`git ls-files -s`), not the names.

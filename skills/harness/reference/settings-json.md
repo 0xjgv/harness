@@ -132,11 +132,16 @@ Stop wiring.
 ```
 
 `post-edit --hook` reads the event on stdin, takes `tool_input.file_path`,
-and acts only when that is a project `.py` file inside the template: it runs
-`ruff check --fix` then `ruff format` on that one file. Anything else — a
-file in another subproject, a non-Python file, unparsable stdin — is a silent
-no-op. It **always exits 0** and speaks through exactly one compact JSON
-object on stdout:
+and acts only when that is a project `.py` file inside the template: it fixes
+and formats that one file, **line-scoped, like `harness fix`/`format`** — a
+`ruff check --fix` that reaches a line the change did not write is reverted,
+and `ruff format --range` runs per changed range, so a three-line edit to a
+never-formatted legacy file stays a three-line diff. A file with no base
+version (untracked, or added since the base ref) is new in its entirety, so
+there the whole file is in scope. Anything else — a file in another
+subproject, a non-Python file, unparsable stdin — is a silent no-op. It
+**always exits 0** and speaks through exactly one compact JSON object on
+stdout:
 
 - nothing at all when the file did not change and lints clean;
 - `{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"harness: reformatted <path>; re-read it before editing it again"}}`

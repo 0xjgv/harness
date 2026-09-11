@@ -106,7 +106,8 @@ can act on rather than a red light it re-runs:
    whole-tree, count-ratcheted pair, and also run the delta pair so a green
    `stop-hook` predicts a green `check`.
 3. **A `PostToolUse` hook fixes the file while the agent still has it in
-   mind.** See settings-json.md.
+   mind.** Line-scoped like `harness fix`/`format`, so it never turns a
+   three-line edit into a whole-file rewrite. See settings-json.md.
 Behavior contract: [behavior-contract.md](reference/behavior-contract.md).
 
 ## Layer 1 — the seven-stage contract

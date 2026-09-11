@@ -22,10 +22,12 @@ minutes — so it reports rather than blocks unless asked to `--enforce`.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import csv
 import dataclasses
 import difflib
 import functools
+import io
 import json
 import os
 import re
@@ -2949,11 +2951,14 @@ def _hook_target(event: dict[str, Any]) -> str | None:
 def _post_edit_hook() -> tuple[bool, list[str]]:
     """Fix and format the one file a PostToolUse event just wrote, and answer on stdout.
 
-    Whole-file `ruff format`, deliberately unlike `_format_scoped`: the agent wrote
-    this file seconds ago in this session, and the reply tells it to re-read the
-    result, so reformatting beyond the edited lines costs a re-read rather than an
-    unreviewed rewrite of somebody else's code. The *lint report* stays line-scoped —
-    a legacy violation this edit did not write is still not this edit's to answer for.
+    Fix and format go through `cmd_fix`/`cmd_format`, so this hook rewrites exactly
+    what `harness fix`/`format` would and nothing else: a fix that reaches a line this
+    change did not write is reverted byte-for-byte, and formatting runs
+    `ruff format --range` per changed range. An agent touching three lines of a
+    two-thousand-line legacy file must not hand its reviewer a two-thousand-line diff
+    — the harness gates the change, not the codebase. A file with no base version
+    (untracked, or added since the base ref) is new in its entirety, so there the
+    whole file is in scope and the re-read notice earns itself.
 
     Always exits 0: a PostToolUse hook speaks through its stdout JSON, and a non-zero
     exit is an error the agent is shown instead of the message.
@@ -2963,11 +2968,11 @@ def _post_edit_hook() -> tuple[bool, list[str]]:
         return True, []
     path = Path(target)
     before = path.read_bytes()
-    for argv in (
-        [*_tool("ruff"), "check", "--fix", "--force-exclude", target],
-        [*_tool("ruff"), "format", "--force-exclude", target],
-    ):
-        subprocess.run(argv, capture_output=True, text=True, check=False)
+    # Those two gates report to a human on stdout. Here stdout is a JSON channel with
+    # room for exactly one object, so their lines are swallowed and answered for below.
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_fix([target], no_exit=True)
+        cmd_format([target], no_exit=True)
 
     findings = _finding_lines(_scoped_lint_result("Lint", [target], None).stdout)
     if findings:

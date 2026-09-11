@@ -27,7 +27,7 @@ task runner:
 For Go and Bun, the lint gate subsumes format checking.
 **`ci`** is the read-only gate — no fixes, just verification. Its read-only gates run in parallel (captured, printed in submission order, run to completion), then coverage streams and CRAP runs advisory.
 **`audit`** audits dependencies for known vulnerabilities.
-**`post-edit`** formats source files if changed by an agent, using repo-root-relative paths so it also works when the harness lives in a subdirectory (e.g. a `monorepo/` subproject). In Python, `post-edit --hook` is additionally wired as a Claude `PostToolUse(Edit|Write)` hook: it fixes and formats the one file just written and answers on stdout with a re-read notice or a `block` carrying the violations ruff could not fix.
+**`post-edit`** formats source files if changed by an agent, using repo-root-relative paths so it also works when the harness lives in a subdirectory (e.g. a `monorepo/` subproject). In Python, `post-edit --hook` is additionally wired as a Claude `PostToolUse(Edit|Write)` hook: it fixes and formats the one file just written — line-scoped, like `fix`/`format`, so a three-line edit never becomes a whole-file rewrite — and answers on stdout with a re-read notice or a `block` carrying the violations ruff could not fix.
 **`stop-hook`** is the Stop hook entrypoint: it runs `post-edit`, then complexity and deadcode where the language ships a separate deadcode gate. In Python those two are **delta** gates — a function or a dead-code finding is reported only when this change introduced or worsened it — because a whole-tree table reprinted after every agent turn is the repository's standing debt, not this change's consequence.
 
 ### Stop hook failures now reach the agent
