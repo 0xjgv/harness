@@ -161,4 +161,22 @@ describe('branch guard decision', () => {
     expect(protectedPushTarget('   \n', 'master')).toBe('master');
     expect(protectedPushTarget('', 'feature/guard')).toBe(null);
   });
+
+  test('malformed ref text with no parseable record falls back to the current branch', () => {
+    // "garbage" has no parseable ref line at all (parseRefLines drops it), so
+    // there is nothing to take precedence over the checked-out branch.
+    expect(protectedPushTarget('garbage', 'main')).toBe('main');
+    expect(protectedPushTarget('garbage', 'feature')).toBe(null);
+  });
+
+  test('a well-formed tag-only ref list is a real answer, not a fallback', () => {
+    // Pushing a tag from `main` is legitimate (`git push origin v1.0`): a
+    // parseable ref line exists, it just names a tag, not a branch. That is
+    // a definitive "not protected" — unlike malformed text, it must NOT fall
+    // back to the checked-out branch.
+    expect(protectedPushTarget('refs/heads/x abc123 refs/tags/main def456\n', 'main')).toBe(null);
+    expect(protectedPushTarget('refs/heads/x abc123 refs/tags/main def456\n', 'feature')).toBe(
+      null,
+    );
+  });
 });

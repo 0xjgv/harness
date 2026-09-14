@@ -18,7 +18,7 @@ used by the Stop hook:
 | `pre-push` | Git pre-push hook | Branch guard, then read-only push gate: lint, format check, acceptance, arch over the whole tree, in parallel | No |
 | `ci` | CI pipeline | Read-only gates (lint, typecheck, dep audit, complexity, acceptance, arch) run in parallel, then coverage + advisory CRAP | No |
 | `audit` | CI pipeline | Audit dependencies for known vulnerabilities | No |
-| `post-edit` | Stop hook helper | Format if source files changed | Yes |
+| `post-edit` | Stop hook helper | Fix and format changed source files (Rust: clippy `--fix` + fmt) | Yes |
 | `stop-hook` | Agent Stop hook | Run `post-edit`, then complexity (+ deadcode where shipped) | Yes |
 
 **`check`** is the one you run constantly. It auto-fixes what it can so you stay in flow. It also ratchets suppression comments (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`, etc.) against `.harness-baseline`: new suppressions fail unless a human signs off on `suppressions --update-baseline`.
@@ -27,7 +27,7 @@ used by the Stop hook:
 For Go and Bun, the lint gate subsumes format checking.
 **`ci`** is the read-only gate — no fixes, just verification. Its read-only gates run in parallel (captured, printed in submission order, run to completion), then coverage streams and CRAP runs advisory.
 **`audit`** audits dependencies for known vulnerabilities.
-**`post-edit`** formats source files if changed by an agent.
+**`post-edit`** runs the template's fixer on source files changed by an agent: format everywhere, plus the linter's auto-fix where the tool has one (ruff, biome, golangci-lint `--fix`, clippy `--fix`).
 **`stop-hook`** is the Stop hook entrypoint: it runs `post-edit`, then complexity and deadcode where the language ships a separate deadcode gate.
 
 ## Available Templates

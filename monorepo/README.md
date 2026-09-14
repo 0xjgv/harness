@@ -35,7 +35,7 @@ make check-api      # scope to one subproject
 | `make check-<name>` | Run `check` in one subproject (tab-complete via help) |
 | `make check-dirty` | Run `check` only in subprojects with working-tree changes |
 | `make pre-commit` | Run `pre-commit` only in subprojects with staged files (arch config changes warn, not fail) |
-| `make pre-push` | Branch guard, the root-pair agents-md drift check, then a read-only push gate across all subprojects (lint, format check, acceptance, arch, agents-md drift); the hook's refs reach each subproject via `HARNESS_PRE_PUSH_REFS` |
+| `make pre-push` | Branch guard runs first and refuses+exits immediately on a protected-branch push, before anything else runs; once it passes: arch config guard, the root-pair agents-md drift check, then a read-only push gate across all subprojects (lint, format check, acceptance, arch, agents-md drift); the hook's refs reach each subproject via `HARNESS_PRE_PUSH_REFS` |
 | `make branch-guard` | Refuse pushes to (or deletions of) `main`/`master` unless `HARNESS_ALLOW_PROTECTED_PUSH=1` |
 | `make ci` | The root-pair agents-md drift check, then a read-only gate across all subprojects (no fixes); each subproject runs its read-only gates in parallel |
 | `make test` | Run tests only, all subprojects |

@@ -405,6 +405,57 @@ class TestArchGuardPrePushRefs(unittest.TestCase):
         self.assertEqual(changed, [".importlinter"])
         self.assertEqual(tip_only, ["other.txt"])  # the tip alone would have missed it
 
+    def test_deleted_arch_config_is_detected_and_blocks_without_override(self):
+        # --diff-filter=d hides deletions. A branch that deletes the protected config
+        # (then adds an unrelated commit) must still be caught by the guard.
+        with temp_git_repo() as root:
+            (root / ".importlinter").write_text("[importlinter]\n", encoding="utf-8")
+            git(root, "add", "-A")
+            git(root, "commit", "-q", "-m", "init")
+            first = harness._git_lines(["rev-parse", "HEAD"])[0]
+            git(root, "update-ref", "refs/remotes/origin/main", first)
+            git(root, "checkout", "-q", "-b", "feature")
+
+            (root / ".importlinter").unlink()
+            git(root, "add", "-A")
+            git(root, "commit", "-q", "-m", "delete arch config")
+            (root / "other.txt").write_text("unrelated\n", encoding="utf-8")
+            git(root, "add", "-A")
+            git(root, "commit", "-q", "-m", "unrelated")
+            tip = harness._git_lines(["rev-parse", "HEAD"])[0]
+
+            refs = f"refs/heads/feature {tip} refs/heads/feature {'0' * 40}"
+            output = io.StringIO()
+            with clean_env(HARNESS_PRE_PUSH_REFS=refs), redirect_stdout(output):
+                ok = harness._check_arch_config_guard(include_pre_push_refs=True)
+
+        self.assertFalse(ok)
+        self.assertIn(".importlinter", output.getvalue())
+
+
+class TestPreCommitArchConfigOnly(unittest.TestCase):
+    def test_staged_arch_config_only_warns_and_exits_zero(self):
+        # cmd_pre_commit used to return early (no staged .py files) before the arch
+        # guard ever ran, so an arch-config-only commit sailed through silently.
+        with temp_git_repo() as root:
+            (root / ".importlinter").write_text("[importlinter]\n", encoding="utf-8")
+            git(root, "add", "-A")
+            git(root, "commit", "-q", "-m", "init")
+
+            (root / ".importlinter").write_text(
+                "[importlinter]\nchanged = true\n", encoding="utf-8"
+            )
+            git(root, "add", "-A")
+
+            output = io.StringIO()
+            with clean_env(), redirect_stdout(output):
+                harness.cmd_pre_commit()  # must not raise SystemExit
+
+        text = output.getvalue()
+        self.assertIn("Arch config changed", text)
+        self.assertIn(".importlinter", text)
+        self.assertIn("No staged Python files", text)
+
 
 class TestParallelGates(unittest.TestCase):
     def test_all_gates_run_to_completion_on_seeded_failure(self):

@@ -74,11 +74,11 @@ arch_config_filter() {
 arch_config_changed_paths() {
   local staged="$$1" include_pre_push="$$2" base=""
   if [ "$$staged" = 1 ]; then
-    git diff --cached --name-only --diff-filter=d 2>/dev/null || true
+    git diff --cached --name-only 2>/dev/null || true
     return 0
   fi
-  git diff --name-only --diff-filter=d 2>/dev/null || true
-  git diff --cached --name-only --diff-filter=d 2>/dev/null || true
+  git diff --name-only 2>/dev/null || true
+  git diff --cached --name-only 2>/dev/null || true
   git ls-files --others --exclude-standard 2>/dev/null || true
   if [ -n "$${HARNESS_ARCH_BASE:-}" ]; then
     base="$$HARNESS_ARCH_BASE"
@@ -86,7 +86,7 @@ arch_config_changed_paths() {
     base="origin/$$GITHUB_BASE_REF"
   fi
   if [ -n "$$base" ] && git rev-parse --verify "$$base" >/dev/null 2>&1; then
-    git diff --name-only --diff-filter=d "$$base...HEAD" 2>/dev/null || true
+    git diff --name-only "$$base...HEAD" 2>/dev/null || true
   fi
   if [ "$$include_pre_push" = 1 ] && [ ! -t 0 ]; then
     local local_ref local_sha remote_ref remote_sha zero nb cand
@@ -99,12 +99,12 @@ arch_config_changed_paths() {
           [ -n "$$cand" ] && git rev-parse --verify -q "$$cand" >/dev/null 2>&1 && { nb=$$(git merge-base "$$cand" "$$local_sha" 2>/dev/null || true); break; }
         done
         if [ -n "$$nb" ]; then
-          git diff --name-only --diff-filter=d "$$nb" "$$local_sha" 2>/dev/null || true
+          git diff --name-only "$$nb" "$$local_sha" 2>/dev/null || true
         else
           git diff-tree --no-commit-id --name-only -r "$$local_sha" 2>/dev/null || true
         fi
       else
-        git diff --name-only --diff-filter=d "$$remote_sha" "$$local_sha" 2>/dev/null || true
+        git diff --name-only "$$remote_sha" "$$local_sha" 2>/dev/null || true
       fi
     done
   fi
@@ -155,12 +155,13 @@ read_pre_push_refs() {
   return 0
 }
 branch_guard_targets() {
-  local refs="$$1" local_ref local_sha remote_ref remote_sha
-  if [ -z "$$refs" ]; then
+  local refs="$$1" local_ref local_sha remote_ref remote_sha records
+  records=$$(printf '%s\n' "$$refs" | awk 'NF >= 4 { print $$3 }')
+  if [ -z "$$records" ]; then
     git rev-parse --abbrev-ref HEAD 2>/dev/null || true
     return 0
   fi
-  printf '%s\n' "$$refs" | while read -r local_ref local_sha remote_ref remote_sha; do
+  printf '%s\n' "$$records" | while read -r remote_ref; do
     case "$$remote_ref" in refs/heads/*) printf '%s\n' "$${remote_ref#refs/heads/}" ;; esac
   done
 }
@@ -298,12 +299,12 @@ pre-commit: ## Root git pre-commit hook
 	$(MAKE) --no-print-directory _run CMD=pre-commit DIRS="$$dirs"
 
 .PHONY: pre-push
-pre-push: ## Root git pre-push hook
-	@$(MAKE) --no-print-directory agents-md-drift
-	@$(MAKE) --no-print-directory skills-drift
+pre-push: ## Root git pre-push hook: branch guard first, then drift, arch guard, templates
 	@set -u -o pipefail; eval "$$SH_BRANCH_GUARD"; eval "$$SH_ARCH_CONFIG_GUARD"; \
 	refs=$$(read_pre_push_refs); \
 	branch_guard "$$refs" || exit 1; \
+	$(MAKE) --no-print-directory agents-md-drift; \
+	$(MAKE) --no-print-directory skills-drift; \
 	printf '%s\n' "$$refs" | arch_config_guard 0 0 1 || exit 1; \
 	HARNESS_PRE_PUSH_REFS="$$refs" $(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)"
 

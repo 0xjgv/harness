@@ -40,6 +40,8 @@ Given(
       'user.email=harness@example.com',
       '-c',
       'user.name=harness',
+      '-c',
+      'commit.gpgsign=false',
       'commit',
       '-q',
       '--no-verify',
@@ -55,6 +57,10 @@ Given('the push updates {string}', function (this: BranchGuardWorld, remoteRef: 
 
 Given('the push deletes {string}', function (this: BranchGuardWorld, remoteRef: string) {
   this.env = { ...this.env, HARNESS_PRE_PUSH_REFS: `(delete) ${ZERO} ${remoteRef} def456` };
+});
+
+Given('the push forwards {string}', function (this: BranchGuardWorld, refsText: string) {
+  this.env = { ...this.env, HARNESS_PRE_PUSH_REFS: refsText };
 });
 
 Given('the protected-push override is set', function (this: BranchGuardWorld) {

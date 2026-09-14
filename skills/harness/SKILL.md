@@ -105,7 +105,7 @@ Apply these when deciding what a ported harness enforces:
 | `pre-push` | Before push | branch guard, then read-only push gate: lint + format check + acceptance + arch over the whole tree, in parallel | no |
 | `ci` | CI pipeline | read-only gates (lint + typecheck + dep audit + complexity + acceptance + arch) **run in parallel**, captured and printed in submission order; then tests/coverage + crap (advisory) | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
-| `post-edit` | Stop hook helper | format if source files changed | yes |
+| `post-edit` | Stop hook helper | fix + format changed source files (rust: clippy `--fix` + fmt) | yes |
 | `stop-hook` | Agent Stop hook | post-edit + complexity + deadcode (python/bun) | yes |
 
 Quality subcommands also callable standalone: `complexity`, `crap`,

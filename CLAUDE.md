@@ -33,7 +33,7 @@ The root `Makefile` manages repo-level dogfooding and skill deployment:
 - `make arch-config-guard ARGS=--warn` — warn on protected arch config changes
 - `make stop-hook` — root Stop hook: sync derived root docs/skills when needed, warn on
   arch config changes, and dispatch `stop-hook` into dirty language templates
-- `make branch-guard` — refuse direct pushes to, or deletions of, `main`/`master`. Reads
+- `make branch-guard` — refuse direct pushes to, or deletions of, `main`/`master`. Runs before every other gate in `make pre-push`; a refusal stops the run. Reads
   `HARNESS_PRE_PUSH_REFS`, else git pre-push stdin (1s deadline; partial input fails),
   else the current branch; `HARNESS_ALLOW_PROTECTED_PUSH=1` overrides. Runs first in
   `make pre-push`, which then exports the refs to every template's `pre-push`.
@@ -68,7 +68,7 @@ cd monorepo && make check           # dispatches check to every subproject copie
 | `pre-push` | git pre-push hook | branch guard, then read-only: lint, format check, acceptance, arch, over the whole tree, in parallel | no |
 | `ci` | CI pipeline | read-only gates (lint, typecheck, dep audit, complexity, deadcode, acceptance, arch) in parallel, then coverage + advisory CRAP | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
-| `post-edit` | Stop hook helper | format changed source files | yes |
+| `post-edit` | Stop hook helper | fix + format changed source files (rust: clippy `--fix` + fmt) | yes |
 | `stop-hook` | agent Stop hook | `post-edit` + complexity (+ deadcode where shipped) | yes |
 
 Other standalone subcommands every template exposes: `complexity`, `crap`, `acceptance`,

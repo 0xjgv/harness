@@ -42,3 +42,19 @@ Feature: Pre-push branch guard refuses protected branches
     When I run "harness branch-guard"
     Then the exit code is 0
     And the output contains "Branch guard override: main"
+
+  Scenario: Malformed forwarded refs fall back to the current branch
+    Given a git repo on branch "main"
+    And the push refs are "garbage"
+    When I run "harness branch-guard"
+    Then the exit code is 1
+    And the output contains "Push targets protected branch: main"
+
+  Scenario: Pre-push refuses before any other gate runs
+    Given a git repo on branch "main"
+    When I run "harness pre-push"
+    Then the exit code is 1
+    And the output contains "Push targets protected branch: main"
+    And the output does not contain "Arch config"
+    And the output does not contain "agents-md-drift"
+    And the output does not contain "Clippy"

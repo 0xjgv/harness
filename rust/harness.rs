@@ -923,14 +923,7 @@ fn changed_paths_from_base() -> Vec<String> {
         if git_lines(&["rev-parse", "--verify", &base]).is_empty() {
             continue;
         }
-        paths.extend(git_lines(&[
-            "diff",
-            "--name-only",
-            "--diff-filter=d",
-            &format!("{base}...HEAD"),
-            "--",
-            ".",
-        ]));
+        paths.extend(git_lines(&["diff", "--name-only", &format!("{base}...HEAD"), "--", "."]));
     }
     paths
 }
@@ -1045,7 +1038,6 @@ fn changed_paths_from_pre_push_refs(text: &str) -> Vec<String> {
                 paths.extend(git_lines(&[
                     "diff",
                     "--name-only",
-                    "--diff-filter=d",
                     &format!("{base}..{local_sha}"),
                     "--",
                     ".",
@@ -1062,15 +1054,7 @@ fn changed_paths_from_pre_push_refs(text: &str) -> Vec<String> {
                 ]));
             }
         } else {
-            paths.extend(git_lines(&[
-                "diff",
-                "--name-only",
-                "--diff-filter=d",
-                remote_sha,
-                local_sha,
-                "--",
-                ".",
-            ]));
+            paths.extend(git_lines(&["diff", "--name-only", remote_sha, local_sha, "--", "."]));
         }
     }
     paths
@@ -1079,10 +1063,10 @@ fn changed_paths_from_pre_push_refs(text: &str) -> Vec<String> {
 fn changed_arch_configs(staged: bool, refs: Option<&str>) -> Vec<String> {
     let mut paths = Vec::new();
     if staged {
-        paths.extend(git_lines(&["diff", "--cached", "--name-only", "--diff-filter=d", "--", "."]));
+        paths.extend(git_lines(&["diff", "--cached", "--name-only", "--", "."]));
     } else {
-        paths.extend(git_lines(&["diff", "--name-only", "--diff-filter=d", "--", "."]));
-        paths.extend(git_lines(&["diff", "--cached", "--name-only", "--diff-filter=d", "--", "."]));
+        paths.extend(git_lines(&["diff", "--name-only", "--", "."]));
+        paths.extend(git_lines(&["diff", "--cached", "--name-only", "--", "."]));
         paths.extend(git_lines(&["ls-files", "--others", "--exclude-standard", "--", "."]));
         paths.extend(changed_paths_from_base());
     }
@@ -1141,8 +1125,9 @@ fn cmd_arch_config_guard() {
 ///
 /// `refs` is the pre-push ref list; empty when there is none. Deleting a
 /// protected branch counts as targeting it. Only `refs/heads/` matches, so tag
-/// pushes never trip the guard. With no ref line at all the decision falls back
-/// to `current_branch`.
+/// pushes never trip the guard. Well-formed records (any line with 4+ fields,
+/// tags included) take precedence once present; `current_branch` decides only
+/// when no line reaches that threshold at all (missing or malformed refs).
 fn protected_push_target(refs: &str, current_branch: &str) -> Option<String> {
     for line in refs.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -1184,7 +1169,7 @@ fn check_branch_guard(refs: &PrePushRefs, allow_protected: bool) -> bool {
             print_incomplete_refs();
             return false;
         }
-        PrePushRefs::Refs(text) => (text.as_str(), String::new()),
+        PrePushRefs::Refs(text) => (text.as_str(), current_branch()),
         PrePushRefs::None => ("", current_branch()),
     };
     let Some(branch) = protected_push_target(text, &fallback) else {
@@ -1628,15 +1613,15 @@ fn cmd_check() {
 }
 
 fn cmd_pre_commit() {
+    println!("\n{BLUE}[pre-commit]{RESET}\n");
+    check_arch_config_guard(true, true, false);
+
     let files = staged_rs_files();
     if files.is_empty() {
         println!("No staged Rust files \u{2014} skipping checks");
         return;
     }
 
-    println!("\n{BLUE}[pre-commit]{RESET}\n");
-
-    check_arch_config_guard(true, true, false);
     cmd_fix();
     check_agents_md_drift(false);
     cmd_test();
@@ -1679,15 +1664,18 @@ fn cmd_ci() {
 /// machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
 fn cmd_pre_push() {
     println!("\n{BLUE}[pre-push]{RESET}\n");
-    // Branch guard first: it is cheap and reads the hook stdin the arch guard
-    // then reuses. Bind both results so the gates still run and report.
-    let branch_ok = check_branch_guard(pre_push_refs(), protected_push_allowed());
+    // Branch guard first, and it short-circuits: on refusal (or incomplete
+    // refs) print only that and exit before the arch guard, drift check, and
+    // the parallel batch even start.
+    if !check_branch_guard(pre_push_refs(), protected_push_allowed()) {
+        std::process::exit(1);
+    }
     let arch_config_ok = check_arch_config_guard(false, false, true);
     let agents_md_drift_ok = check_agents_md_drift(true).ok;
     let mut gates = vec![lint_gate(), format_check_gate()];
     gates.extend(acceptance_gates_or_warn());
     gates.extend(arch_gates_or_warn());
-    if !run_gates_parallel(&gates) || !arch_config_ok || !branch_ok || !agents_md_drift_ok {
+    if !run_gates_parallel(&gates) || !arch_config_ok || !agents_md_drift_ok {
         std::process::exit(1);
     }
 }
@@ -2072,6 +2060,24 @@ mod tests {
         assert_eq!(protected_push_target("", "main"), Some("main".to_string()));
         assert_eq!(protected_push_target("", "master"), Some("master".to_string()));
         assert_eq!(protected_push_target("", "feature/x"), None);
+    }
+
+    #[test]
+    fn malformed_refs_fall_back_to_current_branch() {
+        // "garbage" never reaches the 4-field threshold, so there is no
+        // parseable record at all: same as no refs, the current branch decides.
+        assert_eq!(protected_push_target("garbage", "main"), Some("main".to_string()));
+        assert_eq!(protected_push_target("garbage", "feature/x"), None);
+    }
+
+    #[test]
+    fn tag_only_refs_pass_even_on_a_main_checkout() {
+        // A tag line still parses as a 4-field record, so — like a feature-branch
+        // record — it takes precedence over the current branch even though it
+        // never names a protected head: `git push origin v1.0` from `main` is a
+        // legitimate push and must not be refused. Matches python/go.
+        let line = "refs/tags/v1 abc123 refs/tags/v1 def456";
+        assert_eq!(protected_push_target(line, "main"), None);
     }
 
     #[test]

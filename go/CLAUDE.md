@@ -3,9 +3,9 @@
 ## Commands
 
 - After edits: `go run harness.go check` — fix, format, lint, test, suppression ratchet
-- Pre-commit: `go run harness.go pre-commit` — staged files only (auto via git hook); arch config changes warn here, they do not fail
-- Pre-push: `go run harness.go pre-push` — branch guard (refuses pushes to main/master unless `HARNESS_ALLOW_PROTECTED_PUSH=1`), then a read-only push gate over the whole tree: lint (golangci-lint covers format), agents-md drift, acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
-- CI: `go run harness.go ci` — read-only gates (lint, audit, complexity, agents-md drift, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then test-cov (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
+- Pre-commit: `go run harness.go pre-commit` — arch config guard warns first, even on an arch-config-only commit with no other staged Go files; remaining fix/format/test stay staged-files-only (auto via git hook); arch config changes warn here, they do not fail
+- Pre-push: `go run harness.go pre-push` — branch guard runs first and short-circuits (refuses pushes to main/master unless `HARNESS_ALLOW_PROTECTED_PUSH=1`, printing only the refusal and exiting before anything else runs); then a read-only push gate over the whole tree: lint (golangci-lint covers format), acceptance, arch run in parallel, then agents-md drift as a separate hard check after that batch (the offline checks pre-commit and stop-hook skip). Auto via git pre-push hook.
+- CI: `go run harness.go ci` — read-only gates (lint, audit, complexity, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then agents-md drift as a separate hard check, then test-cov (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
 - Complexity: `go run harness.go complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over the module
 - Deadcode: no separate target — golangci-lint's `unused` linter (run by `lint`/`ci`) already flags unreachable functions, vars, and types, and `go mod tidy` prunes unused dependencies. (`x/tools/cmd/deadcode` needs a `main` package; this template is a library.)
 - Audit: `go run harness.go audit` — audit dependencies for known vulnerabilities (via govulncheck)

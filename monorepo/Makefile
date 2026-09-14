@@ -90,7 +90,7 @@ arch_config_new_branch_paths() {
   base=$$(arch_base_ref) || base=""
   [ -n "$$base" ] && mb=$$(git merge-base "$$base" "$$local_sha" 2>/dev/null || true)
   if [ -n "$$mb" ]; then
-    git diff --name-only --diff-filter=d "$$mb" "$$local_sha" 2>/dev/null || true
+    git diff --name-only "$$mb" "$$local_sha" 2>/dev/null || true
   else
     git diff-tree --no-commit-id --name-only -r "$$local_sha" 2>/dev/null || true
   fi
@@ -98,11 +98,11 @@ arch_config_new_branch_paths() {
 arch_config_changed_paths() {
   local staged="$$1" include_pre_push="$$2" base=""
   if [ "$$staged" = 1 ]; then
-    git diff --cached --name-only --diff-filter=d 2>/dev/null || true
+    git diff --cached --name-only 2>/dev/null || true
     return 0
   fi
-  git diff --name-only --diff-filter=d 2>/dev/null || true
-  git diff --cached --name-only --diff-filter=d 2>/dev/null || true
+  git diff --name-only 2>/dev/null || true
+  git diff --cached --name-only 2>/dev/null || true
   git ls-files --others --exclude-standard 2>/dev/null || true
   if [ -n "$${HARNESS_ARCH_BASE:-}" ]; then
     base="$$HARNESS_ARCH_BASE"
@@ -110,7 +110,7 @@ arch_config_changed_paths() {
     base="origin/$$GITHUB_BASE_REF"
   fi
   if [ -n "$$base" ] && git rev-parse --verify "$$base" >/dev/null 2>&1; then
-    git diff --name-only --diff-filter=d "$$base...HEAD" 2>/dev/null || true
+    git diff --name-only "$$base...HEAD" 2>/dev/null || true
   fi
   if [ "$$include_pre_push" = 1 ] && [ ! -t 0 ]; then
     local local_ref local_sha remote_ref remote_sha zero
@@ -121,7 +121,7 @@ arch_config_changed_paths() {
       if [ "$$remote_sha" = "$$zero" ]; then
         arch_config_new_branch_paths "$$local_sha"
       else
-        git diff --name-only --diff-filter=d "$$remote_sha" "$$local_sha" 2>/dev/null || true
+        git diff --name-only "$$remote_sha" "$$local_sha" 2>/dev/null || true
       fi
     done
   fi
@@ -180,21 +180,24 @@ refs_incomplete() {
   return 1
 }
 branch_guard() {
-  local l_ref l_sha r_ref r_sha saw=0 target="" branch="" refs=""
+  local r_ref target="" branch="" refs="" records=""
   if [ ! -t 0 ]; then
     refs=$$(cat)
     case "$$refs" in *__INCOMPLETE__*) refs_incomplete; return 1 ;; esac
-    while read -r l_ref l_sha r_ref r_sha; do
-      [ -z "$$l_ref$$l_sha$$r_ref$$r_sha" ] && continue
-      saw=1
+    # Only a fully-populated "local-ref local-sha remote-ref remote-sha" line
+    # counts as a parsed record. Malformed/short lines (e.g. HARNESS_PRE_PUSH_REFS
+    # set to garbage) must not suppress the current-branch fallback below.
+    records=$$(printf '%s\n' "$$refs" | awk 'NF >= 4 { print $$3 }')
+  fi
+  if [ -z "$$records" ]; then
+    branch=$$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    case "$$branch" in main|master) target="$$branch" ;; esac
+  else
+    while read -r r_ref; do
       case "$$r_ref" in
         refs/heads/main|refs/heads/master) target="$${r_ref#refs/heads/}" ;;
       esac
-    done <<< "$$refs"
-  fi
-  if [ "$$saw" = 0 ]; then
-    branch=$$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
-    case "$$branch" in main|master) target="$$branch" ;; esac
+    done <<< "$$records"
   fi
   if [ -z "$$target" ]; then
     printf "  $(GREEN)✓$(RESET) Branch guard\n"
@@ -251,11 +254,12 @@ ci: ## Read-only gate across all subprojects
 .PHONY: pre-push
 pre-push: ## Read-only push gate across all subprojects (branch guard, lint, format check, acceptance, arch, agents-md drift)
 	@set -u -o pipefail; \
-	eval "$$SH_BRANCH_GUARD"; eval "$$SH_ARCH_CONFIG_GUARD"; \
+	eval "$$SH_BRANCH_GUARD"; \
 	refs=$$(read_pre_push_refs); \
 	case "$$refs" in *__INCOMPLETE__*) refs_incomplete; exit 1 ;; esac; \
+	printf '%s\n' "$$refs" | branch_guard || exit 1; \
+	eval "$$SH_ARCH_CONFIG_GUARD"; \
 	rc=0; \
-	printf '%s\n' "$$refs" | branch_guard || rc=1; \
 	printf '%s\n' "$$refs" | arch_config_guard 0 0 1 || rc=1; \
 	$(MAKE) --no-print-directory _root_agents_drift || rc=1; \
 	[ $$rc -eq 0 ] || exit 1; \

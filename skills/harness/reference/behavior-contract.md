@@ -51,6 +51,10 @@ gates.
 
 ## Arch config guard
 
+Deleting a protected config counts as a change: the scans do not filter out
+deletions, because a missing config makes the arch gate skip and would
+otherwise slip past review.
+
 Every template exposes `arch-config-guard` through its runner:
 
 | Template | Command | Protected path |
@@ -99,8 +103,8 @@ branch-guard`, `cargo harness branch-guard`, `make branch-guard`).
 - `HARNESS_ALLOW_PROTECTED_PUSH=1`: explicit human override (solo repos that
   push straight to `main` export it once). Tests that spawn the harness strip
   it so an ambient override cannot flip a refusal scenario.
-- Wired first in `pre-push` only; a refusal fails `pre-push` before any other
-  gate runs.
+- Wired first in `pre-push` only; a refusal (or incomplete refs) exits before any
+  other gate runs, including drift checks and the parallel batch.
 
 ## Existing repo port
 

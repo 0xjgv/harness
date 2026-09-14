@@ -126,6 +126,8 @@ fn git_repo_on_branch(world: &mut CrateWorld, branch: String) {
             "user.email=harness@example.com",
             "-c",
             "user.name=harness",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-q",
             "--allow-empty",
@@ -140,6 +142,13 @@ fn push_refs_are(world: &mut CrateWorld, refs: String) {
     let dir = world.tmp.clone().expect("tmp dir not initialised");
     let head = git_out(&dir, &["rev-parse", "HEAD"]);
     world.env.push(("HARNESS_PRE_PUSH_REFS".to_string(), refs.replace("<HEAD>", &head)));
+}
+
+#[given("the arch config is staged")]
+fn arch_config_staged(world: &mut CrateWorld) {
+    let dir = world.tmp.clone().expect("tmp dir not initialised");
+    fs::write(dir.join("arch.toml"), "[rules]\n").expect("write arch.toml");
+    git(&dir, &["add", "arch.toml"]);
 }
 
 #[given("the protected-push override is set")]
@@ -163,6 +172,24 @@ fn branch_with_earlier_arch_change(world: &mut CrateWorld) {
     commit(&dir, "unrelated");
 }
 
+/// Branch pushed for the first time: `origin/main` exists, an earlier commit
+/// on the branch *deletes* the arch config, and the tip commit touches
+/// something else. `git diff --diff-filter=d` hides deletions, so this is the
+/// regression case for the guard dropping that filter.
+#[given("a new branch whose earlier commit deleted the arch config")]
+fn branch_with_earlier_arch_deletion(world: &mut CrateWorld) {
+    let dir = tempdir();
+    world.tmp = Some(dir.clone());
+    git(&dir, &["init", "-q", "-b", "feature/arch"]);
+    fs::write(dir.join("arch.toml"), "[rules]\n").expect("write arch.toml");
+    commit(&dir, "base");
+    git(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    fs::remove_file(dir.join("arch.toml")).expect("delete arch.toml");
+    commit(&dir, "delete arch config");
+    fs::write(dir.join("notes.md"), "unrelated\n").expect("write notes.md");
+    commit(&dir, "unrelated");
+}
+
 fn commit(dir: &PathBuf, message: &str) {
     git(dir, &["add", "-A"]);
     git(
@@ -172,6 +199,8 @@ fn commit(dir: &PathBuf, message: &str) {
             "user.email=harness@example.com",
             "-c",
             "user.name=harness",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-q",
             "--allow-empty",

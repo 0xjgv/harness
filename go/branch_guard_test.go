@@ -246,3 +246,80 @@ func TestArchConfigGuardScansWholeNewBranch(t *testing.T) {
 	out, _ := cmd.CombinedOutput()
 	assertGuard(t, cmd.ProcessState.ExitCode(), string(out), 1, "Arch config changed: .go-arch-lint.yml")
 }
+
+// TestArchConfigGuardDetectsDeletion ensures a branch that deletes the
+// protected config is caught: `--diff-filter=d` (which hides deletions) must
+// not be in any of the arch-config detection diffs. The config is committed,
+// origin/main pinned at that commit, then a new branch deletes it and adds an
+// unrelated commit on top — the guard must still report the deletion.
+func TestArchConfigGuardDetectsDeletion(t *testing.T) {
+	dir := t.TempDir()
+	mustRun(t, dir, exec.Command("git", "init", "-b", "main"))
+	if err := os.WriteFile(filepath.Join(dir, ".go-arch-lint.yml"), []byte("version: 3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	commitAll(t, dir)
+	mustRun(t, dir, exec.Command("git", "update-ref", "refs/remotes/origin/main", "HEAD"))
+
+	mustRun(t, dir, exec.Command("git", "checkout", "-b", "topic"))
+	if err := os.Remove(filepath.Join(dir, ".go-arch-lint.yml")); err != nil {
+		t.Fatal(err)
+	}
+	commitAll(t, dir)
+	if err := os.WriteFile(filepath.Join(dir, "unrelated.txt"), []byte("noise\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	commitAll(t, dir)
+
+	localSha := mustRun(t, dir, exec.Command("git", "rev-parse", "HEAD"))
+	refs := fmt.Sprintf("HARNESS_PRE_PUSH_REFS=refs/heads/topic %s refs/heads/topic %s",
+		localSha, strings.Repeat("0", 40))
+
+	cmd := exec.Command(harnessBin, "arch-config-guard", "--pre-push")
+	cmd.Dir = dir
+	cmd.Env = childEnv([]string{refs})
+	out, _ := cmd.CombinedOutput()
+	assertGuard(t, cmd.ProcessState.ExitCode(), string(out), 1, "Arch config changed: .go-arch-lint.yml")
+}
+
+// TestPreCommitWarnsOnArchConfigOnlyStage covers G2: the arch-config warn
+// must fire even when the protected config is the only staged file — before
+// the "no staged Go files" early return.
+func TestPreCommitWarnsOnArchConfigOnlyStage(t *testing.T) {
+	dir := t.TempDir()
+	mustRun(t, dir, exec.Command("git", "init", "-b", "main"))
+	if err := os.WriteFile(filepath.Join(dir, ".go-arch-lint.yml"), []byte("version: 3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, dir, exec.Command("git", "add", ".go-arch-lint.yml"))
+
+	cmd := exec.Command(harnessBin, "pre-commit")
+	cmd.Dir = dir
+	cmd.Env = childEnv(nil)
+	out, _ := cmd.CombinedOutput()
+	assertGuard(t, cmd.ProcessState.ExitCode(), string(out), 0, "Arch config changed")
+	if !strings.Contains(string(out), "No staged Go files") {
+		t.Fatalf("expected the early-return message after the arch warning:\n%s", out)
+	}
+}
+
+// TestPrePushRefusesBeforeOtherGates covers G3: on a protected branch with no
+// pre-push refs (git passes none on `git push --dry-run` from a tty-less
+// runner), the guard must print only the refusal and exit 1 — no arch guard,
+// no drift, no gate batch output.
+func TestPrePushRefusesBeforeOtherGates(t *testing.T) {
+	dir := t.TempDir()
+	mustRun(t, dir, exec.Command("git", "init", "-b", "main"))
+	commitAll(t, dir)
+
+	cmd := exec.Command(harnessBin, "pre-push")
+	cmd.Dir = dir
+	cmd.Stdin = nil // no pre-push refs at all: falls back to the current branch
+	cmd.Env = childEnv(nil)
+	out, _ := cmd.CombinedOutput()
+	assertGuard(t, cmd.ProcessState.ExitCode(), string(out), 1, guardRefused)
+	if strings.Contains(string(out), "Arch config guard") || strings.Contains(string(out), "Lint") ||
+		strings.Contains(string(out), "agents-md-drift") || strings.Contains(string(out), "Acceptance") {
+		t.Fatalf("expected only the refusal, other gates ran too:\n%s", out)
+	}
+}

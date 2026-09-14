@@ -38,6 +38,8 @@ async function commit(cwd: string, message: string): Promise<string> {
     'user.email=harness@example.com',
     '-c',
     'user.name=harness',
+    '-c',
+    'commit.gpgsign=false',
     'commit',
     '-q',
     '--no-verify',
@@ -68,6 +70,79 @@ describe('arch config guard on a new-branch push', () => {
     // The arch config change is buried mid-branch: the tip commit alone misses it.
     writeFileSync(join(root, '.dependency-cruiser.json'), '{}\n');
     await commit(root, 'arch config');
+    writeFileSync(join(root, 'notes.txt'), 'unrelated\n');
+    const tip = await commit(root, 'unrelated');
+
+    const proc = Bun.spawn(['bun', 'harness.ts', 'arch-config-guard'], {
+      cwd: root,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: childEnv({
+        HARNESS_PRE_PUSH_REFS: `refs/heads/topic ${tip} refs/heads/topic ${ZERO}\n`,
+      }),
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    const output = stdout + stderr;
+    expect(output).toContain('Arch config changed: .dependency-cruiser.json');
+    expect(exitCode).toBe(1);
+  });
+});
+
+describe('pre-commit on an arch-config-only staged change', () => {
+  test('warns and still exits 0, ahead of the no-staged-source-files early return', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pre-commit-arch-'));
+    roots.push(root);
+    copyFileSync(HARNESS_TS, join(root, 'harness.ts'));
+    await git(root, ['init', '-b', 'main', '-q', '.']);
+    writeFileSync(join(root, 'README.md'), '# temp\n');
+    await commit(root, 'base');
+
+    // Only the protected config is staged — no TypeScript files, which used
+    // to make pre-commit return before the arch-config warn ever ran.
+    writeFileSync(join(root, '.dependency-cruiser.json'), '{}\n');
+    await git(root, ['add', '.dependency-cruiser.json']);
+
+    const proc = Bun.spawn(['bun', 'harness.ts', 'pre-commit'], {
+      cwd: root,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: childEnv(),
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    const output = stdout + stderr;
+    expect(output).toContain('⚠'); // warn glyph, not the ✗ fail glyph
+    expect(output).toContain('Arch config changed: .dependency-cruiser.json');
+    expect(exitCode).toBe(0);
+  });
+});
+
+describe('arch config guard on a deletion', () => {
+  test('a branch that deletes the protected config is caught, not waved through', async () => {
+    // `--diff-filter=d` hides deletions; a deleted config is a change that
+    // needs review just as much as an edited one.
+    const root = mkdtempSync(join(tmpdir(), 'arch-guard-delete-'));
+    roots.push(root);
+    copyFileSync(HARNESS_TS, join(root, 'harness.ts'));
+    await git(root, ['init', '-b', 'main', '-q', '.']);
+
+    writeFileSync(join(root, '.dependency-cruiser.json'), '{}\n');
+    const base = await commit(root, 'base with arch config');
+    await git(root, ['update-ref', 'refs/remotes/origin/main', base]);
+
+    // The deletion is buried mid-branch alongside an unrelated commit, same
+    // shape as the tip-commit-only bug the sibling test above covers.
+    rmSync(join(root, '.dependency-cruiser.json'));
+    await commit(root, 'delete arch config');
     writeFileSync(join(root, 'notes.txt'), 'unrelated\n');
     const tip = await commit(root, 'unrelated');
 

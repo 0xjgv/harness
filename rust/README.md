@@ -44,9 +44,9 @@ cargo harness ci                   # Full verification (see below)
 
 ### `ci` pipeline
 
-`harness ci` runs the read-only gates — strict clippy (`-D warnings`), format check, complexity (lizard, CCN 15, args 8), acceptance (cucumber), arch (cargo-modules), agents-md-drift — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then runs dep audit, streams tests + coverage (cargo-llvm-cov, default threshold from `.harness-baseline`), and the advisory CRAP.
+`harness ci` runs the read-only gates — strict clippy (`-D warnings`), format check, complexity (lizard, CCN 15, args 8), acceptance (cucumber), arch (cargo-modules) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then runs agents-md-drift as a separate hard check, dep audit, streams tests + coverage (cargo-llvm-cov, default threshold from `.harness-baseline`), and the advisory CRAP.
 
-`pre-push` is the offline push gate — a branch guard that refuses direct pushes to (or deletions of) `main`/`master` (override: `HARNESS_ALLOW_PROTECTED_PUSH=1`), then clippy, format check, acceptance, arch, agents-md-drift over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
+`pre-push` is the offline push gate — a branch guard that refuses direct pushes to (or deletions of) `main`/`master` (override: `HARNESS_ALLOW_PROTECTED_PUSH=1`) and short-circuits on refusal, printing only that and exiting before anything else runs; otherwise the arch config guard, then agents-md-drift as a separate hard check, then clippy, format check, acceptance, arch run in parallel over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
 
 Dead code needs no separate gate — rust's `dead_code` lint is on by default and the strict clippy (`-D warnings`) denies unused functions, fields, and variants; unused dependencies surface via `cargo`'s own warnings (or `cargo-machete`).
 

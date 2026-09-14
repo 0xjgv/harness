@@ -516,7 +516,7 @@ func changedPathsFromBase() []string {
 		if len(gitLines("rev-parse", "--verify", base)) == 0 {
 			continue
 		}
-		paths = append(paths, gitLines("diff", "--name-only", "--diff-filter=d", base+"...HEAD", "--", ".")...)
+		paths = append(paths, gitLines("diff", "--name-only", base+"...HEAD", "--", ".")...)
 	}
 	return paths
 }
@@ -629,7 +629,7 @@ func archDiffBase() (string, bool) {
 func changedPathsForNewBranch(localSha string) []string {
 	if base, ok := archDiffBase(); ok {
 		if mergeBase := gitLines("merge-base", base, localSha); len(mergeBase) > 0 {
-			return gitLines("diff", "--name-only", "--diff-filter=d", mergeBase[0]+".."+localSha, "--", ".")
+			return gitLines("diff", "--name-only", mergeBase[0]+".."+localSha, "--", ".")
 		}
 	}
 	return gitLines("diff-tree", "--no-commit-id", "--name-only", "-r", localSha, "--", ".")
@@ -650,7 +650,7 @@ func changedPathsFromPrePushRefs() []string {
 		if remoteSha == zero {
 			paths = append(paths, changedPathsForNewBranch(localSha)...)
 		} else {
-			paths = append(paths, gitLines("diff", "--name-only", "--diff-filter=d", remoteSha, localSha, "--", ".")...)
+			paths = append(paths, gitLines("diff", "--name-only", remoteSha, localSha, "--", ".")...)
 		}
 	}
 	return paths
@@ -659,10 +659,10 @@ func changedPathsFromPrePushRefs() []string {
 func changedArchConfigs(staged, includePrePushRefs bool) []string {
 	var paths []string
 	if staged {
-		paths = append(paths, gitLines("diff", "--cached", "--name-only", "--diff-filter=d", "--", ".")...)
+		paths = append(paths, gitLines("diff", "--cached", "--name-only", "--", ".")...)
 	} else {
-		paths = append(paths, gitLines("diff", "--name-only", "--diff-filter=d", "--", ".")...)
-		paths = append(paths, gitLines("diff", "--cached", "--name-only", "--diff-filter=d", "--", ".")...)
+		paths = append(paths, gitLines("diff", "--name-only", "--", ".")...)
+		paths = append(paths, gitLines("diff", "--cached", "--name-only", "--", ".")...)
 		paths = append(paths, gitLines("ls-files", "--others", "--exclude-standard", "--", ".")...)
 		paths = append(paths, changedPathsFromBase()...)
 	}
@@ -1167,15 +1167,15 @@ func cmdCheck() {
 }
 
 func cmdPreCommit() {
+	fmt.Printf("\n%s[pre-commit]%s\n\n", blue, reset)
+	checkArchConfigGuard(true, true, false)
+
 	files := stagedGoFiles()
 	if len(files) == 0 {
 		fmt.Println("No staged Go files — skipping checks")
 		return
 	}
 
-	fmt.Printf("\n%s[pre-commit]%s\n\n", blue, reset)
-
-	checkArchConfigGuard(true, true, false)
 	pkgs := stagedPackages(files)
 	cmdFix(pkgs)
 	checkAgentsMdDrift(false)
@@ -1216,18 +1216,22 @@ func cmdCi() {
 // acceptance, arch — validating the whole pushed tree (after merges/rebases/
 // --no-verify) before it leaves the machine. Network (audit) and advisory
 // (coverage/CRAP) gates stay in ci.
-// The branch guard runs first: it is cheap, and it is the gate that keeps merge
-// authority with the human.
+// The branch guard runs first and short-circuits: on refusal (or incomplete
+// refs) it prints and exits before the arch guard, drift check, or the
+// parallel batch run at all — it is the gate that keeps merge authority with
+// the human, so nothing else needs to run once it has failed.
 func cmdPrePush() {
 	fmt.Printf("\n%s[pre-push]%s\n\n", blue, reset)
-	branchOk := checkBranchGuard()
+	if !checkBranchGuard() {
+		os.Exit(1)
+	}
 	archConfigOk := checkArchConfigGuard(false, false, true)
 	gates := []gate{lintGate(nil)}
 	gates = append(gates, acceptanceGatesOrWarn()...)
 	gates = append(gates, archGatesOrWarn()...)
 	allOk := runGatesParallel(gates)
 	driftOk := checkAgentsMdDrift(true).ok
-	if !allOk || !driftOk || !archConfigOk || !branchOk {
+	if !allOk || !driftOk || !archConfigOk {
 		os.Exit(1)
 	}
 }

@@ -621,9 +621,7 @@ def _changed_paths_from_base() -> list[str]:
     for base in bases:
         if not _git_lines(["rev-parse", "--verify", base]):
             continue
-        paths.extend(
-            _git_lines(["diff", "--name-only", "--diff-filter=d", f"{base}...HEAD", "--", "."])
-        )
+        paths.extend(_git_lines(["diff", "--name-only", f"{base}...HEAD", "--", "."]))
     return paths
 
 
@@ -699,7 +697,6 @@ def _new_branch_paths(local_sha: str) -> list[str]:
         return _git_lines([
             "diff",
             "--name-only",
-            "--diff-filter=d",
             f"{merge_base[0]}..{local_sha}",
             "--",
             ".",
@@ -717,17 +714,7 @@ def _changed_paths_from_pre_push_refs() -> list[str]:
         if remote_sha == zero:
             paths.extend(_new_branch_paths(local_sha))
         else:
-            paths.extend(
-                _git_lines([
-                    "diff",
-                    "--name-only",
-                    "--diff-filter=d",
-                    remote_sha,
-                    local_sha,
-                    "--",
-                    ".",
-                ])
-            )
+            paths.extend(_git_lines(["diff", "--name-only", remote_sha, local_sha, "--", "."]))
     return paths
 
 
@@ -736,10 +723,10 @@ def _changed_arch_configs(
 ) -> list[str]:
     paths: list[str] = []
     if staged:
-        paths.extend(_git_lines(["diff", "--cached", "--name-only", "--diff-filter=d", "--", "."]))
+        paths.extend(_git_lines(["diff", "--cached", "--name-only", "--", "."]))
     else:
-        paths.extend(_git_lines(["diff", "--name-only", "--diff-filter=d", "--", "."]))
-        paths.extend(_git_lines(["diff", "--cached", "--name-only", "--diff-filter=d", "--", "."]))
+        paths.extend(_git_lines(["diff", "--name-only", "--", "."]))
+        paths.extend(_git_lines(["diff", "--cached", "--name-only", "--", "."]))
         paths.extend(_git_lines(["ls-files", "--others", "--exclude-standard", "--", "."]))
         paths.extend(_changed_paths_from_base())
     if include_pre_push_refs:
@@ -1123,13 +1110,13 @@ def cmd_check() -> None:
 
 def cmd_pre_commit() -> None:
     """Staged checks + tests if source files staged."""
+    print("\n=== Pre-commit Checks ===\n")
+    _check_arch_config_guard(warn_only=True, staged=True)
     files = _staged_py_files()
     if not files:
         print("No staged Python files — skipping checks")
         return
 
-    print("\n=== Pre-commit Checks ===\n")
-    _check_arch_config_guard(warn_only=True, staged=True)
     cmd_fix(files)
     cmd_format(files)
     cmd_typecheck()
@@ -1178,7 +1165,8 @@ def cmd_pre_push() -> None:
     stay in ci.
     """
     print("\n=== Pre-push Checks ===\n")
-    branch_ok = _check_branch_guard()
+    if not _check_branch_guard():
+        sys.exit(1)
     arch_config_ok = _check_arch_config_guard(include_pre_push_refs=True)
     gates = [
         _lint_gate(),
@@ -1187,7 +1175,7 @@ def cmd_pre_push() -> None:
         *_acceptance_gates_or_warn(),
         *_arch_gates_or_warn(),
     ]
-    _exit_if_failed(run_gates_parallel(gates) and arch_config_ok and branch_ok)
+    _exit_if_failed(run_gates_parallel(gates) and arch_config_ok)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:

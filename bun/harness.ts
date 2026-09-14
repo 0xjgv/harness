@@ -718,9 +718,7 @@ async function changedPathsFromBase(): Promise<string[]> {
   const paths: string[] = [];
   for (const base of bases) {
     if ((await gitLines(['rev-parse', '--verify', base])).length === 0) continue;
-    paths.push(
-      ...(await gitLines(['diff', '--name-only', '--diff-filter=d', `${base}...HEAD`, '--', '.'])),
-    );
+    paths.push(...(await gitLines(['diff', '--name-only', `${base}...HEAD`, '--', '.'])));
   }
   return paths;
 }
@@ -792,14 +790,7 @@ async function changedPathsForNewBranch(localSha: string): Promise<string[]> {
   const base = await archDiffBase();
   const [mergeBase] = base === null ? [] : await gitLines(['merge-base', base, localSha]);
   if (mergeBase !== undefined) {
-    return await gitLines([
-      'diff',
-      '--name-only',
-      '--diff-filter=d',
-      `${mergeBase}..${localSha}`,
-      '--',
-      '.',
-    ]);
+    return await gitLines(['diff', '--name-only', `${mergeBase}..${localSha}`, '--', '.']);
   }
   return await gitLines(['diff-tree', '--no-commit-id', '--name-only', '-r', localSha, '--', '.']);
 }
@@ -813,17 +804,7 @@ async function changedPathsFromRefs(refs: PrePushRefs): Promise<string[]> {
     if (remoteSha === zero) {
       paths.push(...(await changedPathsForNewBranch(localSha)));
     } else {
-      paths.push(
-        ...(await gitLines([
-          'diff',
-          '--name-only',
-          '--diff-filter=d',
-          remoteSha,
-          localSha,
-          '--',
-          '.',
-        ])),
-      );
+      paths.push(...(await gitLines(['diff', '--name-only', remoteSha, localSha, '--', '.'])));
     }
   }
   return paths;
@@ -834,14 +815,10 @@ async function changedArchConfigs(
 ): Promise<string[]> {
   const paths: string[] = [];
   if (opts.staged) {
-    paths.push(
-      ...(await gitLines(['diff', '--cached', '--name-only', '--diff-filter=d', '--', '.'])),
-    );
+    paths.push(...(await gitLines(['diff', '--cached', '--name-only', '--', '.'])));
   } else {
-    paths.push(...(await gitLines(['diff', '--name-only', '--diff-filter=d', '--', '.'])));
-    paths.push(
-      ...(await gitLines(['diff', '--cached', '--name-only', '--diff-filter=d', '--', '.'])),
-    );
+    paths.push(...(await gitLines(['diff', '--name-only', '--', '.'])));
+    paths.push(...(await gitLines(['diff', '--cached', '--name-only', '--', '.'])));
     paths.push(...(await gitLines(['ls-files', '--others', '--exclude-standard', '--', '.'])));
     paths.push(...(await changedPathsFromBase()));
   }
@@ -900,7 +877,10 @@ function isProtectedBranch(name: string): boolean {
  * Name of the protected branch a push targets, or null when it targets none.
  * Pre-push ref lines (`<local ref> <local sha> <remote ref> <remote sha>`) win
  * when present — deletions included, since dropping `main` is as destructive as
- * pushing to it. Without ref lines the current branch decides.
+ * pushing to it. A well-formed ref list that only touches tags is a real
+ * answer (pushing a tag from `main` is legitimate), so it does NOT fall back —
+ * only ref text with no parseable record at all (empty, or malformed like
+ * `garbage`) falls back to the current branch.
  */
 export function protectedPushTarget(refsText: string, currentBranch: string): string | null {
   const refLines = parseRefLines(refsText);
@@ -923,9 +903,10 @@ function reportIncompleteRefs(): boolean {
 
 async function checkBranchGuard(refs: PrePushRefs): Promise<boolean> {
   if (refs.state === 'incomplete') return reportIncompleteRefs();
-  // Only a push with no refs at all falls back to the checked-out branch.
-  const [branch] =
-    refs.state === 'refs' ? [''] : await gitLines(['rev-parse', '--abbrev-ref', 'HEAD']);
+  // Always resolve the real current branch: protectedPushTarget uses it only
+  // as a fallback, but a fallback of '' would silently pass a push whose ref
+  // text has no parseable ref line at all (e.g. malformed forwarded refs).
+  const [branch] = await gitLines(['rev-parse', '--abbrev-ref', 'HEAD']);
   const target = protectedPushTarget(refs.state === 'refs' ? refs.text : '', branch ?? '');
   if (target === null) {
     console.log(`  ${GREEN}\u2713${RESET} Branch guard`);
@@ -1410,14 +1391,15 @@ async function cmdCheck(): Promise<void> {
 }
 
 async function cmdPreCommit(): Promise<void> {
+  console.log(`\n${BLUE}[pre-commit]${RESET}\n`);
+  await checkArchConfigGuard({ warnOnly: true, staged: true });
+
   const files = await stagedTsFiles();
   if (files.length === 0) {
     console.log('No staged TypeScript files — skipping checks');
     return;
   }
 
-  console.log(`\n${BLUE}[pre-commit]${RESET}\n`);
-  await checkArchConfigGuard({ warnOnly: true, staged: true });
   await cmdFix(files);
   await cmdTypecheck();
   await checkAgentsMdDrift();
@@ -1458,7 +1440,7 @@ async function cmdPrePush(): Promise<void> {
   // leaves the machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
   console.log(`\n${BLUE}[pre-push]${RESET}\n`);
   const refs = await prePushRefs();
-  const branchOk = await checkBranchGuard(refs);
+  if (!(await checkBranchGuard(refs))) process.exit(1);
   const archConfigOk = await checkArchConfigGuard({ refs });
   const gates: Gate[] = [
     lintGate(),
@@ -1466,7 +1448,7 @@ async function cmdPrePush(): Promise<void> {
     ...(await acceptanceGatesOrWarn()),
     ...(await archGatesOrWarn()),
   ];
-  if (!(await runGatesParallel(gates)) || !archConfigOk || !branchOk) process.exit(1);
+  if (!(await runGatesParallel(gates)) || !archConfigOk) process.exit(1);
 }
 
 async function cmdHooks(): Promise<void> {

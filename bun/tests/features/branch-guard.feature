@@ -48,3 +48,20 @@ Feature: Branch guard refuses pushes to protected branches
     When I run "harness branch-guard"
     Then the exit code is 0
     And the output contains "Branch guard override: main"
+
+  Scenario: Malformed forwarded refs on main are refused
+    Given a git repository on branch "main"
+    And the push forwards "garbage"
+    When I run "harness branch-guard"
+    Then the exit code is 1
+    And the output contains "Push targets protected branch: main"
+
+  # A tag-only ref list is a well-formed, parseable record — a real answer,
+  # not "no refs forwarded" — so it must NOT fall back to the checked-out
+  # branch. Pushing a tag from main (`git push origin v1.0`) is legitimate.
+  Scenario: A tag-only ref list on main passes
+    Given a git repository on branch "main"
+    And the push updates "refs/tags/main"
+    When I run "harness branch-guard"
+    Then the exit code is 0
+    And the output contains "Branch guard"
