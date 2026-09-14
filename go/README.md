@@ -37,7 +37,7 @@ go run harness.go setup-hooks
 |---|---|---|---|
 | `go run harness.go check` | After edits | Fix, format, lint, test, suppression ratchet | Yes |
 | `go run harness.go pre-commit` | Git hook | Staged files only | Yes |
-| `go run harness.go pre-push` | Git pre-push hook | Read-only push gate: lint, acceptance, arch over the whole tree | No |
+| `go run harness.go pre-push` | Git pre-push hook | Read-only push gate: branch guard, lint, agents-md drift, acceptance, arch over the whole tree | No |
 | `go run harness.go ci` | CI pipeline | Read-only verification (see below) | No |
 | `go run harness.go audit` | CI pipeline | Dependency vulnerability audit | No |
 | `go run harness.go post-edit` | Stop hook helper | Format if source files changed | No |
@@ -46,22 +46,28 @@ go run harness.go setup-hooks
 ### `ci` pipeline
 
 `harness ci` runs the read-only gates — lint, dep audit, complexity (lizard, CCN 15,
-args 8), acceptance (godog), arch (go-arch-lint) — **in parallel**: each is captured
-and printed in submission order, and the batch runs to completion so one pass surfaces
-every failure. It then streams coverage (`go test -race -coverprofile`, default
-threshold from `.harness-baseline`) and the
+args 8), agents-md drift, acceptance (godog), arch (go-arch-lint) — **in parallel**:
+each is captured and printed in submission order, and the batch runs to completion so
+one pass surfaces every failure. It then streams coverage (`go test -race -coverprofile`,
+default threshold from `.harness-baseline`) and the
 advisory CRAP.
 
-`pre-push` is the offline push gate — lint (golangci-lint covers format), acceptance,
-arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
+`pre-push` is the offline push gate — the branch guard (no pushes to `main`/`master`),
+then lint (golangci-lint covers format), agents-md drift, acceptance, arch over the
+whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
 
 Dead code needs no separate gate — golangci-lint's `unused` linter (run by `lint`)
 already flags unreachable functions, vars, and types, and `go mod tidy` prunes
 unused dependencies. (`x/tools/cmd/deadcode` only analyzes programs with a `main`
 package, not this library template.)
 
-CRAP is advisory: it warns by default and exits 0 unless `--enforce` is passed.
-Mutation testing is also advisory and is NOT wired into `ci` — invoke explicitly.
+The gates split into four groups: hard quality gates that block (lint, arch,
+complexity, suppressions, dead code via lint's `unused`, audit, agents-md drift),
+advisory metrics that inform but never fail the build (CRAP, mutation), a ratchet
+that only moves up (the coverage floor in `.harness-baseline`), and two permission
+gates that need a human to unblock (arch-config-guard, branch-guard). CRAP is
+**advisory**: it warns by default and exits 0 unless `--enforce` is passed. Mutation
+testing is also advisory and is NOT wired into `ci` — invoke explicitly.
 
 ### Continuous integration
 
@@ -95,7 +101,8 @@ Every command is also a `make` target — `make check`, `make ci`, `make pre-pus
 | `go run harness.go crap` | CRAP complexity × coverage gate (advisory) |
 | `go run harness.go suppressions` | Suppression breakdown; `--update-baseline` with human sign-off |
 | `go run harness.go pre-commit` | Staged checks + tests |
-| `go run harness.go pre-push` | Read-only push gate: lint, acceptance, arch |
+| `go run harness.go pre-push` | Read-only push gate: branch guard, lint, agents-md drift, acceptance, arch |
+| `go run harness.go branch-guard` | Refuse pushes to main/master |
 | `go run harness.go ci` | Full verification pipeline |
 | `go run harness.go setup-hooks` | Install git pre-commit + pre-push hooks and the Claude/Codex Stop wiring |
 | `go run harness.go clean` | Remove coverage and test cache |
@@ -117,10 +124,11 @@ harness.go           Development task runner (zero dependencies; //go:build igno
 
 `AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract. Agents that read either file receive the same instructions.
 
-- **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
-- **Human-is-engineer**: do not `git commit` / `git push` unless the user's current prompt explicitly asked.
-- **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
-- **Arch config guard**: `.go-arch-lint.yml` changes warn during `check`/`stop-hook` and fail `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. Note `.golangci.yaml` is deliberately *not* protected — it is the general lint config, and protecting it would block all lint-config edits.
+- **Plan first**: open with the sub-tasks and files, then execute in the same turn.
+- **Human-is-engineer**: commit and push on a feature branch; never `main`/`master`, never force-push, never merge.
+- **Specify what is worth specifying**: `.feature` scenarios for user-visible flows, law-like rules, and cross-component contracts; unit tests suffice for the rest.
+- **Branch guard**: `pre-push` refuses a push that lands on (or deletes) `main`/`master` unless `HARNESS_ALLOW_PROTECTED_PUSH=1` is set. Destinations come from `HARNESS_PRE_PUSH_REFS`, else the git pre-push stdin refs (1s deadline; partial input fails), else the current branch. It stops accidents, not `--no-verify` — agents push feature branches, humans merge.
+- **Arch config guard**: `.go-arch-lint.yml` changes warn during `check`/`pre-commit`/`stop-hook` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. Note `.golangci.yaml` is deliberately *not* protected — it is the general lint config, and protecting it would block all lint-config edits.
 
 Stop hooks are wired via `.claude/settings.json` for Claude and
 `.codex/hooks.json` for Codex.
@@ -131,10 +139,10 @@ Day-1 defaults are deliberately loose so adopting this template does not fail ex
 
 - Complexity is gated at CCN 15 and args 8 (lizard + golangci-lint's `gocyclo`); lower it once the codebase is clean.
 - Acceptance ships one smoke `.feature`; an empty `features/` dir warns and passes. Add real scenarios.
-- `coverage --min=0` — explicit flags win; otherwise the default comes from `.harness-baseline` `coverage.min`.
+- `coverage` — floor from the baseline; `--min=N` overrides it locally, it is not a target.
 - `.harness-baseline` also ratchets suppression counts. New suppressions fail `check`; run `harness suppressions --update-baseline` only with human sign-off.
-- Mutation / CRAP are advisory — enable as blocking gates once baselines are established.
-- `crap --max=30` is the starting ceiling; tighten it as coverage rises.
+- CRAP and mutation are advisory by design — they tell you where the next test or split pays off, they are not gates, because a coverage-shaped target gets satisfied with assertion-free tests. `--enforce` exists for teams that want it on CRAP; it is not the recommended default.
+- The coverage floor is a ratchet: `.harness-baseline` `coverage.min` only ever moves up, by a human, and starts at 0.
 - `.go-arch-lint.yml` ships with one starter rule (the sample `suppressions` package is a leaf — it may not import other project components). Extend the component graph as the module grows.
 
 ### Mutation testing notes

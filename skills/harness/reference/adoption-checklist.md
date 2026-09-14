@@ -6,7 +6,7 @@ substages, noisy output, and incomplete hook/docs wiring before changing code.
 
 This checklist covers **complete harness adoption**: Layer 1 quality harness,
 Layer 2 behavior contract, Stop hook wiring, AGENTS.md/CLAUDE.md drift
-protection, `arch-config-guard`, and the supporting gates (`pre-push`,
+protection, `arch-config-guard`, `branch-guard`, and the supporting gates (`pre-push`,
 `stop-hook`, deadcode where applicable, CRAP, property-based tests,
 suppression ratchets).
 
@@ -86,7 +86,8 @@ Default classification:
 | CRAP advisory gate in `ci` | Required |
 | Property-based tests under normal `test` | Strongly recommended |
 | Mutation command | Contextual |
-| `arch-config-guard` | Required |
+| `arch-config-guard` | Required for complete adoption; opt-in before wiring in brownfield (Layer 2) |
+| `branch-guard` | Required for complete adoption; opt-in before wiring in brownfield (Layer 2) |
 | Layer 2 behavior contract text | Required for complete adoption; opt-in before wiring in brownfield |
 
 ## Command surface
@@ -110,6 +111,7 @@ The repo must expose these commands through its chosen runner:
 | `acceptance` | Runs Gherkin acceptance tests when present. |
 | `arch` | Runs the architecture boundary check when configured. |
 | `arch-config-guard` | Warns or blocks protected arch config changes; strict mode allows `HARNESS_ALLOW_ARCH_CONFIG=1` after review. |
+| `branch-guard` | Refuses direct pushes to or deletions of `main`/`master` from `HARNESS_PRE_PUSH_REFS`, else git pre-push stdin refs, else the current branch; `HARNESS_ALLOW_PROTECTED_PUSH=1` overrides. Must not block on an idle non-tty stdin and must fail on partial stdin. |
 | `mutation` | Available as an explicit command; advisory and not wired into `ci`. |
 | `agents-md-drift` | Fails if `AGENTS.md` differs from `CLAUDE.md`. |
 | `sync-agents-md` | Writes `AGENTS.md <- CLAUDE.md`. |
@@ -156,6 +158,7 @@ Must:
 - Run on staged source files where practical.
 - Fix/format, typecheck, test when source changed, and check suppressions and
   AGENTS/CLAUDE drift.
+- Run `arch-config-guard` in warning mode over staged paths.
 - Avoid network-dependent work.
 
 Gap examples:
@@ -172,9 +175,15 @@ Must:
 - Be installed as `.git/hooks/pre-push` or through the repo's configured git
   hooks path.
 - Be read-only.
+- Run `branch-guard` first; refuse `main`/`master` unless
+  `HARNESS_ALLOW_PROTECTED_PUSH=1`.
 - Run offline deterministic gates over the whole pushed tree:
   lint, format check where separate, acceptance, arch.
 - Run `arch-config-guard` in strict mode.
+- Read git pre-push stdin at most once, never block on an idle pipe, fail on
+  partial input, and honour `HARNESS_PRE_PUSH_REFS` when a dispatcher sets it.
+- On a new-branch push, diff the whole branch against its merge-base with
+  `origin/main`/`origin/master`, not only the tip commit.
 - Not run audit, coverage, CRAP, mutation, or network-bound checks.
 
 Gap examples:
@@ -353,8 +362,8 @@ Must:
 
 - Run Gherkin acceptance tests when present.
 - Be included in `ci` and `pre-push`.
-- Preserve the behavior contract's Gherkin-first workflow when Layer 2 is
-  adopted.
+- Preserve the behavior contract's specify-what-is-worth-specifying workflow
+  when Layer 2 is adopted.
 
 Fix suggestions:
 
@@ -446,7 +455,8 @@ Must verify:
 - `sync-agents-md` writes `AGENTS.md <- CLAUDE.md`.
 - Layer 2 contract text appears in both files when complete adoption is the
   target.
-- Commit/push ownership and Gherkin-first rules are present as instructions.
+- Branch-only commits and specify-what-is-worth-specifying rules are present as
+  instructions.
 - Arch config review is documented as an `arch-config-guard` integration gate.
 
 Fix suggestions:
@@ -463,16 +473,15 @@ Even greenfield adoption must be verified:
 2. Install dependencies.
 3. Run `setup-hooks`.
 4. Run `check`.
-5. Run `ci`; confirm `git status --short` is unchanged.
-6. Run `pre-push`.
+5. Run `ci`; then `git status --short` must print nothing.
+6. Run `pre-push` with `HARNESS_PRE_PUSH_REFS="refs/heads/x abc refs/heads/feature def"`.
 7. Run `audit`.
 8. Run `stop-hook`.
-9. Confirm pre-commit and pre-push hooks exist.
-10. Confirm Claude and Codex Stop hooks point at `stop-hook`.
-11. Confirm `AGENTS.md` and `CLAUDE.md` are byte-identical.
-12. Confirm `arch-config-guard --warn` runs.
-13. Confirm successful commands print short stage summaries.
-14. Confirm `--verbose` shows raw command output.
+9. Run `setup-hooks`; it installs the git hooks and reports the Claude/Codex Stop
+   wiring, so its output is the check.
+10. Run `agents-md-drift`; its exit code is the check.
+11. Run `arch-config-guard --warn` and `branch-guard`; their exit codes are the check.
+12. Successful commands print short stage summaries; `--verbose` shows raw output.
 
 ## Brownfield audit procedure
 

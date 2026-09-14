@@ -37,18 +37,20 @@ See the [5-script contract](../README.md#the-5-script-contract) for the full rat
 
 ```bash
 cargo harness check                # Fix + format + lint + tests (after editing)
-cargo harness pre-commit           # Staged checks + tests (runs via git hook)
-cargo harness pre-push             # Read-only push gate: clippy, format check, acceptance, arch (runs via git hook)
+cargo harness pre-commit           # Staged checks + tests (runs via git hook; arch config warns)
+cargo harness pre-push             # Branch guard + read-only push gate: clippy, format check, acceptance, arch (runs via git hook)
 cargo harness ci                   # Full verification (see below)
 ```
 
 ### `ci` pipeline
 
-`harness ci` runs the read-only gates — strict clippy (`-D warnings`), format check, complexity (lizard, CCN 15, args 8), acceptance (cucumber), arch (cargo-modules) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then runs dep audit, streams tests + coverage (cargo-llvm-cov, default threshold from `.harness-baseline`), and the advisory CRAP.
+`harness ci` runs the read-only gates — strict clippy (`-D warnings`), format check, complexity (lizard, CCN 15, args 8), acceptance (cucumber), arch (cargo-modules), agents-md-drift — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then runs dep audit, streams tests + coverage (cargo-llvm-cov, default threshold from `.harness-baseline`), and the advisory CRAP.
 
-`pre-push` is the offline push gate — clippy, format check, acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
+`pre-push` is the offline push gate — a branch guard that refuses direct pushes to (or deletions of) `main`/`master` (override: `HARNESS_ALLOW_PROTECTED_PUSH=1`), then clippy, format check, acceptance, arch, agents-md-drift over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
 
 Dead code needs no separate gate — rust's `dead_code` lint is on by default and the strict clippy (`-D warnings`) denies unused functions, fields, and variants; unused dependencies surface via `cargo`'s own warnings (or `cargo-machete`).
+
+The gates split into four kinds: hard quality gates that block (clippy, format check, complexity, arch, suppressions, dead code, dep audit, agents-md-drift), advisory metrics that inform but never block (CRAP, mutation), a ratchet that only ever moves up (the coverage floor in `.harness-baseline`), and two permission gates that need a human to unblock (arch-config-guard, branch-guard).
 
 `cmd_coverage` runs the test suite under llvm-cov once and emits both the
 console summary (with the `--min=N` threshold check) and an LCOV file at
@@ -78,7 +80,7 @@ Every command is also a `make` target — `make check`, `make ci`, `make pre-pus
 ```bash
 cargo harness acceptance           # cucumber against tests/features/
 cargo harness complexity           # lizard CCN gate (≤15, args≤8) over src + tests
-cargo harness coverage --min=80    # tests with coverage, fails below threshold
+cargo harness coverage             # tests with coverage, floor from .harness-baseline (--min=N overrides locally)
 cargo harness crap --max=30        # CRAP complexity × coverage gate (advisory)
 cargo harness crap --enforce       # …same, but hard-fail when offenders exist
 cargo harness suppressions         # suppression breakdown; --update-baseline with human sign-off
@@ -92,7 +94,7 @@ cargo harness arch                 # cargo-modules checks against arch.toml
 cargo harness fix                  # Fix lint errors (clippy --fix) + format
 cargo harness lint                 # Lint + format check (read-only)
 cargo harness test                 # Run tests
-cargo harness pre-push             # Read-only push gate: clippy, format check, acceptance, arch
+cargo harness pre-push             # Branch guard + read-only push gate: clippy, format check, acceptance, arch
 cargo harness setup-hooks          # Install git pre-commit + pre-push hooks; verify Claude/Codex Stop wiring (std-only)
 cargo harness clean                # Remove build artifacts
 ```
@@ -112,10 +114,10 @@ arch.toml             Architecture rules (cargo-modules)
 
 `AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract. Agents that read either file receive the same instructions.
 
-- **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
-- **Human-is-engineer**: do not `git commit` / `git push` unless the user's current prompt explicitly asked.
-- **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
-- **Arch config guard**: `arch.toml` changes warn during `check`/`stop-hook` and fail `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+- **Plan then execute**: open with the sub-tasks and the files each touches, then do the work in the same turn.
+- **Human-is-engineer**: commit and push on a feature branch; the human merges. The `pre-push` branch guard refuses direct pushes to (or deletions of) `main`/`master` unless `HARNESS_ALLOW_PROTECTED_PUSH=1` — it stops accidents, not `--no-verify`. It reads `HARNESS_PRE_PUSH_REFS`, else the hook's stdin refs, else the current branch.
+- **Specify what is worth specifying**: `.feature` scenarios for user-visible flows, law-like rules, and cross-component contracts; unit tests suffice for the rest.
+- **Arch config guard**: `arch.toml` changes warn during `check`/`pre-commit`/`stop-hook` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 
 Stop hooks are wired via `.claude/settings.json` for Claude and
 `.codex/hooks.json` for Codex.
@@ -142,8 +144,7 @@ Day-1 defaults are deliberately loose so adopting this template does not fail ex
 - `coverage --min=0` — explicit flags win; otherwise the default comes from `.harness-baseline` `coverage.min`.
 - `.harness-baseline` also ratchets suppression counts. New suppressions fail `check`; run `harness suppressions --update-baseline` only with human sign-off.
 - Complexity is gated at CCN 15 and args 8 via lizard; lower it once the codebase is clean.
-- CRAP is advisory (`crap --max=30` is the starting ceiling). Add `--enforce` to make it blocking once your team has paid down the existing offenders.
-- Mutation is advisory — enable as a blocking gate once a baseline kill-rate is established.
+- CRAP and mutation are advisory by design — they tell you where the next test or split pays off, they are not gates, because a coverage-shaped target gets satisfied with assertion-free tests. `--enforce` on `crap` exists for teams that want it; it is not the recommended default.
 - `arch.toml` ships with two starter rules (no cycles, no orphans). Extend as the module graph grows.
 - `tests/features/` ships one smoke scenario. An empty features directory warns and passes — add real scenarios before writing user-visible behavior.
 

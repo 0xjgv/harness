@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -31,6 +32,64 @@ def temp_project(*, with_tests=False):
                 "        self.assertTrue(True)\n",
                 encoding="utf-8",
             )
+        os.chdir(root)
+        try:
+            yield root
+        finally:
+            os.chdir(old_cwd)
+
+
+GIT = shutil.which("git") or "git"
+GIT_IDENTITY = ["-c", "user.email=harness@example.com", "-c", "user.name=Harness"]
+GUARD_ENV_VARS = (
+    "HARNESS_ALLOW_PROTECTED_PUSH",
+    "HARNESS_ALLOW_ARCH_CONFIG",
+    "HARNESS_PRE_PUSH_REFS",
+)
+
+
+@contextmanager
+def clean_env(**overrides):
+    """Environment without the guard overrides an ambient shell may have set."""
+    env = {k: v for k, v in os.environ.items() if k not in GUARD_ENV_VARS}
+    env.update(overrides)
+    with mock.patch.dict(os.environ, env, clear=True):
+        yield
+
+
+@contextmanager
+def stdin_pipe(data=b"", *, close=True):
+    """Stand in for the git hook's stdin: a pipe, optionally left open after `data`."""
+    read_fd, write_fd = os.pipe()
+    reader = os.fdopen(read_fd, "rb")
+    try:
+        if data:
+            os.write(write_fd, data)
+        if close:
+            os.close(write_fd)
+        with mock.patch.object(harness.sys, "stdin", reader):
+            yield
+    finally:
+        if not close:
+            os.close(write_fd)
+        reader.close()
+
+
+def git(root, *args):
+    subprocess.run(
+        [GIT, "-C", str(root), *GIT_IDENTITY, "-c", "commit.gpgsign=false", *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+@contextmanager
+def temp_git_repo():
+    old_cwd = Path.cwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        git(root, "init", "-q")
         os.chdir(root)
         try:
             yield root
@@ -173,6 +232,178 @@ class TestStopHook(unittest.TestCase):
         # Mutating fix/format runs first and alone; the read-only complexity and
         # dead-code gates run through the parallel batch.
         self.assertEqual(calls, ["post-edit", "batch:Complexity (lizard),Dead code (vulture)"])
+
+
+class TestBranchGuard(unittest.TestCase):
+    MAIN_PUSH = "refs/heads/main abc123 refs/heads/main def456"
+    FEATURE_PUSH = "refs/heads/feature abc123 refs/heads/feature def456"
+    ZERO = "0000000000000000000000000000000000000000"
+
+    def setUp(self):
+        harness._pre_push_refs.cache_clear()
+        self.addCleanup(harness._pre_push_refs.cache_clear)
+
+    def test_ref_line_targeting_main_is_protected(self):
+        self.assertEqual(harness._protected_push_branch([self.MAIN_PUSH], "feature/x"), "main")
+
+    def test_ref_line_targeting_feature_branch_is_not_protected(self):
+        self.assertIsNone(harness._protected_push_branch([self.FEATURE_PUSH], "main"))
+
+    def test_deleting_a_protected_branch_is_protected(self):
+        line = f"(delete) {self.ZERO} refs/heads/main def456"
+        self.assertEqual(harness._protected_push_branch([line], "feature/x"), "main")
+
+    def test_deleting_a_feature_branch_is_not_protected(self):
+        line = f"(delete) {self.ZERO} refs/heads/feature def456"
+        self.assertIsNone(harness._protected_push_branch([line], "feature/x"))
+
+    def test_tag_refs_never_match(self):
+        line = "refs/tags/v1 abc123 refs/tags/main def456"
+        self.assertIsNone(harness._protected_push_branch([line], "feature/x"))
+
+    def test_current_branch_decides_without_ref_lines(self):
+        self.assertEqual(harness._protected_push_branch([], "main"), "main")
+        self.assertEqual(harness._protected_push_branch([], "master"), "master")
+        self.assertIsNone(harness._protected_push_branch([], "feature/x"))
+
+    def test_override_env_passes_the_guard(self):
+        output = io.StringIO()
+        with (
+            redirect_stdout(output),
+            mock.patch.object(
+                harness, "_pre_push_refs", return_value=harness.PrePushRefs((self.MAIN_PUSH,))
+            ),
+            clean_env(HARNESS_ALLOW_PROTECTED_PUSH="1"),
+        ):
+            self.assertTrue(harness._check_branch_guard())
+
+        self.assertIn("Branch guard override: main", output.getvalue())
+
+    def test_guard_fails_and_explains_without_override(self):
+        output = io.StringIO()
+        with (
+            redirect_stdout(output),
+            mock.patch.object(
+                harness, "_pre_push_refs", return_value=harness.PrePushRefs((self.MAIN_PUSH,))
+            ),
+            clean_env(),
+        ):
+            self.assertFalse(harness._check_branch_guard())
+
+        text = output.getvalue()
+        self.assertIn("Push targets protected branch: main", text)
+        self.assertIn(harness.PROTECTED_PUSH_ALLOW_ENV, text)
+
+    def test_env_refs_win_over_stdin(self):
+        with (
+            clean_env(HARNESS_PRE_PUSH_REFS=self.MAIN_PUSH),
+            mock.patch.object(harness, "_read_pre_push_stdin") as read_mock,
+        ):
+            refs = harness._pre_push_refs()
+
+        self.assertEqual(refs.lines, (self.MAIN_PUSH,))
+        read_mock.assert_not_called()
+
+    def test_closed_empty_stdin_means_no_refs(self):
+        with clean_env(), stdin_pipe(b""):
+            refs = harness._pre_push_refs()
+
+        self.assertEqual(refs, harness.PrePushRefs())
+
+    def test_closed_stdin_yields_refs(self):
+        with clean_env(), stdin_pipe(f"{self.MAIN_PUSH}\n".encode()):
+            refs = harness._pre_push_refs()
+
+        self.assertEqual(refs.lines, (self.MAIN_PUSH,))
+        self.assertFalse(refs.incomplete)
+
+    def test_idle_pipe_times_out_without_refs(self):
+        with (
+            clean_env(),
+            mock.patch.object(harness, "PRE_PUSH_STDIN_TIMEOUT", 0.1),
+            stdin_pipe(b"", close=False),
+        ):
+            refs = harness._pre_push_refs()
+
+        self.assertEqual(refs, harness.PrePushRefs())
+
+    def test_partial_input_is_incomplete(self):
+        # Data arrived but the writer never closed: the deadline bounds the whole read.
+        with (
+            clean_env(),
+            mock.patch.object(harness, "PRE_PUSH_STDIN_TIMEOUT", 0.1),
+            stdin_pipe(self.FEATURE_PUSH.encode(), close=False),
+        ):
+            refs = harness._pre_push_refs()
+
+        self.assertTrue(refs.incomplete)
+        self.assertEqual(refs.lines, ())
+
+    def test_incomplete_refs_fail_both_push_guards(self):
+        output = io.StringIO()
+        with (
+            redirect_stdout(output),
+            mock.patch.object(
+                harness, "_pre_push_refs", return_value=harness.PrePushRefs(incomplete=True)
+            ),
+            clean_env(),
+        ):
+            self.assertFalse(harness._check_branch_guard())
+            self.assertFalse(harness._check_arch_config_guard(include_pre_push_refs=True))
+
+        self.assertEqual(output.getvalue().count("Pre-push refs incomplete after 1s"), 2)
+
+    def test_stdin_is_read_once_and_shared(self):
+        # The pipe hits EOF on the first read: a second resolution only works if the
+        # first one was cached, and the arch guard consumes the very same refs.
+        with clean_env(), stdin_pipe(f"{self.MAIN_PUSH}\n".encode()):
+            first = harness._pre_push_refs()
+            second = harness._pre_push_refs()
+            with mock.patch.object(harness, "_git_lines", return_value=["src/app.py"]):
+                paths = harness._changed_paths_from_pre_push_refs()
+
+        self.assertEqual(first.lines, (self.MAIN_PUSH,))
+        self.assertEqual(second.lines, first.lines)
+        self.assertEqual(paths, ["src/app.py"])
+
+
+class TestArchGuardPrePushRefs(unittest.TestCase):
+    def setUp(self):
+        harness._pre_push_refs.cache_clear()
+        self.addCleanup(harness._pre_push_refs.cache_clear)
+
+    def test_new_branch_push_reports_arch_config_from_the_whole_branch(self):
+        # A branch the remote has never seen (zero remote sha): the arch config change
+        # sits below the tip commit, so only a merge-base diff finds it.
+        with temp_git_repo() as root:
+            (root / "README.md").write_text("init\n", encoding="utf-8")
+            git(root, "add", "-A")
+            git(root, "commit", "-q", "-m", "init")
+            first = harness._git_lines(["rev-parse", "HEAD"])[0]
+            git(root, "update-ref", "refs/remotes/origin/main", first)
+            git(root, "checkout", "-q", "-b", "feature")
+
+            (root / ".importlinter").write_text("[importlinter]\n", encoding="utf-8")
+            git(root, "add", "-A")
+            git(root, "commit", "-q", "-m", "arch")
+            (root / "other.txt").write_text("unrelated\n", encoding="utf-8")
+            git(root, "add", "-A")
+            git(root, "commit", "-q", "-m", "unrelated")
+            tip = harness._git_lines(["rev-parse", "HEAD"])[0]
+
+            refs = f"refs/heads/feature {tip} refs/heads/feature {'0' * 40}"
+            with clean_env(HARNESS_PRE_PUSH_REFS=refs):
+                changed = harness._changed_arch_configs(include_pre_push_refs=True)
+            tip_only = harness._git_lines([
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                tip,
+            ])
+
+        self.assertEqual(changed, [".importlinter"])
+        self.assertEqual(tip_only, ["other.txt"])  # the tip alone would have missed it
 
 
 class TestParallelGates(unittest.TestCase):

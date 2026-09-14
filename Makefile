@@ -89,13 +89,20 @@ arch_config_changed_paths() {
     git diff --name-only --diff-filter=d "$$base...HEAD" 2>/dev/null || true
   fi
   if [ "$$include_pre_push" = 1 ] && [ ! -t 0 ]; then
-    local local_ref local_sha remote_ref remote_sha zero
+    local local_ref local_sha remote_ref remote_sha zero nb cand
     zero=0000000000000000000000000000000000000000
     while read -r local_ref local_sha remote_ref remote_sha; do
       [ -z "$$local_sha" ] && continue
       [ "$$local_sha" = "$$zero" ] && continue
       if [ "$$remote_sha" = "$$zero" ]; then
-        git diff-tree --no-commit-id --name-only -r "$$local_sha" 2>/dev/null || true
+        nb=""; for cand in origin/main origin/master "$${HARNESS_ARCH_BASE:-}"; do
+          [ -n "$$cand" ] && git rev-parse --verify -q "$$cand" >/dev/null 2>&1 && { nb=$$(git merge-base "$$cand" "$$local_sha" 2>/dev/null || true); break; }
+        done
+        if [ -n "$$nb" ]; then
+          git diff --name-only --diff-filter=d "$$nb" "$$local_sha" 2>/dev/null || true
+        else
+          git diff-tree --no-commit-id --name-only -r "$$local_sha" 2>/dev/null || true
+        fi
       else
         git diff --name-only --diff-filter=d "$$remote_sha" "$$local_sha" 2>/dev/null || true
       fi
@@ -124,6 +131,59 @@ arch_config_guard() {
   return 1
 }
 endef
+
+# Branch guard: refuse direct pushes to (or deletions of) main/master.
+# Refs come from HARNESS_PRE_PUSH_REFS, else git pre-push stdin
+# ("<local ref> <local sha> <remote ref> <remote sha>" per line) read with a
+# 1s deadline (bash 3.2's read -t cannot tell timeout from EOF, so a background
+# cat is reaped instead); partial input is a hard failure, no input falls back
+# to the current branch.
+define SH_BRANCH_GUARD
+read_pre_push_refs() {
+  local tmp pid i
+  if [ -n "$${HARNESS_PRE_PUSH_REFS:-}" ]; then printf '%s\n' "$$HARNESS_PRE_PUSH_REFS"; return 0; fi
+  [ -t 0 ] && return 0
+  tmp=$$(mktemp); exec 3<&0; cat <&3 >"$$tmp" & pid=$$!
+  for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$$pid" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$$pid" 2>/dev/null; then
+    kill "$$pid" 2>/dev/null; wait "$$pid" 2>/dev/null
+    [ -s "$$tmp" ] && printf '__INCOMPLETE__\n'
+  else
+    wait "$$pid" 2>/dev/null; cat "$$tmp"
+  fi
+  exec 3<&-; rm -f "$$tmp"
+  return 0
+}
+branch_guard_targets() {
+  local refs="$$1" local_ref local_sha remote_ref remote_sha
+  if [ -z "$$refs" ]; then
+    git rev-parse --abbrev-ref HEAD 2>/dev/null || true
+    return 0
+  fi
+  printf '%s\n' "$$refs" | while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$$remote_ref" in refs/heads/*) printf '%s\n' "$${remote_ref#refs/heads/}" ;; esac
+  done
+}
+branch_guard() {
+  local hit
+  case "$$1" in *__INCOMPLETE__*)
+    printf "  $(RED)✗$(RESET) Pre-push refs incomplete after 1s\n"; return 1 ;;
+  esac
+  hit=$$(branch_guard_targets "$$1" | grep -E '^(main|master)$$' | sort -u | paste -sd, -)
+  if [ -z "$$hit" ]; then
+    printf "  $(GREEN)✓$(RESET) Branch guard\n"
+    return 0
+  fi
+  if [ "$${HARNESS_ALLOW_PROTECTED_PUSH:-}" = 1 ]; then
+    printf "  $(GREEN)⚠$(RESET) Branch guard override: %s\n" "$$hit"
+    return 0
+  fi
+  printf "  $(RED)✗$(RESET) Push targets protected branch: %s\n" "$$hit"
+  printf "  ↳ fix: push a feature branch and open a PR; humans may set HARNESS_ALLOW_PROTECTED_PUSH=1\n"
+  return 1
+}
+endef
+export SH_BRANCH_GUARD
 export SH_ARCH_CONFIG_GUARD
 
 .PHONY: check
@@ -202,6 +262,12 @@ arch-config-guard: ## Block unreviewed arch config changes; pass ARGS=--warn for
 	case " $(ARGS) " in *" --staged "*) staged=1 ;; esac; \
 	arch_config_guard "$$staged" "$$warn" 0
 
+.PHONY: branch-guard
+branch-guard: ## Refuse direct pushes to main/master (HARNESS_ALLOW_PROTECTED_PUSH=1 overrides)
+	@set -u -o pipefail; eval "$$SH_BRANCH_GUARD"; \
+	refs=$$(read_pre_push_refs); \
+	branch_guard "$$refs" || exit 1
+
 .PHONY: post-edit
 post-edit: ## Root Stop helper: sync derived docs/skills and format dirty templates
 	@set -u -o pipefail; \
@@ -224,7 +290,7 @@ stop-hook: ## Agent Stop hook: post-edit, arch-config warning, dirty template st
 
 .PHONY: pre-commit
 pre-commit: ## Root git pre-commit hook
-	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 1 0 0
+	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 1 1 0
 	@$(MAKE) --no-print-directory agents-md-drift
 	@$(MAKE) --no-print-directory skills-drift
 	@set -u -o pipefail; eval "$$SH_FILTER_DIRS"; dirs=$$(staged_dirs); \
@@ -233,10 +299,13 @@ pre-commit: ## Root git pre-commit hook
 
 .PHONY: pre-push
 pre-push: ## Root git pre-push hook
-	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 0 0 1
 	@$(MAKE) --no-print-directory agents-md-drift
 	@$(MAKE) --no-print-directory skills-drift
-	@$(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)"
+	@set -u -o pipefail; eval "$$SH_BRANCH_GUARD"; eval "$$SH_ARCH_CONFIG_GUARD"; \
+	refs=$$(read_pre_push_refs); \
+	branch_guard "$$refs" || exit 1; \
+	printf '%s\n' "$$refs" | arch_config_guard 0 0 1 || exit 1; \
+	HARNESS_PRE_PUSH_REFS="$$refs" $(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)"
 
 .PHONY: ci
 ci: ## Root read-only verification

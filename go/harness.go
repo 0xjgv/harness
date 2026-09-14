@@ -521,28 +521,134 @@ func changedPathsFromBase() []string {
 	return paths
 }
 
-func changedPathsFromPrePushStdin() []string {
-	info, err := os.Stdin.Stat()
-	if err != nil || info.Mode()&os.ModeCharDevice != 0 {
-		return nil
+// prePushRefsEnv carries the refs a dispatcher already consumed from the hook,
+// so a child harness sees the real push destinations instead of exhausted stdin.
+const prePushRefsEnv = "HARNESS_PRE_PUSH_REFS"
+
+// prePushRefs is the resolved push destination list. `incomplete` means data
+// arrived but the sender never closed the pipe: acting on half a push's refs is
+// worse than refusing, so both guards fail on it.
+type prePushRefs struct {
+	lines      []string
+	incomplete bool
+}
+
+var (
+	prePushRefsOnce   sync.Once
+	prePushRefsResult prePushRefs
+)
+
+func refLinesOf(text string) []string {
+	var lines []string
+	for line := range strings.SplitSeq(text, "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
 	}
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil || len(strings.TrimSpace(string(data))) == 0 {
-		return nil
+	return lines
+}
+
+// readPrePushRefs resolves the pre-push refs once per process, shared by the
+// branch guard and the arch-config guard: HARNESS_PRE_PUSH_REFS wins, then a
+// non-tty stdin read, and a tty means a manual run with no refs.
+func readPrePushRefs() prePushRefs {
+	prePushRefsOnce.Do(func() {
+		if text := os.Getenv(prePushRefsEnv); strings.TrimSpace(text) != "" {
+			prePushRefsResult = prePushRefs{lines: refLinesOf(text)}
+			return
+		}
+		info, err := os.Stdin.Stat()
+		if err != nil || info.Mode()&os.ModeCharDevice != 0 {
+			return
+		}
+		prePushRefsResult = readRefsWithDeadline(os.Stdin, time.Second)
+	})
+	return prePushRefsResult
+}
+
+// readRefsWithDeadline reads r to EOF, bounding the whole read by limit. A
+// deadline with nothing received is an idle pipe (an agent tool, not a hook) —
+// no refs; a deadline with bytes received is incomplete input.
+func readRefsWithDeadline(r io.Reader, limit time.Duration) prePushRefs {
+	var (
+		mu   sync.Mutex
+		buf  strings.Builder
+		done = make(chan struct{})
+	)
+	go func() {
+		defer close(done)
+		chunk := make([]byte, 4096)
+		for {
+			n, err := r.Read(chunk)
+			if n > 0 {
+				mu.Lock()
+				buf.Write(chunk[:n])
+				mu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(limit):
+		mu.Lock()
+		defer mu.Unlock()
+		return prePushRefs{incomplete: buf.Len() > 0}
 	}
+	mu.Lock()
+	defer mu.Unlock()
+	return prePushRefs{lines: refLinesOf(buf.String())}
+}
+
+// reportIncompleteRefs fails a guard that cannot trust its input.
+func reportIncompleteRefs() bool {
+	fmt.Printf("  %s\u2717%s Pre-push refs incomplete after 1s\n", red, reset)
+	fmt.Printf("  \u21b3 fix: run from the git pre-push hook, or pass the refs in %s\n", prePushRefsEnv)
+	return false
+}
+
+// archDiffBase names the upstream branch a new local branch forked from.
+func archDiffBase() (string, bool) {
+	candidates := []string{"origin/main", "origin/master"}
+	if base := os.Getenv("HARNESS_ARCH_BASE"); base != "" {
+		candidates = append(candidates, base)
+	}
+	for _, candidate := range candidates {
+		if len(gitLines("rev-parse", "--verify", candidate)) > 0 {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+// changedPathsForNewBranch lists what a branch the remote has never seen adds:
+// everything since it forked from upstream, not just its tip commit. Without an
+// upstream to fork from, the tip commit is all we can honestly report.
+func changedPathsForNewBranch(localSha string) []string {
+	if base, ok := archDiffBase(); ok {
+		if mergeBase := gitLines("merge-base", base, localSha); len(mergeBase) > 0 {
+			return gitLines("diff", "--name-only", "--diff-filter=d", mergeBase[0]+".."+localSha, "--", ".")
+		}
+	}
+	return gitLines("diff-tree", "--no-commit-id", "--name-only", "-r", localSha, "--", ".")
+}
+
+func changedPathsFromPrePushRefs() []string {
 	zero := strings.Repeat("0", 40)
 	var paths []string
-	for line := range strings.SplitSeq(string(data), "\n") {
+	for _, line := range readPrePushRefs().lines {
 		parts := strings.Fields(line)
 		if len(parts) < 4 {
 			continue
 		}
 		localSha, remoteSha := parts[1], parts[3]
 		if localSha == zero {
-			continue
+			continue // a deletion pushes no commits to inspect
 		}
 		if remoteSha == zero {
-			paths = append(paths, gitLines("diff-tree", "--no-commit-id", "--name-only", "-r", localSha, "--", ".")...)
+			paths = append(paths, changedPathsForNewBranch(localSha)...)
 		} else {
 			paths = append(paths, gitLines("diff", "--name-only", "--diff-filter=d", remoteSha, localSha, "--", ".")...)
 		}
@@ -550,7 +656,7 @@ func changedPathsFromPrePushStdin() []string {
 	return paths
 }
 
-func changedArchConfigs(staged, includePrePushStdin bool) []string {
+func changedArchConfigs(staged, includePrePushRefs bool) []string {
 	var paths []string
 	if staged {
 		paths = append(paths, gitLines("diff", "--cached", "--name-only", "--diff-filter=d", "--", ".")...)
@@ -560,8 +666,8 @@ func changedArchConfigs(staged, includePrePushStdin bool) []string {
 		paths = append(paths, gitLines("ls-files", "--others", "--exclude-standard", "--", ".")...)
 		paths = append(paths, changedPathsFromBase()...)
 	}
-	if includePrePushStdin {
-		paths = append(paths, changedPathsFromPrePushStdin()...)
+	if includePrePushRefs {
+		paths = append(paths, changedPathsFromPrePushRefs()...)
 	}
 
 	seen := map[string]bool{}
@@ -580,8 +686,11 @@ func changedArchConfigs(staged, includePrePushStdin bool) []string {
 	return changed
 }
 
-func checkArchConfigGuard(warnOnly, staged, includePrePushStdin bool) bool {
-	changed := changedArchConfigs(staged, includePrePushStdin)
+func checkArchConfigGuard(warnOnly, staged, includePrePushRefs bool) bool {
+	if includePrePushRefs && readPrePushRefs().incomplete {
+		return reportIncompleteRefs()
+	}
+	changed := changedArchConfigs(staged, includePrePushRefs)
 	if len(changed) == 0 {
 		fmt.Printf("  %s✓%s Arch config guard\n", green, reset)
 		return true
@@ -602,7 +711,77 @@ func checkArchConfigGuard(warnOnly, staged, includePrePushStdin bool) bool {
 }
 
 func cmdArchConfigGuard() {
-	if !checkArchConfigGuard(hasFlag("warn"), hasFlag("staged"), false) {
+	if !checkArchConfigGuard(hasFlag("warn"), hasFlag("staged"), hasFlag("pre-push")) {
+		os.Exit(1)
+	}
+}
+
+// ── Branch guard ────────────────────────────────────────────────────
+
+const protectedPushAllowEnv = "HARNESS_ALLOW_PROTECTED_PUSH"
+
+var protectedBranches = []string{"main", "master"}
+
+// protectedPushTarget names the protected branch a push targets, or "" when the
+// push is safe. Pure so it is testable without git: refLines are the pre-push
+// ref lines, currentBranch the fallback used when there are none. Deleting a
+// protected branch counts too — it is the most destructive push of all.
+func protectedPushTarget(refLines []string, currentBranch string) string {
+	sawRef := false
+	for _, line := range refLines {
+		parts := strings.Fields(line)
+		if len(parts) < 4 {
+			continue
+		}
+		sawRef = true
+		for _, branch := range protectedBranches {
+			if parts[2] == "refs/heads/"+branch {
+				return branch
+			}
+		}
+	}
+	if sawRef {
+		return ""
+	}
+	for _, branch := range protectedBranches {
+		if currentBranch == branch {
+			return branch
+		}
+	}
+	return ""
+}
+
+func currentBranch() string {
+	lines := gitLines("rev-parse", "--abbrev-ref", "HEAD")
+	if len(lines) == 0 {
+		return ""
+	}
+	return lines[0]
+}
+
+// checkBranchGuard refuses pushes that land on a protected branch. Humans keep
+// merge authority; agents push feature branches and open a PR.
+func checkBranchGuard() bool {
+	refs := readPrePushRefs()
+	if refs.incomplete {
+		return reportIncompleteRefs()
+	}
+	target := protectedPushTarget(refs.lines, currentBranch())
+	if target == "" {
+		fmt.Printf("  %s\u2713%s Branch guard\n", green, reset)
+		return true
+	}
+	if os.Getenv(protectedPushAllowEnv) == "1" {
+		fmt.Printf("  %s\u26a0%s Branch guard override: %s\n", green, reset, target)
+		return true
+	}
+	fmt.Printf("  %s\u2717%s Push targets protected branch: %s\n", red, reset, target)
+	fmt.Printf("  \u21b3 fix: push a feature branch and open a PR; humans may set %s=1\n", protectedPushAllowEnv)
+	return false
+}
+
+func cmdBranchGuard() {
+	if !checkBranchGuard() {
 		os.Exit(1)
 	}
 }
@@ -996,9 +1175,7 @@ func cmdPreCommit() {
 
 	fmt.Printf("\n%s[pre-commit]%s\n\n", blue, reset)
 
-	if !checkArchConfigGuard(false, true, false) {
-		os.Exit(1)
-	}
+	checkArchConfigGuard(true, true, false)
 	pkgs := stagedPackages(files)
 	cmdFix(pkgs)
 	checkAgentsMdDrift(false)
@@ -1016,6 +1193,7 @@ func cmdCi() {
 	gates = append(gates, acceptanceGatesOrWarn()...)
 	gates = append(gates, archGatesOrWarn()...)
 	allOk := runGatesParallel(gates)
+	driftOk := checkAgentsMdDrift(true).ok
 	cmdTestCov() // after the batch
 	cmdCrap()    // advisory unless --enforce
 	archConfigOk := checkArchConfigGuard(false, false, false)
@@ -1026,7 +1204,7 @@ func cmdCi() {
 		"go run harness.go suppressions --update-baseline",
 		true,
 	)
-	if !allOk || !archConfigOk || !suppressionsOk {
+	if !allOk || !driftOk || !archConfigOk || !suppressionsOk {
 		os.Exit(1)
 	}
 }
@@ -1034,16 +1212,22 @@ func cmdCi() {
 // cmdPrePush is the read-only push gate: the offline checks pre-commit and
 // stop-hook do not run. pre-commit covers fix/format/test on staged files;
 // stop-hook adds complexity. This fills the gap with the deterministic, offline
-// gates none of them run — lint (golangci-lint covers format), acceptance, arch —
-// validating the whole pushed tree (after merges/rebases/--no-verify) before it
-// leaves the machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
+// gates none of them run — lint (golangci-lint covers format), agents-md drift,
+// acceptance, arch — validating the whole pushed tree (after merges/rebases/
+// --no-verify) before it leaves the machine. Network (audit) and advisory
+// (coverage/CRAP) gates stay in ci.
+// The branch guard runs first: it is cheap, and it is the gate that keeps merge
+// authority with the human.
 func cmdPrePush() {
 	fmt.Printf("\n%s[pre-push]%s\n\n", blue, reset)
+	branchOk := checkBranchGuard()
 	archConfigOk := checkArchConfigGuard(false, false, true)
 	gates := []gate{lintGate(nil)}
 	gates = append(gates, acceptanceGatesOrWarn()...)
 	gates = append(gates, archGatesOrWarn()...)
-	if !runGatesParallel(gates) || !archConfigOk {
+	allOk := runGatesParallel(gates)
+	driftOk := checkAgentsMdDrift(true).ok
+	if !allOk || !driftOk || !archConfigOk || !branchOk {
 		os.Exit(1)
 	}
 }
@@ -1294,12 +1478,13 @@ var tasks = []task{
 	{"acceptance", cmdAcceptance, "Run acceptance scenarios (godog)"},
 	{"arch", cmdArch, "Architecture checks (go-arch-lint)"},
 	{"arch-config-guard", cmdArchConfigGuard, "Block unreviewed arch config changes"},
+	{"branch-guard", cmdBranchGuard, "Refuse pushes to main/master"},
 	{"mutation", cmdMutation, "Mutation testing (gremlins, advisory)"},
 	{"crap", cmdCrap, "CRAP complexity x coverage gate (advisory)"},
 	{"suppressions", cmdSuppressions, "Show or update suppression baseline"},
 	{"pre-commit", cmdPreCommit, "Staged checks + tests"},
-	{"pre-push", cmdPrePush, "Read-only push gate: lint, acceptance, arch"},
-	{"ci", cmdCi, "Full verification: lint, audit, complexity, acceptance, coverage, crap, arch"},
+	{"pre-push", cmdPrePush, "Read-only push gate: branch guard, lint, agents-md drift, acceptance, arch"},
+	{"ci", cmdCi, "Full verification: lint, audit, complexity, agents-md drift, acceptance, coverage, crap, arch"},
 	{"setup-hooks", cmdHooks, "Install git pre-commit + pre-push hooks and Claude/Codex Stop wiring"},
 	{"post-edit", cmdPostEdit, "Format if source files changed"},
 	{"stop-hook", cmdStopHook, "Format changed files, then run stop-hook checks"},

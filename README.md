@@ -15,7 +15,7 @@ used by the Stop hook:
 |---|---|---|---|
 | `check` | After edits | Fix, format, typecheck, test, suppression ratchet | Yes |
 | `pre-commit` | Git pre-commit hook | Staged files only — fix, format, typecheck, test if source changed | Yes |
-| `pre-push` | Git pre-push hook | Read-only push gate: lint, format check, acceptance, arch over the whole tree, in parallel | No |
+| `pre-push` | Git pre-push hook | Branch guard, then read-only push gate: lint, format check, acceptance, arch over the whole tree, in parallel | No |
 | `ci` | CI pipeline | Read-only gates (lint, typecheck, dep audit, complexity, acceptance, arch) run in parallel, then coverage + advisory CRAP | No |
 | `audit` | CI pipeline | Audit dependencies for known vulnerabilities | No |
 | `post-edit` | Stop hook helper | Format if source files changed | Yes |
@@ -23,7 +23,7 @@ used by the Stop hook:
 
 **`check`** is the one you run constantly. It auto-fixes what it can so you stay in flow. It also ratchets suppression comments (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`, etc.) against `.harness-baseline`: new suppressions fail unless a human signs off on `suppressions --update-baseline`.
 **`pre-commit`** runs the same checks scoped to staged files, installed as a git hook.
-**`pre-push`** is the read-only push gate — lint, format check, acceptance, arch over the whole pushed tree (the offline checks `pre-commit` and `stop-hook` skip), run in parallel. Installed as a git pre-push hook.
+**`pre-push`** is the read-only push gate — it first refuses direct pushes to or deletions of `main`/`master` (`branch-guard`, override with `HARNESS_ALLOW_PROTECTED_PUSH=1`), then runs lint, format check, acceptance, arch over the whole pushed tree (the offline checks `pre-commit` and `stop-hook` skip), in parallel. Installed as a git pre-push hook.
 For Go and Bun, the lint gate subsumes format checking.
 **`ci`** is the read-only gate — no fixes, just verification. Its read-only gates run in parallel (captured, printed in submission order, run to completion), then coverage streams and CRAP runs advisory.
 **`audit`** audits dependencies for known vulnerabilities.
@@ -105,16 +105,20 @@ make check-api      # scope to one subproject
 - **Dead-code detection** — vulture (Python, via `uvx`) / knip (Bun, via `bunx`); Go & Rust use their linters (golangci-lint `unused` / clippy `dead_code`) — runs in `ci` + `stop-hook`
 - **CRAP advisory** — complexity × coverage signal, advisory by default and still run in `ci`
 - **Suppression baseline ratchet** — `.harness-baseline` tracks allowed suppression counts and the coverage floor (`coverage.min`)
-- **Arch config guard** — protected architecture config changes warn in `check` / `stop-hook` and fail `pre-commit` / `pre-push` / `ci` unless reviewed with `HARNESS_ALLOW_ARCH_CONFIG=1`
+- **Arch config guard** — protected architecture config changes warn in `check` / `pre-commit` / `stop-hook` and fail `pre-push` / `ci` unless reviewed with `HARNESS_ALLOW_ARCH_CONFIG=1`
+- **Branch guard** — `pre-push` refuses direct pushes to `main`/`master` so agents work on feature branches and open PRs; `HARNESS_ALLOW_PROTECTED_PUSH=1` overrides. It catches accidents, not `--no-verify`; merge ownership stays with the human by rule or server-side branch protection
 - **Agent Stop hooks** — `.claude/settings.json` runs `stop-hook`; `.codex/hooks.json` runs the Codex JSON wrapper around `stop-hook`
 - **Property-based testing** — hypothesis (Python) / fast-check (Bun) / rapid (Go) / proptest (Rust), seeded with a property suite over each template's own CRAP and parser helpers as the worked example; runs under the normal `test` step
-- **AGENTS.md + CLAUDE.md** — tell AI agents which commands to run and when
+- **AGENTS.md + CLAUDE.md** — tell AI agents which commands to run and when, plus the behavior contract: plan first, commit on a branch and open a PR, specify what is worth specifying with a `.feature`, arch config changes in their own commit
 
 ## Design Principles
 
 - **Zero external dependencies in the runner** — stdlib/runtime APIs only
 - **Quiet by default** — only errors shown, `--verbose` for everything
 - **Fix what you can** — `check` and `pre-commit` auto-fix; `ci` is read-only
+- **Tools own everything checkable** — formatting, lint, types, dead code, drift, and complexity are decided by deterministic tools and auto-fixed where the tool can. The agent reads the output and fixes the code, never the gate
+- **Quality gates are hard, permission gates are two** — lint, types, arch boundaries, complexity, suppression ratchet, dead code, dependency audit, and drift block. Only `arch-config-guard` (pre-push/ci) and `branch-guard` (pre-push) need a human to unblock; everything else an agent can clear by doing the work
+- **Metrics that can be gamed are advisory** — CRAP and mutation point at the next test or split; they are never gates, because a coverage-shaped target gets satisfied with assertion-free tests. The coverage floor is a ratchet from `.harness-baseline`, raised by a human, never a target number
 
 ## Harness skill
 

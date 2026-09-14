@@ -13,7 +13,7 @@ not paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
   quality subcommands `complexity`, `deadcode`, `acceptance`, `coverage`,
-  `mutation`, `crap`, `arch`, `arch-config-guard`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
+  `mutation`, `crap`, `arch`, `arch-config-guard`, `branch-guard`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
   (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
   fail on drift). `test` runs `unittest`, or `py_compile` over `src/` and
   `harness.py` when no `tests/test*.py` files exist. `ci` runs the
@@ -23,7 +23,7 @@ not paraphrase (it drifts). Two sections:
   every failure — then streams `coverage` and the advisory `crap`; `ci`
   also runs `arch-config-guard` in strict mode.
   `pre-push` is the offline push gate: `lint`, `format check`, `acceptance`,
-  `arch`, and strict `arch-config-guard` over the whole pushed tree (the
+  `arch`, and strict `arch-config-guard` over the whole pushed tree, after `branch-guard` refuses `main`/`master` (the
   deterministic checks pre-commit and stop-hook skip). `deadcode` runs vulture (pinned `2.16`) over `src/` only —
   never `tests/`, so a dead helper that still has a test is reported, not
   masked — at `--min-confidence 60`; allowlist dynamic references
@@ -71,4 +71,5 @@ Codex Stop command:
   (dead code, via `uvx`), behave (acceptance), mutmut (mutation), hypothesis
   (property-based tests, see `tests/test_properties.py`), import-linter (arch)
 - Protected arch config: `.importlinter` (`uv run harness arch-config-guard`)
+- Branch guard: `uv run harness branch-guard` (warns nothing, fails on `main`/`master`; `HARNESS_ALLOW_PROTECTED_PUSH=1` overrides)
 - Dead-code allowlist: `vulture_allowlist.py`

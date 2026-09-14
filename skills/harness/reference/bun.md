@@ -13,7 +13,7 @@ paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
   quality subcommands `complexity`, `deadcode`, `acceptance`, `coverage`,
-  `mutation`, `crap`, `arch`, `arch-config-guard`, `suppressions`, and the drift pair `agents-md-drift` /
+  `mutation`, `crap`, `arch`, `arch-config-guard`, `branch-guard`, `suppressions`, and the drift pair `agents-md-drift` /
   `sync-agents-md` (keeps `AGENTS.md` byte-identical to `CLAUDE.md`;
   `check` + `pre-commit` fail on drift). `ci` runs the read-only gates
   (`lint`, `typecheck`, `audit`, `complexity`, `deadcode`, `acceptance`,
@@ -21,7 +21,7 @@ paraphrase (it drifts). Two sections:
   completion so one pass surfaces every failure — then streams `coverage` and
   the advisory `crap`; `ci` also runs `arch-config-guard` in strict mode.
   `pre-push` is the offline push gate: `lint` (biome
-  covers format), `acceptance`, `arch`, and strict `arch-config-guard` over the whole pushed tree (the
+  covers format), `acceptance`, `arch`, and strict `arch-config-guard` over the whole pushed tree, after `branch-guard` refuses `main`/`master` (the
   deterministic checks pre-commit and stop-hook skip). `deadcode` runs knip
   (pinned, fetched on demand via `bunx` — no devDep) to flag unused files,
   exports, and dependencies; `knip.json` declares the cucumber step files as
@@ -69,4 +69,5 @@ Codex Stop command:
   cucumber (acceptance), Stryker (mutation), fast-check (property-based tests,
   see `tests/properties.test.ts`), dependency-cruiser (arch)
 - Protected arch config: `.dependency-cruiser.json` (`bun harness.ts arch-config-guard`)
+- Branch guard: `bun harness.ts branch-guard` (warns nothing, fails on `main`/`master`; `HARNESS_ALLOW_PROTECTED_PUSH=1` overrides)
 - Dead-code config: `knip.json`

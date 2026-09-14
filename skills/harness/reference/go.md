@@ -13,7 +13,7 @@ paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
   quality subcommands `complexity`, `acceptance`, `coverage` (`test-cov` alias), `mutation`,
-  `crap`, `arch`, `arch-config-guard`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
+  `crap`, `arch`, `arch-config-guard`, `branch-guard`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
   (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
   fail on drift). `ci` runs the read-only gates (`lint`, `audit`,
   `complexity`, `acceptance`, `arch`) **in parallel** — captured and
@@ -21,7 +21,7 @@ paraphrase (it drifts). Two sections:
   failure — then streams `coverage` and the advisory `crap`; `ci` also runs
   `arch-config-guard` in strict mode. `pre-push` is
   the offline push gate: `lint` (golangci-lint covers format), `acceptance`,
-  `arch`, and strict `arch-config-guard` over the whole pushed tree (the
+  `arch`, and strict `arch-config-guard` over the whole pushed tree, after `branch-guard` refuses `main`/`master` (the
   deterministic checks pre-commit and stop-hook skip). There is **no** `deadcode` target — golangci-lint's
   `unused` linter (run by the `lint` gate) already flags unreachable
   functions, vars, and types, and `go mod tidy` prunes unused dependencies;
@@ -72,3 +72,4 @@ Codex Stop command:
   gremlins (mutation), rapid (property-based tests, see
   `crap/properties_test.go`), go-arch-lint (arch)
 - Protected arch config: `.go-arch-lint.yml` (`go run harness.go arch-config-guard`)
+- Branch guard: `go run harness.go branch-guard` (warns nothing, fails on `main`/`master`; `HARNESS_ALLOW_PROTECTED_PUSH=1` overrides)

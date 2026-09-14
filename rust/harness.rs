@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -33,6 +33,9 @@ const BASELINE_FILE: &str = ".harness-baseline";
 const SUPPRESSION_BASELINE_PREFIX: &str = "suppressions.";
 const ARCH_CONFIG: &str = "arch.toml";
 const ARCH_CONFIG_ALLOW_ENV: &str = "HARNESS_ALLOW_ARCH_CONFIG";
+const PROTECTED_BRANCHES: [&str; 2] = ["main", "master"];
+const PROTECTED_PUSH_ALLOW_ENV: &str = "HARNESS_ALLOW_PROTECTED_PUSH";
+const PRE_PUSH_REFS_ENV: &str = "HARNESS_PRE_PUSH_REFS";
 
 // ── Runner ──────────────────────────────────────────────────────────
 
@@ -671,6 +674,13 @@ fn cmd_post_edit() {
     if changed_rs_files().is_empty() {
         return;
     }
+    // Reuse the full fix path (clippy --fix + fmt) — same as check/pre-commit —
+    // so the Stop hook fixes lint issues, not just formatting.
+    run(
+        "Clippy fix",
+        &["cargo", "clippy", "--fix", "--allow-dirty", "--allow-staged"],
+        Some(&RunOpts { no_exit: true, ..RunOpts::default() }),
+    );
     run("Format", &["cargo", "fmt"], Some(&RunOpts { no_exit: true, ..RunOpts::default() }));
 }
 
@@ -925,15 +935,99 @@ fn changed_paths_from_base() -> Vec<String> {
     paths
 }
 
-fn changed_paths_from_pre_push_stdin() -> Vec<String> {
-    let mut stdin = io::stdin();
-    if stdin.is_terminal() {
-        return Vec::new();
+/// What the push destinations are, resolved once per process.
+///
+/// `Refs` carries `<local ref> <local sha> <remote ref> <remote sha>` lines.
+/// `Incomplete` means data arrived but the read never reached EOF within the
+/// deadline: guessing the destinations from a truncated list would be worse
+/// than refusing, so both guards fail on it.
+enum PrePushRefs {
+    None,
+    Refs(String),
+    Incomplete,
+}
+
+/// Push destinations, read at most once: `HARNESS_PRE_PUSH_REFS` first (set by
+/// dispatchers whose children never see the hook's stdin), then git pre-push
+/// stdin, which only the first reader could consume.
+fn pre_push_refs() -> &'static PrePushRefs {
+    static REFS: std::sync::OnceLock<PrePushRefs> = std::sync::OnceLock::new();
+    REFS.get_or_init(|| {
+        if let Ok(text) = env::var(PRE_PUSH_REFS_ENV)
+            && !text.trim().is_empty()
+        {
+            return PrePushRefs::Refs(text);
+        }
+        if io::stdin().is_terminal() {
+            return PrePushRefs::None;
+        }
+        read_until(io::stdin(), Duration::from_secs(1))
+    })
+}
+
+/// Read `source` on a detached thread, bounding the whole read by `deadline`.
+///
+/// Run from a CI job or an agent tool, stdin is a pipe nobody ever writes to
+/// and a blocking read would hang the command; the deadline bounds that. Chunks
+/// are forwarded as they arrive so a deadline hit can tell "nothing came" (no
+/// refs) from "some came" (incomplete) instead of discarding what was read.
+fn read_until<R: Read + Send + 'static>(mut source: R, deadline: Duration) -> PrePushRefs {
+    let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        while let Ok(read) = source.read(&mut buffer) {
+            if read == 0 || sender.send(buffer[..read].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+
+    let start = Instant::now();
+    let mut text = Vec::new();
+    loop {
+        let left = deadline.checked_sub(start.elapsed()).unwrap_or_default();
+        match receiver.recv_timeout(left) {
+            Ok(chunk) => text.extend_from_slice(&chunk),
+            // Sender dropped: the reader hit EOF, so the text is whole.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let text = String::from_utf8_lossy(&text).into_owned();
+                return if text.trim().is_empty() {
+                    PrePushRefs::None
+                } else {
+                    PrePushRefs::Refs(text)
+                };
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return if text.is_empty() { PrePushRefs::None } else { PrePushRefs::Incomplete };
+            }
+        }
     }
-    let mut text = String::new();
-    if stdin.read_to_string(&mut text).is_err() || text.trim().is_empty() {
-        return Vec::new();
+}
+
+/// Base commit for a push that creates a branch on the remote (zero remote sha):
+/// the merge-base with the first upstream ref that exists, so the guard sees the
+/// whole branch instead of only its tip commit.
+fn new_branch_base(local_sha: &str) -> Option<String> {
+    let mut candidates = vec!["origin/main".to_string(), "origin/master".to_string()];
+    if let Ok(base) = env::var("HARNESS_ARCH_BASE")
+        && !base.is_empty()
+    {
+        candidates.push(base);
     }
+    for candidate in candidates {
+        if git_lines(&["rev-parse", "--verify", &candidate]).is_empty() {
+            continue;
+        }
+        if let Some(merge_base) =
+            git_lines(&["merge-base", &candidate, local_sha]).into_iter().next()
+        {
+            return Some(merge_base);
+        }
+    }
+    None
+}
+
+fn changed_paths_from_pre_push_refs(text: &str) -> Vec<String> {
     let zero = "0".repeat(40);
     let mut paths = Vec::new();
     for line in text.lines() {
@@ -947,15 +1041,26 @@ fn changed_paths_from_pre_push_stdin() -> Vec<String> {
             continue;
         }
         if remote_sha == zero {
-            paths.extend(git_lines(&[
-                "diff-tree",
-                "--no-commit-id",
-                "--name-only",
-                "-r",
-                local_sha,
-                "--",
-                ".",
-            ]));
+            if let Some(base) = new_branch_base(local_sha) {
+                paths.extend(git_lines(&[
+                    "diff",
+                    "--name-only",
+                    "--diff-filter=d",
+                    &format!("{base}..{local_sha}"),
+                    "--",
+                    ".",
+                ]));
+            } else {
+                paths.extend(git_lines(&[
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    local_sha,
+                    "--",
+                    ".",
+                ]));
+            }
         } else {
             paths.extend(git_lines(&[
                 "diff",
@@ -971,7 +1076,7 @@ fn changed_paths_from_pre_push_stdin() -> Vec<String> {
     paths
 }
 
-fn changed_arch_configs(staged: bool, include_pre_push_stdin: bool) -> Vec<String> {
+fn changed_arch_configs(staged: bool, refs: Option<&str>) -> Vec<String> {
     let mut paths = Vec::new();
     if staged {
         paths.extend(git_lines(&["diff", "--cached", "--name-only", "--diff-filter=d", "--", "."]));
@@ -981,8 +1086,8 @@ fn changed_arch_configs(staged: bool, include_pre_push_stdin: bool) -> Vec<Strin
         paths.extend(git_lines(&["ls-files", "--others", "--exclude-standard", "--", "."]));
         paths.extend(changed_paths_from_base());
     }
-    if include_pre_push_stdin {
-        paths.extend(changed_paths_from_pre_push_stdin());
+    if let Some(text) = refs {
+        paths.extend(changed_paths_from_pre_push_refs(text));
     }
 
     let prefix = git_prefix();
@@ -994,8 +1099,17 @@ fn changed_arch_configs(staged: bool, include_pre_push_stdin: bool) -> Vec<Strin
     changed.into_iter().collect()
 }
 
-fn check_arch_config_guard(warn_only: bool, staged: bool, include_pre_push_stdin: bool) -> bool {
-    let changed = changed_arch_configs(staged, include_pre_push_stdin);
+fn check_arch_config_guard(warn_only: bool, staged: bool, include_pre_push_refs: bool) -> bool {
+    let refs = if include_pre_push_refs { pre_push_refs() } else { &PrePushRefs::None };
+    if matches!(refs, PrePushRefs::Incomplete) {
+        print_incomplete_refs();
+        return false;
+    }
+    let text = match refs {
+        PrePushRefs::Refs(text) => Some(text.as_str()),
+        _ => None,
+    };
+    let changed = changed_arch_configs(staged, text);
     if changed.is_empty() {
         println!("  {GREEN}\u{2713}{RESET} Arch config guard");
         return true;
@@ -1018,7 +1132,78 @@ fn check_arch_config_guard(warn_only: bool, staged: bool, include_pre_push_stdin
 }
 
 fn cmd_arch_config_guard() {
-    if !check_arch_config_guard(arg_flag("--warn"), arg_flag("--staged"), false) {
+    if !check_arch_config_guard(arg_flag("--warn"), arg_flag("--staged"), arg_flag("--pre-push")) {
+        std::process::exit(1);
+    }
+}
+
+/// Branch a push would land on, when that branch is protected.
+///
+/// `refs` is the pre-push ref list; empty when there is none. Deleting a
+/// protected branch counts as targeting it. Only `refs/heads/` matches, so tag
+/// pushes never trip the guard. With no ref line at all the decision falls back
+/// to `current_branch`.
+fn protected_push_target(refs: &str, current_branch: &str) -> Option<String> {
+    for line in refs.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let Some(branch) = parts[2].strip_prefix("refs/heads/") else { continue };
+        if PROTECTED_BRANCHES.contains(&branch) {
+            return Some(branch.to_string());
+        }
+    }
+    if refs.lines().any(|line| line.split_whitespace().count() >= 4) {
+        return None;
+    }
+    PROTECTED_BRANCHES.contains(&current_branch).then(|| current_branch.to_string())
+}
+
+fn current_branch() -> String {
+    git_lines(&["rev-parse", "--abbrev-ref", "HEAD"]).into_iter().next().unwrap_or_default()
+}
+
+fn protected_push_allowed() -> bool {
+    env::var(PROTECTED_PUSH_ALLOW_ENV).as_deref() == Ok("1")
+}
+
+fn print_incomplete_refs() {
+    // Both guards consume the same refs; the operator needs the reason once.
+    static PRINTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if PRINTED.set(()).is_err() {
+        return;
+    }
+    println!("  {RED}\u{2717}{RESET} Pre-push refs incomplete after 1s");
+    println!("  \u{21b3} fix: feed the hook's refs on stdin or set {PRE_PUSH_REFS_ENV}");
+}
+
+fn check_branch_guard(refs: &PrePushRefs, allow_protected: bool) -> bool {
+    let (text, fallback) = match refs {
+        PrePushRefs::Incomplete => {
+            print_incomplete_refs();
+            return false;
+        }
+        PrePushRefs::Refs(text) => (text.as_str(), String::new()),
+        PrePushRefs::None => ("", current_branch()),
+    };
+    let Some(branch) = protected_push_target(text, &fallback) else {
+        println!("  {GREEN}\u{2713}{RESET} Branch guard");
+        return true;
+    };
+    if allow_protected {
+        println!("  {GREEN}\u{26a0}{RESET} Branch guard override: {branch}");
+        return true;
+    }
+    println!("  {RED}\u{2717}{RESET} Push targets protected branch: {branch}");
+    println!(
+        "  \u{21b3} fix: push a feature branch and open a PR; humans may set {PROTECTED_PUSH_ALLOW_ENV}=1"
+    );
+    false
+}
+
+fn cmd_branch_guard() {
+    if !check_branch_guard(pre_push_refs(), protected_push_allowed()) {
         std::process::exit(1);
     }
 }
@@ -1451,9 +1636,7 @@ fn cmd_pre_commit() {
 
     println!("\n{BLUE}[pre-commit]{RESET}\n");
 
-    if !check_arch_config_guard(false, true, false) {
-        std::process::exit(1);
-    }
+    check_arch_config_guard(true, true, false);
     cmd_fix();
     check_agents_md_drift(false);
     cmd_test();
@@ -1469,6 +1652,7 @@ fn cmd_ci() {
     // Bind each result before combining: every step must run (no &&-short-circuit)
     // so one pass surfaces every failure. Audit is install-aware and strict in ci.
     let batch_ok = run_gates_parallel(&gates);
+    let agents_md_drift_ok = check_agents_md_drift(true).ok;
     let audit_ok = cmd_audit_inner(true);
     let tests_ok =
         run("Tests", &["cargo", "test"], Some(&RunOpts { no_exit: true, ..RunOpts::default() })).ok;
@@ -1476,7 +1660,13 @@ fn cmd_ci() {
     cmd_crap();
     let arch_config_ok = check_arch_config_guard(false, false, false);
     let suppressions_ok = check_suppressions_baseline(true);
-    if !batch_ok || !audit_ok || !tests_ok || !arch_config_ok || !suppressions_ok {
+    if !batch_ok
+        || !agents_md_drift_ok
+        || !audit_ok
+        || !tests_ok
+        || !arch_config_ok
+        || !suppressions_ok
+    {
         std::process::exit(1);
     }
 }
@@ -1484,16 +1674,20 @@ fn cmd_ci() {
 /// Read-only push gate: the offline checks pre-commit and stop-hook do not run.
 /// pre-commit covers fix/format/test on staged files; stop-hook adds complexity.
 /// This fills the gap with the deterministic, offline gates none of them run —
-/// clippy (strict), format check, acceptance, arch — validating the whole pushed
-/// tree (after merges/rebases/--no-verify) before it leaves the machine. Network
-/// (audit) and advisory (coverage/CRAP) gates stay in ci.
+/// clippy (strict), format check, acceptance, arch, agents-md-drift — validating
+/// the whole pushed tree (after merges/rebases/--no-verify) before it leaves the
+/// machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
 fn cmd_pre_push() {
     println!("\n{BLUE}[pre-push]{RESET}\n");
+    // Branch guard first: it is cheap and reads the hook stdin the arch guard
+    // then reuses. Bind both results so the gates still run and report.
+    let branch_ok = check_branch_guard(pre_push_refs(), protected_push_allowed());
     let arch_config_ok = check_arch_config_guard(false, false, true);
+    let agents_md_drift_ok = check_agents_md_drift(true).ok;
     let mut gates = vec![lint_gate(), format_check_gate()];
     gates.extend(acceptance_gates_or_warn());
     gates.extend(arch_gates_or_warn());
-    if !run_gates_parallel(&gates) || !arch_config_ok {
+    if !run_gates_parallel(&gates) || !arch_config_ok || !branch_ok || !agents_md_drift_ok {
         std::process::exit(1);
     }
 }
@@ -1599,6 +1793,7 @@ const COMMANDS: &[(&str, fn())] = &[
     ("mutation", cmd_mutation),
     ("arch", cmd_arch),
     ("arch-config-guard", cmd_arch_config_guard),
+    ("branch-guard", cmd_branch_guard),
     ("complexity", cmd_complexity),
     ("crap", cmd_crap),
     ("suppressions", cmd_suppressions),
@@ -1838,6 +2033,95 @@ mod tests {
         assert!(last.exists(), "the gate after the failure still ran (no short-circuit)");
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stdin_ref_targeting_main_is_protected() {
+        let line = "refs/heads/topic abc123 refs/heads/main def456";
+        assert_eq!(protected_push_target(line, "topic"), Some("main".to_string()));
+    }
+
+    #[test]
+    fn stdin_ref_targeting_feature_is_not_protected() {
+        let line = "refs/heads/topic abc123 refs/heads/feature def456";
+        assert_eq!(protected_push_target(line, "main"), None);
+    }
+
+    #[test]
+    fn deleting_main_is_protected() {
+        let zero = "0".repeat(40);
+        let line = format!("(delete) {zero} refs/heads/main def456");
+        assert_eq!(protected_push_target(&line, "topic"), Some("main".to_string()));
+    }
+
+    #[test]
+    fn deleting_a_feature_branch_is_not_protected() {
+        let zero = "0".repeat(40);
+        let line = format!("(delete) {zero} refs/heads/feature/old def456");
+        assert_eq!(protected_push_target(&line, "main"), None);
+    }
+
+    #[test]
+    fn tag_refs_never_match_a_protected_branch() {
+        let line = "refs/tags/main abc123 refs/tags/main def456";
+        assert_eq!(protected_push_target(line, "feature/x"), None);
+    }
+
+    #[test]
+    fn no_stdin_falls_back_to_current_branch() {
+        assert_eq!(protected_push_target("", "main"), Some("main".to_string()));
+        assert_eq!(protected_push_target("", "master"), Some("master".to_string()));
+        assert_eq!(protected_push_target("", "feature/x"), None);
+    }
+
+    #[test]
+    fn override_lets_a_protected_push_pass() {
+        let refs = PrePushRefs::Refs("refs/heads/topic abc refs/heads/main def".to_string());
+        assert!(!check_branch_guard(&refs, false), "protected push must be refused by default");
+        assert!(check_branch_guard(&refs, true), "override must let a protected push pass");
+    }
+
+    #[test]
+    fn incomplete_refs_fail_both_guards() {
+        assert!(!check_branch_guard(&PrePushRefs::Incomplete, true), "partial refs must refuse");
+    }
+
+    /// Sends one chunk, then stalls past any deadline: a pipe git never closes.
+    struct StalledReader {
+        sent: bool,
+    }
+
+    impl Read for StalledReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.sent {
+                std::thread::sleep(Duration::from_secs(30));
+                return Ok(0);
+            }
+            self.sent = true;
+            let line = b"refs/heads/x abc refs/heads/feature def";
+            buf[..line.len()].copy_from_slice(line);
+            Ok(line.len())
+        }
+    }
+
+    #[test]
+    fn whole_read_empty_input_means_no_refs() {
+        let refs = read_until(io::Cursor::new(Vec::new()), Duration::from_secs(1));
+        assert!(matches!(refs, PrePushRefs::None));
+    }
+
+    #[test]
+    fn whole_read_to_eof_keeps_the_refs() {
+        let line = "refs/heads/x abc refs/heads/main def";
+        let refs = read_until(io::Cursor::new(line.as_bytes().to_vec()), Duration::from_secs(1));
+        let PrePushRefs::Refs(text) = refs else { panic!("expected refs") };
+        assert_eq!(text, line);
+    }
+
+    #[test]
+    fn deadline_after_partial_data_is_incomplete() {
+        let refs = read_until(StalledReader { sent: false }, Duration::from_millis(200));
+        assert!(matches!(refs, PrePushRefs::Incomplete), "partial read must not look like refs");
     }
 
     #[test]

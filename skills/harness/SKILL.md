@@ -3,8 +3,8 @@ name: harness
 description: >
   Bootstrap or align a repo with the harness-templates contract: the
   5-script quality harness (check, pre-commit, ci, audit, post-edit) plus
-  the behavior contract (task sizing, human-owned commits, Gherkin-first,
-  arch-config integration guard). Use when starting a new
+  the behavior contract (plan-first, branch-only commits with human-owned
+  merge, specify-what-is-worth-specifying, arch-config and branch guards). Use when starting a new
   python/bun/go/rust/monorepo project, adding a quality harness to an
   existing repo, or asked to match ~/Code/harness-templates conventions.
   Triggers: "add a harness", "set up check/ci/pre-commit", "align with
@@ -20,9 +20,11 @@ has **two layers**:
 - **Layer 1 — quality harness** (always): the 5 scripts `check`,
   `pre-commit`, `ci`, `audit`, `post-edit`.
 - **Layer 2 — behavior contract** (greenfield: automatic; existing repo:
-  opt-in): `AGENTS.md`/`CLAUDE.md` instructions plus `arch-config-guard`,
-  which warns during `check`/`stop-hook` and blocks `pre-commit`/`pre-push`/`ci`
-  unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. See
+  opt-in): `AGENTS.md`/`CLAUDE.md` instructions plus two runner guards:
+  `arch-config-guard` warns during `check`/`pre-commit`/`stop-hook` and blocks
+  `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review;
+  `branch-guard` makes `pre-push` refuse direct pushes to `main`/`master`
+  unless `HARNESS_ALLOW_PROTECTED_PUSH=1` is set. See
   [behavior-contract.md](reference/behavior-contract.md).
 
 ## Source of truth
@@ -48,11 +50,11 @@ Never edit anything under `~/Code/harness-templates/`.
 
 1. **Empty dir** → copy a template verbatim (see per-language reference).
    Layer 2 comes through `AGENTS.md`/`CLAUDE.md` and the runner's
-   `arch-config-guard` — keep it.
+   `arch-config-guard` + `branch-guard` — keep them.
 2. **Existing repo with a runner** (just/make/npm scripts/cargo) → adapt
    Layer 1; reuse the existing runner. Do **not** add a second one.
    Layer 2 is **opt-in** — ask before wiring it because it adds explicit
-   agent instructions and arch-config integration failures.
+   agent instructions, arch-config integration failures, and a push guard.
 3. **Polyglot / multi-project** → use `monorepo/` Makefile dispatch.
 
 When auditing or repairing a repo that already has some harness pieces,
@@ -77,13 +79,30 @@ read-only complexity gate (plus the dead-code gate where the language ships
 one) in parallel.
 Behavior contract: [behavior-contract.md](reference/behavior-contract.md).
 
+## Gate principles
+
+Apply these when deciding what a ported harness enforces:
+
+- Tools own everything checkable. Formatting, lint, types, dead code, drift, and
+  complexity are decided by deterministic tools and auto-fixed where the tool can.
+  Never write an instruction that asks the agent to check one of these by hand.
+- Quality gates are hard: lint, types, arch boundaries, complexity (CCN 15),
+  suppression ratchet, dead code, dependency audit, AGENTS/CLAUDE drift. An agent
+  clears them by doing the work, so they cost nothing as models improve.
+- Permission gates are exactly two: `arch-config-guard` at `pre-push`/`ci` and
+  `branch-guard` at `pre-push`. Do not add a third without a measured error rate
+  that justifies stalling the agent.
+- Gameable metrics are advisory: CRAP and mutation target the next test or split
+  and are never gates. The coverage floor is a ratchet (`.harness-baseline`
+  `coverage.min`, human-raised, starts at 0), never a target number.
+
 ## Layer 1 — the 5-script contract
 
 | Script | When | What | Fixes? |
 |---|---|---|---|
 | `check` | After edits | fix + format + typecheck + test + suppression ratchet | yes |
 | `pre-commit` | Git pre-commit hook | same, staged files only | yes |
-| `pre-push` | Before push | read-only push gate: lint + format check + acceptance + arch over the whole tree, in parallel | no |
+| `pre-push` | Before push | branch guard, then read-only push gate: lint + format check + acceptance + arch over the whole tree, in parallel | no |
 | `ci` | CI pipeline | read-only gates (lint + typecheck + dep audit + complexity + acceptance + arch) **run in parallel**, captured and printed in submission order; then tests/coverage + crap (advisory) | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
 | `post-edit` | Stop hook helper | format if source files changed | yes |
@@ -91,10 +110,14 @@ Behavior contract: [behavior-contract.md](reference/behavior-contract.md).
 
 Quality subcommands also callable standalone: `complexity`, `crap`,
 `acceptance`, `coverage` (Go also keeps `test-cov`), `mutation`, `arch`,
-`arch-config-guard`, `suppressions`, and `deadcode` (python/bun).
-`arch-config-guard` warns in `check`/`stop-hook` and fails
-`pre-commit`/`pre-push`/`ci` when protected arch config paths changed unless
-`HARNESS_ALLOW_ARCH_CONFIG=1` is set. `deadcode` flags unused code and runs in `ci` +
+`arch-config-guard`, `branch-guard`, `suppressions`, and `deadcode` (python/bun).
+`arch-config-guard` warns in `check`/`pre-commit`/`stop-hook` and fails
+`pre-push`/`ci` when protected arch config paths changed unless
+`HARNESS_ALLOW_ARCH_CONFIG=1` is set. `branch-guard` runs first in `pre-push`
+and refuses direct pushes to or deletions of `main`/`master`
+(`HARNESS_PRE_PUSH_REFS`, else git pre-push stdin refs, else the current
+branch) unless `HARNESS_ALLOW_PROTECTED_PUSH=1` is set. Both guards are
+Layer 2. `deadcode` flags unused code and runs in `ci` +
 `stop-hook`: python via vulture (app sources only, `--min-confidence 60`,
 allowlist false positives in `vulture_allowlist.py`), bun via knip (unused
 files/exports/deps, configured by `knip.json`, fetched on demand via
@@ -128,13 +151,17 @@ For an existing repo, wire it **only when the user opts in**. Full porting + onb
   section. The two files hold the same content (the templates'
   `agents-md-drift` check enforces no drift).
 - `arch-config-guard` protects the repo's architecture config at integration
-  time: warning mode in `check`/`stop-hook`, strict mode in
-  `pre-commit`/`pre-push`/`ci`, reviewed override via
-  `HARNESS_ALLOW_ARCH_CONFIG=1`.
+  time: warning mode in `check`/`pre-commit`/`stop-hook`, strict mode in
+  `pre-push`/`ci`, reviewed override via `HARNESS_ALLOW_ARCH_CONFIG=1`.
+- `branch-guard` keeps agents on feature branches: `pre-push` refuses direct
+  pushes to `main`/`master` unless `HARNESS_ALLOW_PROTECTED_PUSH=1` is set.
+  It stops accidents, not `--no-verify`; merge ownership is instruction
+  unless the server enforces branch protection.
 
-After wiring Layer 2, **onboard the user** — state plainly that commit/push
-ownership is instruction-only, while arch-config changes are blocked by the
-runner gates until reviewed.
+After wiring Layer 2, **onboard the user** — state plainly that the agent
+commits and pushes on feature branches and opens PRs, that merge stays
+human-owned (instruction plus `branch-guard`), and that arch-config changes
+are blocked at push/CI until reviewed.
 
 ## Adapt rules (existing repos)
 
@@ -152,8 +179,9 @@ runner gates until reviewed.
 - Template runner files (`harness.py`, `harness.ts`, `harness.go`,
   `cargo harness`) are for greenfield/copy flow — not the default for
   repos that already have a runner.
-- Layer 2 is opt-in: never wire behavior-contract instructions or the
-  arch-config integration guard into a repo that did not ask for them.
+- Layer 2 is opt-in: never wire behavior-contract instructions, the
+  arch-config integration guard, or the branch guard into a repo that did
+  not ask for them.
 - The contract's law-like rule (property tests) needs the language's PBT
   dev-dep: hypothesis (python), fast-check (bun), rapid (go), proptest
   (rust). Wire it when porting the contract — or on the first law-like
@@ -180,11 +208,15 @@ Layer 1:
 5. `stop-hook` runs via Stop hook and includes post-edit formatting (Claude/Codex hooks wired per
    [settings-json.md](reference/settings-json.md)).
 6. Suppression growth above `.harness-baseline` fails; `suppressions --update-baseline` updates it.
-7. `arch-config-guard` warns in `check`/`stop-hook` and fails
-   `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set.
-8. Runner imports nothing outside stdlib/runtime.
+7. Runner imports nothing outside stdlib/runtime.
 
 Layer 2 (only if wired):
 
-9. `AGENTS.md` and `CLAUDE.md` include the same full behavior contract text.
-10. Commit/push ownership and Gherkin-first rules are present as instructions.
+8. `AGENTS.md` and `CLAUDE.md` include the same full behavior contract text.
+9. Plan-first, branch-only commits, and specify-what-is-worth-specifying rules
+   are present as instructions.
+10. `arch-config-guard` warns in `check`/`pre-commit`/`stop-hook` and fails
+    `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set.
+11. `branch-guard` fails on `main`/`master` (including deletions), passes with
+    `HARNESS_ALLOW_PROTECTED_PUSH=1` or a feature-branch ref, never blocks on
+    an idle pipe, and fails on partial stdin.

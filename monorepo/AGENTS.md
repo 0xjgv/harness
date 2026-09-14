@@ -3,16 +3,17 @@
 ## Commands
 
 - After edits: `make check` — dispatches `check` to every subproject (fix, format, typecheck, test, suppression ratchet)
-- Pre-commit: `make pre-commit` — runs only in subprojects with staged files (auto via git hook)
-- Pre-push: `make pre-push` — read-only push gate across every subproject; each runs its own `harness pre-push` (lint, format check, acceptance, arch over the whole tree). Auto via git pre-push hook.
-- CI: `make ci` — read-only gate across every subproject; each runs its own `harness ci` — read-only gates (lint, typecheck, dep audit, complexity, deadcode where the language ships one, acceptance, arch) in parallel, then coverage + crap
+- Pre-commit: `make pre-commit` — runs only in subprojects with staged files (auto via git hook); arch config changes warn here, they do not fail
+- Pre-push: `make pre-push` — branch guard (refuses pushes to, or deletions of, `main`/`master` unless `HARNESS_ALLOW_PROTECTED_PUSH=1`), the root-pair agents-md drift check, then a read-only push gate across every subproject; each runs its own `harness pre-push` (lint, format check, acceptance, arch, agents-md drift over the whole tree). The hook's refs are read once here and handed to every subproject as `HARNESS_PRE_PUSH_REFS`. Auto via git pre-push hook.
+- CI: `make ci` — the root-pair agents-md drift check, then a read-only gate across every subproject; each runs its own `harness ci` — read-only gates (lint, typecheck, dep audit, complexity, deadcode where the language ships one, acceptance, arch, agents-md drift) in parallel, then coverage + crap
 - CRAP (advisory): `make crap` — fan out the CRAP gate to every subproject (each runs its own `harness crap`). Forward flags via `ARGS`, e.g. `make crap ARGS="--enforce --max=50"`.
 - Complexity: `make complexity` — fan out the complexity gate to every subproject (lizard CCN). Same `ARGS=...` forwarding.
 - Scope to one subproject: `make check-<subproject>` (e.g. `make check-api`, `make ci-web`, `make pre-push-api`, `make crap-api`, `make complexity-api`)
 - Scope to dirty subprojects: `make check-dirty` (working-tree + untracked changes)
 - Parallel fan-out: `PARALLEL=1 make check` — opt-in, buffered per-subproject output. Keep off for CI and agent-visible runs.
 - List subprojects: `make list`
-- Arch config guard: `make arch-config-guard` — blocks unreviewed `.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, or `arch.toml` changes in pre-commit/pre-push/CI; use `HARNESS_ALLOW_ARCH_CONFIG=1` after review
+- Branch guard: `make branch-guard` — refuses pushes to (or deletions of) `main`/`master`; reads `HARNESS_PRE_PUSH_REFS`, else git pre-push stdin (1s deadline; partial input fails), else the current branch; `HARNESS_ALLOW_PROTECTED_PUSH=1` overrides
+- Arch config guard: `make arch-config-guard` — unreviewed `.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, or `arch.toml` changes warn in check/pre-commit/stop-hook and block pre-push/CI; use `HARNESS_ALLOW_ARCH_CONFIG=1` after review
 - Agents drift: `make agents-md-drift` — fail if any subproject's AGENTS.md differs from its CLAUDE.md (root pair included). Scope: `make agents-md-drift-<sub>`
 - Sync: `make sync-agents-md` — overwrite each subproject's AGENTS.md from its CLAUDE.md. Scope: `make sync-agents-md-<sub>`
 - Setup: `make bootstrap` — per-language install + install the root git hook
@@ -21,10 +22,11 @@
 ## Definition of done
 
 - `make check` passes clean — never stop with check failing.
-- User-visible behavior change → a `.feature` scenario exists and acceptance passes.
+- Behavior worth specifying → a `.feature` scenario exists and acceptance passes; other behavior changes have unit tests.
 - No new suppressions: additions above `.harness-baseline` fail check; suppress only with the human's sign-off, stating why.
-- Arch config changes are integration-blocked: `check`/`stop-hook` warn, and `pre-commit`/`pre-push`/`ci` fail unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
-- `pre-push`/`ci` are the human's gates: leave the tree in a state where they would pass, but do not commit or push yourself.
+- Arch config changes are integration-blocked: `check`/`pre-commit`/`stop-hook` warn, and `pre-push`/`ci` fail unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+- `pre-push`/`ci` must pass on your branch before you open or update a PR. Merge is the human's.
+- Never spend a turn on what a tool checks: formatting, lint, types, dead code, drift, and complexity come back as `check`/`stop-hook` output. Read the output, fix the code, never the gate.
 
 Each subproject keeps its own zero-dep harness (`harness.ts` / `harness.py` / `harness.go` / `cargo harness`). The Makefile only dispatches — never reimplements lint, format, or test logic. Running a subproject's harness directly from its own directory still works:
 
@@ -35,27 +37,25 @@ cd api && uv run harness check
 ## Behavior contract
 
 <important if="you accept a new task">
-- Restate the task as at most 5 sub-tasks. Each sub-task MUST touch ≤1 non-test file and ≤1 test.
-- If the task cannot be decomposed within that bound, STOP and return a decomposition proposal. Do NOT edit code in the same turn.
-- If a proposed sub-task would edit more than one non-test file, split it further before writing code.
+- Open with a plan: the sub-tasks, the files each touches, and which of them change user-visible behavior. Then execute the plan in the same turn.
+- If the plan crosses a subproject boundary, say so in the plan so the reviewer can read the diff in that order.
 </important>
 
 <important>
 ## Role
 
-- The human is the engineer. They own design, API shape, and merge authority. You propose, they dispose.
-- Do NOT run `git commit`, `git push`, or equivalent publishing commands unless the user's current prompt asked for it. The verbs `commit`, `push`, `ship`, `land`, `merge` in action context authorize that turn only.
+- The human is the engineer. They own design, API shape, and merge authority. You propose on a branch, they merge.
+- Commit and push on a feature branch as you go. Never commit to `main`/`master`, never force-push, never merge. `pre-push` refuses direct pushes to `main`/`master` unless a human sets `HARNESS_ALLOW_PROTECTED_PUSH=1`; that guard stops accidents, not `--no-verify`, so merge ownership is a rule you follow, not one the tool can enforce.
 </important>
 
-<important if="the task changes user-visible behavior">
-- Workflow: write or extend a `.feature` scenario in the affected subproject → get human approval → write step definitions → write implementation.
-- If the behavior is law-like (formula, parser, codec, round-trip, invariant), also write a property test with the subproject's PBT tool (hypothesis / fast-check / rapid / proptest), not just examples.
-- Refactors, typo fixes, dependency bumps, and internal cleanup are NOT user-visible behavior changes. You MAY proceed without a new `.feature`, but you MUST state in your first response that the change is non-behavioral and why.
-- If it is unclear whether a task changes user-visible behavior, ASK before editing source.
+<important if="the task changes behavior">
+- Specify before you build when the behavior is worth specifying: a user-visible flow, a law-like rule (formula, parser, codec, round-trip, invariant), or anything another component will depend on. Write or extend a `.feature` scenario in the affected subproject, then step definitions, then implementation, in the same turn. The human judges in review whether the scenario earns its keep.
+- Law-like behavior also gets a property test with the subproject's PBT tool (hypothesis / fast-check / rapid / proptest), not just examples — see that subproject's own CLAUDE.md for the pattern.
+- Small or incidental behavior changes may ship on unit tests alone; say so in your first response. Refactors, typo fixes, dependency bumps, and internal cleanup are not behavior changes at all.
+- If it is unclear which bucket a task falls in, state your classification and proceed.
 </important>
 
-<important if="you want to edit a subproject's arch config">
-- Each language subproject has its own arch config: `.importlinter` (python), `.dependency-cruiser.json` (bun), `.go-arch-lint.yml` (go), `arch.toml` (rust).
-- Do not silently edit an arch config to silence a violation. Architectural violations imply a design decision — surface them to the human.
-- The harness warns about arch config changes during `check`/`stop-hook` and blocks `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+<important if="you want to edit a subproject's arch config (`.importlinter` python, `.dependency-cruiser.json` bun, `.go-arch-lint.yml` go, `arch.toml` rust)">
+- Do not silently edit an arch config to silence a violation. Architectural violations imply a design decision — put the config change in its own commit whose message states the rationale, so the reviewer sees it isolated.
+- The harness warns about arch config changes during `check`/`pre-commit`/`stop-hook` and blocks `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. Expect the push to be refused; report it and let the human review.
 </important>

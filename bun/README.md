@@ -18,7 +18,7 @@ See the [5-script contract](../README.md#the-5-script-contract) for the full rat
 ```bash
 bun run check                      # Fix + format + typecheck + tests/no-test warning (after editing)
 bun run pre-commit                 # Staged checks + tests (runs via git hook)
-bun harness.ts pre-push            # Read-only push gate: lint, acceptance, arch (runs via git hook)
+bun harness.ts pre-push            # Read-only push gate: branch guard, lint, acceptance, arch (runs via git hook)
 bun run ci                         # Full verification (see below)
 ```
 
@@ -26,13 +26,13 @@ Every command above is also a `make` target — `make check`, `make ci`, `make p
 
 ### `ci` pipeline
 
-`harness ci` runs the read-only gates — lint + format check (biome), typecheck (tsc), dep audit (bun audit), complexity (lizard, CCN 15, args 8), deadcode (knip), acceptance (cucumber), arch (dependency-cruiser) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then streams coverage (`bun test --coverage`, default threshold from `.harness-baseline`) and the advisory crap.
+`harness ci` runs the read-only gates — lint + format check (biome), typecheck (tsc), dep audit (bun audit), agents-md drift, complexity (lizard, CCN 15, args 8), deadcode (knip), acceptance (cucumber), arch (dependency-cruiser) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then streams coverage (`bun test --coverage`, default threshold from `.harness-baseline`) and the advisory crap.
 
-`pre-push` is the offline push gate — lint (biome covers format), acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
+`pre-push` is the offline push gate — a branch guard that refuses pushes to (or deletions of) `main`/`master` (unless `HARNESS_ALLOW_PROTECTED_PUSH=1`), reading `HARNESS_PRE_PUSH_REFS` or git's pre-push stdin (1s deadline; partial input fails) and falling back to the current branch, then lint (biome covers format), agents-md drift, acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
 
 The complexity gate requires `uvx` on PATH — install via [uv](https://docs.astral.sh/uv/).
 
-CRAP is **advisory** but still runs in `ci`. Mutation testing is advisory and invoked explicitly.
+The gates split into four groups: hard quality gates that block (lint, typecheck, arch, complexity, suppressions, deadcode, audit, agents-md drift), advisory metrics that inform but never fail the build (CRAP, mutation), a ratchet that only moves up (the coverage floor in `.harness-baseline`), and two permission gates that need a human to unblock (arch-config-guard, branch-guard). CRAP is **advisory** but still runs in `ci`. Mutation testing is advisory and invoked explicitly.
 
 ### Continuous integration
 
@@ -49,7 +49,7 @@ bun harness.ts check --verbose
 ```bash
 bun run acceptance                 # cucumber against tests/features/
 bun harness.ts deadcode            # knip (via bunx): unused files/exports/deps; config in knip.json
-bun run coverage --min=80          # tests with coverage, fails below threshold
+bun run coverage                   # tests with coverage, floor from .harness-baseline (--min=N for a local override)
 bun run mutation                   # Stryker mutation score on src/ (advisory)
 bun run crap --max=30              # CRAP = CCN² × (1-cov)³ + CCN per function (advisory)
 bun harness.ts suppressions        # suppression breakdown; --update-baseline with human sign-off
@@ -83,10 +83,10 @@ cucumber.json              Acceptance runner config (cucumber)
 
 `AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract. Agents that read either file receive the same instructions.
 
-- **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
-- **Human-is-engineer**: do not `git commit` / `git push` unless the user's current prompt explicitly asked.
-- **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
-- **Arch config guard**: `.dependency-cruiser.json` changes warn during `check`/`stop-hook` and fail `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+- **Plan first**: open with the sub-tasks and the files each touches, then execute in the same turn.
+- **Human-is-engineer**: commit and push on a feature branch; `main`/`master` and merges stay human — `pre-push` refuses direct pushes to (and deletions of) them unless `HARNESS_ALLOW_PROTECTED_PUSH=1`. The guard stops accidents, not `--no-verify`.
+- **Specify what is worth specifying**: `.feature` scenarios for user-visible flows, law-like rules, and cross-component contracts; unit tests suffice for the rest.
+- **Arch config guard**: `.dependency-cruiser.json` changes warn during `check`/`pre-commit`/`stop-hook` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 
 Stop hooks are wired via `.claude/settings.json` for Claude and
 `.codex/hooks.json` for Codex.
@@ -98,8 +98,8 @@ Day-1 defaults are deliberately loose so adopting this template does not fail ex
 - `coverage --min=0` — explicit flags win; otherwise the default comes from `.harness-baseline` `coverage.min`.
 - `.harness-baseline` also ratchets suppression counts. New suppressions fail `check`; run `harness suppressions --update-baseline` only with human sign-off.
 - `harness test`, coverage, mutation, and CRAP warn and skip when no test files exist.
-- CRAP is advisory in `ci`; pass `--enforce` when you are ready to block on it.
-- Mutation is advisory — enable as a blocking gate once a baseline is established.
+- CRAP and mutation are advisory by design — they tell you where the next test or split pays off, they are not gates, because a coverage-shaped target gets satisfied with assertion-free tests. `--enforce` exists for teams that want it on CRAP; it is not the recommended default.
+- The coverage floor is a ratchet: `.harness-baseline` `coverage.min` only ever moves up, by a human, and starts at 0.
 - StrykerJS has no official Bun test-runner plugin; `stryker.conf.json` uses the universal `command` runner, which shells out to `bun test` and grades each mutant by exit code. It works everywhere but cannot do per-test coverage optimizations — expect a full test run per mutant.
 - `.dependency-cruiser.json` ships with one starter rule (`src/internal/` is not importable from outside it) plus a `no-circular` rule. Extend as the module graph grows.
 

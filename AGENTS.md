@@ -33,6 +33,10 @@ The root `Makefile` manages repo-level dogfooding and skill deployment:
 - `make arch-config-guard ARGS=--warn` — warn on protected arch config changes
 - `make stop-hook` — root Stop hook: sync derived root docs/skills when needed, warn on
   arch config changes, and dispatch `stop-hook` into dirty language templates
+- `make branch-guard` — refuse direct pushes to, or deletions of, `main`/`master`. Reads
+  `HARNESS_PRE_PUSH_REFS`, else git pre-push stdin (1s deadline; partial input fails),
+  else the current branch; `HARNESS_ALLOW_PROTECTED_PUSH=1` overrides. Runs first in
+  `make pre-push`, which then exports the refs to every template's `pre-push`.
 - `make setup-hooks` — install root `.git/hooks/pre-commit` and `.git/hooks/pre-push`,
   then verify root Claude/Codex Stop hook wiring
 - `make help` — list targets
@@ -61,15 +65,15 @@ cd monorepo && make check           # dispatches check to every subproject copie
 |---|---|---|---|
 | `check` | after edits | fix, format, typecheck, test, suppression ratchet | yes |
 | `pre-commit` | git pre-commit hook | same, staged files only | yes |
-| `pre-push` | git pre-push hook | read-only: lint, format check, acceptance, arch, over the whole tree, in parallel | no |
+| `pre-push` | git pre-push hook | branch guard, then read-only: lint, format check, acceptance, arch, over the whole tree, in parallel | no |
 | `ci` | CI pipeline | read-only gates (lint, typecheck, dep audit, complexity, deadcode, acceptance, arch) in parallel, then coverage + advisory CRAP | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
 | `post-edit` | Stop hook helper | format changed source files | yes |
 | `stop-hook` | agent Stop hook | `post-edit` + complexity (+ deadcode where shipped) | yes |
 
 Other standalone subcommands every template exposes: `complexity`, `crap`, `acceptance`,
-`coverage` (Go also keeps `test-cov`), `mutation`, `arch`, `suppressions`,
-`agents-md-drift`, `sync-agents-md`, `setup-hooks`. Python and Bun additionally expose `deadcode` (vulture / knip); Go and
+`coverage` (Go also keeps `test-cov`), `mutation`, `arch`, `arch-config-guard`,
+`branch-guard`, `suppressions`, `agents-md-drift`, `sync-agents-md`, `setup-hooks`. Python and Bun additionally expose `deadcode` (vulture / knip); Go and
 Rust rely on their linters (`golangci-lint unused`, clippy `dead_code`) instead of a
 separate target. `crap` is advisory by default (`--enforce` to hard-fail). Full command
 tables with exact flags live in each template's own `CLAUDE.md` — read that file before
@@ -98,11 +102,12 @@ templates copied inside it as subprojects (`cp -r python/ api`), not edited stan
 **Two-layer contract, shipped per template:**
 - **Layer 1 — quality harness** (always on): the 5-script contract above.
 - **Layer 2 — behavior contract** (greenfield: automatic; ported into an existing repo:
-  opt-in only): instruction text in `AGENTS.md` and `CLAUDE.md` for task-sizing,
-  human-owned commits, and Gherkin-first behavior changes, plus a portable
-  `arch-config-guard` that warns during `check`/`stop-hook` and blocks
-  `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after
-  review. Full design: `skills/harness/reference/behavior-contract.md`.
+  opt-in only): instruction text in `AGENTS.md` and `CLAUDE.md` for plan-first tasks,
+  human-owned merges, and specify-what-is-worth-specifying, plus two portable guards:
+  `arch-config-guard` warns during `check`/`pre-commit`/`stop-hook` and blocks
+  `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review;
+  `branch-guard` makes `pre-push` refuse direct pushes to `main`/`master` unless
+  `HARNESS_ALLOW_PROTECTED_PUSH=1` is set. Full design: `skills/harness/reference/behavior-contract.md`.
 
 **`AGENTS.md`/`CLAUDE.md` are byte-identical within each template**, enforced by that
 template's own `agents-md-drift` harness command and fixed by `sync-agents-md`
@@ -126,29 +131,29 @@ are documentation *about* this repo's contract, not code that runs here.
 ## Behavior contract
 
 <important if="you accept a new task">
-- Restate the task as at most 5 sub-tasks. Each sub-task MUST touch ≤1 non-test file and ≤1 test.
-- If the task cannot be decomposed within that bound, STOP and return a decomposition proposal. Do NOT edit code in the same turn.
-- If a proposed sub-task would edit more than one non-test file, split it further before writing code.
+- Open with a plan: the sub-tasks, the files each touches, and which of them change user-visible template behavior. Then execute the plan in the same turn.
+- If the plan crosses template boundaries (several of `python/`, `bun/`, `go/`, `rust/`, `monorepo/`, root, `skills/harness/`), say so in the plan so the reviewer can read the diff in that order.
 </important>
 
 <important>
 ## Role
 
-- The human is the engineer. They own design, API shape, and merge authority. You propose, they dispose.
-- Do NOT run `git commit`, `git push`, or equivalent publishing commands unless the user's current prompt asked for it. The verbs `commit`, `push`, `ship`, `land`, `merge` in action context authorize that turn only.
+- The human is the engineer. They own design, API shape, and merge authority. You propose on a branch, they merge.
+- Commit and push on a feature branch as you go. Never commit to `main`/`master`, never force-push, never merge. `make pre-push` refuses direct pushes to `main`/`master` unless a human sets `HARNESS_ALLOW_PROTECTED_PUSH=1`; that guard stops accidents, not `--no-verify`, so merge ownership is a rule you follow, not one the tool can enforce.
 </important>
 
-<important if="the task changes user-visible template behavior">
-- Workflow: write or extend a `.feature` scenario in the affected template when that template has acceptance coverage → get human approval → write step definitions → write implementation.
-- If the behavior is law-like (formula, parser, codec, round-trip, invariant), also write a property test with the affected template's PBT tool (hypothesis / fast-check / rapid / proptest), not just examples.
-- Refactors, typo fixes, docs-only changes, dependency bumps, and internal cleanup are NOT user-visible template behavior changes. You MAY proceed without a new `.feature`, but you MUST state in your first response that the change is non-behavioral and why.
-- If it is unclear whether a task changes user-visible template behavior, ASK before editing source.
+<important if="the task changes template behavior">
+- Specify before you build when the behavior is worth specifying: a user-visible flow of a template's harness, a law-like rule (formula, parser, codec, round-trip, invariant), or anything another template or the skill will depend on. Write or extend a `.feature` scenario in the affected template, then step definitions, then implementation, in the same turn. The human judges in review whether the scenario earns its keep.
+- Law-like behavior also gets a property test with the affected template's PBT tool (hypothesis / fast-check / rapid / proptest), not just examples.
+- Small or incidental behavior changes may ship on unit tests alone; say so in your first response. Refactors, typo fixes, docs-only changes, dependency bumps, and internal cleanup are not behavior changes at all.
+- If it is unclear which bucket a task falls in, state your classification and proceed.
+- Never spend a turn on what a tool checks: formatting, lint, types, dead code, drift, and complexity come back as `check`/`stop-hook` output. Read the output, fix the code, never the gate.
 </important>
 
 <important if="you want to edit a template's arch config">
 - Each language template has its own arch config: `.importlinter` (python), `.dependency-cruiser.json` (bun), `.go-arch-lint.yml` (go), `arch.toml` (rust).
-- Do not silently edit an arch config to silence a violation. Architectural violations imply a design decision — surface them to the human.
-- The root and template harnesses warn about arch config changes during `check`/`stop-hook` and block `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+- Do not silently edit an arch config to silence a violation. Architectural violations imply a design decision — put the config change in its own commit whose message states the rationale, so the reviewer sees it isolated.
+- The root and template harnesses warn about arch config changes during `check`/`pre-commit`/`stop-hook` and block `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. Expect the push to be refused; report it and let the human review.
 </important>
 
 ## Adding a new language template
@@ -166,3 +171,12 @@ tables. Use `python/` or `go/` as the reference implementation.
   `--verbose` is the escape hatch.
 - `check`/`pre-commit`/`post-edit` fix what they can; `pre-push`/`ci`/`audit` are
   strictly read-only.
+- Tools own everything checkable. Formatting, lint, types, dead code, drift, and
+  complexity are decided by deterministic tools and auto-fixed where the tool can; the
+  agent never judges or reports them by hand.
+- Quality gates are hard; permission gates are exactly two. Lint, types, arch boundaries,
+  complexity, the suppression ratchet, dead code, dependency audit, and drift block. Only
+  `arch-config-guard` (pre-push/ci) and `branch-guard` (pre-push) need a human to unblock.
+- Gameable metrics are advisory. CRAP and mutation point at the next test or split and
+  are never gates; the coverage floor is a ratchet from `.harness-baseline`, raised by a
+  human, never a target number.

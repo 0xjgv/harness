@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use cucumber::{World, given, then, when};
 
@@ -51,9 +51,15 @@ struct CrateWorld {
     name: Option<&'static str>,
     // Crap scenarios.
     tmp: Option<PathBuf>,
+    env: Vec<(String, String)>,
     exit_code: Option<i32>,
     output: String,
 }
+
+/// Guard overrides leak in from the ambient shell (a human debugging a push, or
+/// CI). Scenarios that want one set it explicitly; every other run starts clean.
+const OVERRIDE_ENV: [&str; 3] =
+    ["HARNESS_ALLOW_PROTECTED_PUSH", "HARNESS_ALLOW_ARCH_CONFIG", "HARNESS_PRE_PUSH_REFS"];
 
 impl CrateWorld {
     fn make_tmp(&mut self) -> PathBuf {
@@ -108,6 +114,84 @@ fn artifact_missing(world: &mut CrateWorld) {
     world.make_tmp();
 }
 
+#[given(expr = "a git repo on branch {string}")]
+fn git_repo_on_branch(world: &mut CrateWorld, branch: String) {
+    let dir = tempdir();
+    world.tmp = Some(dir.clone());
+    git(&dir, &["init", "-q", "-b", &branch]);
+    git(
+        &dir,
+        &[
+            "-c",
+            "user.email=harness@example.com",
+            "-c",
+            "user.name=harness",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "root",
+        ],
+    );
+}
+
+#[given(expr = "the push refs are {string}")]
+fn push_refs_are(world: &mut CrateWorld, refs: String) {
+    let dir = world.tmp.clone().expect("tmp dir not initialised");
+    let head = git_out(&dir, &["rev-parse", "HEAD"]);
+    world.env.push(("HARNESS_PRE_PUSH_REFS".to_string(), refs.replace("<HEAD>", &head)));
+}
+
+#[given("the protected-push override is set")]
+fn protected_push_override(world: &mut CrateWorld) {
+    world.env.push(("HARNESS_ALLOW_PROTECTED_PUSH".to_string(), "1".to_string()));
+}
+
+/// Branch pushed for the first time: `origin/main` exists, the arch config
+/// changed in an earlier commit, and the tip commit touches something else.
+#[given("a new branch whose earlier commit changed the arch config")]
+fn branch_with_earlier_arch_change(world: &mut CrateWorld) {
+    let dir = tempdir();
+    world.tmp = Some(dir.clone());
+    git(&dir, &["init", "-q", "-b", "feature/arch"]);
+    fs::write(dir.join("arch.toml"), "[rules]\n").expect("write arch.toml");
+    commit(&dir, "base");
+    git(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    fs::write(dir.join("arch.toml"), "[rules]\nrelaxed = true\n").expect("rewrite arch.toml");
+    commit(&dir, "relax arch rules");
+    fs::write(dir.join("notes.md"), "unrelated\n").expect("write notes.md");
+    commit(&dir, "unrelated");
+}
+
+fn commit(dir: &PathBuf, message: &str) {
+    git(dir, &["add", "-A"]);
+    git(
+        dir,
+        &[
+            "-c",
+            "user.email=harness@example.com",
+            "-c",
+            "user.name=harness",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            message,
+        ],
+    );
+}
+
+fn git_out(dir: &PathBuf, args: &[&str]) -> String {
+    let output = Command::new("git").args(args).current_dir(dir).output().expect("spawn git");
+    assert!(output.status.success(), "git {args:?} failed in {dir:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git(dir: &PathBuf, args: &[&str]) {
+    let status = Command::new("git").args(args).current_dir(dir).status().expect("spawn git");
+    assert!(status.success(), "git {args:?} failed in {dir:?}");
+}
+
 #[when(expr = "I run {string}")]
 fn i_run(world: &mut CrateWorld, cmd: String) {
     // Drop leading "harness" — the rest is forwarded to the binary.
@@ -116,11 +200,19 @@ fn i_run(world: &mut CrateWorld, cmd: String) {
         argv.remove(0);
     }
     let tmp = world.tmp.as_ref().expect("tmp dir not initialised");
-    let output = Command::new(HARNESS_BIN)
+    let mut command = Command::new(HARNESS_BIN);
+    command
         .args(&argv)
-        .current_dir(tmp)
-        .output()
-        .expect("spawn harness binary");
+        // Null stdin keeps commands that read git pre-push refs deterministic.
+        .stdin(Stdio::null())
+        .current_dir(tmp);
+    for key in OVERRIDE_ENV {
+        command.env_remove(key);
+    }
+    for (key, value) in &world.env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("spawn harness binary");
     world.exit_code = output.status.code();
     world.output = format!(
         "{}{}",

@@ -94,4 +94,4 @@ array shape.
 
 Do not add SessionStart, UserPromptSubmit, or PreToolUse behavior gates. The
 current behavior contract is enforced through instructions plus
-`arch-config-guard` in the runner.
+`arch-config-guard` and `branch-guard` in the runner.

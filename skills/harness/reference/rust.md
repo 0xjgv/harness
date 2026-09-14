@@ -13,7 +13,7 @@ paraphrase (it drifts). Two sections:
 
 - `## Commands` — `check`, `pre-commit`, `pre-push`, `ci`, `audit`, plus
   quality subcommands `complexity`, `acceptance`, `coverage`, `mutation`,
-  `crap`, `arch`, `arch-config-guard`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
+  `crap`, `arch`, `arch-config-guard`, `branch-guard`, `suppressions`, and the drift pair `agents-md-drift` / `sync-agents-md`
   (keeps `AGENTS.md` byte-identical to `CLAUDE.md`; `check` + `pre-commit`
   fail on drift). `ci` runs the read-only gates (`clippy`, `format check`,
   `complexity`, `acceptance`, `arch`) **in parallel** — captured and
@@ -21,7 +21,7 @@ paraphrase (it drifts). Two sections:
   failure — then runs `audit`, streams `tests` + `coverage`, and the
   advisory `crap`; `ci` also runs `arch-config-guard` in strict mode.
   `pre-push` is the offline push gate: `clippy`, `format
-  check`, `acceptance`, `arch`, and strict `arch-config-guard` over the whole pushed tree (the deterministic
+  check`, `acceptance`, `arch`, and strict `arch-config-guard` over the whole pushed tree, after `branch-guard` refuses `main`/`master` (the deterministic
   checks pre-commit and stop-hook skip). There is **no** `deadcode` target —
   rust's `dead_code` lint is on by default and `ci`'s strict clippy
   (`-D warnings`) already denies unused functions, fields, and variants;
@@ -69,3 +69,4 @@ Codex Stop command:
   (mutation), proptest (property-based tests, see `mod property_tests`
   in `harness.rs`), cargo-modules (arch)
 - Protected arch config: `arch.toml` (`cargo harness arch-config-guard`)
+- Branch guard: `cargo harness branch-guard` (warns nothing, fails on `main`/`master`; `HARNESS_ALLOW_PROTECTED_PUSH=1` overrides)

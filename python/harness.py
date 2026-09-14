@@ -5,18 +5,21 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import functools
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Sequence
 
 # ── Configuration ─────────────────────────────────────────────────
 
@@ -32,6 +35,12 @@ BASELINE_FILE = ".harness-baseline"
 SUPPRESSION_BASELINE_PREFIX = "suppressions."
 ARCH_CONFIGS = (".importlinter",)
 ARCH_CONFIG_ALLOW_ENV = "HARNESS_ALLOW_ARCH_CONFIG"
+PROTECTED_BRANCHES = ("main", "master")
+PROTECTED_PUSH_ALLOW_ENV = "HARNESS_ALLOW_PROTECTED_PUSH"
+PRE_PUSH_REFS_ENV = "HARNESS_PRE_PUSH_REFS"
+PRE_PUSH_STDIN_TIMEOUT = 1.0
+ARCH_BASE_ENV = "HARNESS_ARCH_BASE"
+ARCH_BASE_CANDIDATES = ("origin/main", "origin/master")
 
 # ── Hook wiring (installed by `setup-hooks`) ──────────────────────
 # Claude reads .claude/settings.json and runs the harness directly; Codex reads
@@ -618,33 +627,95 @@ def _changed_paths_from_base() -> list[str]:
     return paths
 
 
-def _changed_paths_from_pre_push_stdin() -> list[str]:
+@dataclasses.dataclass(frozen=True)
+class PrePushRefs:
+    """What a push is about to do: `<local ref> <local sha> <remote ref> <remote sha>` lines.
+
+    `incomplete` means data started arriving on stdin but never finished — the guards
+    fail rather than guess from the current branch.
+    """
+
+    lines: tuple[str, ...] = ()
+    incomplete: bool = False
+
+
+def _parse_pre_push_refs(text: str) -> PrePushRefs:
+    return PrePushRefs(tuple(line for line in text.splitlines() if len(line.split()) >= 4))
+
+
+def _read_pre_push_stdin() -> PrePushRefs:
+    """Read stdin under a deadline bounding the whole read, not just the first byte.
+
+    A deadline hit with nothing received is taken as "not a hook invocation" (an idle
+    pipe under an agent tool) and falls back to the current branch: git writes its ref
+    lines immediately, and dispatchers that already drained stdin pass PRE_PUSH_REFS_ENV.
+    A hook whose writer is slower than the deadline therefore degrades to that check.
+    """
+    deadline = time.monotonic() + PRE_PUSH_STDIN_TIMEOUT
+    fd = sys.stdin.fileno()
+    received = b""
+    while True:
+        remaining = deadline - time.monotonic()
+        ready = select.select([fd], [], [], remaining)[0] if remaining > 0 else []
+        if not ready:
+            # Nothing yet means an idle pipe (no refs); a stalled partial read is fatal.
+            return PrePushRefs(incomplete=bool(received.strip()))
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return _parse_pre_push_refs(received.decode("utf-8", errors="replace"))
+        received += chunk
+
+
+@functools.cache
+def _pre_push_refs() -> PrePushRefs:
+    """Resolve the push destinations once per process; both push guards share the result.
+
+    PRE_PUSH_REFS_ENV wins — dispatchers export it for child harnesses, whose own stdin
+    is already exhausted. Otherwise the git hook's stdin: absent on a manual run (tty),
+    often an idle pipe under an agent tool.
+    """
+    env_refs = os.environ.get(PRE_PUSH_REFS_ENV, "")
+    if env_refs.strip():
+        return _parse_pre_push_refs(env_refs)
     if sys.stdin.isatty():
-        return []
-    text = sys.stdin.read()
-    if not text.strip():
-        return []
+        return PrePushRefs()
+    return _read_pre_push_stdin()
+
+
+def _report_incomplete_refs() -> bool:
+    print(f"  {RED}✗{RESET} Pre-push refs incomplete after {PRE_PUSH_STDIN_TIMEOUT:g}s")
+    print(f"  ↳ fix: rerun the push, or pass the refs via {PRE_PUSH_REFS_ENV}")
+    return False
+
+
+def _new_branch_paths(local_sha: str) -> list[str]:
+    """Paths a branch git has never seen changes: the whole branch, not just its tip."""
+    for base in (*ARCH_BASE_CANDIDATES, os.environ.get(ARCH_BASE_ENV, "")):
+        if not base or not _git_lines(["rev-parse", "--verify", base]):
+            continue
+        merge_base = _git_lines(["merge-base", base, local_sha])
+        if not merge_base:
+            continue
+        return _git_lines([
+            "diff",
+            "--name-only",
+            "--diff-filter=d",
+            f"{merge_base[0]}..{local_sha}",
+            "--",
+            ".",
+        ])
+    return _git_lines(["diff-tree", "--no-commit-id", "--name-only", "-r", local_sha, "--", "."])
+
+
+def _changed_paths_from_pre_push_refs() -> list[str]:
     zero = "0" * 40
     paths: list[str] = []
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        _, local_sha, _, remote_sha = parts[:4]
+    for line in _pre_push_refs().lines:
+        _, local_sha, _, remote_sha = line.split()[:4]
         if local_sha == zero:
             continue
         if remote_sha == zero:
-            paths.extend(
-                _git_lines([
-                    "diff-tree",
-                    "--no-commit-id",
-                    "--name-only",
-                    "-r",
-                    local_sha,
-                    "--",
-                    ".",
-                ])
-            )
+            paths.extend(_new_branch_paths(local_sha))
         else:
             paths.extend(
                 _git_lines([
@@ -661,7 +732,7 @@ def _changed_paths_from_pre_push_stdin() -> list[str]:
 
 
 def _changed_arch_configs(
-    *, staged: bool = False, include_pre_push_stdin: bool = False
+    *, staged: bool = False, include_pre_push_refs: bool = False
 ) -> list[str]:
     paths: list[str] = []
     if staged:
@@ -671,8 +742,8 @@ def _changed_arch_configs(
         paths.extend(_git_lines(["diff", "--cached", "--name-only", "--diff-filter=d", "--", "."]))
         paths.extend(_git_lines(["ls-files", "--others", "--exclude-standard", "--", "."]))
         paths.extend(_changed_paths_from_base())
-    if include_pre_push_stdin:
-        paths.extend(_changed_paths_from_pre_push_stdin())
+    if include_pre_push_refs:
+        paths.extend(_changed_paths_from_pre_push_refs())
 
     protected = set(ARCH_CONFIGS)
     prefix = _git_prefix()
@@ -688,9 +759,11 @@ def _check_arch_config_guard(
     *,
     warn_only: bool = False,
     staged: bool = False,
-    include_pre_push_stdin: bool = False,
+    include_pre_push_refs: bool = False,
 ) -> bool:
-    changed = _changed_arch_configs(staged=staged, include_pre_push_stdin=include_pre_push_stdin)
+    if include_pre_push_refs and _pre_push_refs().incomplete:
+        return _report_incomplete_refs()
+    changed = _changed_arch_configs(staged=staged, include_pre_push_refs=include_pre_push_refs)
     if not changed:
         print(f"  {GREEN}✓{RESET} Arch config guard")
         return True
@@ -712,6 +785,54 @@ def _check_arch_config_guard(
 def cmd_arch_config_guard() -> None:
     ok = _check_arch_config_guard(warn_only="--warn" in sys.argv, staged="--staged" in sys.argv)
     if not ok:
+        sys.exit(1)
+
+
+def _protected_push_branch(ref_lines: Sequence[str], current_branch: str) -> str | None:
+    """Protected branch this push writes to, or None.
+
+    Ref lines win when present — including deletions (zero local sha), which are the
+    most destructive write of all. Only `refs/heads/*` remote refs count, so tags never
+    match. With no ref lines the current branch decides.
+    """
+    if not ref_lines:
+        return current_branch if current_branch in PROTECTED_BRANCHES else None
+    for line in ref_lines:
+        remote_ref = line.split()[2]
+        if not remote_ref.startswith("refs/heads/"):
+            continue
+        branch = remote_ref.removeprefix("refs/heads/")
+        if branch in PROTECTED_BRANCHES:
+            return branch
+    return None
+
+
+def _current_branch() -> str:
+    lines = _git_lines(["rev-parse", "--abbrev-ref", "HEAD"])
+    return lines[0] if lines else ""
+
+
+def _check_branch_guard() -> bool:
+    refs = _pre_push_refs()
+    if refs.incomplete:
+        return _report_incomplete_refs()
+    target = _protected_push_branch(refs.lines, _current_branch())
+    if target is None:
+        print(f"  {GREEN}✓{RESET} Branch guard")
+        return True
+    if os.environ.get(PROTECTED_PUSH_ALLOW_ENV) == "1":
+        print(f"  {GREEN}⚠{RESET} Branch guard override: {target}")
+        return True
+    print(f"  {RED}✗{RESET} Push targets protected branch: {target}")
+    print(
+        "  ↳ fix: push a feature branch and open a PR; "
+        f"humans may set {PROTECTED_PUSH_ALLOW_ENV}=1"
+    )
+    return False
+
+
+def cmd_branch_guard() -> None:
+    if not _check_branch_guard():
         sys.exit(1)
 
 
@@ -977,6 +1098,14 @@ def cmd_agents_md_drift() -> None:
     _check_agents_md_drift()
 
 
+def _agents_md_drift_gate() -> Gate:
+    return Gate(
+        "Agents drift",
+        ["uv", "run", "harness", "agents-md-drift"],
+        "run `harness sync-agents-md`",
+    )
+
+
 def cmd_check() -> None:
     """Fix, format, typecheck, and test the full repo."""
     print("\n=== Quality Checks ===\n")
@@ -1000,8 +1129,7 @@ def cmd_pre_commit() -> None:
         return
 
     print("\n=== Pre-commit Checks ===\n")
-    if not _check_arch_config_guard(staged=True):
-        sys.exit(1)
+    _check_arch_config_guard(warn_only=True, staged=True)
     cmd_fix(files)
     cmd_format(files)
     cmd_typecheck()
@@ -1015,9 +1143,9 @@ def cmd_ci() -> None:
     """Run full read-only verification.
 
     Read-only gates run as a parallel batch (lint, format check, typecheck, audit,
-    complexity, deadcode, acceptance, arch) — captured and printed in submission order,
-    run to completion so one pass surfaces every failure. Coverage and CRAP run after
-    the batch: coverage is captured, CRAP is advisory unless --enforce.
+    complexity, deadcode, agents-md drift, acceptance, arch) — captured and printed in
+    submission order, run to completion so one pass surfaces every failure. Coverage and
+    CRAP run after the batch: coverage is captured, CRAP is advisory unless --enforce.
     """
     print("\n=== CI Checks ===\n")
     gates = [
@@ -1027,6 +1155,7 @@ def cmd_ci() -> None:
         _audit_gate(),
         _complexity_gate(),
         _deadcode_gate(),
+        _agents_md_drift_gate(),
         *_acceptance_gates_or_warn(),
         *_arch_gates_or_warn(),
     ]
@@ -1043,19 +1172,22 @@ def cmd_pre_push() -> None:
 
     pre-commit covers fix/format/typecheck/test on staged files; stop-hook adds
     complexity. This fills the gap with the deterministic, offline gates none of them
-    run — lint, format check, acceptance, arch — validating the whole pushed tree
-    (after merges/rebases/--no-verify, which pre-commit may never have seen) before it
-    leaves the machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
+    run — lint, format check, agents-md drift, acceptance, arch — validating the whole
+    pushed tree (after merges/rebases/--no-verify, which pre-commit may never have seen)
+    before it leaves the machine. Network (audit) and advisory (coverage/CRAP) gates
+    stay in ci.
     """
     print("\n=== Pre-push Checks ===\n")
-    arch_config_ok = _check_arch_config_guard(include_pre_push_stdin=True)
+    branch_ok = _check_branch_guard()
+    arch_config_ok = _check_arch_config_guard(include_pre_push_refs=True)
     gates = [
         _lint_gate(),
         _format_check_gate(),
+        _agents_md_drift_gate(),
         *_acceptance_gates_or_warn(),
         *_arch_gates_or_warn(),
     ]
-    _exit_if_failed(run_gates_parallel(gates) and arch_config_ok)
+    _exit_if_failed(run_gates_parallel(gates) and arch_config_ok and branch_ok)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -1215,8 +1347,15 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "test": (cmd_test, "Run tests, or syntax check when no tests exist"),
     "check": (cmd_check, "Fix + format + typecheck + test (full repo)"),
     "pre-commit": (cmd_pre_commit, "Staged checks + tests"),
-    "pre-push": (cmd_pre_push, "Read-only push gate: lint, format check, acceptance, arch"),
-    "ci": (cmd_ci, "Full verification: lint, typecheck, tests, acceptance, coverage, crap, arch"),
+    "pre-push": (
+        cmd_pre_push,
+        "Read-only push gate: branch guard, lint, format check, agents-md drift, acceptance, arch",
+    ),
+    "ci": (
+        cmd_ci,
+        "Full verification: lint, typecheck, tests, acceptance, coverage, crap, arch, "
+        "agents-md drift",
+    ),
     "audit": (cmd_audit, "Audit dependencies for known vulnerabilities"),
     "acceptance": (cmd_acceptance, "Run acceptance scenarios (behave)"),
     "coverage": (cmd_coverage, "Tests with coverage threshold (--min=N)"),
@@ -1227,6 +1366,7 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "deadcode": (cmd_deadcode, "Detect unused (dead) code with vulture (app sources only)"),
     "arch": (cmd_arch, "Architecture checks (import-linter)"),
     "arch-config-guard": (cmd_arch_config_guard, "Block unreviewed arch config changes"),
+    "branch-guard": (cmd_branch_guard, "Refuse pushes to protected branches (main/master)"),
     "post-edit": (cmd_post_edit, "Format if source files changed"),
     "stop-hook": (cmd_stop_hook, "Format changed files, then run stop-hook checks"),
     "agents-md-drift": (cmd_agents_md_drift, "Fail if AGENTS.md differs from CLAUDE.md"),

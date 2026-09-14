@@ -11,6 +11,7 @@ import {
   isQualityTsFile,
   isTestFile,
   porcelainPath,
+  protectedPushTarget,
   qualityTargets,
   runGatesParallel,
 } from '../harness';
@@ -122,5 +123,42 @@ describe('parallel gate runner', () => {
 
   test('empty batch passes', async () => {
     expect(await runGatesParallel([])).toBe(true);
+  });
+});
+
+describe('branch guard decision', () => {
+  const ZERO = '0000000000000000000000000000000000000000';
+
+  test('pre-push ref lines decide the target', () => {
+    expect(protectedPushTarget('refs/heads/x abc123 refs/heads/main def456\n', 'feature')).toBe(
+      'main',
+    );
+    expect(protectedPushTarget('refs/heads/x abc123 refs/heads/master def456\n', 'feature')).toBe(
+      'master',
+    );
+    expect(protectedPushTarget('refs/heads/x abc123 refs/heads/feature def456\n', 'main')).toBe(
+      null,
+    );
+  });
+
+  test('deleting a protected branch still counts as protected', () => {
+    expect(protectedPushTarget(`(delete) ${ZERO} refs/heads/main def456\n`, 'feature')).toBe(
+      'main',
+    );
+    expect(protectedPushTarget(`(delete) ${ZERO} refs/heads/feature def456\n`, 'feature')).toBe(
+      null,
+    );
+  });
+
+  test('non-branch refs never match', () => {
+    expect(protectedPushTarget('refs/tags/main abc123 refs/tags/main def456\n', 'feature')).toBe(
+      null,
+    );
+  });
+
+  test('falls back to the current branch without ref lines', () => {
+    expect(protectedPushTarget('', 'main')).toBe('main');
+    expect(protectedPushTarget('   \n', 'master')).toBe('master');
+    expect(protectedPushTarget('', 'feature/guard')).toBe(null);
   });
 });

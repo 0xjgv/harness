@@ -77,6 +77,24 @@ define SH_ARCH_CONFIG_GUARD
 arch_config_filter() {
   grep -E '(^|/)(\.importlinter|\.dependency-cruiser\.json|\.go-arch-lint\.yml|arch\.toml)$$' | sort -u
 }
+arch_base_ref() {
+  local ref
+  for ref in origin/main origin/master "$${HARNESS_ARCH_BASE:-}"; do
+    [ -z "$$ref" ] && continue
+    git rev-parse --verify --quiet "$$ref" >/dev/null 2>&1 && { printf '%s' "$$ref"; return 0; }
+  done
+  return 1
+}
+arch_config_new_branch_paths() {
+  local local_sha="$$1" base="" mb=""
+  base=$$(arch_base_ref) || base=""
+  [ -n "$$base" ] && mb=$$(git merge-base "$$base" "$$local_sha" 2>/dev/null || true)
+  if [ -n "$$mb" ]; then
+    git diff --name-only --diff-filter=d "$$mb" "$$local_sha" 2>/dev/null || true
+  else
+    git diff-tree --no-commit-id --name-only -r "$$local_sha" 2>/dev/null || true
+  fi
+}
 arch_config_changed_paths() {
   local staged="$$1" include_pre_push="$$2" base=""
   if [ "$$staged" = 1 ]; then
@@ -101,7 +119,7 @@ arch_config_changed_paths() {
       [ -z "$$local_sha" ] && continue
       [ "$$local_sha" = "$$zero" ] && continue
       if [ "$$remote_sha" = "$$zero" ]; then
-        git diff-tree --no-commit-id --name-only -r "$$local_sha" 2>/dev/null || true
+        arch_config_new_branch_paths "$$local_sha"
       else
         git diff --name-only --diff-filter=d "$$remote_sha" "$$local_sha" 2>/dev/null || true
       fi
@@ -132,6 +150,67 @@ arch_config_guard() {
 endef
 export SH_ARCH_CONFIG_GUARD
 
+define SH_BRANCH_GUARD
+# Pre-push refs source, resolved once per process: HARNESS_PRE_PUSH_REFS (set by a
+# dispatcher for child harnesses), else stdin when it is not a tty. The stdin read has
+# a 1s deadline covering the whole read: an idle pipe yields no refs (manual run), but
+# a pipe that delivered data and stalled yields the line `__INCOMPLETE__` — never a
+# current-branch guess. (macOS bash 3.2 cannot tell a `read -t` timeout from EOF, hence
+# the background `cat` + poll.)
+read_pre_push_refs() {
+  local tmp pid i
+  if [ -n "$${HARNESS_PRE_PUSH_REFS:-}" ]; then
+    printf '%s\n' "$$HARNESS_PRE_PUSH_REFS"
+    return 0
+  fi
+  [ -t 0 ] && return 0
+  tmp=$$(mktemp); exec 3<&0; cat <&3 >"$$tmp" & pid=$$!
+  for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$$pid" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$$pid" 2>/dev/null; then
+    kill "$$pid" 2>/dev/null; wait "$$pid" 2>/dev/null
+    [ -s "$$tmp" ] && printf '__INCOMPLETE__\n'
+  else
+    wait "$$pid" 2>/dev/null; cat "$$tmp"
+  fi
+  exec 3<&-; rm -f "$$tmp"; return 0
+}
+refs_incomplete() {
+  printf "  $(RED)✗$(RESET) Pre-push refs incomplete after 1s\n"
+  printf "  ↳ fix: rerun from the git pre-push hook, or pass HARNESS_PRE_PUSH_REFS\n"
+  return 1
+}
+branch_guard() {
+  local l_ref l_sha r_ref r_sha saw=0 target="" branch="" refs=""
+  if [ ! -t 0 ]; then
+    refs=$$(cat)
+    case "$$refs" in *__INCOMPLETE__*) refs_incomplete; return 1 ;; esac
+    while read -r l_ref l_sha r_ref r_sha; do
+      [ -z "$$l_ref$$l_sha$$r_ref$$r_sha" ] && continue
+      saw=1
+      case "$$r_ref" in
+        refs/heads/main|refs/heads/master) target="$${r_ref#refs/heads/}" ;;
+      esac
+    done <<< "$$refs"
+  fi
+  if [ "$$saw" = 0 ]; then
+    branch=$$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    case "$$branch" in main|master) target="$$branch" ;; esac
+  fi
+  if [ -z "$$target" ]; then
+    printf "  $(GREEN)✓$(RESET) Branch guard\n"
+    return 0
+  fi
+  if [ "$${HARNESS_ALLOW_PROTECTED_PUSH:-}" = 1 ]; then
+    printf "  $(GREEN)⚠$(RESET) Branch guard override: %s\n" "$$target"
+    return 0
+  fi
+  printf "  $(RED)✗$(RESET) Push targets protected branch: %s\n" "$$target"
+  printf "  ↳ fix: push a feature branch and open a PR; humans may set HARNESS_ALLOW_PROTECTED_PUSH=1\n"
+  return 1
+}
+endef
+export SH_BRANCH_GUARD
+
 ##@ Daily
 
 .PHONY: check
@@ -152,7 +231,7 @@ check-dirty: ## Run check only in subprojects with working-tree changes
 .PHONY: pre-commit
 pre-commit: ## Staged-only checks across affected subprojects
 	@set -u -o pipefail; eval "$$SH_FILTER_DIRS"; \
-	eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 1 0 0 || exit 1; \
+	eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 1 1 0; \
 	dirs=$$(staged_dirs); \
 	staged_root=$$(git diff --cached --name-only --diff-filter=d | grep -E '^(CLAUDE|AGENTS)\.md$$' || true); \
 	if [ -n "$$staged_root" ]; then \
@@ -165,13 +244,29 @@ pre-commit: ## Staged-only checks across affected subprojects
 
 .PHONY: ci
 ci: ## Read-only gate across all subprojects
+	@$(MAKE) --no-print-directory _root_agents_drift || exit 1
 	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 0 0 0
 	@$(MAKE) --no-print-directory _run CMD=ci DIRS="$(SUBPROJECTS)"
 
 .PHONY: pre-push
-pre-push: ## Read-only push gate across all subprojects (lint, format check, acceptance, arch)
-	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 0 0 1
-	@$(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)"
+pre-push: ## Read-only push gate across all subprojects (branch guard, lint, format check, acceptance, arch, agents-md drift)
+	@set -u -o pipefail; \
+	eval "$$SH_BRANCH_GUARD"; eval "$$SH_ARCH_CONFIG_GUARD"; \
+	refs=$$(read_pre_push_refs); \
+	case "$$refs" in *__INCOMPLETE__*) refs_incomplete; exit 1 ;; esac; \
+	rc=0; \
+	printf '%s\n' "$$refs" | branch_guard || rc=1; \
+	printf '%s\n' "$$refs" | arch_config_guard 0 0 1 || rc=1; \
+	$(MAKE) --no-print-directory _root_agents_drift || rc=1; \
+	[ $$rc -eq 0 ] || exit 1; \
+	[ -n "$$refs" ] && export HARNESS_PRE_PUSH_REFS="$$refs"; \
+	$(MAKE) --no-print-directory _run CMD=pre-push DIRS="$(SUBPROJECTS)"
+
+.PHONY: branch-guard
+branch-guard: ## Refuse pushes to (or deletions of) main/master; HARNESS_ALLOW_PROTECTED_PUSH=1 overrides
+	@set -u -o pipefail; eval "$$SH_BRANCH_GUARD"; \
+	refs=$$(read_pre_push_refs); \
+	printf '%s\n' "$$refs" | branch_guard
 
 .PHONY: test
 test: ## Run tests only, all subprojects

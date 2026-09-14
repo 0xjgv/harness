@@ -1,7 +1,8 @@
 # behavior-contract
 
-Layer 2 of the harness: instruction text plus an integration guard for
-architecture config changes. Greenfield template copies include it by default.
+Layer 2 of the harness: instruction text plus two integration guards, one for
+architecture config changes and one for pushes to protected branches.
+Greenfield template copies include it by default.
 For an existing repo, port it when the user wants the full behavior contract.
 
 Source files:
@@ -20,20 +21,33 @@ The contract lives in two places that must agree:
   byte-for-byte. The templates' `agents-md-drift` check enforces no drift,
   and `sync-agents-md` writes `AGENTS.md <- CLAUDE.md` after edits.
 - The runner command `arch-config-guard` — a portable git-based guard that
-  detects protected architecture config changes. It warns during `check` and
-  `stop-hook`; it fails `pre-commit`, `pre-push`, and `ci` unless
+  detects protected architecture config changes. It warns during `check`,
+  `pre-commit`, and `stop-hook`; it fails `pre-push` and `ci` unless
   `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+- The runner command `branch-guard` — refuses direct pushes to, or deletions
+  of, `main`/`master`. It runs first in `pre-push`, reads
+  `HARNESS_PRE_PUSH_REFS`, else the git pre-push stdin refs, else the current
+  branch, and passes with `HARNESS_ALLOW_PROTECTED_PUSH=1`. It stops
+  accidents, not intent: `git push --no-verify`, local merges, and hosted
+  merges bypass it, so merge ownership stays a rule the agent follows unless
+  server-side branch protection enforces it.
 
 | Rule | Contract says | Mechanical enforcement |
 |---|---|---|
-| Task sizing | <=5 sub-tasks, each <=1 non-test file + <=1 test | instruction only |
-| Human owns commits | no `git commit`/`push` unless the prompt asked | instruction only |
-| Gherkin-first | `.feature` -> approval -> step defs -> impl for behavior changes | instruction only |
-| Arch config review | no silent arch-config changes | `arch-config-guard` blocks integration |
+| Plan first | open with sub-tasks + files, then execute in the same turn | instruction only |
+| Human owns merge | commit/push on a feature branch; never `main`/`master`, force-push, or merge | `branch-guard` blocks direct pushes in `pre-push`; merge itself is instruction (or server branch protection) |
+| Specify what is worth specifying | `.feature` + step defs + impl in one turn for user-visible flows, law-like rules, and cross-component contracts; unit tests suffice for the rest; review judges | instruction only |
+| Arch config review | no silent arch-config changes; own commit with rationale | `arch-config-guard` blocks push/CI |
 
-There are no Claude-only prompt classifiers or pre-tool edit/commit gates. The
-agent can work without prompt-state approval machinery; integration commands
-still catch protected architecture config changes before commit, push, or CI.
+The rules are outcome checks, not process gates: nothing stops the agent
+mid-turn to wait for approval. The bet is that review of a branch catches a
+misread of intent at least as well as a mid-turn question did, and costs a
+capable agent far fewer turns; the contract therefore no longer caps files
+per sub-task or asks before editing when a classification is unclear. The
+agent states its plan and classification and proceeds, and the human reviews
+the branch. The one remaining pre-publication approval is the arch config
+guard. There are no Claude-only prompt classifiers or pre-tool edit/commit
+gates.
 
 ## Arch config guard
 
@@ -58,10 +72,35 @@ Stage wiring:
 
 - `check`: warning mode.
 - `stop-hook`: warning mode.
-- `pre-commit`: strict staged mode.
+- `pre-commit`: warning mode over staged paths.
 - `pre-push`: strict mode, including git pre-push stdin refs when available.
 - `ci`: strict mode. GitHub Actions checkout uses `fetch-depth: 0` so PR runs
   can compare `origin/$GITHUB_BASE_REF...HEAD`.
+
+## Branch guard
+
+Every template exposes `branch-guard` through its runner (`uv run harness
+branch-guard`, `bun harness.ts branch-guard`, `go run harness.go
+branch-guard`, `cargo harness branch-guard`, `make branch-guard`).
+
+- Protected: `main`, `master`.
+- Ref source, in order: `HARNESS_PRE_PUSH_REFS` (set by dispatchers such as
+  the monorepo Makefile so child harnesses see the real destinations), else
+  git pre-push stdin lines (`<local ref> <local sha> <remote ref> <remote
+  sha>`), else the current branch.
+- A push is protected when any remote ref is `refs/heads/main` or
+  `refs/heads/master`, including deletions (all-zero local sha). Tags and
+  other non-branch refs never match.
+- Stdin is read at most once per `pre-push` and shared with the arch guard.
+  The read has a one-second deadline: empty EOF or an idle pipe (agent
+  tools, CI) means no refs and falls back to the current branch; data that
+  arrives without EOF inside the deadline is incomplete and fails both
+  guards (`✗ Pre-push refs incomplete after 1s`) rather than guessing.
+- `HARNESS_ALLOW_PROTECTED_PUSH=1`: explicit human override (solo repos that
+  push straight to `main` export it once). Tests that spawn the harness strip
+  it so an ambient override cannot flip a refusal scenario.
+- Wired first in `pre-push` only; a refusal fails `pre-push` before any other
+  gate runs.
 
 ## Existing repo port
 
@@ -72,9 +111,10 @@ When the user asks for the behavior contract in an existing repo:
 2. Add `agents-md-drift` and `sync-agents-md` so the two files stay identical.
 3. Add `arch-config-guard` for the repo's real architecture config path, or
    skip it explicitly if the repo has no architecture config.
-4. Wire the guard into `check`/`stop-hook` as warning mode and into
-   `pre-commit`/`pre-push`/`ci` as strict mode.
-5. Keep Claude and Codex Stop hook wiring from [settings-json.md](settings-json.md).
+4. Wire the guard into `check`/`pre-commit`/`stop-hook` as warning mode and
+   into `pre-push`/`ci` as strict mode.
+5. Add `branch-guard` and run it first in `pre-push`.
+6. Keep Claude and Codex Stop hook wiring from [settings-json.md](settings-json.md).
 
 Do not add `.claude/scripts/` behavior hooks; the templates no longer use
 SessionStart, UserPromptSubmit, or PreToolUse gates.
@@ -83,11 +123,13 @@ SessionStart, UserPromptSubmit, or PreToolUse gates.
 
 Tell the user:
 
-- "The agent is instructed not to `git commit`/`push` unless your prompt asks
-  for it; this is instruction, not a pre-tool denial."
-- "Architecture config changes warn during `check`/`stop-hook` and fail
-  `pre-commit`/`pre-push`/`ci` unless reviewed with
-  `HARNESS_ALLOW_ARCH_CONFIG=1`."
+- "The agent commits and pushes on feature branches and opens PRs. Merge is
+  yours. `pre-push` refuses `main`/`master`; if you push straight to `main`
+  yourself, export `HARNESS_ALLOW_PROTECTED_PUSH=1`."
+- "Architecture config changes warn during `check`/`pre-commit`/`stop-hook`
+  and fail `pre-push`/`ci` unless reviewed with `HARNESS_ALLOW_ARCH_CONFIG=1`.
+  The agent is told to isolate such a change in its own commit and report
+  the refused push to you."
 - "A guard failure means the arch config changed and needs review; either undo
   it or rerun the integration command with the override after review."
 
@@ -101,6 +143,15 @@ Tell the user:
    `HARNESS_ALLOW_ARCH_CONFIG=1`.
 5. `HARNESS_ALLOW_ARCH_CONFIG=1 <runner> arch-config-guard` passes and prints
    the override line.
-6. `check` and `stop-hook` warn on protected config changes.
-7. `pre-commit`, `pre-push`, and `ci` fail on protected config changes unless
-   the override is set.
+6. `check`, `pre-commit`, and `stop-hook` warn on protected config changes.
+7. `pre-push` and `ci` fail on protected config changes unless the override
+   is set.
+8. `branch-guard` fails on `main`, passes with
+   `HARNESS_ALLOW_PROTECTED_PUSH=1`, passes with a feature-branch ref on
+   stdin, refuses deletion of `main`, honours `HARNESS_PRE_PUSH_REFS`,
+   returns within ~1s on an idle pipe (`sleep 5 | <runner> branch-guard`),
+   and fails on partial input (`(printf 'a b refs/heads/x d'; sleep 5) |
+   <runner> branch-guard`).
+9. On a new-branch push (all-zero remote sha) the arch guard diffs the whole
+   branch against its merge-base with `origin/main`/`origin/master`, not the
+   tip commit: two commits, arch change in the first, still reported.

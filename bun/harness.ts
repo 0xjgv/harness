@@ -29,6 +29,10 @@ const BASELINE_FILE = '.harness-baseline';
 const SUPPRESSION_BASELINE_PREFIX = 'suppressions.';
 const ARCH_CONFIGS = ['.dependency-cruiser.json'] as const;
 const ARCH_CONFIG_ALLOW_ENV = 'HARNESS_ALLOW_ARCH_CONFIG';
+const PROTECTED_BRANCHES = ['main', 'master'] as const;
+const PROTECTED_PUSH_ALLOW_ENV = 'HARNESS_ALLOW_PROTECTED_PUSH';
+const PRE_PUSH_REFS_ENV = 'HARNESS_PRE_PUSH_REFS';
+const PRE_PUSH_STDIN_WAIT_MS = 1000;
 
 // ── Hook wiring (installed by `setup-hooks`) ────────────────────────
 // Claude reads .claude/settings.json and runs the harness directly; Codex reads
@@ -721,29 +725,93 @@ async function changedPathsFromBase(): Promise<string[]> {
   return paths;
 }
 
-async function changedPathsFromPrePushStdin(): Promise<string[]> {
-  if (process.stdin.isTTY) return [];
-  const text = await new Response(Bun.stdin.stream()).text();
-  if (text.trim() === '') return [];
+// Pre-push refs (`<local ref> <local sha> <remote ref> <remote sha>`) reach the
+// harness once per process: from PRE_PUSH_REFS_ENV when a dispatcher forwards them,
+// else from git's pre-push stdin. Both guards consume the same resolved result.
+type PrePushRefs = { state: 'refs'; text: string } | { state: 'none' } | { state: 'incomplete' };
+
+let prePushRefsCache: PrePushRefs | null = null;
+
+// Agent tools and CI hand the process an open, silent stdin pipe, so a plain read
+// would hang. The deadline bounds the whole read, and partial input is a hard
+// failure: half a ref list would silently under-report what is being pushed.
+function readRefsFromStdin(): Promise<PrePushRefs> {
+  return new Promise((resolve) => {
+    const chunks: string[] = [];
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (timedOut: boolean): void => {
+      clearTimeout(timer);
+      process.stdin.pause();
+      const text = chunks.join('');
+      if (timedOut && text !== '') resolve({ state: 'incomplete' });
+      else if (text.trim() === '') resolve({ state: 'none' });
+      else resolve({ state: 'refs', text });
+    };
+    timer = setTimeout(() => finish(true), PRE_PUSH_STDIN_WAIT_MS);
+    // Bun gives redirected stdin a stream without unref; guard the call.
+    (process.stdin as { unref?: () => void }).unref?.();
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk: string) => chunks.push(chunk));
+    process.stdin.on('end', () => finish(false));
+    process.stdin.on('error', () => finish(false));
+  });
+}
+
+async function prePushRefs(): Promise<PrePushRefs> {
+  if (prePushRefsCache !== null) return prePushRefsCache;
+  const forwarded = process.env[PRE_PUSH_REFS_ENV];
+  if (forwarded !== undefined && forwarded !== '') {
+    prePushRefsCache = { state: 'refs', text: forwarded };
+  } else if (process.stdin.isTTY) {
+    prePushRefsCache = { state: 'none' };
+  } else {
+    prePushRefsCache = await readRefsFromStdin();
+  }
+  return prePushRefsCache;
+}
+
+function parseRefLines(text: string): string[][] {
+  return text
+    .split('\n')
+    .map((line) => line.trim().split(/\s+/))
+    .filter((parts) => parts.length >= 4);
+}
+
+async function archDiffBase(): Promise<string | null> {
+  for (const ref of ['origin/main', 'origin/master', process.env.HARNESS_ARCH_BASE]) {
+    if (!ref) continue;
+    if ((await gitLines(['rev-parse', '--verify', ref])).length > 0) return ref;
+  }
+  return null;
+}
+
+// A new branch has no remote sha to diff against. Its tip commit is not the change
+// set, so compare the whole branch — merge-base with the integration branch — and
+// only fall back to the tip when no integration branch is known.
+async function changedPathsForNewBranch(localSha: string): Promise<string[]> {
+  const base = await archDiffBase();
+  const [mergeBase] = base === null ? [] : await gitLines(['merge-base', base, localSha]);
+  if (mergeBase !== undefined) {
+    return await gitLines([
+      'diff',
+      '--name-only',
+      '--diff-filter=d',
+      `${mergeBase}..${localSha}`,
+      '--',
+      '.',
+    ]);
+  }
+  return await gitLines(['diff-tree', '--no-commit-id', '--name-only', '-r', localSha, '--', '.']);
+}
+
+async function changedPathsFromRefs(refs: PrePushRefs): Promise<string[]> {
+  if (refs.state !== 'refs') return [];
   const zero = '0'.repeat(40);
   const paths: string[] = [];
-  for (const line of text.split('\n')) {
-    const parts = line.trim().split(/\s+/);
-    if (parts.length < 4) continue;
-    const [, localSha, , remoteSha] = parts;
-    if (localSha === zero) continue;
+  for (const [, localSha, , remoteSha] of parseRefLines(refs.text)) {
+    if (localSha === zero) continue; // deletion pushes no content to inspect
     if (remoteSha === zero) {
-      paths.push(
-        ...(await gitLines([
-          'diff-tree',
-          '--no-commit-id',
-          '--name-only',
-          '-r',
-          localSha,
-          '--',
-          '.',
-        ])),
-      );
+      paths.push(...(await changedPathsForNewBranch(localSha)));
     } else {
       paths.push(
         ...(await gitLines([
@@ -762,7 +830,7 @@ async function changedPathsFromPrePushStdin(): Promise<string[]> {
 }
 
 async function changedArchConfigs(
-  opts: { staged?: boolean; includePrePushStdin?: boolean } = {},
+  opts: { staged?: boolean; refs?: PrePushRefs } = {},
 ): Promise<string[]> {
   const paths: string[] = [];
   if (opts.staged) {
@@ -777,7 +845,7 @@ async function changedArchConfigs(
     paths.push(...(await gitLines(['ls-files', '--others', '--exclude-standard', '--', '.'])));
     paths.push(...(await changedPathsFromBase()));
   }
-  if (opts.includePrePushStdin) paths.push(...(await changedPathsFromPrePushStdin()));
+  if (opts.refs) paths.push(...(await changedPathsFromRefs(opts.refs)));
 
   const protectedPaths = new Set<string>(ARCH_CONFIGS);
   const prefix = await gitPrefix();
@@ -787,12 +855,10 @@ async function changedArchConfigs(
 }
 
 async function checkArchConfigGuard(
-  opts: { warnOnly?: boolean; staged?: boolean; includePrePushStdin?: boolean } = {},
+  opts: { warnOnly?: boolean; staged?: boolean; refs?: PrePushRefs } = {},
 ): Promise<boolean> {
-  const changed = await changedArchConfigs({
-    staged: opts.staged,
-    includePrePushStdin: opts.includePrePushStdin,
-  });
+  if (opts.refs?.state === 'incomplete') return reportIncompleteRefs();
+  const changed = await changedArchConfigs({ staged: opts.staged, refs: opts.refs });
   if (changed.length === 0) {
     console.log(`  ${GREEN}✓${RESET} Arch config guard`);
     return true;
@@ -815,11 +881,69 @@ async function checkArchConfigGuard(
 }
 
 async function cmdArchConfigGuard(): Promise<void> {
+  // Forwarded refs let the standalone guard see the same push the hook would;
+  // without them it stays a worktree/staged check and never touches stdin.
+  const refs = process.env[PRE_PUSH_REFS_ENV] ? await prePushRefs() : undefined;
   const ok = await checkArchConfigGuard({
     warnOnly: process.argv.includes('--warn'),
     staged: process.argv.includes('--staged'),
+    refs,
   });
   if (!ok) process.exit(1);
+}
+
+function isProtectedBranch(name: string): boolean {
+  return (PROTECTED_BRANCHES as readonly string[]).includes(name);
+}
+
+/**
+ * Name of the protected branch a push targets, or null when it targets none.
+ * Pre-push ref lines (`<local ref> <local sha> <remote ref> <remote sha>`) win
+ * when present — deletions included, since dropping `main` is as destructive as
+ * pushing to it. Without ref lines the current branch decides.
+ */
+export function protectedPushTarget(refsText: string, currentBranch: string): string | null {
+  const refLines = parseRefLines(refsText);
+  if (refLines.length === 0) return isProtectedBranch(currentBranch) ? currentBranch : null;
+  for (const [, , remoteRef] of refLines) {
+    if (!remoteRef.startsWith('refs/heads/')) continue;
+    const name = remoteRef.slice('refs/heads/'.length);
+    if (isProtectedBranch(name)) return name;
+  }
+  return null;
+}
+
+function reportIncompleteRefs(): boolean {
+  console.log(
+    `  ${RED}\u2717${RESET} Pre-push refs incomplete after ${PRE_PUSH_STDIN_WAIT_MS / 1000}s`,
+  );
+  console.log('  \u21b3 fix: rerun the push so git hands over the whole ref list');
+  return false;
+}
+
+async function checkBranchGuard(refs: PrePushRefs): Promise<boolean> {
+  if (refs.state === 'incomplete') return reportIncompleteRefs();
+  // Only a push with no refs at all falls back to the checked-out branch.
+  const [branch] =
+    refs.state === 'refs' ? [''] : await gitLines(['rev-parse', '--abbrev-ref', 'HEAD']);
+  const target = protectedPushTarget(refs.state === 'refs' ? refs.text : '', branch ?? '');
+  if (target === null) {
+    console.log(`  ${GREEN}\u2713${RESET} Branch guard`);
+    return true;
+  }
+  if (process.env[PROTECTED_PUSH_ALLOW_ENV] === '1') {
+    console.log(`  ${GREEN}\u26a0${RESET} Branch guard override: ${target}`);
+    return true;
+  }
+  console.log(`  ${RED}\u2717${RESET} Push targets protected branch: ${target}`);
+  console.log(
+    `  \u21b3 fix: push a feature branch and open a PR; humans may set ${PROTECTED_PUSH_ALLOW_ENV}=1`,
+  );
+  return false;
+}
+
+async function cmdBranchGuard(): Promise<void> {
+  if (!(await checkBranchGuard(await prePushRefs()))) process.exit(1);
 }
 
 async function cmdMutation(): Promise<void> {
@@ -1231,6 +1355,14 @@ async function cmdAgentsMdDrift(): Promise<void> {
   await checkAgentsMdDrift();
 }
 
+function agentsMdDriftGate(): Gate {
+  return {
+    description: 'Agents drift',
+    cmd: ['bun', 'harness.ts', 'agents-md-drift'],
+    hint: 'run `bun harness.ts sync-agents-md`',
+  };
+}
+
 async function cmdCheck(): Promise<void> {
   const start = performance.now();
   console.log(`\n${BLUE}[check]${RESET} Running pre-flight checks...\n`);
@@ -1285,7 +1417,7 @@ async function cmdPreCommit(): Promise<void> {
   }
 
   console.log(`\n${BLUE}[pre-commit]${RESET}\n`);
-  if (!(await checkArchConfigGuard({ staged: true }))) process.exit(1);
+  await checkArchConfigGuard({ warnOnly: true, staged: true });
   await cmdFix(files);
   await cmdTypecheck();
   await checkAgentsMdDrift();
@@ -1303,6 +1435,7 @@ async function cmdCi(): Promise<void> {
     lintGate(),
     typecheckGate(),
     auditGate(),
+    agentsMdDriftGate(),
     ...(await complexityGatesOrWarn()),
     deadcodeGate(),
     ...(await acceptanceGatesOrWarn()),
@@ -1320,17 +1453,20 @@ async function cmdPrePush(): Promise<void> {
   // Read-only push gate: the offline checks pre-commit and stop-hook do not run.
   // pre-commit covers fix/format/typecheck/test on staged files; stop-hook adds
   // complexity. This fills the gap with the deterministic, offline gates none of
-  // them run — lint (biome covers format), acceptance, arch — validating the whole
-  // pushed tree (after merges/rebases/--no-verify) before it leaves the machine.
-  // Network (audit) and advisory (coverage/CRAP) gates stay in ci.
+  // them run — lint (biome covers format), agents-md drift, acceptance, arch —
+  // validating the whole pushed tree (after merges/rebases/--no-verify) before it
+  // leaves the machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
   console.log(`\n${BLUE}[pre-push]${RESET}\n`);
-  const archConfigOk = await checkArchConfigGuard({ includePrePushStdin: true });
+  const refs = await prePushRefs();
+  const branchOk = await checkBranchGuard(refs);
+  const archConfigOk = await checkArchConfigGuard({ refs });
   const gates: Gate[] = [
     lintGate(),
+    agentsMdDriftGate(),
     ...(await acceptanceGatesOrWarn()),
     ...(await archGatesOrWarn()),
   ];
-  if (!(await runGatesParallel(gates)) || !archConfigOk) process.exit(1);
+  if (!(await runGatesParallel(gates)) || !archConfigOk || !branchOk) process.exit(1);
 }
 
 async function cmdHooks(): Promise<void> {
@@ -1374,9 +1510,10 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   deadcode: [cmdDeadcode, 'Detect unused files/exports/deps (knip, via bunx)'],
   arch: [cmdArch, 'Architecture checks (dependency-cruiser)'],
   'arch-config-guard': [cmdArchConfigGuard, 'Block unreviewed arch config changes'],
+  'branch-guard': [cmdBranchGuard, 'Refuse pushes to main/master'],
   check: [cmdCheck, 'Full pre-flight: lockfile + fix + typecheck + tests'],
   'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
-  'pre-push': [cmdPrePush, 'Read-only push gate: lint, acceptance, arch'],
+  'pre-push': [cmdPrePush, 'Read-only push gate: branch guard, lint, acceptance, arch'],
   ci: [
     cmdCi,
     'Lint + typecheck + audit + complexity + deadcode + acceptance + coverage + crap + arch',

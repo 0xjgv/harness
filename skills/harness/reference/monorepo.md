@@ -20,10 +20,12 @@ Code reads `CLAUDE.md`; Codex (and other AGENTS.md-consuming tools) read
   to every subproject; each subproject `ci` runs its read-only gates in
   parallel (including its dead-code gate where the language ships one —
   python vulture, bun knip; go and rust cover dead code via their linters)
-  and its advisory CRAP gate, and `pre-push` is the offline push gate (lint,
-  format check, acceptance, arch, and strict `arch-config-guard` over the
-  whole pushed tree). `make arch-config-guard` protects all known arch config
-  filenames across the repo. `make crap`
+  and its advisory CRAP gate, and `pre-push` is the offline push gate
+  (`make branch-guard` first, then lint, format check, acceptance, arch, and
+  strict `arch-config-guard` over the whole pushed tree). `make
+  arch-config-guard` protects all known arch config filenames across the
+  repo; `make branch-guard` refuses `main`/`master` unless
+  `HARNESS_ALLOW_PROTECTED_PUSH=1`. `make crap`
   fans out the advisory CRAP gate directly
   (per-subproject `harness crap`, pass `--enforce` for hard-fail);
   `make agents-md-drift` / `make sync-agents-md` fan out the root +

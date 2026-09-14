@@ -33,6 +33,9 @@ Every template must follow the same conventions. Use an existing template (e.g. 
 - **Zero external dependencies in the runner** — stdlib/runtime APIs only
 - **Quiet by default** — only errors shown, `--verbose` for everything
 - **Fix what you can** — `check` and `pre-commit` auto-fix; `ci` is read-only
+- **Tools own everything checkable** — formatting, lint, types, dead code, drift, and complexity are decided by deterministic tools and auto-fixed where the tool can. The agent reads the output and fixes the code, never the gate
+- **Quality gates are hard, permission gates are two** — lint, types, arch boundaries, complexity, suppression ratchet, dead code, dependency audit, and drift block. Only `arch-config-guard` (pre-push/ci) and `branch-guard` (pre-push) need a human to unblock; everything else an agent can clear by doing the work
+- **Metrics that can be gamed are advisory** — CRAP and mutation point at the next test or split; they are never gates, because a coverage-shaped target gets satisfied with assertion-free tests. The coverage floor is a ratchet from `.harness-baseline`, raised by a human, never a target number
 
 ## Running checks
 

@@ -6,7 +6,22 @@ import { After, Given, Then, When } from '@cucumber/cucumber';
 
 interface CrapWorld {
   tmp: string;
+  env?: Record<string, string>;
   result?: { exitCode: number; output: string };
+}
+
+// Scenarios must not inherit a reviewer's override from the ambient shell: a
+// scenario that needs one sets it explicitly through the world.
+const OVERRIDE_ENV = [
+  'HARNESS_ALLOW_PROTECTED_PUSH',
+  'HARNESS_ALLOW_ARCH_CONFIG',
+  'HARNESS_PRE_PUSH_REFS',
+];
+
+export function childEnv(extra: Record<string, string> = {}): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const key of OVERRIDE_ENV) delete env[key];
+  return { ...env, ...extra };
 }
 
 // harness.ts uses `import.meta.dir` as ROOT, so isolating to a tmp dir means
@@ -77,6 +92,7 @@ When('I run {string}', async function (this: CrapWorld, cmd: string) {
     cwd: this.tmp,
     stdout: 'pipe',
     stderr: 'pipe',
+    env: childEnv(this.env),
   });
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),

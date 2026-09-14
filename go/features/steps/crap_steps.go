@@ -138,22 +138,54 @@ func (w *crapWorld) artifactMissing() error {
 	return w.makeTmp()
 }
 
-func (w *crapWorld) iRun(cmd string) error {
+// scenarioEnv drops the harness overrides the developer running the suite may
+// have exported, so a scenario only sees the ones it sets itself.
+func scenarioEnv() []string {
+	stripped := map[string]bool{
+		"HARNESS_ALLOW_PROTECTED_PUSH": true,
+		"HARNESS_ALLOW_ARCH_CONFIG":    true,
+		"HARNESS_PRE_PUSH_REFS":        true,
+	}
+	var env []string
+	for _, entry := range os.Environ() {
+		if name, _, ok := strings.Cut(entry, "="); ok && stripped[name] {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return env
+}
+
+// runHarnessBin runs the built harness binary in dir and returns its exit code
+// and combined output. Shared by every step world that drives the CLI.
+func runHarnessBin(dir, stdin string, args ...string) (int, string, error) {
 	bin, err := buildHarness()
 	if err != nil {
-		return err
+		return 0, "", err
 	}
+	//nolint:gosec // test fixture invokes the local harness binary with scenario arguments.
+	c := exec.Command(bin, args...)
+	c.Dir = dir
+	c.Env = scenarioEnv()
+	if stdin != "" {
+		c.Stdin = strings.NewReader(stdin)
+	}
+	out, _ := c.CombinedOutput()
+	return c.ProcessState.ExitCode(), string(out), nil
+}
+
+func (w *crapWorld) iRun(cmd string) error {
 	// Drop leading "harness" — the rest is forwarded to the harness binary.
 	parts := strings.Fields(cmd)
 	if len(parts) > 0 && parts[0] == "harness" {
 		parts = parts[1:]
 	}
-	//nolint:gosec // test fixture invokes the local harness binary with scenario arguments.
-	c := exec.Command(bin, parts...)
-	c.Dir = w.tmp
-	out, _ := c.CombinedOutput()
-	w.output = string(out)
-	w.exitCode = c.ProcessState.ExitCode()
+	code, out, err := runHarnessBin(w.tmp, "", parts...)
+	if err != nil {
+		return err
+	}
+	w.output = out
+	w.exitCode = code
 	return nil
 }
 

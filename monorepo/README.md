@@ -34,9 +34,10 @@ make check-api      # scope to one subproject
 | `make check` | Run `check` across all subprojects (auto-fix + suppression ratchet) |
 | `make check-<name>` | Run `check` in one subproject (tab-complete via help) |
 | `make check-dirty` | Run `check` only in subprojects with working-tree changes |
-| `make pre-commit` | Run `pre-commit` only in subprojects with staged files |
-| `make pre-push` | Read-only push gate across all subprojects (lint, format check, acceptance, arch) |
-| `make ci` | Read-only gate across all subprojects (no fixes); each subproject runs its read-only gates in parallel |
+| `make pre-commit` | Run `pre-commit` only in subprojects with staged files (arch config changes warn, not fail) |
+| `make pre-push` | Branch guard, the root-pair agents-md drift check, then a read-only push gate across all subprojects (lint, format check, acceptance, arch, agents-md drift); the hook's refs reach each subproject via `HARNESS_PRE_PUSH_REFS` |
+| `make branch-guard` | Refuse pushes to (or deletions of) `main`/`master` unless `HARNESS_ALLOW_PROTECTED_PUSH=1` |
+| `make ci` | The root-pair agents-md drift check, then a read-only gate across all subprojects (no fixes); each subproject runs its read-only gates in parallel |
 | `make test` | Run tests only, all subprojects |
 | `make list` | Show detected subprojects |
 | `make setup` | Per-language deps: `bun install`, `uv sync`, `go mod download`, `cargo build` |
@@ -74,10 +75,12 @@ The Makefile fans out `<cmd>` to each matching subproject, continues past failur
 
 `AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract at the monorepo root. Agents that read either file receive the same instructions across every subproject:
 
-- **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
-- **Human-is-engineer**: do not `git commit` / `git push` unless the user's current prompt explicitly asked.
-- **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
-- **Arch config guard**: edits to any subproject's arch config (`.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, `arch.toml`) warn during `check`/`stop-hook` and fail `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+- **Plan first**: open with a plan — the sub-tasks, the files each touches, which change user-visible behavior — then execute it in the same turn.
+- **Human-is-engineer**: commit and push on a feature branch, never to `main`/`master`, never merge. `make pre-push` refuses direct pushes to (or deletions of) a protected branch unless a human sets `HARNESS_ALLOW_PROTECTED_PUSH=1`; that guard stops accidents, not `--no-verify`, so merge ownership is a rule you follow, not one the tool can enforce.
+- **Specify what is worth specifying**: `.feature` scenarios for user-visible flows, law-like rules, and cross-component contracts; unit tests suffice for the rest.
+- **Arch config guard**: edits to any subproject's arch config (`.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, `arch.toml`) warn during `check`/`pre-commit`/`stop-hook` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+
+Each subproject's own harness splits its checks the same way: hard quality gates (lint, types, arch, complexity, suppressions, dead code, audit, drift) always block; advisory metrics (CRAP, mutation) report but never gate; the coverage floor is a ratchet from that subproject's `.harness-baseline`, not a target; and exactly two permission gates need a human to unblock — `arch-config-guard` (`pre-push`/`ci`) and `branch-guard` (`pre-push`, run here at the monorepo root).
 
 Stop hooks are wired via `.claude/settings.json` for Claude and
 `.codex/hooks.json` for Codex. Each single-language template also ships this

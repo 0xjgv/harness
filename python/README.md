@@ -18,7 +18,7 @@ See the [5-script contract](../README.md#the-5-script-contract) for the full rat
 ```bash
 uv run harness check                 # Fix + format + typecheck + tests/syntax check (after editing)
 uv run harness pre-commit            # Staged checks + tests (runs via git hook)
-uv run harness pre-push              # Read-only push gate: lint, format check, acceptance, arch (runs via git hook)
+uv run harness pre-push              # Branch guard + read-only push gate: lint, format check, agents-md drift, acceptance, arch (runs via git hook)
 uv run harness ci                    # Full verification (see below)
 ```
 
@@ -26,9 +26,11 @@ Every command above is also a `make` target — `make check`, `make ci`, `make p
 
 ### `ci` pipeline
 
-`harness ci` runs the read-only gates — lint, format check, typecheck, dep audit, complexity (lizard, CCN 15, args 8), deadcode (vulture), acceptance (behave), arch (import-linter) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then streams coverage (coverage.py, default threshold from `.harness-baseline`) and the advisory crap.
+`harness ci` runs the read-only gates — lint, format check, typecheck, dep audit, complexity (lizard, CCN 15, args 8), deadcode (vulture), agents-md drift, acceptance (behave), arch (import-linter) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then streams coverage (coverage.py, default threshold from `.harness-baseline`) and the advisory crap.
 
-`pre-push` is the offline push gate — lint, format check, acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip). CRAP is **advisory** but still runs in `ci`. Mutation testing is advisory and invoked explicitly.
+`pre-push` is the offline push gate — a branch guard (pushes to, and deletions of, `main`/`master` are refused unless `HARNESS_ALLOW_PROTECTED_PUSH=1`; destinations come from `HARNESS_PRE_PUSH_REFS`, else the hook's stdin under a 1s deadline, else the current branch), then lint, format check, agents-md drift, acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip). CRAP is **advisory** but still runs in `ci`. Mutation testing is advisory and invoked explicitly.
+
+Gate groups: hard quality gates block the build (lint, types, arch, complexity, suppressions, dead code, audit, drift); advisory metrics report and never fail (CRAP, mutation); the coverage floor is a ratchet that only moves up; and two permission gates need a human to unblock (arch-config-guard, branch-guard).
 
 ### Continuous integration
 
@@ -45,11 +47,12 @@ uv run harness check --verbose
 ```bash
 uv run harness acceptance            # behave against tests/features/
 uv run harness deadcode              # vulture over src/ only (--min-confidence 60); allowlist in vulture_allowlist.py
-uv run harness coverage --min=80     # tests with coverage, fails below threshold
+uv run harness coverage              # tests with coverage, floor from .harness-baseline (--min=N overrides locally)
 uv run harness mutation              # mutmut kill-rate on src/ (advisory; see note below)
 uv run harness crap --max=30         # CRAP = CCN² × (1-cov)³ + CCN per function (advisory)
 uv run harness suppressions          # suppression breakdown; --update-baseline with human sign-off
 uv run harness arch                  # import-linter against .importlinter
+uv run harness branch-guard          # refuse pushes to/deletions of main/master (HARNESS_ALLOW_PROTECTED_PUSH=1 overrides)
 ```
 
 ### Individual commands
@@ -78,10 +81,10 @@ harness.py           Development task runner (zero dependencies)
 
 `AGENTS.md` and `CLAUDE.md` encode the same AI behavior contract. Agents that read either file receive the same instructions.
 
-- **Task sizing**: max 5 sub-tasks, each ≤1 non-test file + ≤1 test.
-- **Human-is-engineer**: do not `git commit` / `git push` unless the user's current prompt explicitly asked.
-- **Gherkin-first** for user-visible behavior changes (refactors / typos / dep bumps exempted if declared).
-- **Arch config guard**: `.importlinter` changes warn during `check`/`stop-hook` and fail `pre-commit`/`pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+- **Plan first**: open with the sub-tasks and the files each touches, then execute in the same turn.
+- **Human-is-engineer**: commit and push on a feature branch; merge is the human's. `pre-push` refuses direct pushes to `main`/`master` unless `HARNESS_ALLOW_PROTECTED_PUSH=1` — it stops accidents, not `--no-verify`.
+- **Specify what is worth specifying**: `.feature` scenarios for user-visible flows, law-like rules, and cross-component contracts; unit tests suffice for the rest.
+- **Arch config guard**: `.importlinter` changes warn during `check`/`pre-commit`/`stop-hook` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 
 Stop hooks are wired via `.claude/settings.json` for Claude and
 `.codex/hooks.json` for Codex.
@@ -94,8 +97,8 @@ Day-1 defaults are deliberately loose so adopting this template does not fail ex
 - `.harness-baseline` also ratchets suppression counts. New suppressions fail `check`; run `harness suppressions --update-baseline` only with human sign-off.
 - `harness test` uses `unittest`; when no `tests/test*.py` files exist, it runs `py_compile` over `src/` and `harness.py`.
 - Coverage, mutation, and CRAP warn and skip when no unit tests exist.
-- CRAP is advisory in `ci`; pass `--enforce` when you are ready to block on it.
-- Mutation is advisory — enable as a blocking gate once a baseline is established.
+- CRAP and mutation are advisory by design — they tell you where the next test or split pays off, they are not gates, because a coverage-shaped target gets satisfied with assertion-free tests. `--enforce` exists for teams that want it, it is not the recommended default.
+- The coverage floor is a ratchet: `.harness-baseline` `coverage.min` only ever moves up, by a human, and starts at 0.
 - `mutmut 3.x` isolates `src/` into a `mutants/` subdir. If your tests import top-level modules (e.g., `from harness import ...`), add `[tool.mutmut]` config or a `conftest.py` path shim so the isolated test run can resolve them.
 - `.importlinter` ships with one starter rule (`tests` cannot import `src.internal`). Extend as the module graph grows.
 
