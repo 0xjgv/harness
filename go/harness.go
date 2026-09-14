@@ -460,7 +460,7 @@ func archGatesOrWarn() []gate {
 		return nil
 	}
 	return []gate{{description: "Arch (go-arch-lint)", cmd: []string{
-		"go", "run", "github.com/fe3dback/go-arch-lint@v1.15.0", "check",
+		"go", "run", "github.com/fe3dback/go-arch-lint@v1.19.0", "check",
 	}, hint: "boundary crossed; surface the design decision to the human; don't edit arch config"}}
 }
 
