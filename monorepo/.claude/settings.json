@@ -6,7 +6,20 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd $CLAUDE_PROJECT_DIR && make stop-hook"
+            "command": "cd $CLAUDE_PROJECT_DIR && make -s stop-hook",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd $CLAUDE_PROJECT_DIR && make -s post-edit-hook",
+            "timeout": 60
           }
         ]
       }

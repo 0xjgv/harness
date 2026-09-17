@@ -67,13 +67,20 @@ The monorepo root `AGENTS.md`/`CLAUDE.md` (Layer 2),
 
 ## Hooks
 
-`.claude/settings.json` wires the Claude Stop hook; `.codex/hooks.json` wires
-the Codex Stop hook. Full shape:
-[settings-json.md](settings-json.md).
+`.claude/settings.json` wires the Claude Stop and PostToolUse hooks;
+`.codex/hooks.json` wires the Codex Stop hook. Full shape and the dispatch
+contract: [settings-json.md](settings-json.md).
 Claude Stop command:
-`cd $CLAUDE_PROJECT_DIR && make stop-hook`.
+`cd $CLAUDE_PROJECT_DIR && make -s stop-hook`.
+Claude PostToolUse command:
+`cd $CLAUDE_PROJECT_DIR && make -s post-edit-hook`.
 Codex Stop command:
-`cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh make stop-hook`.
+`cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh make -s stop-hook`.
+
+`make stop-hook` always exits 0 and answers in JSON (block with the
+subprojects' findings, or a `systemMessage` for a tool that could not run):
+`make` turns any failed recipe into exit 2, so it cannot pass a subproject's
+0/1/2 exit code through.
 
 The monorepo's `arch-config-guard` protects **all four** arch configs by
 basename (`.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`,

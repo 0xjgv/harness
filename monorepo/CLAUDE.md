@@ -3,8 +3,8 @@
 ## Commands
 
 - After edits: `make check` — dispatches `check` to every subproject (fix, format, typecheck, test, suppression ratchet)
-- Pre-commit: `make pre-commit` — runs only in subprojects with staged files (auto via git hook); arch config changes warn here, they do not fail
-- Pre-push: `make pre-push` — branch guard runs first (refuses pushes to, or deletions of, `main`/`master` unless `HARNESS_ALLOW_PROTECTED_PUSH=1`); on refusal it prints and exits immediately, before the arch config guard, the root-pair agents-md drift check, and dispatch. Once the branch guard passes: the arch config guard, then the root-pair agents-md drift check, then a read-only push gate across every subproject; each runs its own `harness pre-push` (lint, format check, acceptance, arch, agents-md drift over the whole tree). The hook's refs are read once here and handed to every subproject as `HARNESS_PRE_PUSH_REFS`. Auto via git pre-push hook.
+- Pre-commit: `make pre-commit` — runs only in subprojects with staged files (auto via git hook): fix, format, typecheck, no tests; a staged root `CLAUDE.md` is copied into `AGENTS.md` and staged; arch config changes warn here, they do not fail
+- Pre-push: `make pre-push` — branch guard runs first (refuses pushes to, or deletions of, `main`/`master` unless `HARNESS_ALLOW_PROTECTED_PUSH=1`); on refusal it prints and exits immediately, before the arch config guard, the root-pair agents-md drift check, and dispatch. Once the branch guard passes: the arch config guard, then the root-pair agents-md drift check, then a read-only push gate across every subproject; each runs its own `harness pre-push` (tests, lint, format check, acceptance, arch, agents-md drift over the whole tree). The hook's refs are read once here and handed to every subproject as `HARNESS_PRE_PUSH_REFS`. Auto via git pre-push hook.
 - CI: `make ci` — the root-pair agents-md drift check, then a read-only gate across every subproject; each runs its own `harness ci` — read-only gates (lint, typecheck, dep audit, complexity, deadcode where the language ships one, acceptance, arch, agents-md drift) in parallel, then coverage + crap
 - CRAP (advisory): `make crap` — fan out the CRAP gate to every subproject (each runs its own `harness crap`). Forward flags via `ARGS`, e.g. `make crap ARGS="--enforce --max=50"`.
 - Complexity: `make complexity` — fan out the complexity gate to every subproject (lizard CCN). Same `ARGS=...` forwarding.
@@ -13,18 +13,19 @@
 - Parallel fan-out: `PARALLEL=1 make check` — opt-in, buffered per-subproject output. Keep off for CI and agent-visible runs.
 - List subprojects: `make list`
 - Branch guard: `make branch-guard` — refuses pushes to (or deletions of) `main`/`master`; reads `HARNESS_PRE_PUSH_REFS`, else git pre-push stdin (1s deadline; partial input fails), else the current branch; `HARNESS_ALLOW_PROTECTED_PUSH=1` overrides
-- Arch config guard: `make arch-config-guard` — unreviewed `.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, or `arch.toml` changes warn in check/pre-commit/stop-hook and block pre-push/CI; use `HARNESS_ALLOW_ARCH_CONFIG=1` after review
+- Arch config guard: `make arch-config-guard` — unreviewed `.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, or `arch.toml` changes warn in check/pre-commit and block pre-push/CI; use `HARNESS_ALLOW_ARCH_CONFIG=1` after review
 - Agents drift: `make agents-md-drift` — fail if any subproject's AGENTS.md differs from its CLAUDE.md (root pair included). Scope: `make agents-md-drift-<sub>`
 - Sync: `make sync-agents-md` — overwrite each subproject's AGENTS.md from its CLAUDE.md. Scope: `make sync-agents-md-<sub>`
 - Setup: `make bootstrap` — per-language install + install the root git hook
-- Stop hook: auto-formats/fixes changed files, then runs each dirty subproject's complexity and deadcode where it ships one (`make stop-hook`)
+- Stop hook: `make -s stop-hook` runs each dirty subproject's `stop-hook` (fix + format, then lint on changed lines, complexity new or worse than the merge-base, dead code on changed lines where shipped) and answers as one hook JSON object; pre-existing debt never blocks a stop
+- PostToolUse hook: `make -s post-edit-hook` fixes and formats each edited file in its subproject
 
 ## Definition of done
 
 - `make check` passes clean — never stop with check failing.
 - Behavior worth specifying → a `.feature` scenario exists and acceptance passes; other behavior changes have unit tests.
 - No new suppressions: additions above `.harness-baseline` fail check; suppress only with the human's sign-off, stating why.
-- Arch config changes are integration-blocked: `check`/`pre-commit`/`stop-hook` warn, and `pre-push`/`ci` fail unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+- Arch config changes are integration-blocked: `check`/`pre-commit` warn, and `pre-push`/`ci` fail unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 - `pre-push`/`ci` must pass on your branch before you open or update a PR. Merge is the human's.
 - Never spend a turn on what a tool checks: formatting, lint, types, dead code, drift, and complexity come back as `check`/`stop-hook` output. Read the output, fix the code, never the gate.
 

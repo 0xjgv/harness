@@ -73,6 +73,84 @@ staged_dirs() { filter_dirs 'git diff --cached --name-only --diff-filter=d'; }
 endef
 export SH_FILTER_DIRS
 
+# Agent hook dispatch. make turns every failed recipe into exit 2, so an exit
+# code cannot carry the stop-hook contract (2 = findings, other = the tool
+# failed) through a Makefile. `stop_dispatch <dirs...>` therefore always exits 0
+# and answers as one hook JSON object on stdout, which Claude Code and Codex
+# both read: a block with the findings, or a systemMessage for tool failures.
+# Run from a terminal (stdin is a TTY) it prints the findings and exits 1.
+# Go subprojects are built and run as ./harness: `go run` reports any failing
+# program as exit 1, which would hide the findings exit code.
+# `post_edit_hook` forwards a PostToolUse event to the subproject owning the file.
+define SH_HOOK_DISPATCH
+json_escape() {
+  awk 'BEGIN { ORS = "" }
+    {
+      gsub(/\033\[[0-9;]*[A-Za-z]/, "")
+      gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t")
+      gsub(/[\001-\010\013-\037]/, "")
+      if (NR > 1) print "\\n"
+      print
+    }'
+}
+prefix_lines() {
+  sed -E -e "s|^([^[:space:]]+:[0-9]+:)|$$1/\1|" -e t -e "s|^|$$1: |"
+}
+stop_dispatch() {
+  local tmp dir runner rc
+  tmp=$$(mktemp -d) || return 1
+  if [ -t 0 ]; then : >"$$tmp/in"; else cat >"$$tmp/in"; fi
+  : >"$$tmp/block"; : >"$$tmp/warn"
+  for dir in "$${@:-}"; do
+    [ -n "$$dir" ] || continue
+    runner=$$(runner_of "$$dir") || continue
+    if [ "$$(lang_of "$$dir")" = go ]; then
+      runner=./harness
+      if ! (cd "$$dir" && go build -o harness harness.go) >/dev/null 2>"$$tmp/err"; then
+        prefix_lines "$$dir" <"$$tmp/err" >>"$$tmp/warn"
+        continue
+      fi
+    fi
+    (cd "$$dir" && $$runner stop-hook) <"$$tmp/in" >/dev/null 2>"$$tmp/err"
+    rc=$$?
+    case "$$rc" in
+      0) ;;
+      2) prefix_lines "$$dir" <"$$tmp/err" >>"$$tmp/block" ;;
+      *) [ -s "$$tmp/err" ] || echo "stop-hook exited $$rc" >"$$tmp/err"
+         prefix_lines "$$dir" <"$$tmp/err" >>"$$tmp/warn" ;;
+    esac
+  done
+  if [ -t 0 ]; then
+    cat "$$tmp/block" "$$tmp/warn" >&2
+    [ -s "$$tmp/block" ] && { rm -rf "$$tmp"; return 1; }
+    rm -rf "$$tmp"; return 0
+  fi
+  if [ -s "$$tmp/block" ]; then
+    printf '{"decision":"block","reason":"%s"' "$$(json_escape <"$$tmp/block")"
+  else
+    printf '{"continue":true'
+  fi
+  [ -s "$$tmp/warn" ] && printf ',"systemMessage":"%s"' "$$(json_escape <"$$tmp/warn")"
+  printf '}\n'
+  rm -rf "$$tmp"
+}
+post_edit_hook() {
+  local event file fdir rel dir runner top
+  event=$$(cat)
+  file=$$(printf '%s' "$$event" | sed -n 's/.*"file_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+  [ -n "$$file" ] || return 0
+  top=$$(pwd -P)
+  fdir=$$(cd "$$(dirname "$$file")" 2>/dev/null && pwd -P) || return 0
+  rel="$${fdir#"$$top"/}"
+  [ "$$rel" != "$$fdir" ] || return 0
+  dir="$${rel%%/*}"
+  case " $(SUBPROJECTS) " in *" $$dir "*) ;; *) return 0 ;; esac
+  runner=$$(runner_of "$$dir") || return 0
+  printf '%s' "$$event" | (cd "$$dir" && $$runner post-edit --hook) 2>/dev/null || true
+}
+endef
+export SH_HOOK_DISPATCH
+
 define SH_ARCH_CONFIG_GUARD
 arch_config_filter() {
   grep -E '(^|/)(\.importlinter|\.dependency-cruiser\.json|\.go-arch-lint\.yml|arch\.toml)$$' | sort -u
@@ -237,6 +315,9 @@ pre-commit: ## Staged-only checks across affected subprojects
 	eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 1 1 0; \
 	dirs=$$(staged_dirs); \
 	staged_root=$$(git diff --cached --name-only --diff-filter=d | grep -E '^(CLAUDE|AGENTS)\.md$$' || true); \
+	if printf '%s\n' "$$staged_root" | grep -qx 'CLAUDE.md' && ! cmp -s CLAUDE.md AGENTS.md; then \
+	  $(MAKE) --no-print-directory _root_agents_sync && git add AGENTS.md || exit 1; \
+	fi; \
 	if [ -n "$$staged_root" ]; then \
 	  $(MAKE) --no-print-directory _root_agents_drift || exit 1; \
 	fi; \
@@ -360,6 +441,11 @@ setup-hooks: ## Install root pre-commit + pre-push git hooks and verify Claude/C
 	else \
 	  printf "$(RED)⚠$(RESET) Missing Stop hook wiring: .claude/settings.json\n"; \
 	fi
+	@if [ -f .claude/settings.json ] && grep -q 'PostToolUse' .claude/settings.json && grep -q 'post-edit-hook' .claude/settings.json; then \
+	  printf "$(GREEN)✓$(RESET) PostToolUse hook wiring (.claude/settings.json)\n"; \
+	else \
+	  printf "$(RED)⚠$(RESET) Missing PostToolUse hook wiring: .claude/settings.json\n"; \
+	fi
 	@if [ -f .codex/hooks.json ] && grep -q 'Stop' .codex/hooks.json && grep -q 'stop-hook' .codex/hooks.json; then \
 	  printf "$(GREEN)✓$(RESET) Stop hook wiring (.codex/hooks.json)\n"; \
 	else \
@@ -439,26 +525,36 @@ sync-agents-md-%:
 pre-commit-%:
 	@$(MAKE) --no-print-directory _scoped_run CMD=pre-commit DIR="$*"
 
-# ── Claude Code Stop hook target ──────────────────────────────────
-# Invoked by .claude/settings.json on every Stop. Scopes to subprojects with
+# ── Agent hook targets ────────────────────────────────────────────
+# Stop (.claude/settings.json, .codex/hooks.json) scopes to subprojects with
 # working-tree changes so an N-subproject repo doesn't cold-start N toolchains
-# per turn when Claude touched one file.
+# per turn when the agent touched one file, and answers as one hook JSON
+# object (see SH_HOOK_DISPATCH). PostToolUse forwards each Edit/Write to the
+# subproject that owns the file.
 .PHONY: post-edit
-post-edit:
+post-edit: _root_agents_autosync
 	@set -u -o pipefail; eval "$$SH_FILTER_DIRS"; \
 	dirs=$$(dirty_dirs); \
 	[ -z "$$dirs" ] && exit 0; \
 	$(MAKE) --no-print-directory _run CMD=post-edit DIRS="$$dirs" QUIET=1 PARALLEL=
 
+.PHONY: post-edit-hook
+post-edit-hook:
+	@set -u; eval "$$SH_LANG_HELPERS"; eval "$$SH_HOOK_DISPATCH"; post_edit_hook
+
 .PHONY: stop-hook
 stop-hook:
-	@set -u -o pipefail; eval "$$SH_FILTER_DIRS"; \
-	eval "$$SH_ARCH_CONFIG_GUARD"; \
-	dirs=$$(dirty_dirs); \
-	printf "\n=== Stop Hook Checks ===\n"; \
-	arch_config_guard 0 1 0; \
-	[ -z "$$dirs" ] && exit 0; \
-	$(MAKE) --no-print-directory _run CMD=stop-hook DIRS="$$dirs" PARALLEL=
+	@$(MAKE) --no-print-directory _root_agents_autosync >&2
+	@set -u -o pipefail; eval "$$SH_FILTER_DIRS"; eval "$$SH_LANG_HELPERS"; eval "$$SH_HOOK_DISPATCH"; \
+	stop_dispatch $$(dirty_dirs)
+
+# Root CLAUDE.md is canonical: an uncommitted edit to it refreshes AGENTS.md.
+.PHONY: _root_agents_autosync
+_root_agents_autosync:
+	@set -u; \
+	if [ -f CLAUDE.md ] && [ -n "$$(git status --porcelain -- CLAUDE.md 2>/dev/null)" ] && ! cmp -s CLAUDE.md AGENTS.md; then \
+	  $(MAKE) --no-print-directory _root_agents_sync; \
+	fi
 
 # ── Internal dispatch ─────────────────────────────────────────────
 
