@@ -126,9 +126,6 @@ class TestTargetHelpers(unittest.TestCase):
         self.assertTrue(harness._is_project_python_file("harness.py"))
         self.assertFalse(harness._is_project_python_file("docs/tool.py"))
         self.assertFalse(harness._is_project_python_file("src/data.txt"))
-        self.assertTrue(harness._is_quality_python_file("src/app.py"))
-        self.assertTrue(harness._is_quality_python_file("harness.py"))
-        self.assertFalse(harness._is_quality_python_file("tests/test_app.py"))
 
     def test_default_suppression_scan_includes_harness(self):
         with temp_project(with_tests=False):
@@ -164,7 +161,10 @@ class TestGitFileFiltering(unittest.TestCase):
             ),
             stderr="",
         )
-        with mock.patch.object(harness.subprocess, "run", return_value=result):
+        with (
+            mock.patch.object(harness.subprocess, "run", return_value=result),
+            mock.patch.object(harness, "_git_prefix", return_value=""),
+        ):
             self.assertEqual(
                 harness._changed_py_files(),
                 ["src/app.py", "tests/test_app.py", "harness.py"],
@@ -211,27 +211,6 @@ class TestNoTestBehavior(unittest.TestCase):
                 self.assertIn(expected, output.getvalue())
                 run_mock.assert_not_called()
                 subprocess_run.assert_not_called()
-
-
-class TestStopHook(unittest.TestCase):
-    def test_stop_hook_runs_post_edit_then_parallel_batch(self):
-        calls: list[str] = []
-
-        def record_batch(gates: list[harness.Gate]) -> bool:
-            calls.append("batch:" + ",".join(gate.description for gate in gates))
-            return True
-
-        with (
-            mock.patch.object(
-                harness, "cmd_post_edit", side_effect=lambda: calls.append("post-edit")
-            ),
-            mock.patch.object(harness, "run_gates_parallel", side_effect=record_batch),
-        ):
-            harness.cmd_stop_hook()
-
-        # Mutating fix/format runs first and alone; the read-only complexity and
-        # dead-code gates run through the parallel batch.
-        self.assertEqual(calls, ["post-edit", "batch:Complexity (lizard),Dead code (vulture)"])
 
 
 class TestBranchGuard(unittest.TestCase):

@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import concurrent.futures
+import csv
 import dataclasses
 import functools
+import hashlib
 import json
 import os
 import re
@@ -13,6 +15,7 @@ import select
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -30,7 +33,9 @@ LIZARD = "lizard@1.22.2"
 VULTURE = "vulture@2.16"
 VULTURE_MIN_CONFIDENCE = "60"
 VULTURE_ALLOWLIST = "vulture_allowlist.py"
+COMPLEXITY_MAX_CCN = 15
 COMPLEXITY_MAX_ARGS = 8
+COMPLEXITY_MAX_LENGTH = 100
 BASELINE_FILE = ".harness-baseline"
 SUPPRESSION_BASELINE_PREFIX = "suppressions."
 ARCH_CONFIGS = (".importlinter",)
@@ -41,25 +46,63 @@ PRE_PUSH_REFS_ENV = "HARNESS_PRE_PUSH_REFS"
 PRE_PUSH_STDIN_TIMEOUT = 1.0
 ARCH_BASE_ENV = "HARNESS_ARCH_BASE"
 ARCH_BASE_CANDIDATES = ("origin/main", "origin/master")
+# Where the stop hook's delta starts: env overrides first (ARCH_BASE_ENV, then
+# GITHUB_BASE_REF), then these. Never fetched — a hook must not touch the network.
+DELTA_BASE_CANDIDATES = ("origin/HEAD", "origin/main", "origin/master", "main", "master")
+HOOK_STDIN_TIMEOUT = 1.0
+# Finding lines a stop-hook payload carries; the rest are one command away.
+HOOK_FINDING_LIMIT = 20
 
 # ── Hook wiring (installed by `setup-hooks`) ──────────────────────
 # Claude reads .claude/settings.json and runs the harness directly; Codex reads
 # .codex/hooks.json and goes through the codex-stop-hook.sh wrapper (which turns
 # the exit code into the block/continue JSON Codex expects). Keep both forms in
 # sync with the committed template files so re-running the installer is a no-op.
+# PostToolUse is Claude-only: it formats the file an Edit/Write just touched.
+CLAUDE_SETTINGS = ".claude/settings.json"
 CLAUDE_SETTINGS_SCHEMA = "https://json.schemastore.org/claude-code-settings.json"
 CLAUDE_STOP_COMMAND = "cd $CLAUDE_PROJECT_DIR && uv run harness stop-hook"
+CLAUDE_POST_EDIT_COMMAND = "cd $CLAUDE_PROJECT_DIR && uv run harness post-edit --hook"
 CODEX_STOP_COMMAND = (
     'cd "$(git rev-parse --show-toplevel)" && '
     ".codex/hooks/codex-stop-hook.sh uv run harness stop-hook"
 )
-CLAUDE_STOP_HOOK: dict[str, Any] = {"type": "command", "command": CLAUDE_STOP_COMMAND}
+CLAUDE_STOP_HOOK: dict[str, Any] = {
+    "type": "command",
+    "command": CLAUDE_STOP_COMMAND,
+    "timeout": 300,
+}
+CLAUDE_POST_EDIT_HOOK: dict[str, Any] = {
+    "type": "command",
+    "command": CLAUDE_POST_EDIT_COMMAND,
+    "timeout": 60,
+}
 CODEX_STOP_HOOK: dict[str, Any] = {
     "type": "command",
     "command": CODEX_STOP_COMMAND,
     "timeout": 300,
     "statusMessage": "Running stop-hook checks",
 }
+
+
+@dataclasses.dataclass(frozen=True)
+class HookWiring:
+    """One harness hook in an agent settings file; `marker` identifies it on reinstall."""
+
+    path: str
+    event: str
+    marker: str
+    handler: dict[str, Any]
+    matcher: str | None = None
+
+
+HOOK_WIRINGS = (
+    HookWiring(CLAUDE_SETTINGS, "Stop", "stop-hook", CLAUDE_STOP_HOOK),
+    HookWiring(
+        CLAUDE_SETTINGS, "PostToolUse", "post-edit --hook", CLAUDE_POST_EDIT_HOOK, "Edit|Write"
+    ),
+    HookWiring(".codex/hooks.json", "Stop", "stop-hook", CODEX_STOP_HOOK),
+)
 
 # ── Output ────────────────────────────────────────────────────────
 
@@ -94,9 +137,15 @@ class Gate:
     hint: str | None = None
 
 
-def run_capture(description: str, cmd: list[str], hint: str | None = None) -> GateResult:
+def run_capture(
+    description: str,
+    cmd: list[str],
+    hint: str | None = None,
+    *,
+    env: dict[str, str] | None = None,
+) -> GateResult:
     """Run a command with output captured; the thread-safe unit for the parallel batch."""
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
     return GateResult(description, cmd, result.returncode, result.stdout, result.stderr, hint)
 
 
@@ -245,11 +294,6 @@ def _matches_python_target(path: str, targets: Iterable[str]) -> bool:
 def _is_project_python_file(path: str) -> bool:
     """Return true for Python files owned by the template project."""
     return _matches_python_target(path, (*QUALITY_SOURCES, TEST_DIR))
-
-
-def _is_quality_python_file(path: str) -> bool:
-    """Return true for non-test quality targets."""
-    return _matches_python_target(path, QUALITY_SOURCES)
 
 
 def _porcelain_path(line: str) -> str:
@@ -444,18 +488,23 @@ def _staged_py_files() -> list[str]:
 
 
 def _changed_py_files() -> list[str]:
-    """Return project .py files with uncommitted changes."""
+    """Return project .py files with uncommitted changes, relative to this project.
+
+    Porcelain paths are repository-relative, so a project in a subdirectory strips
+    its prefix; `--untracked-files=all` lists new files inside new directories.
+    """
     result = subprocess.run(
-        ["git", "status", "--porcelain"],
+        ["git", "status", "--porcelain", "--untracked-files=all", "--", "."],
         capture_output=True,
         text=True,
         check=False,
     )
+    prefix = _git_prefix()
     changed: list[str] = []
     for line in result.stdout.splitlines():
         if len(line) <= 3 or "D" in line[:2]:
             continue
-        path = _porcelain_path(line)
+        path = _normalize_changed_path(_porcelain_path(line), prefix)
         if _is_project_python_file(path):
             changed.append(path)
     return changed
@@ -503,19 +552,44 @@ def cmd_typecheck() -> None:
     run(gate.description, gate.cmd)
 
 
-def cmd_test() -> None:
+def _test_gate() -> Gate | None:
+    """The unittest suite, or a syntax check when no tests exist; None with nothing to check."""
     if _has_tests():
-        run(
-            "Tests",
-            ["uv", "run", "python", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"],
+        return Gate(
+            "Tests", ["uv", "run", "python", "-m", "unittest", "discover", "-s", TEST_DIR, "-q"]
         )
-        return
-
     files = [str(path) for path in _iter_python_files(_quality_targets(include_tests=False))]
     if not files:
+        return None
+    return Gate("Syntax check", ["uv", "run", "python", "-m", "py_compile", *files])
+
+
+def cmd_test() -> None:
+    gate = _test_gate()
+    if gate is None:
         warn("Syntax check: no Python files found; skipped")
         return
-    run("Syntax check", ["uv", "run", "python", "-m", "py_compile", *files])
+    run(gate.description, gate.cmd)
+
+
+def _env_without_git() -> dict[str, str]:
+    """This environment minus the GIT_* variables git exports to hooks."""
+    return {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+
+
+def _check_tests() -> bool:
+    """Run the test gate captured, outside git's hook environment.
+
+    git exports GIT_DIR (and, for commits, GIT_INDEX_FILE) to hooks; a test that runs
+    `git init` in a temp dir would otherwise write into this repository.
+    """
+    gate = _test_gate()
+    if gate is None:
+        warn("Syntax check: no Python files found; skipped")
+        return True
+    result = run_capture(gate.description, gate.cmd, gate.hint, env=_env_without_git())
+    print_gate_result(result, no_exit=True)
+    return result.ok
 
 
 def cmd_coverage() -> None:
@@ -641,27 +715,39 @@ def _parse_pre_push_refs(text: str) -> PrePushRefs:
     return PrePushRefs(tuple(line for line in text.splitlines() if len(line.split()) >= 4))
 
 
-def _read_pre_push_stdin() -> PrePushRefs:
-    """Read stdin under a deadline bounding the whole read, not just the first byte.
+def _read_stdin(timeout: float) -> tuple[bytes, bool]:
+    """Read stdin to EOF within `timeout` seconds; returns (bytes, whether EOF arrived).
 
-    A deadline hit with nothing received is taken as "not a hook invocation" (an idle
-    pipe under an agent tool) and falls back to the current branch: git writes its ref
-    lines immediately, and dispatchers that already drained stdin pass PRE_PUSH_REFS_ENV.
-    A hook whose writer is slower than the deadline therefore degrades to that check.
+    The deadline bounds the whole read, not just the first byte, so an idle pipe (an
+    agent tool that never closes stdin) cannot hang the caller.
     """
-    deadline = time.monotonic() + PRE_PUSH_STDIN_TIMEOUT
+    deadline = time.monotonic() + timeout
     fd = sys.stdin.fileno()
     received = b""
     while True:
         remaining = deadline - time.monotonic()
         ready = select.select([fd], [], [], remaining)[0] if remaining > 0 else []
         if not ready:
-            # Nothing yet means an idle pipe (no refs); a stalled partial read is fatal.
-            return PrePushRefs(incomplete=bool(received.strip()))
+            return received, False
         chunk = os.read(fd, 65536)
         if not chunk:
-            return _parse_pre_push_refs(received.decode("utf-8", errors="replace"))
+            return received, True
         received += chunk
+
+
+def _read_pre_push_stdin() -> PrePushRefs:
+    """Read the hook's ref lines under PRE_PUSH_STDIN_TIMEOUT.
+
+    A deadline hit with nothing received is taken as "not a hook invocation" (an idle
+    pipe under an agent tool) and falls back to the current branch: git writes its ref
+    lines immediately, and dispatchers that already drained stdin pass PRE_PUSH_REFS_ENV.
+    A hook whose writer is slower than the deadline therefore degrades to that check.
+    """
+    received, complete = _read_stdin(PRE_PUSH_STDIN_TIMEOUT)
+    if not complete:
+        # Nothing yet means an idle pipe (no refs); a stalled partial read is fatal.
+        return PrePushRefs(incomplete=bool(received.strip()))
+    return _parse_pre_push_refs(received.decode("utf-8", errors="replace"))
 
 
 @functools.cache
@@ -959,15 +1045,16 @@ def _complexity_gate() -> Gate:
             LIZARD,
             *_app_targets(include_tests=True),
             "-C",
-            "15",
+            str(COMPLEXITY_MAX_CCN),
             "-a",
             str(COMPLEXITY_MAX_ARGS),
             "-L",
-            "100",
+            str(COMPLEXITY_MAX_LENGTH),
             "-i",
             "0",
         ],
-        "extract helpers or flatten branches until CCN <= 15; do not raise the threshold",
+        f"extract helpers or flatten branches until CCN <= {COMPLEXITY_MAX_CCN}; "
+        "do not raise the threshold",
     )
 
 
@@ -1004,8 +1091,557 @@ def cmd_deadcode() -> None:
     run(gate.description, gate.cmd)
 
 
+# ── Agent hooks ───────────────────────────────────────────────────
+# The stop hook runs after every agent turn and judges the change, not the tree:
+# lint left on changed lines, functions pushed over (or further over) a complexity
+# limit, dead code on changed lines. Pre-existing debt never blocks a stop; the
+# whole-tree gates stay in check / ci / pre-push. Exit contract: silent 0 when
+# clean, 2 with a stderr payload the agent reads, 1 when a tool could not run.
+
+LineRanges = list[tuple[int, int]]  # inclusive (start, end) line spans
+
+WHOLE_FILE: LineRanges = [(1, sys.maxsize)]
+STOP_HOOK_RERUN = "uv run harness stop-hook --verbose"
+LOOP_GUARD_NOTICE = "harness: same findings as the previous stop; not blocking again"
+POST_EDIT_NOTICE = "harness: reformatted {}; re-read it before editing it again"
+COMPLEXITY_LIMITS = (
+    ("CCN", "ccn", COMPLEXITY_MAX_CCN),
+    ("args", "args", COMPLEXITY_MAX_ARGS),
+    ("length", "length", COMPLEXITY_MAX_LENGTH),
+)
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_VULTURE_LINE_RE = re.compile(r"^(?P<path>.+?):(?P<line>\d+): ")
+
+
+class ToolError(Exception):
+    """A gate's tool could not run, or printed output the gate cannot read."""
+
+
+@dataclasses.dataclass(frozen=True)
+class DeltaResult:
+    """One delta gate: findings block the stop; a problem means its tool failed."""
+
+    gate: str
+    findings: list[str]
+    problem: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class FunctionMetrics:
+    """One function as `lizard --csv` measured it."""
+
+    name: str
+    line: int
+    ccn: int
+    args: int
+    length: int
+
+
+def _run_tool(
+    tool: str, cmd: list[str], *, ok: Sequence[int] = (0,), cwd: str | None = None
+) -> str:
+    """The command's stdout; ToolError when it cannot start or exits outside `ok`."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=cwd)
+    except OSError as exc:
+        raise ToolError(f"{tool} not runnable: {exc.strerror or exc}") from exc
+    if result.returncode in ok:
+        return result.stdout
+    detail = (result.stderr.strip() or result.stdout.strip()).splitlines()
+    reason = f"{tool} exited {result.returncode}"
+    raise ToolError(f"{reason}: {detail[-1].strip()}" if detail else reason)
+
+
+def _git_output(args: list[str]) -> str:
+    return _run_tool("git", ["git", "-c", "core.quotePath=false", *args])
+
+
+# ── Changed lines ──
+
+
+def _base_ref() -> str | None:
+    """The first base ref that resolves: env overrides, then DELTA_BASE_CANDIDATES."""
+    candidates = [os.environ.get(ARCH_BASE_ENV, "")]
+    if github_base := os.environ.get("GITHUB_BASE_REF"):
+        candidates.append(f"origin/{github_base}")
+    candidates.extend(DELTA_BASE_CANDIDATES)
+    for ref in candidates:
+        if ref and _git_lines(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"]):
+            return ref
+    return None
+
+
+def _delta_base() -> str | None:
+    """merge-base(base ref, HEAD); HEAD without a base ref; None before the first commit."""
+    if not _git_lines(["rev-parse", "--verify", "--quiet", "HEAD"]):
+        return None
+    ref = _base_ref()
+    merge_base = _git_lines(["merge-base", ref, "HEAD"]) if ref else []
+    return merge_base[0] if merge_base else "HEAD"
+
+
+def _diff_path(header: str) -> str | None:
+    """The new-side path of a `+++ b/<path>` header; None for a deleted file."""
+    name = header.removeprefix("+++ ").rstrip("\t")
+    if name == "/dev/null":
+        return None
+    if len(name) > 1 and name.startswith('"') and name.endswith('"'):
+        name = name[1:-1]
+    return name.removeprefix("b/")
+
+
+def _parse_diff_ranges(diff: str) -> dict[str, LineRanges]:
+    """`{path: [(start, end)]}` of the new-side lines in a `git diff -U0` (a/ b/ prefixes).
+
+    File headers are read only between `diff --git` and the first hunk, so an added line
+    whose text starts with `++ ` is never taken for one. A pure deletion (`+N,0`) adds no
+    range, but its file is still listed.
+    """
+    ranges: dict[str, LineRanges] = {}
+    path: str | None = None
+    in_header = False
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            path, in_header = None, True
+        elif in_header and line.startswith("+++ "):
+            path = _diff_path(line)
+            if path is not None:
+                ranges[path] = []
+        elif line.startswith("@@"):
+            in_header = False
+            match = _HUNK_RE.match(line)
+            count = int(match[2] or 1) if match else 0
+            if match and path is not None and count:
+                start = int(match[1])
+                ranges[path].append((start, start + count - 1))
+    return ranges
+
+
+def _changed_scope(base: str | None) -> dict[str, LineRanges]:
+    """Changed lines per path relative to this project: `git diff <base>` plus untracked.
+
+    Covers work committed on the branch and uncommitted work alike. Untracked files, and
+    every file before the first commit, are in scope whole. Renames count as new files.
+    """
+    listing = ["ls-files", "--others", "--exclude-standard", "--", "."]
+    scope: dict[str, LineRanges] = {}
+    if base is None:
+        listing.insert(1, "--cached")
+    else:
+        diff = _git_output([
+            "diff",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            "--relative",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            base,
+            "--",
+            ".",
+        ])
+        scope = _parse_diff_ranges(diff)
+    for path in _git_output(listing).splitlines():
+        scope[path] = list(WHOLE_FILE)
+    return scope
+
+
+def _in_ranges(line: int, ranges: Iterable[tuple[int, int]]) -> bool:
+    return any(start <= line <= end for start, end in ranges)
+
+
+def _scoped_files(scope: dict[str, LineRanges], targets: Iterable[str]) -> list[str]:
+    """Changed Python files under `targets` that still exist."""
+    return sorted(
+        path for path in scope if _matches_python_target(path, targets) and Path(path).is_file()
+    )
+
+
+# ── Lint residue ──
+
+
+def _ruff_findings(report: str, scope: dict[str, LineRanges], root: Path) -> list[str]:
+    """`path:line: CODE message` for each ruff JSON diagnostic on a changed line."""
+    findings: list[str] = []
+    try:
+        for item in json.loads(report):
+            filename = Path(item["filename"]).resolve()
+            path = filename.relative_to(root.resolve(), walk_up=True).as_posix()
+            row = int(item["location"]["row"])
+            if _in_ranges(row, scope.get(path, [])):
+                code = f"{item['code']} " if item.get("code") else ""
+                findings.append(f"{path}:{row}: {code}{item['message']}")
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ToolError(f"unreadable ruff output: {exc!r}") from exc
+    return findings
+
+
+def _lint_residue(scope: dict[str, LineRanges]) -> list[str]:
+    """Lint the fix pass could not fix, on changed lines of changed project files."""
+    files = _scoped_files(scope, (*QUALITY_SOURCES, TEST_DIR))
+    if not files:
+        return []
+    cmd = ["uv", "run", "ruff", "check", "--no-fix", "--output-format=json", *files]
+    return _ruff_findings(_run_tool("ruff", cmd, ok=(0, 1)), scope, Path.cwd())
+
+
+# ── Complexity delta ──
+
+
+def _lizard_row(row: list[str]) -> tuple[str, str, FunctionMetrics] | None:
+    """(file, long_name, metrics) from one `lizard --csv` row; None for anything else.
+
+    Columns: nloc, ccn, tokens, params, length, location, file, name, long_name, start, end.
+    """
+    if len(row) < 11 or not all(row[i].isdigit() for i in (1, 3, 4, 9)):
+        return None
+    ccn, args, length, start = (int(row[i]) for i in (1, 3, 4, 9))
+    return row[6], row[8], FunctionMetrics(row[7], start, ccn, args, length)
+
+
+def _parse_lizard_csv(text: str) -> dict[str, dict[str, FunctionMetrics]]:
+    """`{file: {key: metrics}}` from `lizard --csv`, keyed by long_name (the signature).
+
+    A signature survives a function moving within its file; a start line does not. A
+    repeated signature (two classes' `__init__( self )`) is keyed `#2`, `#3` in file order.
+    """
+    functions: dict[str, dict[str, FunctionMetrics]] = {}
+    for row in csv.reader(text.splitlines()):
+        parsed = _lizard_row(row)
+        if parsed is None:
+            continue
+        path, long_name, metrics = parsed
+        in_file = functions.setdefault(path, {})
+        key, copy = long_name, 1
+        while key in in_file:
+            copy += 1
+            key = f"{long_name}#{copy}"
+        in_file[key] = metrics
+    return functions
+
+
+def _base_twin(
+    key: str,
+    now: FunctionMetrics,
+    current: dict[str, FunctionMetrics],
+    base: dict[str, FunctionMetrics],
+) -> FunctionMetrics | None:
+    """The base version of a current function: same signature, else the same unique name.
+
+    The name fallback keeps a signature-only edit (a new annotation) on a legacy function
+    from reading as a brand-new function.
+    """
+    if key in base:
+        return base[key]
+    twins = [fn for fn in base.values() if fn.name == now.name]
+    unique_now = sum(fn.name == now.name for fn in current.values()) == 1
+    return twins[0] if unique_now and len(twins) == 1 else None
+
+
+def _function_regressions(
+    path: str, now: FunctionMetrics, was: FunctionMetrics | None
+) -> list[str]:
+    """One line per limit `now` exceeds where `was` is absent or measured lower."""
+    lines: list[str] = []
+    for label, field, limit in COMPLEXITY_LIMITS:
+        value = getattr(now, field)
+        before = None if was is None else getattr(was, field)
+        if value > limit and (before is None or value > before):
+            shown = "new" if before is None else before
+            lines.append(f"{path}:{now.line}: {now.name} {label} {shown}→{value} (limit {limit})")
+    return lines
+
+
+def _complexity_delta(
+    current: dict[str, dict[str, FunctionMetrics]],
+    base: dict[str, dict[str, FunctionMetrics]],
+) -> list[str]:
+    """Functions over a limit now that are new, or worse than their base version."""
+    findings: list[str] = []
+    for path, functions in current.items():
+        base_functions = base.get(path, {})
+        for key, now in functions.items():
+            was = _base_twin(key, now, functions, base_functions)
+            findings.extend(_function_regressions(path, now, was))
+    return findings
+
+
+def _lizard_functions(
+    files: list[str], cwd: str | None = None
+) -> dict[str, dict[str, FunctionMetrics]]:
+    # lizard with no file arguments walks the working directory; never let it.
+    if not files:
+        return {}
+    return _parse_lizard_csv(_run_tool("lizard", ["uvx", LIZARD, "--csv", *files], cwd=cwd))
+
+
+def _write_base_sources(files: list[str], base: str, root: Path) -> list[str]:
+    """Write each file's `base` version under `root`; returns those that existed at base."""
+    written: list[str] = []
+    for path in files:
+        shown = subprocess.run(
+            ["git", "show", f"{base}:./{path}"], capture_output=True, check=False
+        )
+        if shown.returncode != 0:
+            continue  # absent at base: every function in it is new
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(shown.stdout)
+        written.append(path)
+    return written
+
+
+def _complexity_regressions(scope: dict[str, LineRanges], base: str | None) -> list[str]:
+    """Complexity this change introduced or worsened, over the complexity gate's targets."""
+    files = _scoped_files(scope, (*APP_SOURCES, TEST_DIR))
+    current = _lizard_functions(files)
+    if not current:
+        return []
+    with tempfile.TemporaryDirectory(prefix="harness-base-") as tmp:
+        written = _write_base_sources(files, base, Path(tmp)) if base else []
+        before = _lizard_functions(written, cwd=tmp)
+    return _complexity_delta(current, before)
+
+
+# ── Dead-code delta ──
+
+
+def _vulture_findings(output: str, scope: dict[str, LineRanges]) -> list[str]:
+    """vulture's own `path:line: message` lines that sit on a changed line."""
+    findings: list[str] = []
+    for line in output.splitlines():
+        match = _VULTURE_LINE_RE.match(line)
+        if match and _in_ranges(int(match["line"]), scope.get(match["path"], [])):
+            findings.append(line)
+    return findings
+
+
+def _deadcode_residue(scope: dict[str, LineRanges]) -> list[str]:
+    """Dead code on changed lines. vulture still reads all of src/: deadness is global."""
+    if not _scoped_files(scope, APP_SOURCES):
+        return []
+    output = _run_tool("vulture", _deadcode_gate().cmd, ok=(0, 3))  # 3: dead code found
+    return _vulture_findings(output, scope)
+
+
+# ── Stop-hook verdict ──
+
+
+def _delta_result(gate: str, measure: Callable[[], list[str]]) -> DeltaResult:
+    try:
+        return DeltaResult(gate, measure())
+    except ToolError as exc:
+        return DeltaResult(gate, [], str(exc))
+
+
+def _run_delta_gates(scope: dict[str, LineRanges], base: str | None) -> list[DeltaResult]:
+    """Lint residue, complexity delta, and dead-code delta; read-only, in parallel."""
+    gates: list[tuple[str, Callable[[], list[str]]]] = [
+        ("Lint", lambda: _lint_residue(scope)),
+        ("Complexity", lambda: _complexity_regressions(scope, base)),
+        ("Dead code", lambda: _deadcode_residue(scope)),
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(gates)) as executor:
+        return list(executor.map(lambda gate: _delta_result(*gate), gates))
+
+
+def _cap_findings(findings: list[str]) -> list[str]:
+    """At most HOOK_FINDING_LIMIT findings, then one line counting the rest.
+
+    `--verbose` lifts the cap, which is what the counting line tells the reader to run.
+    """
+    if VERBOSE or len(findings) <= HOOK_FINDING_LIMIT:
+        return list(findings)
+    rest = len(findings) - HOOK_FINDING_LIMIT
+    return [*findings[:HOOK_FINDING_LIMIT], f"… +{rest} more — run `{STOP_HOOK_RERUN}`"]
+
+
+def _stop_hook_payload(results: list[DeltaResult]) -> str:
+    """The stderr block an agent reads: failed gates, then their findings; '' when clean."""
+    failed = [result for result in results if result.findings]
+    if not failed:
+        return ""
+    header = f"stop-hook failed: {', '.join(result.gate for result in failed)}"
+    findings = [line for result in failed for line in result.findings]
+    return "\n".join([header, *_cap_findings(findings)])
+
+
+def _payload_digest(payload: str) -> str:
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _stop_hook_exit(payload: str, failed_tools: int, event: dict[str, Any], stored: str) -> int:
+    """2 blocks on findings; 1 for a tool failure or a repeated block; 0 when clean.
+
+    A repeat is the stored digest of the same payload while the agent is already
+    continuing because of a stop hook (`stop_hook_active`): blocking again would loop.
+    A payload that changed blocks again.
+    """
+    if payload:
+        repeat = event.get("stop_hook_active") is True and stored == _payload_digest(payload)
+        return 1 if repeat else 2
+    return 1 if failed_tools else 0
+
+
+def _loop_guard_key(prefix: str) -> str:
+    """A file-name-safe key for this project within its repository."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", prefix).strip("-") or "root"
+
+
+def _loop_guard_path() -> Path | None:
+    git_path = _git_lines(["rev-parse", "--git-path", "harness"])
+    if not git_path:
+        return None
+    return Path(git_path[0]).resolve() / f"stop-hook-{_loop_guard_key(_git_prefix())}"
+
+
+def _read_digest(path: Path | None) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip() if path else ""
+    except OSError:
+        return ""
+
+
+def _update_loop_guard(path: Path | None, code: int, payload: str) -> None:
+    """Remember a block's digest; forget it once the stop is clean."""
+    if path is None:
+        return
+    if code == 2:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_payload_digest(payload), encoding="utf-8")
+    elif code == 0:
+        path.unlink(missing_ok=True)
+
+
+def _report_stop_hook(results: list[DeltaResult], event: dict[str, Any]) -> int:
+    """Print the verdict to stderr (nothing when clean) and return the exit code."""
+    payload = _stop_hook_payload(results)
+    problems = [f"stop-hook: {r.gate} could not run: {r.problem}" for r in results if r.problem]
+    guard = _loop_guard_path()
+    code = _stop_hook_exit(payload, len(problems), event, _read_digest(guard))
+    for line in problems:
+        print(line, file=sys.stderr)
+    if payload:
+        print(payload, file=sys.stderr)
+    if payload and code == 1:
+        print(LOOP_GUARD_NOTICE, file=sys.stderr)
+    _update_loop_guard(guard, code, payload)
+    return code
+
+
+def _hook_event() -> dict[str, Any]:
+    """The agent's hook JSON from stdin; `{}` for a terminal or empty/invalid input."""
+    try:
+        if sys.stdin.isatty():
+            return {}
+        received, _ = _read_stdin(HOOK_STDIN_TIMEOUT)
+        event = json.loads(received)
+    except (AttributeError, OSError, ValueError):
+        return {}
+    return event if isinstance(event, dict) else {}
+
+
+def _fix_and_format(files: list[str]) -> None:
+    """Fix, then format, `files` in place, silently; what is left surfaces as lint residue."""
+    if not files:
+        return
+    for args in (["check", "--fix"], ["format"]):
+        try:
+            subprocess.run(["uv", "run", "ruff", *args, *files], capture_output=True, check=False)
+        except OSError:
+            return
+
+
+def _agents_md_stale() -> bool:
+    """True when CLAUDE.md exists and AGENTS.md is missing or differs from it."""
+    claude, agents = Path("CLAUDE.md"), Path("AGENTS.md")
+    if not claude.is_file():
+        return False
+    return not agents.is_file() or agents.read_bytes() != claude.read_bytes()
+
+
+def _mirror_claude_md() -> None:
+    Path("AGENTS.md").write_bytes(Path("CLAUDE.md").read_bytes())
+
+
+def _sync_agents_md_after_edit() -> None:
+    """Stop hook: an uncommitted CLAUDE.md edit carries into AGENTS.md, silently.
+
+    CLAUDE.md is canonical. An edit to AGENTS.md alone is left for pre-commit to report.
+    """
+    if _git_lines(["status", "--porcelain", "--", "CLAUDE.md"]) and _agents_md_stale():
+        _mirror_claude_md()
+
+
+def cmd_stop_hook() -> None:
+    """Post-edit, then changed-lines lint, complexity delta, dead-code delta.
+
+    Silent on success. Findings exit 2 with a capped stderr payload; a tool that could
+    not run exits 1; the same findings on a stop the agent is already continuing from
+    exit 1 (loop guard). `check` and `ci` keep the whole-tree gates.
+    """
+    event = _hook_event()  # stdin belongs to the hook event; read it before anything else
+    _fix_and_format(_changed_py_files())
+    _sync_agents_md_after_edit()
+    base = _delta_base()
+    try:
+        scope = _changed_scope(base)
+    except ToolError as exc:
+        print(f"stop-hook: changed lines could not run: {exc}", file=sys.stderr)
+        sys.exit(1)
+    code = _report_stop_hook(_run_delta_gates(scope, base), event)
+    if VERBOSE and code == 0:
+        print(f"stop-hook: clean ({len(scope)} changed path(s) vs {base or 'no commits'})")
+    if code:
+        sys.exit(code)
+
+
+def _hook_target(event: dict[str, Any], root: Path) -> str | None:
+    """The project .py file a PostToolUse event names, relative to `root`; else None."""
+    tool_input = event.get("tool_input")
+    file_path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
+    if not isinstance(file_path, str) or not file_path:
+        return None
+    resolved = (root / file_path).resolve()
+    try:
+        relative = resolved.relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return None  # outside this project: another harness owns it
+    return relative if _is_project_python_file(relative) and resolved.is_file() else None
+
+
+def _post_edit_hook() -> None:
+    """Fix and format the one file a PostToolUse event names. Never blocks.
+
+    Prints one additionalContext line when the file changed, so the agent re-reads it
+    before its next edit; otherwise nothing.
+    """
+    target = _hook_target(_hook_event(), Path.cwd())
+    if target is None:
+        return
+    path = Path(target)
+    try:
+        before = path.read_bytes()
+        _fix_and_format([target])
+        changed = path.read_bytes() != before
+    except OSError:
+        return
+    if changed:
+        context = {
+            "hookEventName": "PostToolUse",
+            "additionalContext": POST_EDIT_NOTICE.format(target),
+        }
+        print(
+            json.dumps({"hookSpecificOutput": context}, separators=(",", ":"), ensure_ascii=False)
+        )
+
+
 def cmd_post_edit() -> None:
-    """Format if source files have uncommitted changes."""
+    """Format if source files have uncommitted changes; `--hook`: the file a hook event names."""
+    if "--hook" in sys.argv:
+        _post_edit_hook()
+        return
     files = _changed_py_files()
     if not files:
         return
@@ -1013,26 +1649,35 @@ def cmd_post_edit() -> None:
     run("Format code", ["uv", "run", "ruff", "format", *files], no_exit=True)
 
 
-def cmd_stop_hook() -> None:
-    """Run stop-time checks after agent edits."""
-    print("\n=== Stop Hook Checks ===\n")
-    cmd_post_edit()  # mutating — sequential, first
-    _check_arch_config_guard(warn_only=True)
-    all_ok = run_gates_parallel([_complexity_gate(), _deadcode_gate()])  # read-only batch
-    _exit_if_failed(all_ok)
-
-
 # ── Stages ────────────────────────────────────────────────────────
 
 
+def _hook_wired(wiring: HookWiring) -> bool:
+    """True when the settings file has a handler for this hook under its event."""
+    try:
+        data = _read_json_object(Path(wiring.path))
+    except (OSError, ValueError):
+        return False
+    hooks = data.get("hooks")
+    groups = hooks.get(wiring.event) if isinstance(hooks, dict) else None
+    if not isinstance(groups, list):
+        return False
+    return any(
+        _is_harness_handler(handler, wiring.marker)
+        for group in groups
+        if isinstance(group, dict) and isinstance(group.get("hooks"), list)
+        for handler in group["hooks"]
+    )
+
+
 def _check_stop_hooks_present() -> None:
-    """Warn when Claude/Codex Stop hook wiring is missing."""
-    for rel in (".claude/settings.json", ".codex/hooks.json"):
-        text = Path(rel).read_text(encoding="utf-8") if Path(rel).exists() else ""
-        if "Stop" in text and "stop-hook" in text:
-            print(f"  {GREEN}✓{RESET} Stop hook wiring ({rel})")
+    """Warn when the Claude/Codex Stop or Claude PostToolUse wiring is missing."""
+    for wiring in HOOK_WIRINGS:
+        label = f"{wiring.event} hook wiring"
+        if _hook_wired(wiring):
+            print(f"  {GREEN}✓{RESET} {label} ({wiring.path})")
         else:
-            print(f"  {RED}⚠{RESET} Missing Stop hook wiring: {rel}")
+            print(f"  {RED}⚠{RESET} Missing {label}: {wiring.path}")
 
 
 def _first_diff_line(a: str, b: str) -> int:
@@ -1071,13 +1716,31 @@ def _check_agents_md_drift() -> None:
 
 def cmd_sync_agents_md() -> None:
     """Overwrite AGENTS.md with CLAUDE.md contents."""
-    claude = Path("CLAUDE.md")
-    agents = Path("AGENTS.md")
-    if not claude.exists():
+    if not Path("CLAUDE.md").exists():
         print(f"  {RED}✗{RESET} sync-agents-md: CLAUDE.md not found")
         sys.exit(1)
-    agents.write_bytes(claude.read_bytes())
+    _mirror_claude_md()
     print(f"  {GREEN}✓{RESET} sync-agents-md: AGENTS.md ← CLAUDE.md")
+
+
+def _sync_agents_md_staged() -> None:
+    """pre-commit: a staged CLAUDE.md carries AGENTS.md into the same commit.
+
+    The `git add` inherits git's hook environment on purpose: GIT_INDEX_FILE is the
+    index this commit is being built from.
+    """
+    staged = _git_lines(["diff", "--cached", "--name-only", "--", "CLAUDE.md"])
+    if not staged or not _agents_md_stale():
+        return
+    _mirror_claude_md()
+    added = subprocess.run(
+        ["git", "add", "--", "AGENTS.md"], capture_output=True, text=True, check=False
+    )
+    if added.returncode != 0:
+        print(f"  {RED}✗{RESET} sync-agents-md: git add AGENTS.md failed")
+        print(added.stderr, end="")
+        sys.exit(1)
+    print(f"  {GREEN}✓{RESET} sync-agents-md: AGENTS.md ← CLAUDE.md (staged)")
 
 
 def cmd_agents_md_drift() -> None:
@@ -1109,10 +1772,13 @@ def cmd_check() -> None:
 
 
 def cmd_pre_commit() -> None:
-    """Staged checks + tests if source files staged."""
+    """Fix/format staged files, typecheck, and mirror a staged CLAUDE.md; tests run at pre-push."""
     print("\n=== Pre-commit Checks ===\n")
     _check_arch_config_guard(warn_only=True, staged=True)
+    _sync_agents_md_staged()
     files = _staged_py_files()
+    if files or _git_lines(["diff", "--cached", "--name-only", "--", "AGENTS.md", "CLAUDE.md"]):
+        _check_agents_md_drift()
     if not files:
         print("No staged Python files — skipping checks")
         return
@@ -1120,10 +1786,6 @@ def cmd_pre_commit() -> None:
     cmd_fix(files)
     cmd_format(files)
     cmd_typecheck()
-    _check_agents_md_drift()
-
-    if any(_is_quality_python_file(f) for f in files):
-        cmd_test()
 
 
 def cmd_ci() -> None:
@@ -1157,17 +1819,19 @@ def cmd_ci() -> None:
 def cmd_pre_push() -> None:
     """Read-only push gate: the offline checks pre-commit and stop-hook do not run.
 
-    pre-commit covers fix/format/typecheck/test on staged files; stop-hook adds
-    complexity. This fills the gap with the deterministic, offline gates none of them
-    run — lint, format check, agents-md drift, acceptance, arch — validating the whole
-    pushed tree (after merges/rebases/--no-verify, which pre-commit may never have seen)
-    before it leaves the machine. Network (audit) and advisory (coverage/CRAP) gates
-    stay in ci.
+    pre-commit covers fix/format/typecheck on staged files; stop-hook covers the
+    change's delta. This fills the gap with the deterministic, offline gates none of
+    them run — tests, lint, format check, agents-md drift, acceptance, arch —
+    validating the whole pushed tree (after merges/rebases/--no-verify, which pre-commit
+    may never have seen) before it leaves the machine. Tests run first and alone: they
+    write caches (.hypothesis/, bytecode). Network (audit) and advisory (coverage/CRAP)
+    gates stay in ci.
     """
     print("\n=== Pre-push Checks ===\n")
     if not _check_branch_guard():
         sys.exit(1)
     arch_config_ok = _check_arch_config_guard(include_pre_push_refs=True)
+    tests_ok = _check_tests()
     gates = [
         _lint_gate(),
         _format_check_gate(),
@@ -1175,7 +1839,7 @@ def cmd_pre_push() -> None:
         *_acceptance_gates_or_warn(),
         *_arch_gates_or_warn(),
     ]
-    _exit_if_failed(run_gates_parallel(gates) and arch_config_ok)
+    _exit_if_failed(run_gates_parallel(gates) and arch_config_ok and tests_ok)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -1215,31 +1879,33 @@ def _json_list_child(data: dict[str, Any], key: str, path: Path) -> list[Any]:
     return child
 
 
-def _is_stop_hook_handler(handler: object) -> bool:
-    """True for a command handler that already runs our stop-hook (any form)."""
+def _is_harness_handler(handler: object, marker: str) -> bool:
+    """True for a command handler that already runs this harness hook (any form)."""
     return (
         isinstance(handler, dict)
         and handler.get("type") == "command"
         and isinstance(handler.get("command"), str)
-        and "stop-hook" in handler["command"]
+        and marker in handler["command"]
     )
 
 
-def _install_stop_hook(path: Path, hook: dict[str, Any], *, claude_settings: bool = False) -> None:
-    """Inject/refresh the Stop hook in a settings file, preserving every other hook.
+def _install_hook(wiring: HookWiring) -> None:
+    """Inject/refresh one hook in its settings file, preserving every other hook.
 
-    Idempotent: an existing stop-hook handler (current or legacy) is replaced in
-    place and any duplicates are dropped, so re-running never accumulates entries.
+    Idempotent: an existing handler carrying the wiring's marker (current or legacy)
+    is replaced in place and any duplicates are dropped, so re-running never
+    accumulates entries.
     """
+    path = Path(wiring.path)
     data = _read_json_object(path)
-    if claude_settings and "$schema" not in data:
+    if wiring.path == CLAUDE_SETTINGS and "$schema" not in data:
         data["$schema"] = CLAUDE_SETTINGS_SCHEMA
 
     hooks = _json_object_child(data, "hooks", path)
-    stop_groups = _json_list_child(hooks, "Stop", path)
+    event_groups = _json_list_child(hooks, wiring.event, path)
     installed = False
 
-    for group in stop_groups:
+    for group in event_groups:
         if not isinstance(group, dict):
             continue
         group_hooks = group.get("hooks")
@@ -1247,30 +1913,30 @@ def _install_stop_hook(path: Path, hook: dict[str, Any], *, claude_settings: boo
             continue
         next_group_hooks: list[Any] = []
         for handler in group_hooks:
-            if _is_stop_hook_handler(handler):
+            if _is_harness_handler(handler, wiring.marker):
                 if not installed:
-                    next_group_hooks.append(dict(hook))
+                    next_group_hooks.append(dict(wiring.handler))
                     installed = True
                 continue
             next_group_hooks.append(handler)
         group["hooks"] = next_group_hooks
 
     if not installed:
-        stop_groups.append({"hooks": [dict(hook)]})
+        matcher = {} if wiring.matcher is None else {"matcher": wiring.matcher}
+        event_groups.append({**matcher, "hooks": [dict(wiring.handler)]})
 
     _write_json_object(path, data)
 
 
 def _git_hook_path(name: str) -> Path:
     """Resolve a git hook path via `git rev-parse` so worktrees / core.hooksPath work."""
-    git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--git-path", f"hooks/{name}"],
             capture_output=True,
             text=True,
             check=False,
-            env=git_env,
+            env=_env_without_git(),
         )
     except FileNotFoundError:
         return Path(f".git/hooks/{name}")
@@ -1290,12 +1956,12 @@ def _install_git_hook(name: str) -> None:
 
 
 def cmd_hooks() -> None:
-    """Install git pre-commit + pre-push hooks and the Claude/Codex Stop wiring."""
+    """Install git pre-commit + pre-push hooks and the Claude/Codex agent hook wiring."""
     _install_git_hook("pre-commit")
     _install_git_hook("pre-push")
-    _install_stop_hook(Path(".codex/hooks.json"), CODEX_STOP_HOOK)
-    _install_stop_hook(Path(".claude/settings.json"), CLAUDE_STOP_HOOK, claude_settings=True)
-    print("Installed pre-commit, pre-push, and Claude/Codex Stop hooks")
+    for wiring in HOOK_WIRINGS:
+        _install_hook(wiring)
+    print("Installed pre-commit, pre-push, Claude/Codex Stop, and Claude PostToolUse hooks")
 
 
 def cmd_clean() -> None:
@@ -1334,10 +2000,11 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "typecheck": (cmd_typecheck, "Type-check with basedpyright"),
     "test": (cmd_test, "Run tests, or syntax check when no tests exist"),
     "check": (cmd_check, "Fix + format + typecheck + test (full repo)"),
-    "pre-commit": (cmd_pre_commit, "Staged checks + tests"),
+    "pre-commit": (cmd_pre_commit, "Staged fix/format + typecheck; mirrors a staged CLAUDE.md"),
     "pre-push": (
         cmd_pre_push,
-        "Read-only push gate: branch guard, lint, format check, agents-md drift, acceptance, arch",
+        "Read-only push gate: branch guard, tests, lint, format check, agents-md drift, "
+        "acceptance, arch",
     ),
     "ci": (
         cmd_ci,
@@ -1355,13 +2022,17 @@ TASKS: dict[str, tuple[Callable[..., None], str]] = {
     "arch": (cmd_arch, "Architecture checks (import-linter)"),
     "arch-config-guard": (cmd_arch_config_guard, "Block unreviewed arch config changes"),
     "branch-guard": (cmd_branch_guard, "Refuse pushes to protected branches (main/master)"),
-    "post-edit": (cmd_post_edit, "Format if source files changed"),
-    "stop-hook": (cmd_stop_hook, "Format changed files, then run stop-hook checks"),
+    "post-edit": (cmd_post_edit, "Format changed files (--hook: the file a PostToolUse names)"),
+    "stop-hook": (
+        cmd_stop_hook,
+        "post-edit, then changed-lines lint, complexity delta, deadcode delta; "
+        "silent on success, exit 2 with findings",
+    ),
     "agents-md-drift": (cmd_agents_md_drift, "Fail if AGENTS.md differs from CLAUDE.md"),
     "sync-agents-md": (cmd_sync_agents_md, "Overwrite AGENTS.md from CLAUDE.md"),
     "setup-hooks": (
         cmd_hooks,
-        "Install git pre-commit + pre-push hooks and Claude/Codex Stop wiring",
+        "Install git pre-commit + pre-push hooks and Claude/Codex agent hook wiring",
     ),
     "clean": (cmd_clean, "Remove cache and build artifacts"),
 }

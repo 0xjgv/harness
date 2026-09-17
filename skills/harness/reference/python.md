@@ -22,13 +22,41 @@ not paraphrase (it drifts). Two sections:
   and printed in submission order, run to completion so one pass surfaces
   every failure — then streams `coverage` and the advisory `crap`; `ci`
   also runs `arch-config-guard` in strict mode.
-  `pre-push` is the offline push gate: `lint`, `format check`, `acceptance`,
-  `arch`, and strict `arch-config-guard` over the whole pushed tree, after `branch-guard` refuses `main`/`master` (the
-  deterministic checks pre-commit and stop-hook skip). `deadcode` runs vulture (pinned `2.16`) over `src/` only —
+  `pre-commit` fixes and formats staged files and typechecks; it no longer
+  runs tests. A staged `CLAUDE.md` is copied to `AGENTS.md` and staged with
+  it; a hand edit to `AGENTS.md` alone fails the drift check.
+  `pre-push` is the offline push gate: after `branch-guard` refuses
+  `main`/`master`, it runs the test suite (alone, with git's `GIT_*` hook
+  variables stripped, since the suite writes caches and runs `git init` in
+  temp dirs), then `lint`, `format check`, `acceptance`, `arch`, and strict
+  `arch-config-guard` over the whole pushed tree (the deterministic checks
+  pre-commit and stop-hook skip).
+  `stop-hook` runs post-edit, then changed-lines lint, complexity delta, and
+  deadcode delta. It prints nothing on success and exits 2 with findings on
+  stderr (at most 20 lines). Changed lines come from `git diff -U0` against
+  the merge-base with the base branch (`HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`,
+  then `origin/HEAD`, `origin/main`, `origin/master`, `main`, `master`; never
+  fetched), plus untracked files. Each delta gate keeps the targets of its
+  whole-tree counterpart. Lint residue runs `ruff check` JSON on changed
+  project files (`src/`, `harness.py`, `tests/`) and keeps findings on changed
+  lines. The complexity delta runs `lizard --csv` on changed `src/` and `tests/`
+  files, now and at the base (`git show <base>:./<path>`). It keys functions by
+  `long_name`. When a signature is missing at the base, it falls back to the
+  function name, but only if that name is unique in both the current and base
+  file. A function blocks only when it is over a limit and new or worse than at
+  the base. The dead-code delta runs vulture over `src/` as `ci` does, and only
+  when a `src/` file changed. It keeps the findings on changed lines. Exit 1 means a tool
+  could not run, or the same payload came back with `stop_hook_active: true`
+  (loop guard, state under `git rev-parse --git-path harness`). An
+  uncommitted `CLAUDE.md` edit is copied to `AGENTS.md`. No arch-config warning
+  and no whole-tree gates at stop.
+  `post-edit --hook` (Claude PostToolUse) fixes and formats the one file the
+  event names and prints one `additionalContext` line when it changed. It
+  never blocks. `deadcode` runs vulture (pinned `2.16`) over `src/` only —
   never `tests/`, so a dead helper that still has a test is reported, not
   masked — at `--min-confidence 60`; allowlist dynamic references
   (decorator-registered handlers, getattr dispatch) in `vulture_allowlist.py`.
-  It runs in `ci` and `stop-hook`. `crap` is advisory (warns by default,
+  It runs in `ci`; `stop-hook` keeps only findings on changed lines. `crap` is advisory (warns by default,
   `--enforce` to hard-fail) but runs in `ci`, not `stop-hook`. Suppressions
   are ratcheted by `.harness-baseline`; `coverage.min` in the same file is
   the default coverage floor. Requires `uvx` on PATH
@@ -54,11 +82,15 @@ This brings `AGENTS.md`/`CLAUDE.md` (Layer 2), `.claude/settings.json`,
 
 ## Hooks
 
-`.claude/settings.json` wires the Claude Stop hook; `.codex/hooks.json` wires
-the Codex Stop hook. Full shape:
+`.claude/settings.json` wires the Claude Stop hook (`timeout` 300) and the
+Claude PostToolUse hook (`matcher` `Edit|Write`, `timeout` 60);
+`.codex/hooks.json` wires the Codex Stop hook only. `setup-hooks` installs all
+three idempotently, and `check` warns when any is missing. Full shape:
 [settings-json.md](settings-json.md).
 Claude Stop command:
 `cd $CLAUDE_PROJECT_DIR && uv run harness stop-hook`.
+Claude PostToolUse command:
+`cd $CLAUDE_PROJECT_DIR && uv run harness post-edit --hook`.
 Codex Stop command:
 `cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh uv run harness stop-hook`.
 
