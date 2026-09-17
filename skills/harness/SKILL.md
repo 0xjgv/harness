@@ -73,10 +73,13 @@ wiring, then apply the smallest compatible fix.
 | `go.mod` | `go/` → [go.md](reference/go.md) |
 | `Makefile` + multiple subprojects | `monorepo/` → [monorepo.md](reference/monorepo.md) |
 
-Claude/Codex hook + Stop-hook shape: [settings-json.md](reference/settings-json.md).
-The Stop hook runs `stop-hook`; `stop-hook` runs `post-edit`, then the
-read-only complexity gate (plus the dead-code gate where the language ships
-one) in parallel.
+Claude/Codex hook shape and the `stop-hook` contract: [settings-json.md](reference/settings-json.md).
+The Stop hook runs `stop-hook`: `post-edit`, then read-only delta gates that
+block only on what the change introduced (lint left on changed lines,
+over-limit functions the change touched, dead code on changed lines where
+the language ships a deadcode gate). Silent on success, exit 2 with findings,
+exit 1 when a tool cannot run. Claude's PostToolUse hook runs
+`post-edit --hook` on each edited file.
 Behavior contract: [behavior-contract.md](reference/behavior-contract.md).
 
 ## Gate principles
@@ -89,6 +92,10 @@ Apply these when deciding what a ported harness enforces:
 - Quality gates are hard: lint, types, arch boundaries, complexity (CCN 15),
   suppression ratchet, dead code, dependency audit, AGENTS/CLAUDE drift. An agent
   clears them by doing the work, so they cost nothing as models improve.
+- Gate the change, not the codebase, at agent stop. `stop-hook` blocks only on
+  findings the change introduced; pre-existing debt belongs to `check`/`ci`, where a
+  human decides when to pay it down. Cheap mechanical fixes (format, auto-fixable
+  lint, a derived `AGENTS.md`) are applied, not reported.
 - Permission gates are exactly two: `arch-config-guard` at `pre-push`/`ci` and
   `branch-guard` at `pre-push`. Do not add a third without a measured error rate
   that justifies stalling the agent.
@@ -101,24 +108,24 @@ Apply these when deciding what a ported harness enforces:
 | Script | When | What | Fixes? |
 |---|---|---|---|
 | `check` | After edits | fix + format + typecheck + test + suppression ratchet | yes |
-| `pre-commit` | Git pre-commit hook | same, staged files only | yes |
-| `pre-push` | Before push | branch guard, then read-only push gate: lint + format check + acceptance + arch over the whole tree, in parallel | no |
+| `pre-commit` | Git pre-commit hook | fix + format + typecheck on staged files; syncs a staged `CLAUDE.md` into `AGENTS.md`; no tests | yes |
+| `pre-push` | Before push | branch guard, then read-only push gate: tests + lint + format check + acceptance + arch over the whole tree | no |
 | `ci` | CI pipeline | read-only gates (lint + typecheck + dep audit + complexity + acceptance + arch) **run in parallel**, captured and printed in submission order; then tests/coverage + crap (advisory) | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
-| `post-edit` | Stop hook helper | fix + format changed source files (rust: clippy `--fix` + fmt) | yes |
-| `stop-hook` | Agent Stop hook | post-edit + complexity + deadcode (python/bun) | yes |
+| `post-edit` | Stop hook helper; `--hook` = Claude PostToolUse | fix + format changed source files (`--hook`: the edited file) | yes |
+| `stop-hook` | Agent Stop hook | post-edit, then lint on changed lines + over-limit functions touched + deadcode on changed lines (python/bun); silent on success, exit 2 with ≤20 findings | yes |
 
 Quality subcommands also callable standalone: `complexity`, `crap`,
 `acceptance`, `coverage` (Go also keeps `test-cov`), `mutation`, `arch`,
 `arch-config-guard`, `branch-guard`, `suppressions`, and `deadcode` (python/bun).
-`arch-config-guard` warns in `check`/`pre-commit`/`stop-hook` and fails
+`arch-config-guard` warns in `check`/`pre-commit` and fails
 `pre-push`/`ci` when protected arch config paths changed unless
 `HARNESS_ALLOW_ARCH_CONFIG=1` is set. `branch-guard` runs first in `pre-push`
 and refuses direct pushes to or deletions of `main`/`master`
 (`HARNESS_PRE_PUSH_REFS`, else git pre-push stdin refs, else the current
 branch) unless `HARNESS_ALLOW_PROTECTED_PUSH=1` is set. Both guards are
-Layer 2. `deadcode` flags unused code and runs in `ci` +
-`stop-hook`: python via vulture (app sources only, `--min-confidence 60`,
+Layer 2. `deadcode` flags unused code and runs in `ci` (`stop-hook` keeps
+only findings on changed lines): python via vulture (app sources only, `--min-confidence 60`,
 allowlist false positives in `vulture_allowlist.py`), bun via knip (unused
 files/exports/deps, configured by `knip.json`, fetched on demand via
 `bunx`). Go and rust have **no** `deadcode` target — their linters already
@@ -151,7 +158,7 @@ For an existing repo, wire it **only when the user opts in**. Full porting + onb
   section. The two files hold the same content (the templates'
   `agents-md-drift` check enforces no drift).
 - `arch-config-guard` protects the repo's architecture config at integration
-  time: warning mode in `check`/`pre-commit`/`stop-hook`, strict mode in
+  time: warning mode in `check`/`pre-commit`, strict mode in
   `pre-push`/`ci`, reviewed override via `HARNESS_ALLOW_ARCH_CONFIG=1`.
 - `branch-guard` keeps agents on feature branches: `pre-push` refuses direct
   pushes to `main`/`master` unless `HARNESS_ALLOW_PROTECTED_PUSH=1` is set.
@@ -206,7 +213,9 @@ Layer 1:
 3. Pre-commit hook fires on a staged change (`.git/hooks/pre-commit` exists).
 4. `audit` passes.
 5. `stop-hook` runs via Stop hook and includes post-edit formatting (Claude/Codex hooks wired per
-   [settings-json.md](reference/settings-json.md)).
+   [settings-json.md](reference/settings-json.md)). On a clean tree it prints nothing and
+   exits 0; a pre-existing over-limit function does not block; a new one exits 2 with a
+   `path:line` finding. `post-edit --hook` is wired as Claude PostToolUse.
 6. Suppression growth above `.harness-baseline` fails; `suppressions --update-baseline` updates it.
 7. Runner imports nothing outside stdlib/runtime.
 
@@ -215,7 +224,7 @@ Layer 2 (only if wired):
 8. `AGENTS.md` and `CLAUDE.md` include the same full behavior contract text.
 9. Plan-first, branch-only commits, and specify-what-is-worth-specifying rules
    are present as instructions.
-10. `arch-config-guard` warns in `check`/`pre-commit`/`stop-hook` and fails
+10. `arch-config-guard` warns in `check`/`pre-commit` and fails
     `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set.
 11. `branch-guard` fails on `main`/`master` (including deletions), passes with
     `HARNESS_ALLOW_PROTECTED_PUSH=1` or a feature-branch ref, never blocks on

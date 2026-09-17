@@ -181,9 +181,14 @@ func TestBranchGuardIncompleteRefs(t *testing.T) {
 	}
 }
 
+// mustRun runs cmd in dir; without an explicit environment it drops git's hook
+// variables, so a suite run from a git hook never writes into the real repo.
 func mustRun(t *testing.T, dir string, cmd *exec.Cmd) string {
 	t.Helper()
 	cmd.Dir = dir
+	if cmd.Env == nil {
+		cmd.Env = hookEnv()
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("%v: %v\n%s", cmd.Args, err, out)

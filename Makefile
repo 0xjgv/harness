@@ -52,6 +52,84 @@ runner_of() {
 endef
 export SH_LANG_HELPERS
 
+# Agent hook dispatch. make turns every failed recipe into exit 2, so an exit
+# code cannot carry the stop-hook contract (2 = findings, other = the tool
+# failed) through a Makefile. `stop_dispatch <dirs...>` therefore always exits 0
+# and answers as one hook JSON object on stdout, which Claude Code and Codex
+# both read: a block with the findings, or a systemMessage for tool failures.
+# Run from a terminal (stdin is a TTY) it prints the findings and exits 1.
+# Go subprojects are built and run as ./harness: `go run` reports any failing
+# program as exit 1, which would hide the findings exit code.
+# `post_edit_hook` forwards a PostToolUse event to the template owning the file.
+define SH_HOOK_DISPATCH
+json_escape() {
+  awk 'BEGIN { ORS = "" }
+    {
+      gsub(/\033\[[0-9;]*[A-Za-z]/, "")
+      gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t")
+      gsub(/[\001-\010\013-\037]/, "")
+      if (NR > 1) print "\\n"
+      print
+    }'
+}
+prefix_lines() {
+  sed -E -e "s|^([^[:space:]]+:[0-9]+:)|$$1/\1|" -e t -e "s|^|$$1: |"
+}
+stop_dispatch() {
+  local tmp dir runner rc
+  tmp=$$(mktemp -d) || return 1
+  if [ -t 0 ]; then : >"$$tmp/in"; else cat >"$$tmp/in"; fi
+  : >"$$tmp/block"; : >"$$tmp/warn"
+  for dir in "$${@:-}"; do
+    [ -n "$$dir" ] || continue
+    runner=$$(runner_of "$$dir") || continue
+    if [ "$$(lang_of "$$dir")" = go ]; then
+      runner=./harness
+      if ! (cd "$$dir" && go build -o harness harness.go) >/dev/null 2>"$$tmp/err"; then
+        prefix_lines "$$dir" <"$$tmp/err" >>"$$tmp/warn"
+        continue
+      fi
+    fi
+    (cd "$$dir" && $$runner stop-hook) <"$$tmp/in" >/dev/null 2>"$$tmp/err"
+    rc=$$?
+    case "$$rc" in
+      0) ;;
+      2) prefix_lines "$$dir" <"$$tmp/err" >>"$$tmp/block" ;;
+      *) [ -s "$$tmp/err" ] || echo "stop-hook exited $$rc" >"$$tmp/err"
+         prefix_lines "$$dir" <"$$tmp/err" >>"$$tmp/warn" ;;
+    esac
+  done
+  if [ -t 0 ]; then
+    cat "$$tmp/block" "$$tmp/warn" >&2
+    [ -s "$$tmp/block" ] && { rm -rf "$$tmp"; return 1; }
+    rm -rf "$$tmp"; return 0
+  fi
+  if [ -s "$$tmp/block" ]; then
+    printf '{"decision":"block","reason":"%s"' "$$(json_escape <"$$tmp/block")"
+  else
+    printf '{"continue":true'
+  fi
+  [ -s "$$tmp/warn" ] && printf ',"systemMessage":"%s"' "$$(json_escape <"$$tmp/warn")"
+  printf '}\n'
+  rm -rf "$$tmp"
+}
+post_edit_hook() {
+  local event file fdir rel dir runner top
+  event=$$(cat)
+  file=$$(printf '%s' "$$event" | sed -n 's/.*"file_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+  [ -n "$$file" ] || return 0
+  top=$$(pwd -P)
+  fdir=$$(cd "$$(dirname "$$file")" 2>/dev/null && pwd -P) || return 0
+  rel="$${fdir#"$$top"/}"
+  [ "$$rel" != "$$fdir" ] || return 0
+  dir="$${rel%%/*}"
+  case " $(SUBPROJECTS) " in *" $$dir "*) ;; *) return 0 ;; esac
+  runner=$$(runner_of "$$dir") || return 0
+  printf '%s' "$$event" | (cd "$$dir" && $$runner post-edit --hook) 2>/dev/null || true
+}
+endef
+export SH_HOOK_DISPATCH
+
 define SH_FILTER_DIRS
 filter_dirs() {
   local files p dirs=""
@@ -269,31 +347,40 @@ branch-guard: ## Refuse direct pushes to main/master (HARNESS_ALLOW_PROTECTED_PU
 	refs=$$(read_pre_push_refs); \
 	branch_guard "$$refs" || exit 1
 
+.PHONY: sync-derived
+sync-derived: ## Sync AGENTS.md from an edited CLAUDE.md; deploy an edited skills/harness/
+	@set -u; \
+	if [ -n "$$(git status --porcelain -- CLAUDE.md)" ] && ! cmp -s CLAUDE.md AGENTS.md; then \
+	  $(MAKE) --no-print-directory sync-agents-md; \
+	fi; \
+	if [ -n "$$(git status --porcelain -- skills/harness)" ]; then \
+	  $(MAKE) --no-print-directory sync-skills; \
+	fi
+
 .PHONY: post-edit
-post-edit: ## Root Stop helper: sync derived docs/skills and format dirty templates
-	@set -u -o pipefail; \
-	claude_dirty=$$(git diff --name-only --diff-filter=d -- CLAUDE.md; git ls-files --others --exclude-standard -- CLAUDE.md); \
-	if [ -n "$$claude_dirty" ]; then $(MAKE) --no-print-directory sync-agents-md; fi; \
-	skill_dirty=$$(git diff --name-only --diff-filter=d -- skills/harness; git ls-files --others --exclude-standard -- skills/harness); \
-	if [ -n "$$skill_dirty" ]; then $(MAKE) --no-print-directory sync-skills; fi; \
-	eval "$$SH_FILTER_DIRS"; dirs=$$(dirty_dirs); \
+post-edit: sync-derived ## Sync derived docs/skills and format dirty templates
+	@set -u -o pipefail; eval "$$SH_FILTER_DIRS"; dirs=$$(dirty_dirs); \
 	[ -z "$$dirs" ] && exit 0; \
 	$(MAKE) --no-print-directory _run CMD=post-edit DIRS="$$dirs" QUIET=1
 
+.PHONY: post-edit-hook
+post-edit-hook: ## Claude PostToolUse hook: fix + format the edited file in its template
+	@set -u; eval "$$SH_LANG_HELPERS"; eval "$$SH_HOOK_DISPATCH"; post_edit_hook
+
 .PHONY: stop-hook
-stop-hook: ## Agent Stop hook: post-edit, arch-config warning, dirty template stop-hooks
-	@printf "\n=== Root Stop Hook Checks ===\n"
-	@$(MAKE) --no-print-directory post-edit
-	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 0 1 0
-	@set -u -o pipefail; eval "$$SH_FILTER_DIRS"; dirs=$$(dirty_dirs); \
-	[ -z "$$dirs" ] && exit 0; \
-	$(MAKE) --no-print-directory _run CMD=stop-hook DIRS="$$dirs"
+stop-hook: ## Agent Stop hook: sync derived docs, then dirty templates' stop-hooks as one JSON answer
+	@$(MAKE) --no-print-directory sync-derived >&2
+	@set -u -o pipefail; eval "$$SH_FILTER_DIRS"; eval "$$SH_LANG_HELPERS"; eval "$$SH_HOOK_DISPATCH"; \
+	stop_dispatch $$(dirty_dirs)
 
 .PHONY: pre-commit
 pre-commit: ## Root git pre-commit hook
 	@set -u -o pipefail; eval "$$SH_ARCH_CONFIG_GUARD"; arch_config_guard 1 1 0
+	@set -u; \
+	if [ -n "$$(git diff --cached --name-only -- CLAUDE.md)" ] && ! cmp -s CLAUDE.md AGENTS.md; then \
+	  $(MAKE) --no-print-directory sync-agents-md && git add AGENTS.md; \
+	fi
 	@$(MAKE) --no-print-directory agents-md-drift
-	@$(MAKE) --no-print-directory skills-drift
 	@set -u -o pipefail; eval "$$SH_FILTER_DIRS"; dirs=$$(staged_dirs); \
 	[ -z "$$dirs" ] && exit 0; \
 	$(MAKE) --no-print-directory _run CMD=pre-commit DIRS="$$dirs"
@@ -342,6 +429,11 @@ setup-hooks: ## Install root pre-commit/pre-push hooks and verify Stop hook wiri
 	else \
 	  printf "  $(RED)⚠$(RESET) Missing Stop hook wiring: .claude/settings.json\n"; \
 	fi
+	@if [ -f .claude/settings.json ] && grep -q 'PostToolUse' .claude/settings.json && grep -q 'post-edit-hook' .claude/settings.json; then \
+	  printf "  $(GREEN)✓$(RESET) PostToolUse hook wiring (.claude/settings.json)\n"; \
+	else \
+	  printf "  $(RED)⚠$(RESET) Missing PostToolUse hook wiring: .claude/settings.json\n"; \
+	fi
 	@if [ -f .codex/hooks.json ] && grep -q 'Stop' .codex/hooks.json && grep -q 'stop-hook' .codex/hooks.json; then \
 	  printf "  $(GREEN)✓$(RESET) Stop hook wiring (.codex/hooks.json)\n"; \
 	else \
@@ -354,8 +446,12 @@ list: ## Show detected language templates
 	for d in $(SUBPROJECTS); do printf "  \033[36m%-12s\033[0m %s\n" "$$d" "$$(lang_of "$$d")"; done
 
 .PHONY: _run
+# A git hook in a linked worktree exports GIT_DIR, which tells git the current
+# directory is the top of the work tree; after `cd <subproject>` that makes
+# `--relative` and `--show-prefix` wrong. Unset it (git rediscovers the same
+# repo from the cwd; GIT_INDEX_FILE stays, so pre-commit still sees the index).
 _run:
-	@set -u -o pipefail; \
+	@set -u -o pipefail; unset GIT_DIR GIT_WORK_TREE; \
 	dirs="$(DIRS)"; cmd="$(CMD)"; args="$(ARGS)"; quiet="$(QUIET)"; \
 	[ -z "$$dirs" ] && { printf "$(DIM)No templates to run '%s'.$(RESET)\n" "$$cmd"; exit 0; }; \
 	eval "$$SH_LANG_HELPERS"; \

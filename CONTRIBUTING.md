@@ -22,9 +22,9 @@ Every template must follow the same conventions. Use an existing template (e.g. 
 - [ ] Include a **`README.md`** with getting-started instructions
 - [ ] Include **security-focused lint rules** enabled in the linter config
 - [ ] Include a **dependency audit** command (`audit`) wired into `ci`
-- [ ] Include a **post-edit** command that formats changed source files (non-blocking)
-- [ ] Include a **stop-hook** command that runs post-edit, then complexity (+ deadcode where shipped)
-- [ ] Include **`.claude/settings.json`** and **`.codex/hooks.json`** with Stop hooks for stop-hook
+- [ ] Include a **post-edit** command that formats changed source files (non-blocking), and `post-edit --hook` for Claude PostToolUse (one file, always exit 0, `additionalContext` when the file changed)
+- [ ] Include a **stop-hook** command that runs post-edit, then blocks only on the change: lint on changed lines, over-limit functions the change touched (+ deadcode on changed lines where shipped). Silent on success, exit 2 with findings on stderr, exit 1 on tool failure, exit 1 instead of 2 when `stop_hook_active` (see `skills/harness/reference/settings-json.md`)
+- [ ] Include **`.claude/settings.json`** (Stop → stop-hook, PostToolUse → post-edit --hook) and **`.codex/hooks.json`** (Stop → the Codex wrapper around stop-hook)
 - [ ] Include at least one **smoke test**
 - [ ] Add the template to the root `README.md` tables (Available Templates, Getting Started)
 

@@ -41,7 +41,7 @@ make check-api      # scope to one subproject
 | `make test` | Run tests only, all subprojects |
 | `make list` | Show detected subprojects |
 | `make setup` | Per-language deps: `bun install`, `uv sync`, `go mod download`, `cargo build` |
-| `make setup-hooks` | Install git pre-commit + pre-push hooks → `make pre-commit` / `make pre-push` (path resolved via `git rev-parse`, worktree-safe) and verify Claude/Codex Stop hook wiring. Idempotent — re-run any time |
+| `make setup-hooks` | Install git pre-commit + pre-push hooks → `make pre-commit` / `make pre-push` (path resolved via `git rev-parse`, worktree-safe) and verify Claude Stop/PostToolUse and Codex Stop hook wiring. Idempotent — re-run any time |
 | `make bootstrap` | `setup` + `setup-hooks` |
 | `make clean` | Delegate `clean` to each subproject |
 
@@ -78,12 +78,15 @@ The Makefile fans out `<cmd>` to each matching subproject, continues past failur
 - **Plan first**: open with a plan — the sub-tasks, the files each touches, which change user-visible behavior — then execute it in the same turn.
 - **Human-is-engineer**: commit and push on a feature branch, never to `main`/`master`, never merge. `make pre-push` refuses direct pushes to (or deletions of) a protected branch unless a human sets `HARNESS_ALLOW_PROTECTED_PUSH=1`; that guard stops accidents, not `--no-verify`, so merge ownership is a rule you follow, not one the tool can enforce.
 - **Specify what is worth specifying**: `.feature` scenarios for user-visible flows, law-like rules, and cross-component contracts; unit tests suffice for the rest.
-- **Arch config guard**: edits to any subproject's arch config (`.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, `arch.toml`) warn during `check`/`pre-commit`/`stop-hook` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+- **Arch config guard**: edits to any subproject's arch config (`.importlinter`, `.dependency-cruiser.json`, `.go-arch-lint.yml`, `arch.toml`) warn during `check`/`pre-commit` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 
 Each subproject's own harness splits its checks the same way: hard quality gates (lint, types, arch, complexity, suppressions, dead code, audit, drift) always block; advisory metrics (CRAP, mutation) report but never gate; the coverage floor is a ratchet from that subproject's `.harness-baseline`, not a target; and exactly two permission gates need a human to unblock — `arch-config-guard` (`pre-push`/`ci`) and `branch-guard` (`pre-push`, run here at the monorepo root).
 
-Stop hooks are wired via `.claude/settings.json` for Claude and
-`.codex/hooks.json` for Codex. Each single-language template also ships this
+Agent hooks are wired via `.claude/settings.json` for Claude (Stop and
+PostToolUse) and `.codex/hooks.json` for Codex (Stop). `make -s stop-hook`
+runs each dirty subproject's `stop-hook` and answers as one hook JSON object,
+because `make` flattens exit codes; `make -s post-edit-hook` forwards each edit
+to the subproject that owns the file. Each single-language template also ships this
 wiring for standalone use; at a monorepo root only the root copy runs, so a
 subproject's own hooks lie dormant until you open it as its own project.
 

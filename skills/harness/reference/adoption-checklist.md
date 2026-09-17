@@ -72,6 +72,7 @@ Default classification:
 | `audit` command | Required |
 | `post-edit` command | Required |
 | `stop-hook` command + Claude/Codex Stop wiring | Required |
+| `post-edit --hook` + Claude PostToolUse wiring | Required |
 | Quiet runner output contract | Required |
 | Read-only `ci` and `pre-push` | Required |
 | Suppression ratchet via `.harness-baseline` | Required |
@@ -101,9 +102,9 @@ The repo must expose these commands through its chosen runner:
 | `pre-push` | Offline read-only push gate: lint, format check where separate, acceptance, arch over the whole pushed tree. Must not mutate. |
 | `ci` | Full read-only verification. Read-only gates run in parallel and print in submission order; then coverage and advisory CRAP run. Must not mutate tracked files. |
 | `audit` | Dependency vulnerability audit. Must not mutate. |
-| `post-edit` | Stop hook helper. Formats source files when changed. May mutate formatting only. |
-| `stop-hook` | Agent Stop hook entrypoint. Runs `post-edit`, then read-only complexity and deadcode where applicable. |
-| `setup-hooks` | Installs or refreshes pre-commit, pre-push, and Claude/Codex Stop hook wiring. |
+| `post-edit` | Stop hook helper. Formats source files when changed. May mutate formatting only. `--hook` is the Claude PostToolUse handler for one file. |
+| `stop-hook` | Agent Stop hook entrypoint. Runs `post-edit`, then read-only delta gates: lint on changed lines, over-limit functions the change touched, deadcode on changed lines where applicable. |
+| `setup-hooks` | Installs or refreshes pre-commit, pre-push, Claude Stop/PostToolUse, and Codex Stop hook wiring. |
 | `suppressions` | Shows suppression counts; `--update-baseline` is the only writer and needs human sign-off. |
 | `coverage` | Enforces the `.harness-baseline` `coverage.min` floor unless overridden. |
 | `complexity` | Enforces lizard thresholds: CCN<=15, args<=8, length<=100. |
@@ -156,8 +157,10 @@ Must:
 - Be installed as `.git/hooks/pre-commit` or through the repo's configured
   git hooks path.
 - Run on staged source files where practical.
-- Fix/format, typecheck, test when source changed, and check suppressions and
-  AGENTS/CLAUDE drift.
+- Fix/format, typecheck, and check suppressions. Sync `AGENTS.md` from a
+  staged `CLAUDE.md` and stage it; fail only when `AGENTS.md` was edited on its
+  own.
+- Not run the test suite (it runs in `pre-push`).
 - Run `arch-config-guard` in warning mode over staged paths.
 - Avoid network-dependent work.
 
@@ -178,7 +181,8 @@ Must:
 - Run `branch-guard` first; refuse `main`/`master` unless
   `HARNESS_ALLOW_PROTECTED_PUSH=1`.
 - Run offline deterministic gates over the whole pushed tree:
-  lint, format check where separate, acceptance, arch.
+  tests, lint, format check where separate, acceptance, arch. Tests run before
+  the parallel read-only batch when they write artifacts.
 - Run `arch-config-guard` in strict mode.
 - Read git pre-push stdin at most once, never block on an idle pipe, fail on
   partial input, and honour `HARNESS_PRE_PUSH_REFS` when a dispatcher sets it.
@@ -234,6 +238,10 @@ Must:
 - Avoid typecheck, tests, network, audit, coverage, CRAP, mutation, acceptance,
   or arch.
 - Be safe to run from an agent Stop hook.
+- Offer `post-edit --hook`: read the PostToolUse event on stdin, fix and
+  format `tool_input.file_path` when it is a source file of the repo, always
+  exit 0, and print the `additionalContext` re-read notice only when the file
+  changed.
 
 Gap examples:
 
@@ -246,11 +254,17 @@ Gap examples:
 Must:
 
 - Run `post-edit` first.
-- Run `arch-config-guard` in warning mode.
-- Then run read-only complexity and deadcode gates where applicable.
+- Then run read-only delta gates that report only what the change introduced,
+  measured against the merge-base with the default branch plus uncommitted and
+  untracked files: lint left on changed lines, over-limit functions whose span
+  overlaps a changed line, and deadcode on changed lines where applicable.
 - Use Python/Bun deadcode gates (`vulture`/`knip`).
 - Use lint-based deadcode coverage for Go/Rust; do not invent a standalone
   `deadcode` command there.
+- Not run `arch-config-guard`, whole-tree gates, or tests.
+- Print nothing on success; exit 2 with at most 20 `path:line` findings on
+  stderr; exit 1 when a tool cannot run; exit 1 instead of 2 when
+  `stop_hook_active` is set (block once per stop).
 - Be wired into Claude and Codex Stop hooks.
 
 Gap examples:
@@ -259,6 +273,9 @@ Gap examples:
 - Codex hook points directly at a human runner: wrap it with
   `.codex/hooks/codex-stop-hook.sh` so stdout is JSON.
 - Stop hook omits deadcode in Python/Bun: add the language deadcode gate.
+- Stop hook runs whole-tree gates or exits 1 on findings: it either blocks on
+  pre-existing debt or never reaches the agent. Scope it to the change and
+  exit 2.
 
 ## Supporting gates
 
@@ -316,11 +333,13 @@ Must:
 
 - Use lizard pinned through `uvx` where the templates do.
 - Enforce CCN<=15, args<=8, length<=100.
-- Run in `ci` and `stop-hook`.
+- Run in `ci` over the whole tree, and in `stop-hook` as a delta (functions
+  over a limit whose span overlaps a changed line).
 
 Fix suggestions:
 
-- Add the `complexity` command and call it from both `ci` and `stop-hook`.
+- Add the `complexity` command and call it from `ci`; add the delta to
+  `stop-hook`: `lizard --csv` on the changed files, filtered by line span.
 - Capture successful lizard output; print details only on failure.
 
 ### Deadcode
@@ -337,7 +356,7 @@ Must:
 Fix suggestions:
 
 - Add a standalone `deadcode` command only for Python/Bun.
-- Add Python/Bun deadcode to `ci` and `stop-hook`.
+- Add Python/Bun deadcode to `ci`, and to `stop-hook` filtered to changed lines.
 - For Go/Rust, fix the lint config instead of adding another tool.
 
 ### Property-based tests
@@ -378,7 +397,7 @@ Must:
 - Run the repo's architecture boundary check when configured.
 - Be included in `ci` and `pre-push`.
 - Keep the architecture config under `arch-config-guard`.
-- Warn in `check`/`stop-hook` and fail `pre-commit`/`pre-push`/`ci` unless
+- Warn in `check`/`pre-commit` and fail `pre-push`/`ci` unless
   `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 
 Fix suggestions:
@@ -436,7 +455,8 @@ Must verify:
 - Claude Stop hook runs `<runner> stop-hook`.
 - Codex Stop hook runs `.codex/hooks/codex-stop-hook.sh <runner> stop-hook`.
 - Codex Stop hook has timeout and status message.
-- Claude settings wire Stop only.
+- Claude settings wire Stop (timeout 300) and PostToolUse on `Edit|Write`
+  running `<runner> post-edit --hook` (timeout 60).
 - No `.claude/scripts/` behavior hooks are required.
 
 Fix suggestions:

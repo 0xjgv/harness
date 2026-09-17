@@ -6,7 +6,8 @@
  *   bun harness.ts                  # full pre-flight (default)
  *   bun harness.ts check            # full pre-flight
  *   bun harness.ts fix              # fix lint errors + format
- *   bun harness.ts pre-commit       # staged checks + tests
+ *   bun harness.ts pre-commit       # staged fix/format + typecheck
+ *   bun harness.ts stop-hook        # agent Stop hook: delta gates, silent when clean
  *   bun harness.ts ci               # CI verification
  *   bun harness.ts acceptance       # cucumber scenarios
  *   bun harness.ts coverage --min=N # tests with coverage threshold
@@ -23,7 +24,9 @@ const QUALITY_SOURCES = ['src', 'harness.ts'] as const;
 const TEST_DIR = 'tests';
 const LIZARD = 'lizard@1.22.2';
 const KNIP = 'knip@5.88.1';
+const COMPLEXITY_MAX_CCN = 15;
 const COMPLEXITY_MAX_ARGS = 8;
+const COMPLEXITY_MAX_LENGTH = 100;
 const ROOT = import.meta.dir;
 const BASELINE_FILE = '.harness-baseline';
 const SUPPRESSION_BASELINE_PREFIX = 'suppressions.';
@@ -33,17 +36,24 @@ const PROTECTED_BRANCHES = ['main', 'master'] as const;
 const PROTECTED_PUSH_ALLOW_ENV = 'HARNESS_ALLOW_PROTECTED_PUSH';
 const PRE_PUSH_REFS_ENV = 'HARNESS_PRE_PUSH_REFS';
 const PRE_PUSH_STDIN_WAIT_MS = 1000;
+// Where the stop hook's delta starts: env overrides first (HARNESS_ARCH_BASE, then
+// GITHUB_BASE_REF), then these. Never fetched — a hook must not touch the network.
+const DELTA_BASE_CANDIDATES = ['origin/HEAD', 'origin/main', 'origin/master', 'main', 'master'];
+const HOOK_STDIN_WAIT_MS = 1000;
+// Finding lines a stop-hook payload carries; the rest are one command away.
+const HOOK_FINDING_LIMIT = 20;
 
 // ── Hook wiring (installed by `setup-hooks`) ────────────────────────
 // Claude reads .claude/settings.json and runs the harness directly; Codex reads
 // .codex/hooks.json and goes through the codex-stop-hook.sh wrapper (which turns
 // the exit code into the block/continue JSON Codex expects). Keep both in sync
-// with the committed template files so re-running the installer is a no-op.
+// with the committed template files so re-running the installer is a no-op. The
+// committed .claude/settings.json also carries the PostToolUse (post-edit --hook) wiring.
 const CLAUDE_SETTINGS_SCHEMA = 'https://json.schemastore.org/claude-code-settings.json';
 const CLAUDE_STOP_COMMAND = 'cd $CLAUDE_PROJECT_DIR && bun harness.ts stop-hook';
 const CODEX_STOP_COMMAND =
   'cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh bun harness.ts stop-hook';
-const CLAUDE_STOP_HOOK = { type: 'command', command: CLAUDE_STOP_COMMAND };
+const CLAUDE_STOP_HOOK = { type: 'command', command: CLAUDE_STOP_COMMAND, timeout: 300 };
 const CODEX_STOP_HOOK = {
   type: 'command',
   command: CODEX_STOP_COMMAND,
@@ -153,6 +163,7 @@ export interface Gate {
   cmd: string[];
   extract?: (output: string) => string | undefined;
   hint?: string;
+  env?: Record<string, string>;
 }
 
 interface GateResult {
@@ -167,7 +178,7 @@ interface GateResult {
 
 /** Run a command with output captured (no printing, no exit): the unit the batch runs. */
 async function runCapture(gate: Gate): Promise<GateResult> {
-  const proc = Bun.spawn(gate.cmd, { cwd: ROOT, stdout: 'pipe', stderr: 'pipe' });
+  const proc = Bun.spawn(gate.cmd, { cwd: ROOT, env: gate.env, stdout: 'pipe', stderr: 'pipe' });
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -511,19 +522,21 @@ async function stagedTsFiles(): Promise<string[]> {
     .filter((f) => isProjectTsFile(f));
 }
 
+// Porcelain paths are repository-relative: a project in a subdirectory strips its
+// prefix. `--untracked-files=all` lists new files inside new directories.
 async function changedTsFiles(): Promise<string[]> {
-  const proc = Bun.spawn(['git', 'status', '--porcelain'], {
+  const proc = Bun.spawn(['git', 'status', '--porcelain', '--untracked-files=all', '--', '.'], {
     cwd: ROOT,
     stdout: 'pipe',
     stderr: 'pipe',
   });
   const stdout = await new Response(proc.stdout).text();
   await proc.exited;
+  const prefix = await gitPrefix();
   return stdout
-    .trim()
     .split('\n')
     .filter((line) => line.length > 3 && !line.slice(0, 2).includes('D'))
-    .map(porcelainPath)
+    .map((line) => normalizeChangedPath(porcelainPath(line), prefix))
     .filter((f) => isProjectTsFile(f));
 }
 
@@ -568,6 +581,28 @@ async function cmdTest(): Promise<void> {
     return;
   }
   await run('Tests', ['bun', 'test'], { extract: extractTestSummary });
+}
+
+/** This environment minus the GIT_* variables git exports to hooks. */
+function envWithoutGit(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined && !key.startsWith('GIT_')) env[key] = value;
+  }
+  return env;
+}
+
+// Tests run without git's hook variables (GIT_DIR, GIT_INDEX_FILE): a test that runs
+// `git init` in a temp dir would otherwise write into this repository.
+async function checkTests(): Promise<boolean> {
+  if (!(await hasTests())) {
+    warn(`Tests: no ${TEST_DIR}/*.test.ts or *.spec.ts files; skipped`);
+    return true;
+  }
+  const gate = { description: 'Tests', cmd: ['bun', 'test'], env: envWithoutGit() };
+  return printGateResult(await runCapture({ ...gate, extract: extractTestSummary }), {
+    noExit: true,
+  });
 }
 
 function auditGate(): Gate {
@@ -731,21 +766,17 @@ type PrePushRefs = { state: 'refs'; text: string } | { state: 'none' } | { state
 let prePushRefsCache: PrePushRefs | null = null;
 
 // Agent tools and CI hand the process an open, silent stdin pipe, so a plain read
-// would hang. The deadline bounds the whole read, and partial input is a hard
-// failure: half a ref list would silently under-report what is being pushed.
-function readRefsFromStdin(): Promise<PrePushRefs> {
+// would hang. The deadline bounds the whole read, not just the first byte.
+function readStdin(waitMs: number): Promise<{ text: string; complete: boolean }> {
   return new Promise((resolve) => {
     const chunks: string[] = [];
     let timer: ReturnType<typeof setTimeout>;
     const finish = (timedOut: boolean): void => {
       clearTimeout(timer);
       process.stdin.pause();
-      const text = chunks.join('');
-      if (timedOut && text !== '') resolve({ state: 'incomplete' });
-      else if (text.trim() === '') resolve({ state: 'none' });
-      else resolve({ state: 'refs', text });
+      resolve({ text: chunks.join(''), complete: !timedOut });
     };
-    timer = setTimeout(() => finish(true), PRE_PUSH_STDIN_WAIT_MS);
+    timer = setTimeout(() => finish(true), waitMs);
     // Bun gives redirected stdin a stream without unref; guard the call.
     (process.stdin as { unref?: () => void }).unref?.();
     process.stdin.setEncoding('utf8');
@@ -753,6 +784,15 @@ function readRefsFromStdin(): Promise<PrePushRefs> {
     process.stdin.on('end', () => finish(false));
     process.stdin.on('error', () => finish(false));
   });
+}
+
+// Partial input is a hard failure: half a ref list would silently under-report
+// what is being pushed.
+async function readRefsFromStdin(): Promise<PrePushRefs> {
+  const { text, complete } = await readStdin(PRE_PUSH_STDIN_WAIT_MS);
+  if (!complete && text !== '') return { state: 'incomplete' };
+  if (text.trim() === '') return { state: 'none' };
+  return { state: 'refs', text };
 }
 
 async function prePushRefs(): Promise<PrePushRefs> {
@@ -996,6 +1036,18 @@ async function artifactIsFresh(path: string, roots: string[]): Promise<boolean> 
   return true;
 }
 
+// One `lizard --csv` function row, or null. Columns 1, 3, 4 are CCN, params, length.
+// Signatures can contain commas, so name/start/end/path come from the self-contained
+// quoted `name@start-end@path` location field. Name is empty for anonymous functions.
+function lizardRow(row: string) {
+  const cols = row.split(',');
+  const location = /"([^"@]*)@(\d+)-(\d+)@([^"]+)"/.exec(row);
+  const [ccn, , args, length] = cols.slice(1, 5).map(Number);
+  if (cols.length < 11 || location === null || !Number.isFinite(ccn)) return null;
+  const [, name, start, end, path] = location;
+  return { name, path, start: Number(start), end: Number(end), ccn, args, length };
+}
+
 async function cmdCrap(): Promise<void> {
   // CRAP = ccn^2 * (1-cov)^3 + ccn per function. Advisory — lizard + LCOV.
   if (!(await hasTests())) {
@@ -1049,26 +1101,14 @@ async function cmdCrap(): Promise<void> {
     return;
   }
 
-  // lizard --csv: column 1 is CCN; the quoted location field encodes
-  // `name@start-end@path`. Signatures can contain commas, so derive the
-  // location (and thus path/start/end) from that self-contained field.
-  // Name may be empty for anonymous arrows/IIFEs — match but skip cleanly.
-  const locRe = /"([^"@]*)@(\d+)-(\d+)@([^"]+)"/;
   const offenders: CrapFn[] = [];
   for (const row of lzOut.split('\n')) {
-    const cols = row.split(',');
-    if (cols.length < 11) continue;
-    const ccn = Number(cols[1]);
-    if (!Number.isFinite(ccn)) continue;
-    const lm = locRe.exec(row);
-    if (!lm) continue;
-    const [, name, startS, endS, path] = lm;
+    const fn = lizardRow(row);
     // Anonymous functions: lizard emits an empty name. They share their
     // parent's coverage attribution in LCOV, so a per-function join cannot
     // score them fairly — skip rather than silently misattribute.
-    if (!name) continue;
-    const start = Number(startS);
-    const end = Number(endS);
+    if (!fn?.name) continue;
+    const { name, start, end, path, ccn } = fn;
     const location = `${name}@${start}-${end}@${path}`;
 
     const lines = covMap[path] ?? covMap[path.replace(/^\.\//, '')] ?? {};
@@ -1113,15 +1153,15 @@ async function complexityGatesOrWarn(): Promise<Gate[]> {
         LIZARD,
         ...targets,
         '-C',
-        '15',
+        String(COMPLEXITY_MAX_CCN),
         '-a',
         String(COMPLEXITY_MAX_ARGS),
         '-L',
-        '100',
+        String(COMPLEXITY_MAX_LENGTH),
         '-i',
         '0',
       ],
-      hint: 'extract helpers or flatten branches until CCN <= 15; do not raise the threshold',
+      hint: `extract helpers or flatten branches until CCN <= ${COMPLEXITY_MAX_CCN}; do not raise the threshold`,
     },
   ];
 }
@@ -1148,34 +1188,372 @@ async function cmdDeadcode(): Promise<void> {
   await run(gate.description, gate.cmd);
 }
 
+// ── Agent hooks ─────────────────────────────────────────────────────
+// The stop hook judges the change, not the tree; the whole-tree gates stay in check /
+// ci / pre-push. Silent 0 when clean, 2 with a stderr payload, 1 when a tool failed.
+
+/** Changed lines per path relative to this project, as inclusive [start, end] spans. */
+type ChangedScope = Map<string, [number, number][]>;
+
+/** One delta gate: findings block the stop; a problem means its tool could not run. */
+interface DeltaResult {
+  gate: string;
+  findings: string[];
+  problem?: string;
+}
+
+interface BiomeReport {
+  diagnostics: {
+    severity: string;
+    category?: string;
+    message: string;
+    location: { path?: string; start?: { line: number } };
+  }[];
+}
+
+interface KnipIssue {
+  description: string;
+  location: { path: string; positions?: { begin: { line: number } } };
+}
+
+export const LOOP_GUARD_NOTICE = 'harness: already blocked once on this stop; not blocking again';
+const HUNK_RE = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+// The new side of a file header; `--dst-prefix=b/` is forced, so `/dev/null` never matches.
+const NEW_PATH_RE = /^\+\+\+ "?b\/(.*?)"?\t*$/;
+// knip issue types that name a symbol on a line; unused files and dependencies stay in ci.
+const KNIP_SYMBOL_ISSUES = 'exports,types,nsExports,nsTypes,enumMembers,classMembers,duplicates';
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** The command's stdout; throws when it cannot run, or fails outside `ok` or silently. */
+async function runTool(tool: string, cmd: string[], ok = [0]): Promise<string> {
+  const proc = Bun.spawn(cmd, { cwd: ROOT, stdout: 'pipe', stderr: 'pipe' });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  // A findings exit always carries a report: biome exits 1 on a broken config too.
+  if (code === 0 || (ok.includes(code) && stdout.trim() !== '')) return stdout;
+  const last = (stderr.trim() || stdout.trim()).split('\n').at(-1);
+  throw new Error(`${tool} exited ${code}${last ? `: ${last}` : ''}`);
+}
+
+// ── Changed lines ──
+
+/** merge-base(first base ref that resolves, HEAD); HEAD without one; null before a commit. */
+async function deltaBase(): Promise<string | null> {
+  if ((await gitLines(['rev-parse', '--verify', '--quiet', 'HEAD'])).length === 0) return null;
+  const { HARNESS_ARCH_BASE: archBase, GITHUB_BASE_REF: githubBase } = process.env;
+  for (const ref of [archBase, githubBase && `origin/${githubBase}`, ...DELTA_BASE_CANDIDATES]) {
+    if (!ref) continue;
+    const [resolved] = await gitLines(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
+    if (resolved === undefined) continue;
+    const [mergeBase] = await gitLines(['merge-base', ref, 'HEAD']);
+    return mergeBase ?? 'HEAD';
+  }
+  return 'HEAD';
+}
+
+/**
+ * `{path: [[start, end]]}` of the new-side lines in a `git diff -U0` (a/ b/ prefixes).
+ * Headers are read only before a file's first hunk (an added `++ x` line is no header).
+ * A pure deletion (`+N,0`) adds no range but lists its file; a deleted file is not listed.
+ */
+export function parseDiffRanges(diff: string): ChangedScope {
+  const ranges: ChangedScope = new Map();
+  let spans: [number, number][] = [];
+  let inHeader = false;
+  for (const line of diff.split('\n')) {
+    const path = inHeader ? NEW_PATH_RE.exec(line)?.[1] : undefined;
+    const hunk = HUNK_RE.exec(line);
+    if (line.startsWith('diff --git ')) {
+      spans = []; // detached until a `+++ b/` header claims it
+      inHeader = true;
+    } else if (path !== undefined) {
+      ranges.set(path, spans);
+    } else if (hunk !== null) {
+      inHeader = false;
+      const start = Number(hunk[1]);
+      const count = Number(hunk[2] ?? 1);
+      if (count > 0) spans.push([start, start + count - 1]);
+    }
+  }
+  return ranges;
+}
+
+/**
+ * Changed lines per path: `git diff <base>` (branch commits and uncommitted work; a
+ * rename is a new file) plus untracked files, whole; before the first commit, every file.
+ */
+async function changedScope(base: string | null): Promise<ChangedScope> {
+  const git = (...args: string[]) => runTool('git', ['git', '-c', 'core.quotePath=false', ...args]);
+  const diff = ['diff', '-U0', '--no-color', '--no-ext-diff', '--no-renames', '--relative'];
+  const scope: ChangedScope =
+    base === null
+      ? new Map()
+      : parseDiffRanges(await git(...diff, '--src-prefix=a/', '--dst-prefix=b/', base, '--', '.'));
+  const listed = base === null ? ['--cached', '--others'] : ['--others'];
+  const whole = await git('ls-files', ...listed, '--exclude-standard', '--', '.');
+  for (const path of whole.split('\n')) {
+    if (path) scope.set(path, [[1, Number.MAX_SAFE_INTEGER]]);
+  }
+  return scope;
+}
+
+/** True when lines [start, end] overlap a changed span. */
+function touches(spans: [number, number][] | undefined, start: number, end = start): boolean {
+  return (spans ?? []).some(([from, to]) => from <= end && start <= to);
+}
+
+/** Changed paths `keep` accepts that are still files, sorted. */
+async function scopedFiles(scope: ChangedScope, keep: (p: string) => boolean): Promise<string[]> {
+  const { statSync } = await import('node:fs');
+  const isFile = (path: string) => statSync(`${ROOT}/${path}`, { throwIfNoEntry: false })?.isFile();
+  return [...scope.keys()].filter((path) => keep(path) && isFile(path)).sort();
+}
+
+/** `path:line: message` for each `[path, line, message]` on a changed line. */
+function onChangedLines(scope: ChangedScope, items: [string, number, string][]): string[] {
+  return items
+    .filter(([path, line]) => touches(scope.get(path), line))
+    .map(([path, line, message]) => `${path}:${line}: ${message}`);
+}
+
+// ── Delta gates ──
+
+/**
+ * Biome errors the fix pass left, on changed lines. Like the whole-tree gate (which
+ * lints `.`), every changed file goes to biome. Warnings never fail that gate either;
+ * line 0 is a whole-file diagnostic (a format diff), which no changed line matches.
+ */
+async function lintResidue(scope: ChangedScope): Promise<string[]> {
+  const files = await scopedFiles(scope, () => true);
+  if (files.length === 0) return [];
+  const flags = ['--reporter=json', '--max-diagnostics=none', '--files-ignore-unknown=true'];
+  const cmd = ['bunx', 'biome', 'check', ...flags, '--no-errors-on-unmatched', ...files];
+  const report = JSON.parse(await runTool('biome', cmd, [0, 1])) as BiomeReport;
+  const blocking = report.diagnostics.filter((d) => ['error', 'fatal'].includes(d.severity));
+  return onChangedLines(
+    scope,
+    blocking.map((d) => [
+      normalizeChangedPath(d.location.path ?? '', ''),
+      d.location.start?.line ?? 0,
+      d.category ? `${d.category} ${d.message}` : d.message,
+    ]),
+  );
+}
+
+/**
+ * `path:start: name CCN 19 (limit 15)` per limit exceeded by a function the change touches.
+ * lizard's TypeScript reader ends a function on the line of the next token, so the span
+ * ends at the last line up to there that starts with `}` (`sources`: lines per path).
+ */
+export function touchedOverLimit(
+  csv: string,
+  scope: ChangedScope,
+  sources: Map<string, string[]>,
+): string[] {
+  const findings: string[] = [];
+  for (const row of csv.split('\n')) {
+    const fn = lizardRow(row);
+    if (fn === null) continue;
+    const lines = sources.get(fn.path) ?? [];
+    let end = fn.end;
+    while (end > fn.start && !lines[end - 1]?.trimStart().startsWith('}')) end--;
+    if (!touches(scope.get(fn.path), fn.start, end)) continue;
+    const metrics = [
+      ['CCN', fn.ccn, COMPLEXITY_MAX_CCN],
+      ['args', fn.args, COMPLEXITY_MAX_ARGS],
+      ['length', fn.length, COMPLEXITY_MAX_LENGTH],
+    ] as const;
+    for (const [label, value, limit] of metrics) {
+      if (value <= limit) continue;
+      findings.push(`${fn.path}:${fn.start}: ${fn.name} ${label} ${value} (limit ${limit})`);
+    }
+  }
+  return findings;
+}
+
+/** Over-limit functions the change touches (legacy ones too: leave what you touch better). */
+async function complexityResidue(scope: ChangedScope): Promise<string[]> {
+  const targets = [...APP_SOURCES, TEST_DIR];
+  const files = await scopedFiles(scope, (path) => matchesTsTarget(path, targets));
+  // lizard with no file arguments walks the working directory; never let it.
+  if (files.length === 0) return [];
+  const { readFileSync } = await import('node:fs');
+  const sources = new Map(files.map((f) => [f, readFileSync(`${ROOT}/${f}`, 'utf8').split('\n')]));
+  const csv = await runTool('lizard', ['uvx', LIZARD, '--csv', ...files]);
+  return touchedOverLimit(csv, scope, sources);
+}
+
+/** knip symbol findings on changed lines. knip still reads the whole project: deadness is global. */
+async function deadcodeResidue(scope: ChangedScope): Promise<string[]> {
+  if ((await scopedFiles(scope, isQualityTsFile)).length === 0) return [];
+  const cmd = [...deadcodeGate().cmd, '--reporter', 'codeclimate', '--include', KNIP_SYMBOL_ISSUES];
+  const issues = JSON.parse(await runTool('knip', cmd, [0, 1])) as KnipIssue[];
+  return onChangedLines(
+    scope,
+    issues.map((i) => [i.location.path, i.location.positions?.begin.line ?? 0, i.description]),
+  );
+}
+
+async function deltaResult(gate: string, measure: () => Promise<string[]>): Promise<DeltaResult> {
+  try {
+    return { gate, findings: await measure() };
+  } catch (error) {
+    return { gate, findings: [], problem: errorMessage(error) };
+  }
+}
+
+/** Lint, complexity, and dead code on the change; read-only, in parallel. */
+async function runDeltaGates(): Promise<DeltaResult[]> {
+  let scope: ChangedScope;
+  try {
+    scope = await changedScope(await deltaBase());
+  } catch (error) {
+    return [{ gate: 'Changed lines', findings: [], problem: errorMessage(error) }];
+  }
+  return await Promise.all([
+    deltaResult('Lint', () => lintResidue(scope)),
+    deltaResult('Complexity', () => complexityResidue(scope)),
+    deltaResult('Dead code', () => deadcodeResidue(scope)),
+  ]);
+}
+
+// ── Stop-hook verdict ──
+
+/** At most HOOK_FINDING_LIMIT findings, then one line counting the rest; `--verbose` lifts it. */
+export function capFindings(findings: string[], verbose = VERBOSE): string[] {
+  if (verbose || findings.length <= HOOK_FINDING_LIMIT) return [...findings];
+  const rest = findings.length - HOOK_FINDING_LIMIT;
+  return [
+    ...findings.slice(0, HOOK_FINDING_LIMIT),
+    `… +${rest} more — run \`bun harness.ts stop-hook --verbose\``,
+  ];
+}
+
+/** The stderr block an agent reads: failed gates, then their findings; '' when clean. */
+export function stopHookPayload(results: DeltaResult[]): string {
+  const failed = results.filter((result) => result.findings.length > 0);
+  if (failed.length === 0) return '';
+  const header = `stop-hook failed: ${failed.map((result) => result.gate).join(', ')}`;
+  return [header, ...capFindings(failed.flatMap((result) => result.findings))].join('\n');
+}
+
+/** 2 on findings, but 1 when this stop already follows a block (no loop); 1 on a tool failure. */
+export function stopHookExit(payload: string, failedTools: number, event: JsonObject): number {
+  if (payload) return event.stop_hook_active === true ? 1 : 2;
+  return failedTools > 0 ? 1 : 0;
+}
+
+/** The agent's hook JSON on stdin; `{}` for a terminal, or for empty or invalid input. */
+async function hookEvent(): Promise<JsonObject> {
+  if (process.stdin.isTTY) return {};
+  try {
+    return asObject(JSON.parse((await readStdin(HOOK_STDIN_WAIT_MS)).text)) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+/** Fix, then format, `files` in place, silently; what is left surfaces as lint residue. */
+async function fixAndFormat(files: string[]): Promise<void> {
+  if (files.length === 0) return;
+  const cmd = ['bunx', 'biome', 'check', '--write', '--no-errors-on-unmatched', ...files];
+  await runCapture({ description: 'Fix & format', cmd });
+}
+
+/** Copy CLAUDE.md (canonical) over a missing or different AGENTS.md; true when it wrote. */
+async function syncAgentsMd(): Promise<boolean> {
+  const { existsSync, readFileSync, writeFileSync } = await import('node:fs');
+  const claude = `${ROOT}/CLAUDE.md`;
+  const agents = `${ROOT}/AGENTS.md`;
+  if (!existsSync(claude)) return false;
+  const text = readFileSync(claude);
+  if (existsSync(agents) && readFileSync(agents).equals(text)) return false;
+  writeFileSync(agents, text);
+  return true;
+}
+
+/** Post-edit, then lint, complexity, and dead code on the change; see stopHookExit. */
+async function cmdStopHook(): Promise<void> {
+  const event = await hookEvent(); // stdin belongs to the hook event; read it first
+  await fixAndFormat(await changedTsFiles());
+  // An uncommitted CLAUDE.md edit carries into AGENTS.md; an AGENTS.md-only edit is
+  // left for pre-commit to report.
+  if ((await gitLines(['status', '--porcelain', '--', 'CLAUDE.md'])).length > 0) {
+    await syncAgentsMd();
+  }
+  const results = await runDeltaGates();
+  const payload = stopHookPayload(results);
+  const lines = results
+    .filter((result) => result.problem)
+    .map((result) => `stop-hook: ${result.gate} could not run: ${result.problem}`);
+  const code = stopHookExit(payload, lines.length, event);
+  if (payload) lines.push(payload);
+  if (payload && code === 1) lines.push(LOOP_GUARD_NOTICE);
+  if (lines.length > 0) await Bun.write(Bun.stderr, `${lines.join('\n')}\n`);
+  process.exitCode = code;
+}
+
+/** The project source file a PostToolUse event names, relative to `root`; else null. */
+export async function hookTarget(event: JsonObject, root: string): Promise<string | null> {
+  const filePath = asObject(event.tool_input)?.file_path;
+  if (typeof filePath !== 'string') return null;
+  const { realpathSync, statSync } = await import('node:fs');
+  const { relative, resolve, sep } = await import('node:path');
+  try {
+    const real = realpathSync(resolve(root, filePath));
+    const path = relative(realpathSync(root), real).split(sep).join('/');
+    // A path outside the project starts with `../` (or a drive), so it is never a target.
+    return isProjectTsFile(path) && statSync(real).isFile() ? path : null;
+  } catch {
+    return null;
+  }
+}
+
+/** PostToolUse: fix + format the file the event names; never blocks, asks for a re-read. */
+async function postEditHook(): Promise<void> {
+  const target = await hookTarget(await hookEvent(), ROOT);
+  if (target === null) return;
+  const { readFileSync } = await import('node:fs');
+  const before = readFileSync(`${ROOT}/${target}`);
+  await fixAndFormat([target]);
+  if (readFileSync(`${ROOT}/${target}`).equals(before)) return;
+  const additionalContext = `harness: reformatted ${target}; re-read it before editing it again`;
+  console.log(
+    JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext } }),
+  );
+}
+
 async function cmdPostEdit(): Promise<void> {
+  if (process.argv.includes('--hook')) return await postEditHook();
   const files = await changedTsFiles();
   if (files.length === 0) return;
   await run('Fix & format', ['bunx', 'biome', 'check', '--write', ...files], { noExit: true });
 }
 
-async function cmdStopHook(): Promise<void> {
-  console.log('\n=== Stop Hook Checks ===\n');
-  await cmdPostEdit(); // mutating — sequential, first
-  await checkArchConfigGuard({ warnOnly: true });
-  // read-only batch: complexity + dead code
-  const allOk = await runGatesParallel([...(await complexityGatesOrWarn()), deadcodeGate()]);
-  if (!allOk) process.exit(1);
-}
-
 // ── Stages ──────────────────────────────────────────────────────────
 
 async function checkStopHooksPresent(): Promise<void> {
-  // Warn when Claude/Codex Stop hook wiring is missing.
+  // Warn when Claude/Codex Stop or Claude PostToolUse wiring is missing.
   const { existsSync } = await import('node:fs');
   const { readFile } = await import('node:fs/promises');
-  for (const rel of ['.claude/settings.json', '.codex/hooks.json']) {
+  const wirings = [
+    ['.claude/settings.json', 'Stop', 'stop-hook'],
+    ['.claude/settings.json', 'PostToolUse', 'post-edit --hook'],
+    ['.codex/hooks.json', 'Stop', 'stop-hook'],
+  ];
+  for (const [rel, event, command] of wirings) {
     const full = `${ROOT}/${rel}`;
     const text = existsSync(full) ? await readFile(full, 'utf8') : '';
-    if (text.includes('Stop') && text.includes('stop-hook')) {
-      console.log(`  ${GREEN}✓${RESET} Stop hook wiring (${rel})`);
+    if (text.includes(event) && text.includes(command)) {
+      console.log(`  ${GREEN}✓${RESET} ${event} hook wiring (${rel})`);
     } else {
-      console.log(`  ${RED}⚠${RESET} Missing Stop hook wiring: ${rel}`);
+      console.log(`  ${RED}⚠${RESET} Missing ${event} hook wiring: ${rel}`);
     }
   }
 }
@@ -1211,15 +1589,11 @@ function isStopHookHandler(handler: unknown): boolean {
 async function gitHookPath(name: string): Promise<string> {
   // Resolve via git so worktrees / core.hooksPath land in the right place. Strip
   // GIT_* env so an ambient GIT_DIR from a parent process can't redirect us.
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined && !key.startsWith('GIT_')) env[key] = value;
-  }
   const proc = Bun.spawn(['git', 'rev-parse', '--git-path', `hooks/${name}`], {
     cwd: ROOT,
     stdout: 'pipe',
     stderr: 'pipe',
-    env,
+    env: envWithoutGit(),
   });
   const out = (await new Response(proc.stdout).text()).trim();
   const code = await proc.exited;
@@ -1332,6 +1706,14 @@ async function cmdSyncAgentsMd(): Promise<void> {
   console.log(`  ${GREEN}✓${RESET} sync-agents-md: AGENTS.md ← CLAUDE.md`);
 }
 
+/** pre-commit: a staged CLAUDE.md carries its AGENTS.md mirror into the same commit. */
+async function syncAgentsMdStaged(): Promise<void> {
+  const staged = await gitLines(['diff', '--cached', '--name-only', '--', 'CLAUDE.md']);
+  if (staged.length === 0 || !(await syncAgentsMd())) return;
+  // `run` keeps git's hook environment: GIT_INDEX_FILE is the index this commit builds from.
+  await run('sync-agents-md: AGENTS.md ← CLAUDE.md (staged)', ['git', 'add', '--', 'AGENTS.md']);
+}
+
 async function cmdAgentsMdDrift(): Promise<void> {
   await checkAgentsMdDrift();
 }
@@ -1391,10 +1773,21 @@ async function cmdCheck(): Promise<void> {
 }
 
 async function cmdPreCommit(): Promise<void> {
+  // Fix/format staged files, typecheck, and mirror a staged CLAUDE.md; tests run at pre-push.
   console.log(`\n${BLUE}[pre-commit]${RESET}\n`);
   await checkArchConfigGuard({ warnOnly: true, staged: true });
+  await syncAgentsMdStaged();
 
   const files = await stagedTsFiles();
+  const stagedDocs = await gitLines([
+    'diff',
+    '--cached',
+    '--name-only',
+    '--',
+    'AGENTS.md',
+    'CLAUDE.md',
+  ]);
+  if (files.length > 0 || stagedDocs.length > 0) await checkAgentsMdDrift();
   if (files.length === 0) {
     console.log('No staged TypeScript files — skipping checks');
     return;
@@ -1402,11 +1795,6 @@ async function cmdPreCommit(): Promise<void> {
 
   await cmdFix(files);
   await cmdTypecheck();
-  await checkAgentsMdDrift();
-
-  if (files.some((f) => isQualityTsFile(f))) {
-    await cmdTest();
-  }
 }
 
 async function cmdCi(): Promise<void> {
@@ -1433,22 +1821,24 @@ async function cmdCi(): Promise<void> {
 
 async function cmdPrePush(): Promise<void> {
   // Read-only push gate: the offline checks pre-commit and stop-hook do not run.
-  // pre-commit covers fix/format/typecheck/test on staged files; stop-hook adds
-  // complexity. This fills the gap with the deterministic, offline gates none of
-  // them run — lint (biome covers format), agents-md drift, acceptance, arch —
+  // pre-commit covers fix/format/typecheck on staged files; stop-hook covers the
+  // change's delta. This fills the gap with the deterministic, offline gates none of
+  // them run — tests, lint (biome covers format), agents-md drift, acceptance, arch —
   // validating the whole pushed tree (after merges/rebases/--no-verify) before it
-  // leaves the machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
+  // leaves the machine. Tests run first and alone: they spawn processes and write temp
+  // repos. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
   console.log(`\n${BLUE}[pre-push]${RESET}\n`);
   const refs = await prePushRefs();
   if (!(await checkBranchGuard(refs))) process.exit(1);
   const archConfigOk = await checkArchConfigGuard({ refs });
+  const testsOk = await checkTests();
   const gates: Gate[] = [
     lintGate(),
     agentsMdDriftGate(),
     ...(await acceptanceGatesOrWarn()),
     ...(await archGatesOrWarn()),
   ];
-  if (!(await runGatesParallel(gates)) || !archConfigOk) process.exit(1);
+  if (!(await runGatesParallel(gates)) || !archConfigOk || !testsOk) process.exit(1);
 }
 
 async function cmdHooks(): Promise<void> {
@@ -1494,15 +1884,19 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   'arch-config-guard': [cmdArchConfigGuard, 'Block unreviewed arch config changes'],
   'branch-guard': [cmdBranchGuard, 'Refuse pushes to main/master'],
   check: [cmdCheck, 'Full pre-flight: lockfile + fix + typecheck + tests'],
-  'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
-  'pre-push': [cmdPrePush, 'Read-only push gate: branch guard, lint, acceptance, arch'],
+  'pre-commit': [cmdPreCommit, 'Staged fix/format + typecheck; mirrors a staged CLAUDE.md'],
+  'pre-push': [cmdPrePush, 'Read-only push gate: branch guard, tests, lint, acceptance, arch'],
   ci: [
     cmdCi,
     'Lint + typecheck + audit + complexity + deadcode + acceptance + coverage + crap + arch',
   ],
   'setup-hooks': [cmdHooks, 'Install git pre-commit + pre-push hooks and Claude/Codex Stop wiring'],
-  'post-edit': [cmdPostEdit, 'Format if source files changed'],
-  'stop-hook': [cmdStopHook, 'Format changed files, then run stop-hook checks'],
+  'post-edit': [cmdPostEdit, 'Format changed files (--hook: the file a PostToolUse names)'],
+  'stop-hook': [
+    cmdStopHook,
+    'post-edit, then changed-lines lint, touched over-limit functions, changed-lines ' +
+      'deadcode; silent on success, exit 2 with findings',
+  ],
   'agents-md-drift': [cmdAgentsMdDrift, 'Fail if AGENTS.md differs from CLAUDE.md'],
   'sync-agents-md': [cmdSyncAgentsMd, 'Overwrite AGENTS.md from CLAUDE.md'],
   clean: [cmdClean, 'Remove caches and build artifacts'],

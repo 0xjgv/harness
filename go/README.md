@@ -36,12 +36,12 @@ go run harness.go setup-hooks
 | Script | When | What it does | Fixes code? |
 |---|---|---|---|
 | `go run harness.go check` | After edits | Fix, format, lint, test, suppression ratchet | Yes |
-| `go run harness.go pre-commit` | Git hook | Staged files only | Yes |
-| `go run harness.go pre-push` | Git pre-push hook | Read-only push gate: branch guard, lint, agents-md drift, acceptance, arch over the whole tree | No |
+| `go run harness.go pre-commit` | Git hook | Fix/format staged packages; mirrors a staged `CLAUDE.md` into `AGENTS.md` | Yes |
+| `go run harness.go pre-push` | Git pre-push hook | Branch guard, tests, then a read-only push gate: lint, agents-md drift, acceptance, arch over the whole tree | No |
 | `go run harness.go ci` | CI pipeline | Read-only verification (see below) | No |
 | `go run harness.go audit` | CI pipeline | Dependency vulnerability audit | No |
-| `go run harness.go post-edit` | Stop hook helper | Format if source files changed | No |
-| `go run harness.go stop-hook` | Stop hook entrypoint | Format/fix changed files, then run complexity | Yes |
+| `go run harness.go post-edit` | Stop hook helper; `--hook` is the Claude PostToolUse hook | Format changed files, fix their packages; `--hook`: the one edited file, never blocks | Yes |
+| `go run harness.go stop-hook` | Stop hook entrypoint | post-edit, then changed-lines lint and touched-function complexity; silent on success, exit 2 with findings | Yes |
 
 ### `ci` pipeline
 
@@ -53,8 +53,10 @@ default threshold from `.harness-baseline`) and the
 advisory CRAP.
 
 `pre-push` is the offline push gate — the branch guard (no pushes to `main`/`master`),
-then lint (golangci-lint covers format), agents-md drift, acceptance, arch over the
-whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
+then the test suite (without git's `GIT_*` hook variables, since the tests create temp
+git repos; a failure stops the push), then lint (golangci-lint covers format),
+agents-md drift, acceptance, arch over the whole pushed tree (the deterministic checks
+pre-commit and stop-hook skip). `pre-commit` no longer runs tests.
 
 Dead code needs no separate gate — golangci-lint's `unused` linter (run by `lint`)
 already flags unreachable functions, vars, and types, and `go mod tidy` prunes
@@ -100,11 +102,13 @@ Every command is also a `make` target — `make check`, `make ci`, `make pre-pus
 | `go run harness.go mutation` | Mutation testing (gremlins, advisory) |
 | `go run harness.go crap` | CRAP complexity × coverage gate (advisory) |
 | `go run harness.go suppressions` | Suppression breakdown; `--update-baseline` with human sign-off |
-| `go run harness.go pre-commit` | Staged checks + tests |
-| `go run harness.go pre-push` | Read-only push gate: branch guard, lint, agents-md drift, acceptance, arch |
+| `go run harness.go pre-commit` | Staged fix/format; mirrors a staged `CLAUDE.md` |
+| `go run harness.go pre-push` | Push gate: branch guard, tests, lint, agents-md drift, acceptance, arch |
 | `go run harness.go branch-guard` | Refuse pushes to main/master |
 | `go run harness.go ci` | Full verification pipeline |
 | `go run harness.go setup-hooks` | Install git pre-commit + pre-push hooks and the Claude/Codex Stop wiring |
+| `go run harness.go stop-hook` | post-edit, then changed-lines lint and touched-function complexity; silent on success, exit 2 with findings |
+| `go run harness.go post-edit` | Format changed files and fix their packages (`--hook`: the file a PostToolUse names) |
 | `go run harness.go clean` | Remove coverage and test cache |
 
 Add `--verbose` to any command to see all output.
@@ -128,10 +132,26 @@ harness.go           Development task runner (zero dependencies; //go:build igno
 - **Human-is-engineer**: commit and push on a feature branch; never `main`/`master`, never force-push, never merge.
 - **Specify what is worth specifying**: `.feature` scenarios for user-visible flows, law-like rules, and cross-component contracts; unit tests suffice for the rest.
 - **Branch guard**: `pre-push` refuses a push that lands on (or deletes) `main`/`master` unless `HARNESS_ALLOW_PROTECTED_PUSH=1` is set. Destinations come from `HARNESS_PRE_PUSH_REFS`, else the git pre-push stdin refs (1s deadline; partial input fails), else the current branch. It stops accidents, not `--no-verify` — agents push feature branches, humans merge.
-- **Arch config guard**: `.go-arch-lint.yml` changes warn during `check`/`pre-commit`/`stop-hook` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. Note `.golangci.yaml` is deliberately *not* protected — it is the general lint config, and protecting it would block all lint-config edits.
+- **Arch config guard**: `.go-arch-lint.yml` changes warn during `check`/`pre-commit` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. Note `.golangci.yaml` is deliberately *not* protected — it is the general lint config, and protecting it would block all lint-config edits.
 
 Stop hooks are wired via `.claude/settings.json` for Claude and
-`.codex/hooks.json` for Codex.
+`.codex/hooks.json` for Codex; `setup-hooks` installs them. The checked-in
+`.claude/settings.json` also carries a PostToolUse hook (`post-edit --hook`,
+Edit|Write) that formats the edited file; `check` warns when either wiring is missing.
+The Stop commands run `go build -o harness harness.go && ./harness stop-hook` (the
+binary is gitignored): `go run` reports any non-zero exit as 1, so exit 2 would never
+block.
+
+`stop-hook` judges the change, not the tree. Its scope is `git diff` against the
+merge-base with the base branch (`HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`, then
+origin/HEAD, origin/main, origin/master, main, master; never fetched) plus untracked
+files. It formats the changed files, fixes lint in their packages, then blocks (exit 2,
+at most 20 findings on stderr) on lint left on changed lines (`unused` covers dead
+code; compile errors always block) and on any non-test function over a lizard limit
+whose lines the change touches. Touching an over-limit function blocks, so leave what
+you touch better; untouched debt never blocks. It prints nothing on success. Exit 1
+means a tool could not run, or this stop already blocked once (`stop_hook_active`). An
+uncommitted `CLAUDE.md` edit is copied to `AGENTS.md`.
 
 ## Thresholds: start at 0, ratchet up
 

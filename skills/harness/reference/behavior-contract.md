@@ -21,8 +21,8 @@ The contract lives in two places that must agree:
   byte-for-byte. The templates' `agents-md-drift` check enforces no drift,
   and `sync-agents-md` writes `AGENTS.md <- CLAUDE.md` after edits.
 - The runner command `arch-config-guard` — a portable git-based guard that
-  detects protected architecture config changes. It warns during `check`,
-  `pre-commit`, and `stop-hook`; it fails `pre-push` and `ci` unless
+  detects protected architecture config changes. It warns during `check` and
+  `pre-commit`; it fails `pre-push` and `ci` unless
   `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 - The runner command `branch-guard` — refuses direct pushes to, or deletions
   of, `main`/`master`. It runs first in `pre-push`, reads
@@ -75,7 +75,8 @@ Modes:
 Stage wiring:
 
 - `check`: warning mode.
-- `stop-hook`: warning mode.
+- `stop-hook`: not run (a warning printed on a successful stop never reaches
+  the agent).
 - `pre-commit`: warning mode over staged paths.
 - `pre-push`: strict mode, including git pre-push stdin refs when available.
 - `ci`: strict mode. GitHub Actions checkout uses `fetch-depth: 0` so PR runs
@@ -115,7 +116,7 @@ When the user asks for the behavior contract in an existing repo:
 2. Add `agents-md-drift` and `sync-agents-md` so the two files stay identical.
 3. Add `arch-config-guard` for the repo's real architecture config path, or
    skip it explicitly if the repo has no architecture config.
-4. Wire the guard into `check`/`pre-commit`/`stop-hook` as warning mode and
+4. Wire the guard into `check`/`pre-commit` as warning mode and
    into `pre-push`/`ci` as strict mode.
 5. Add `branch-guard` and run it first in `pre-push`.
 6. Keep Claude and Codex Stop hook wiring from [settings-json.md](settings-json.md).
@@ -130,7 +131,7 @@ Tell the user:
 - "The agent commits and pushes on feature branches and opens PRs. Merge is
   yours. `pre-push` refuses `main`/`master`; if you push straight to `main`
   yourself, export `HARNESS_ALLOW_PROTECTED_PUSH=1`."
-- "Architecture config changes warn during `check`/`pre-commit`/`stop-hook`
+- "Architecture config changes warn during `check`/`pre-commit`
   and fail `pre-push`/`ci` unless reviewed with `HARNESS_ALLOW_ARCH_CONFIG=1`.
   The agent is told to isolate such a change in its own commit and report
   the refused push to you."
@@ -147,7 +148,7 @@ Tell the user:
    `HARNESS_ALLOW_ARCH_CONFIG=1`.
 5. `HARNESS_ALLOW_ARCH_CONFIG=1 <runner> arch-config-guard` passes and prints
    the override line.
-6. `check`, `pre-commit`, and `stop-hook` warn on protected config changes.
+6. `check` and `pre-commit` warn on protected config changes.
 7. `pre-push` and `ci` fail on protected config changes unless the override
    is set.
 8. `branch-guard` fails on `main`, passes with

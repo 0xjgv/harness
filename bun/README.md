@@ -17,8 +17,10 @@ See the [5-script contract](../README.md#the-5-script-contract) for the full rat
 
 ```bash
 bun run check                      # Fix + format + typecheck + tests/no-test warning (after editing)
-bun run pre-commit                 # Staged checks + tests (runs via git hook)
-bun harness.ts pre-push            # Read-only push gate: branch guard, lint, acceptance, arch (runs via git hook)
+bun run pre-commit                 # Staged fix/format + typecheck; mirrors a staged CLAUDE.md into AGENTS.md (runs via git hook)
+bun harness.ts pre-push            # Branch guard + tests + read-only push gate: lint, acceptance, arch (runs via git hook)
+bun harness.ts stop-hook           # post-edit, then lint/complexity/dead code on the change; silent on success, exit 2 with findings (agent Stop hook)
+bun harness.ts post-edit --hook    # Fix + format the file a Claude PostToolUse event names; never blocks
 bun run ci                         # Full verification (see below)
 ```
 
@@ -28,7 +30,7 @@ Every command above is also a `make` target — `make check`, `make ci`, `make p
 
 `harness ci` runs the read-only gates — lint + format check (biome), typecheck (tsc), dep audit (bun audit), agents-md drift, complexity (lizard, CCN 15, args 8), deadcode (knip), acceptance (cucumber), arch (dependency-cruiser) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then streams coverage (`bun test --coverage`, default threshold from `.harness-baseline`) and the advisory crap.
 
-`pre-push` is the offline push gate — a branch guard that refuses pushes to (or deletions of) `main`/`master` (unless `HARNESS_ALLOW_PROTECTED_PUSH=1`), reading `HARNESS_PRE_PUSH_REFS` or git's pre-push stdin (1s deadline; partial input fails) and falling back to the current branch, then lint (biome covers format), agents-md drift, acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
+`pre-push` is the offline push gate — a branch guard that refuses pushes to (or deletions of) `main`/`master` (unless `HARNESS_ALLOW_PROTECTED_PUSH=1`), reading `HARNESS_PRE_PUSH_REFS` or git's pre-push stdin (1s deadline; partial input fails) and falling back to the current branch, then the test suite (run alone and without git's `GIT_*` hook variables, since it creates temp git repos), then lint (biome covers format), agents-md drift, acceptance, arch over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip). `pre-commit` no longer runs tests.
 
 The complexity gate requires `uvx` on PATH — install via [uv](https://docs.astral.sh/uv/).
 
@@ -86,10 +88,23 @@ cucumber.json              Acceptance runner config (cucumber)
 - **Plan first**: open with the sub-tasks and the files each touches, then execute in the same turn.
 - **Human-is-engineer**: commit and push on a feature branch; `main`/`master` and merges stay human — `pre-push` refuses direct pushes to (and deletions of) them unless `HARNESS_ALLOW_PROTECTED_PUSH=1`. The guard stops accidents, not `--no-verify`.
 - **Specify what is worth specifying**: `.feature` scenarios for user-visible flows, law-like rules, and cross-component contracts; unit tests suffice for the rest.
-- **Arch config guard**: `.dependency-cruiser.json` changes warn during `check`/`pre-commit`/`stop-hook` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+- **Arch config guard**: `.dependency-cruiser.json` changes warn during `check`/`pre-commit` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 
 Stop hooks are wired via `.claude/settings.json` for Claude and
-`.codex/hooks.json` for Codex.
+`.codex/hooks.json` for Codex; the committed `.claude/settings.json` also carries a
+PostToolUse hook (`post-edit --hook`, Edit|Write) that formats the edited file.
+`check` warns when any of the three is missing.
+
+`stop-hook` judges the change, not the tree. Its scope is `git diff` against the
+merge-base with the base branch (`HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`, then
+origin/HEAD, origin/main, origin/master, main, master; never fetched) plus untracked
+files. It blocks (exit 2, findings on stderr, at most 20 lines) on biome errors and
+knip unused exports, types, and members on changed lines, and on any function in
+`src/` or `tests/` that is over a lizard limit and overlaps a changed line. Touching an
+over-limit function means leaving it under the limits; untouched debt never blocks. It
+prints nothing on success. Exit 1 means a tool could not run, or the hook already
+blocked this stop (`stop_hook_active`). An uncommitted `CLAUDE.md` edit is copied to
+`AGENTS.md`.
 
 ## Thresholds: start at 0, ratchet up
 

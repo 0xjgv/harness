@@ -5,9 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode, Output, Stdio};
 use std::time::{Duration, Instant};
 
 // ── Configuration ───────────────────────────────────────────────────
@@ -36,6 +36,14 @@ const ARCH_CONFIG_ALLOW_ENV: &str = "HARNESS_ALLOW_ARCH_CONFIG";
 const PROTECTED_BRANCHES: [&str; 2] = ["main", "master"];
 const PROTECTED_PUSH_ALLOW_ENV: &str = "HARNESS_ALLOW_PROTECTED_PUSH";
 const PRE_PUSH_REFS_ENV: &str = "HARNESS_PRE_PUSH_REFS";
+const ARCH_BASE_ENV: &str = "HARNESS_ARCH_BASE";
+const LIZARD: &str = "lizard@1.22.2";
+const COMPLEXITY_TARGETS: [&str; 2] = ["src", "tests"];
+/// lizard's limits as (finding label, flag, max): CCN, parameters, function length.
+const COMPLEXITY_LIMITS: [(&str, &str, u32); 3] =
+    [("CCN", "-C", 15), ("args", "-a", 8), ("length", "-L", 100)];
+/// Finding lines a stop-hook payload carries; the rest are one command away.
+const HOOK_FINDING_LIMIT: usize = 20;
 
 // ── Runner ──────────────────────────────────────────────────────────
 
@@ -149,6 +157,8 @@ struct Gate {
     cmd: Vec<String>,
     extract: Option<fn(&str) -> Option<String>>,
     hint: Option<&'static str>,
+    /// Run without the `GIT_*` variables git exports to hooks.
+    without_git_env: bool,
 }
 
 impl Gate {
@@ -158,6 +168,7 @@ impl Gate {
             cmd: cmd.iter().map(|&s| s.to_string()).collect(),
             extract: None,
             hint: None,
+            without_git_env: false,
         }
     }
 
@@ -165,6 +176,21 @@ impl Gate {
         self.hint = Some(hint);
         self
     }
+}
+
+/// Clear the command's environment down to this one minus every `GIT_*` variable.
+///
+/// git exports `GIT_DIR` (and, for commits, `GIT_INDEX_FILE`) to hooks; a child that
+/// runs git elsewhere — a test that `git init`s a temp dir — would otherwise write
+/// into this repository.
+fn strip_git_env(cmd: &mut Command) -> &mut Command {
+    cmd.env_clear();
+    for (key, value) in env::vars_os() {
+        if !key.to_string_lossy().starts_with("GIT_") {
+            cmd.env(key, value);
+        }
+    }
+    cmd
 }
 
 struct GateResult {
@@ -178,16 +204,16 @@ struct GateResult {
 }
 
 /// Run a gate's command with output captured (no printing, no exit): the
-/// thread-safe unit the parallel batch spawns. Batch gates never need env vars.
+/// thread-safe unit the parallel batch spawns.
 fn run_capture(gate: &Gate) -> GateResult {
     let program = &gate.cmd[0];
     let args: Vec<&str> = gate.cmd[1..].iter().map(String::as_str).collect();
-    let result = Command::new(program)
-        .args(&args)
-        .current_dir(root())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+    let mut cmd = Command::new(program);
+    if gate.without_git_env {
+        strip_git_env(&mut cmd);
+    }
+    let result =
+        cmd.args(&args).current_dir(root()).stdout(Stdio::piped()).stderr(Stdio::piped()).output();
     match result {
         Ok(output) => {
             let combined = format!(
@@ -578,32 +604,19 @@ fn staged_rs_files() -> Vec<String> {
         .collect()
 }
 
+fn is_rs_path(path: &str) -> bool {
+    Path::new(path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+}
+
+/// A `.rs` file of this crate: anything but build output.
+fn is_project_rs_file(path: &str) -> bool {
+    is_rs_path(path) && path != "target" && !path.starts_with("target/")
+}
+
+/// Project `.rs` files with uncommitted changes (untracked included), relative to this crate.
 fn changed_rs_files() -> Vec<String> {
-    let output = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(root())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
-
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            if line.len() < 4 {
-                return None;
-            }
-            let f = &line[3..];
-            if Path::new(f).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rs")) {
-                Some(f.to_string())
-            } else {
-                None
-            }
-        })
-        .collect()
+    let scope = changed_scope(head_commit().as_deref()).unwrap_or_default();
+    scope.into_keys().filter(|path| is_project_rs_file(path)).collect()
 }
 
 // ── Commands ────────────────────────────────────────────────────────
@@ -670,27 +683,48 @@ fn cmd_audit_inner(strict: bool) -> bool {
     true
 }
 
+/// Format `.rs` files with uncommitted changes; `--hook`: the file a hook event names.
+///
+/// rustfmt only: `cargo clippy --fix` rewrites the whole crate, so it stays in
+/// `check` / `fix` / `pre-commit`.
 fn cmd_post_edit() {
-    if changed_rs_files().is_empty() {
+    if arg_flag("--hook") {
+        post_edit_hook();
         return;
     }
-    // Reuse the full fix path (clippy --fix + fmt) — same as check/pre-commit —
-    // so the Stop hook fixes lint issues, not just formatting.
-    run(
-        "Clippy fix",
-        &["cargo", "clippy", "--fix", "--allow-dirty", "--allow-staged"],
-        Some(&RunOpts { no_exit: true, ..RunOpts::default() }),
-    );
-    run("Format", &["cargo", "fmt"], Some(&RunOpts { no_exit: true, ..RunOpts::default() }));
+    let files = changed_rs_files();
+    if files.is_empty() {
+        return;
+    }
+    let failed = format_files(&files);
+    if failed.is_empty() {
+        println!("  {GREEN}\u{2713}{RESET} Format ({} changed file(s))", files.len());
+    } else {
+        println!("  {RED}\u{26a0}{RESET} rustfmt could not format: {}", failed.join(", "));
+    }
 }
 
+/// Post-edit, then changed-lines lint and touched over-limit functions.
+///
+/// Silent on success. Findings exit 2 with a capped stderr payload; a tool that could
+/// not run exits 1; findings on a stop the agent is already continuing from exit 1
+/// (loop guard). `check` and `ci` keep the whole-tree gates.
 fn cmd_stop_hook() {
-    println!("\n=== Stop Hook Checks ===\n");
-    cmd_post_edit(); // mutating — sequential, first
-    check_arch_config_guard(true, false, false);
-    let all_ok = run_gates_parallel(&[complexity_gate()]); // read-only batch
-    if !all_ok {
+    let event = hook_event(); // stdin belongs to the hook event; read it before anything else
+    format_files(&changed_rs_files());
+    sync_agents_md_after_edit();
+    let base = delta_base();
+    let scope = changed_scope(base.as_deref()).unwrap_or_else(|reason| {
+        eprintln!("stop-hook: changed lines could not run: {reason}");
         std::process::exit(1);
+    });
+    let code = report_stop_hook(&run_delta_gates(&scope), &event);
+    if is_verbose() && code == 0 {
+        let against = base.as_deref().unwrap_or("no commits");
+        println!("stop-hook: clean ({} changed path(s) vs {against})", scope.len());
+    }
+    if code != 0 {
+        std::process::exit(code);
     }
 }
 
@@ -907,7 +941,7 @@ fn normalize_changed_path(path: &str, prefix: &str) -> String {
 
 fn changed_paths_from_base() -> Vec<String> {
     let mut bases: Vec<String> = Vec::new();
-    if let Ok(base) = env::var("HARNESS_ARCH_BASE")
+    if let Ok(base) = env::var(ARCH_BASE_ENV)
         && !base.is_empty()
     {
         bases.push(base);
@@ -958,13 +992,16 @@ fn pre_push_refs() -> &'static PrePushRefs {
     })
 }
 
-/// Read `source` on a detached thread, bounding the whole read by `deadline`.
+/// Read `source` to EOF on a detached thread, bounding the whole read by `deadline`.
+/// Returns what arrived and whether EOF did.
 ///
 /// Run from a CI job or an agent tool, stdin is a pipe nobody ever writes to
 /// and a blocking read would hang the command; the deadline bounds that. Chunks
-/// are forwarded as they arrive so a deadline hit can tell "nothing came" (no
-/// refs) from "some came" (incomplete) instead of discarding what was read.
-fn read_until<R: Read + Send + 'static>(mut source: R, deadline: Duration) -> PrePushRefs {
+/// are forwarded as they arrive so a deadline hit keeps what was read.
+fn read_with_deadline<R: Read + Send + 'static>(
+    mut source: R,
+    deadline: Duration,
+) -> (Vec<u8>, bool) {
     let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
         let mut buffer = [0u8; 4096];
@@ -976,25 +1013,27 @@ fn read_until<R: Read + Send + 'static>(mut source: R, deadline: Duration) -> Pr
     });
 
     let start = Instant::now();
-    let mut text = Vec::new();
+    let mut input = Vec::new();
     loop {
         let left = deadline.checked_sub(start.elapsed()).unwrap_or_default();
         match receiver.recv_timeout(left) {
-            Ok(chunk) => text.extend_from_slice(&chunk),
-            // Sender dropped: the reader hit EOF, so the text is whole.
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                let text = String::from_utf8_lossy(&text).into_owned();
-                return if text.trim().is_empty() {
-                    PrePushRefs::None
-                } else {
-                    PrePushRefs::Refs(text)
-                };
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return if text.is_empty() { PrePushRefs::None } else { PrePushRefs::Incomplete };
-            }
+            Ok(chunk) => input.extend_from_slice(&chunk),
+            // Sender dropped: the reader hit EOF, so the input is whole.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return (input, true),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return (input, false),
         }
     }
+}
+
+/// The pre-push refs in `source`: a deadline hit tells "nothing came" (no refs)
+/// from "some came" (incomplete) instead of guessing from a truncated list.
+fn read_until<R: Read + Send + 'static>(source: R, deadline: Duration) -> PrePushRefs {
+    let (received, complete) = read_with_deadline(source, deadline);
+    if !complete {
+        return if received.is_empty() { PrePushRefs::None } else { PrePushRefs::Incomplete };
+    }
+    let text = String::from_utf8_lossy(&received).into_owned();
+    if text.trim().is_empty() { PrePushRefs::None } else { PrePushRefs::Refs(text) }
 }
 
 /// Base commit for a push that creates a branch on the remote (zero remote sha):
@@ -1002,7 +1041,7 @@ fn read_until<R: Read + Send + 'static>(mut source: R, deadline: Duration) -> Pr
 /// whole branch instead of only its tip commit.
 fn new_branch_base(local_sha: &str) -> Option<String> {
     let mut candidates = vec!["origin/main".to_string(), "origin/master".to_string()];
-    if let Ok(base) = env::var("HARNESS_ARCH_BASE")
+    if let Ok(base) = env::var(ARCH_BASE_ENV)
         && !base.is_empty()
     {
         candidates.push(base);
@@ -1195,26 +1234,14 @@ fn cmd_branch_guard() {
 
 /// Run lizard as a cyclomatic-complexity gate. Mirrors bun/python invocation.
 fn complexity_gate() -> Gate {
-    Gate::new(
-        "Complexity (lizard)",
-        &[
-            "uvx",
-            "lizard@1.22.2",
-            "-l",
-            "rust",
-            "src",
-            "tests",
-            "-C",
-            "15",
-            "-a",
-            "8",
-            "-L",
-            "100",
-            "-i",
-            "0",
-        ],
+    let limits = COMPLEXITY_LIMITS.map(|(_, flag, max)| format!("{flag}{max}"));
+    let mut cmd = vec!["uvx", LIZARD, "-l", "rust"];
+    cmd.extend(COMPLEXITY_TARGETS);
+    cmd.extend(limits.iter().map(String::as_str));
+    cmd.extend(["-i", "0"]);
+    Gate::new("Complexity (lizard)", &cmd).with_hint(
+        "extract helpers or flatten branches until CCN <= 15; do not raise the threshold",
     )
-    .with_hint("extract helpers or flatten branches until CCN <= 15; do not raise the threshold")
 }
 
 fn cmd_complexity() {
@@ -1276,7 +1303,7 @@ fn cmd_crap() {
     };
 
     let lz_output = Command::new("uvx")
-        .args(["lizard@1.22.2", "-l", "rust", "src", "--csv"])
+        .args([LIZARD, "-l", "rust", "src", "--csv"])
         .current_dir(root())
         .output();
 
@@ -1313,7 +1340,7 @@ fn cmd_crap() {
     let mut offenders: Vec<CrapFn> = Vec::new();
     for row in lz_stdout.lines() {
         let Some(parsed) = parse_lizard_csv_row(row) else { continue };
-        let (ccn, name, start, end, path) = parsed;
+        let ([ccn, ..], name, start, end, path) = parsed;
         let normalized = path.trim_start_matches("./").to_string();
         let abs_key = format!("{abs_root}/{normalized}");
         let lines = cov_map
@@ -1443,19 +1470,19 @@ fn parse_lcov_str(text: &str) -> HashMap<String, HashMap<u32, u32>> {
     map
 }
 
-/// Parse one `lizard --csv` row into (ccn, name, start, end, path).
+/// Parse one `lizard --csv` row into ([ccn, params, length], name, start, end, path).
 ///
 /// Lizard columns: nloc,ccn,token,param,length,location,file,name,sig,start,end.
 /// The location column is the only one whose value is self-contained:
 /// `"name@start-end@path"`. Signatures can contain commas, so we extract
 /// the location field directly rather than splitting the whole row.
-fn parse_lizard_csv_row(row: &str) -> Option<(u32, String, u32, u32, String)> {
+fn parse_lizard_csv_row(row: &str) -> Option<([u32; 3], String, u32, u32, String)> {
     let mut iter = row.splitn(6, ',');
     let _nloc = iter.next()?;
     let ccn: u32 = iter.next()?.parse().ok()?;
     let _token = iter.next()?;
-    let _param = iter.next()?;
-    let _length = iter.next()?;
+    let args: u32 = iter.next()?.parse().ok()?;
+    let length: u32 = iter.next()?.parse().ok()?;
     let rest = iter.next()?;
     let after_q = rest.strip_prefix('"')?;
     let end_q = after_q.find('"')?;
@@ -1470,7 +1497,7 @@ fn parse_lizard_csv_row(row: &str) -> Option<(u32, String, u32, u32, String)> {
     let start: u32 = after_at1[..dash].parse().ok()?;
     let end: u32 = after_dash[..at2].parse().ok()?;
     let path = after_dash[at2 + 1..].to_string();
-    Some((ccn, name, start, end, path))
+    Some(([ccn, args, length], name, start, end, path))
 }
 
 /// True when `cargo <subcommand> --version` succeeds (the subcommand is installed).
@@ -1495,16 +1522,518 @@ fn arg_flag(name: &str) -> bool {
     env::args().skip(1).any(|a| a == name)
 }
 
+// ── Agent hooks ─────────────────────────────────────────────────────
+// The stop hook runs after every agent turn and judges the change, not the tree:
+// lint left on changed lines, and over-limit functions the change touched. There is
+// no dead-code gate: rustc's `dead_code` reaches the agent through the lint. The
+// whole-tree gates stay in check / ci / pre-push. Exit contract: silent 0 when clean,
+// 2 with a stderr payload the agent reads, 1 when a tool could not run.
+
+/// Changed lines per path relative to this crate: inclusive (start, end) spans.
+type Scope = BTreeMap<String, Vec<(usize, usize)>>;
+
+const WHOLE_FILE: (usize, usize) = (1, usize::MAX);
+
+/// One delta gate: findings block the stop; an error means its tool failed.
+struct DeltaResult {
+    gate: &'static str,
+    outcome: Result<Vec<String>, String>,
+}
+
+/// A tool's captured output; Err only when it cannot start.
+fn tool_output(tool: &str, cmd: &[&str]) -> Result<Output, String> {
+    Command::new(cmd[0])
+        .args(&cmd[1..])
+        .current_dir(root())
+        .output()
+        .map_err(|e| format!("{tool} not runnable: {e}"))
+}
+
+/// The tool's stdout when it succeeded; otherwise why not, from its first `error`
+/// line or else its last line.
+fn expect_success(tool: &str, output: &Output) -> Result<String, String> {
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail =
+        if stderr.trim().is_empty() { String::from_utf8_lossy(&output.stdout) } else { stderr };
+    let lines: Vec<&str> = detail.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    let reason = format!("{tool} exited {}", output.status.code().unwrap_or(-1));
+    Err(match lines.iter().find(|line| line.starts_with("error")).or_else(|| lines.last()) {
+        Some(line) => format!("{reason}: {line}"),
+        None => reason,
+    })
+}
+
+fn run_tool(tool: &str, cmd: &[&str]) -> Result<String, String> {
+    expect_success(tool, &tool_output(tool, cmd)?)
+}
+
+fn git_output(args: &[&str]) -> Result<String, String> {
+    let mut cmd = vec!["git", "-c", "core.quotePath=false"];
+    cmd.extend(args);
+    run_tool("git", &cmd)
+}
+
+// ── Changed lines ──
+
+/// The first base ref that resolves: env overrides, then the usual default branches.
+/// Never fetched — a hook must not touch the network.
+fn base_ref() -> Option<String> {
+    let mut candidates = vec![env::var(ARCH_BASE_ENV).unwrap_or_default()];
+    if let Ok(github_base) = env::var("GITHUB_BASE_REF")
+        && !github_base.is_empty()
+    {
+        candidates.push(format!("origin/{github_base}"));
+    }
+    candidates.extend(
+        ["origin/HEAD", "origin/main", "origin/master", "main", "master"].map(String::from),
+    );
+    candidates.into_iter().find(|candidate| {
+        !candidate.is_empty()
+            && !git_lines(&["rev-parse", "--verify", "--quiet", &format!("{candidate}^{{commit}}")])
+                .is_empty()
+    })
+}
+
+fn head_commit() -> Option<String> {
+    git_lines(&["rev-parse", "--verify", "--quiet", "HEAD"]).into_iter().next()
+}
+
+/// merge-base(base ref, HEAD); HEAD without a base ref; None before the first commit.
+fn delta_base() -> Option<String> {
+    let head = head_commit()?;
+    let merge_base =
+        base_ref().and_then(|base| git_lines(&["merge-base", &base, "HEAD"]).into_iter().next());
+    Some(merge_base.unwrap_or(head))
+}
+
+/// The new-side path of a `+++ b/<path>` header; None for a deleted file.
+fn diff_path(header: &str) -> Option<String> {
+    let name = header.strip_prefix("+++ ").unwrap_or(header).trim_end_matches('\t');
+    if name == "/dev/null" {
+        return None;
+    }
+    let name = if name.len() > 1 && name.starts_with('"') && name.ends_with('"') {
+        &name[1..name.len() - 1]
+    } else {
+        name
+    };
+    Some(name.strip_prefix("b/").unwrap_or(name).to_string())
+}
+
+/// (start, count) of a `@@ -a[,b] +c[,d] @@` hunk header's new side; count defaults to 1.
+fn parse_hunk(line: &str) -> Option<(usize, usize)> {
+    let (_, rest) = line.strip_prefix("@@ -")?.split_once(" +")?;
+    let (new, _) = rest.split_once(" @@")?;
+    let (start, count) = new.split_once(',').unwrap_or((new, "1"));
+    Some((start.parse().ok()?, count.parse().ok()?))
+}
+
+/// `{path: [(start, end)]}` of the new-side lines in a `git diff -U0` (a/ b/ prefixes).
+///
+/// File headers are read only between `diff --git` and the first hunk, so an added line
+/// whose text starts with `++ ` is never taken for one. A pure deletion (`+N,0`) adds no
+/// range, but its file is still listed.
+fn parse_diff_ranges(diff: &str) -> Scope {
+    let mut ranges = Scope::new();
+    let mut path: Option<String> = None;
+    let mut in_header = false;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            (path, in_header) = (None, true);
+        } else if in_header && line.starts_with("+++ ") {
+            path = diff_path(line);
+            if let Some(path) = &path {
+                ranges.insert(path.clone(), Vec::new());
+            }
+        } else if line.starts_with("@@") {
+            in_header = false;
+            if let (Some((start, count)), Some(path)) = (parse_hunk(line), &path)
+                && count > 0
+            {
+                ranges.entry(path.clone()).or_default().push((start, start + count - 1));
+            }
+        }
+    }
+    ranges
+}
+
+/// Changed lines per path relative to this crate: `git diff <base>` plus untracked files.
+///
+/// Covers work committed on the branch and uncommitted work alike. Untracked files, and
+/// every file before the first commit, are in scope whole. Renames count as new files.
+fn changed_scope(base: Option<&str>) -> Result<Scope, String> {
+    let mut listing = vec!["ls-files", "-z", "--others", "--exclude-standard", "--", "."];
+    let mut scope = Scope::new();
+    match base {
+        None => listing.insert(1, "--cached"),
+        Some(base) => {
+            scope = parse_diff_ranges(&git_output(&[
+                "diff",
+                "-U0",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-renames",
+                "--relative",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                base,
+                "--",
+                ".",
+            ])?);
+        }
+    }
+    for path in git_output(&listing)?.split('\0').filter(|path| !path.is_empty()) {
+        scope.insert(path.to_string(), vec![WHOLE_FILE]);
+    }
+    Ok(scope)
+}
+
+/// True when lines `start..=end` share a line with any of `ranges`.
+fn overlaps(start: usize, end: usize, ranges: &[(usize, usize)]) -> bool {
+    ranges.iter().any(|&(from, to)| from <= end && start <= to)
+}
+
+/// Changed `.rs` files under `targets` (directories) that still exist.
+fn scoped_files(scope: &Scope, targets: &[&str]) -> Vec<String> {
+    let under = |path: &str| {
+        targets
+            .iter()
+            .any(|target| path.strip_prefix(target).is_some_and(|rest| rest.starts_with('/')))
+    };
+    scope
+        .keys()
+        .filter(|path| is_rs_path(path) && under(path) && root().join(path).is_file())
+        .cloned()
+        .collect()
+}
+
+// ── Lint residue ──
+
+fn is_diagnostic(text: &str) -> bool {
+    ["warning:", "warning[", "error:", "error["].iter().any(|level| text.starts_with(level))
+}
+
+/// `path:line: level: message` for each clippy warning or error on a changed line.
+///
+/// cargo replays a cached diagnostic in the format that first rendered it, so both
+/// forms are read: long (`warning: m`, then ` --> path:line:col`) and short
+/// (`path:line:col: warning: m`).
+fn clippy_findings(report: &str, scope: &Scope) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut header = None; // a long-form diagnostic waiting for its ` --> ` line
+    for line in report.lines() {
+        let located = if let Some(location) = line.trim_start().strip_prefix("--> ") {
+            header.take().map(|message| (location, message))
+        } else if line.starts_with(char::is_whitespace) {
+            None
+        } else {
+            header = is_diagnostic(line).then_some(line);
+            line.split_once(": ").filter(|(_, message)| is_diagnostic(message))
+        };
+        let Some((location, message)) = located else { continue };
+        let mut parts = location.rsplitn(3, ':').skip(1);
+        let (Some(line_no), Some(path)) = (parts.next(), parts.next()) else { continue };
+        // Only `.rs` lines: a broken Cargo.toml means clippy could not run.
+        if let (Ok(line_no), Some(ranges)) = (line_no.parse(), scope.get(path))
+            && is_rs_path(path)
+            && overlaps(line_no, line_no, ranges)
+        {
+            findings.push(format!("{path}:{line_no}: {message}"));
+        }
+    }
+    findings
+}
+
+/// Lint on changed lines. clippy checks the whole crate either way.
+fn lint_residue(scope: &Scope) -> Result<Vec<String>, String> {
+    if !scope.keys().any(|path| is_project_rs_file(path)) {
+        return Ok(Vec::new());
+    }
+    let output = tool_output("clippy", &["cargo", "clippy"])?;
+    let findings = clippy_findings(&String::from_utf8_lossy(&output.stderr), scope);
+    if findings.is_empty() {
+        // A build that failed away from the changed lines is a tool failure, not a pass.
+        expect_success("clippy", &output)?;
+    }
+    Ok(findings)
+}
+
+// ── Complexity ──
+
+/// `path:start: name CCN 19 (limit 15)` for each limit a function in `lizard --csv`
+/// output exceeds, when the function overlaps a changed line.
+///
+/// Touching an over-limit function blocks until it is back under; an untouched one
+/// never does.
+fn touched_over_limit(csv: &str, scope: &Scope) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (measured, name, start, end, path) in csv.lines().filter_map(parse_lizard_csv_row) {
+        let span = (start as usize, end as usize);
+        if !scope.get(&path).is_some_and(|ranges| overlaps(span.0, span.1, ranges)) {
+            continue;
+        }
+        for ((label, _, limit), value) in COMPLEXITY_LIMITS.into_iter().zip(measured) {
+            if value > limit {
+                findings.push(format!("{path}:{start}: {name} {label} {value} (limit {limit})"));
+            }
+        }
+    }
+    findings
+}
+
+/// Over-limit functions this change touched, over the complexity gate's targets.
+fn complexity_residue(scope: &Scope) -> Result<Vec<String>, String> {
+    let files = scoped_files(scope, &COMPLEXITY_TARGETS);
+    // lizard with no file arguments walks the working directory; never let it.
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cmd = vec!["uvx", LIZARD, "-l", "rust", "--csv"];
+    cmd.extend(files.iter().map(String::as_str));
+    Ok(touched_over_limit(&run_tool("lizard", &cmd)?, scope))
+}
+
+// ── Stop-hook verdict ──
+
+/// Lint residue and complexity; read-only, in parallel.
+fn run_delta_gates(scope: &Scope) -> Vec<DeltaResult> {
+    let panicked = |_| Err("the gate panicked".to_string());
+    std::thread::scope(|threads| {
+        let lint = threads.spawn(|| lint_residue(scope));
+        let complexity = threads.spawn(|| complexity_residue(scope));
+        vec![
+            DeltaResult { gate: "Lint", outcome: lint.join().unwrap_or_else(panicked) },
+            DeltaResult { gate: "Complexity", outcome: complexity.join().unwrap_or_else(panicked) },
+        ]
+    })
+}
+
+/// The stderr block an agent reads: failed gates, then their findings; "" when clean.
+///
+/// At most `HOOK_FINDING_LIMIT` findings, then one line counting the rest; `verbose`
+/// lifts the cap, which is what that line tells the reader to run.
+fn stop_hook_payload(results: &[DeltaResult], verbose: bool) -> String {
+    let failed: Vec<(&str, &Vec<String>)> = results
+        .iter()
+        .filter_map(|r| r.outcome.as_ref().ok().filter(|f| !f.is_empty()).map(|f| (r.gate, f)))
+        .collect();
+    if failed.is_empty() {
+        return String::new();
+    }
+    let gates: Vec<&str> = failed.iter().map(|(gate, _)| *gate).collect();
+    let findings: Vec<&String> = failed.iter().flat_map(|(_, findings)| *findings).collect();
+    let shown = if verbose { findings.len() } else { findings.len().min(HOOK_FINDING_LIMIT) };
+    let mut lines = vec![format!("stop-hook failed: {}", gates.join(", "))];
+    lines.extend(findings[..shown].iter().map(ToString::to_string));
+    if shown < findings.len() {
+        let rest = findings.len() - shown;
+        lines.push(format!(
+            "\u{2026} +{rest} more \u{2014} run `cargo harness stop-hook --verbose`"
+        ));
+    }
+    lines.join("\n")
+}
+
+/// 2 blocks on findings; 1 for a tool failure; 0 when clean.
+///
+/// Findings on a stop the agent is already continuing from (`"stop_hook_active": true`
+/// in the hook `event`) exit 1: the hook blocks once per stop, never in a loop.
+fn stop_hook_exit(payload: &str, failed_tools: usize, event: &str) -> i32 {
+    if payload.is_empty() {
+        i32::from(failed_tools > 0)
+    } else if json_value(event, "stop_hook_active").is_some_and(|v| v.starts_with("true")) {
+        1
+    } else {
+        2
+    }
+}
+
+/// Print the verdict to stderr (nothing when clean) and return the exit code.
+fn report_stop_hook(results: &[DeltaResult], event: &str) -> i32 {
+    let mut failed_tools = 0;
+    for result in results {
+        if let Err(problem) = &result.outcome {
+            eprintln!("stop-hook: {} could not run: {problem}", result.gate);
+            failed_tools += 1;
+        }
+    }
+    let payload = stop_hook_payload(results, is_verbose());
+    let code = stop_hook_exit(&payload, failed_tools, event);
+    if !payload.is_empty() {
+        eprintln!("{payload}");
+        if code == 1 {
+            eprintln!("harness: already blocked once on this stop; not blocking again");
+        }
+    }
+    code
+}
+
+// ── Hook input ──
+
+/// The agent's hook JSON from stdin, read under a deadline; empty for a terminal.
+fn hook_event() -> String {
+    if io::stdin().is_terminal() {
+        return String::new();
+    }
+    let (input, _) = read_with_deadline(io::stdin(), Duration::from_secs(1));
+    String::from_utf8_lossy(&input).into_owned()
+}
+
+/// What follows `"key":` in a hook's JSON (first occurrence); None without the key.
+fn json_value<'a>(event: &'a str, key: &str) -> Option<&'a str> {
+    let (_, rest) = event.split_once(&format!("\"{key}\""))?;
+    rest.trim_start().strip_prefix(':').map(str::trim_start)
+}
+
+/// The first `"file_path"` string of a hook event; None for any escape but `\\ \" \/`.
+fn hook_file_path(event: &str) -> Option<String> {
+    let mut chars = json_value(event, "file_path")?.strip_prefix('"')?.chars();
+    let mut path = String::new();
+    loop {
+        match chars.next()? {
+            '"' => return Some(path),
+            '\\' => path.push(chars.next().filter(|c| matches!(c, '\\' | '"' | '/'))?),
+            c => path.push(c),
+        }
+    }
+}
+
+/// The project `.rs` file a `PostToolUse` event names, relative to `dir`; else None.
+fn hook_target(event: &str, dir: &Path) -> Option<String> {
+    let resolved = dir.join(hook_file_path(event)?).canonicalize().ok()?;
+    // Outside this crate: another harness owns it.
+    let relative =
+        resolved.strip_prefix(dir.canonicalize().ok()?).ok()?.to_str()?.replace('\\', "/");
+    (is_project_rs_file(&relative) && resolved.is_file()).then_some(relative)
+}
+
+// ── Formatting ──
+
+/// The crate's edition from Cargo.toml, which `cargo fmt` would pass to rustfmt.
+fn crate_edition() -> Option<String> {
+    let manifest = fs::read_to_string(root().join("Cargo.toml")).ok()?;
+    manifest.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("edition")?.trim_start().strip_prefix('=')?;
+        Some(value.trim().trim_matches('"').to_string())
+    })
+}
+
+/// `source` as rustfmt formats it; None when rustfmt fails (a parse error mid-edit).
+///
+/// Formatting stdin keeps rustfmt from following `mod` declarations into files
+/// nobody changed; rustfmt still reads `rustfmt.toml` from the crate root (the cwd).
+fn rustfmt_source(source: &[u8]) -> Option<Vec<u8>> {
+    let mut cmd = Command::new("rustfmt");
+    if let Some(edition) = crate_edition() {
+        cmd.args(["--edition", &edition]);
+    }
+    let mut child = cmd
+        .current_dir(root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let input = source.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child.wait_with_output().ok()?;
+    let written = writer.join().is_ok_and(|result| result.is_ok());
+    let emptied = output.stdout.is_empty() && !source.trim_ascii().is_empty();
+    (written && output.status.success() && !emptied).then_some(output.stdout)
+}
+
+/// Rewrite one file as rustfmt formats it: Some(true) when its bytes changed, None when
+/// it could not be read, formatted, or written.
+fn format_file(path: &str) -> Option<bool> {
+    let file = root().join(path);
+    let source = fs::read(&file).ok()?;
+    let formatted = rustfmt_source(&source)?;
+    if formatted == source {
+        return Some(false);
+    }
+    fs::write(&file, formatted).ok()?;
+    Some(true)
+}
+
+/// Format each file in place, silently; returns those rustfmt could not format.
+fn format_files(files: &[String]) -> Vec<String> {
+    files.iter().filter(|path| format_file(path).is_none()).cloned().collect()
+}
+
+/// Format the one file a `PostToolUse` event names. Never blocks.
+///
+/// Prints one additionalContext line when the file changed, so the agent re-reads it
+/// before its next edit; otherwise nothing.
+fn post_edit_hook() {
+    let Some(target) = hook_target(&hook_event(), root()) else { return };
+    if format_file(&target) == Some(true) {
+        let path = target.replace('\\', "\\\\").replace('"', "\\\"");
+        println!(
+            "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"harness: reformatted {path}; re-read it before editing it again\"}}}}"
+        );
+    }
+}
+
+// ── AGENTS.md mirror ──
+
+/// True when CLAUDE.md exists and AGENTS.md is missing or differs from it.
+fn agents_md_stale() -> bool {
+    let Ok(claude) = fs::read(root().join("CLAUDE.md")) else { return false };
+    fs::read(root().join("AGENTS.md")).map_or(true, |agents| agents != claude)
+}
+
+fn mirror_claude_md() -> io::Result<()> {
+    fs::write(root().join("AGENTS.md"), fs::read(root().join("CLAUDE.md"))?)
+}
+
+/// Stop hook: an uncommitted CLAUDE.md edit carries into AGENTS.md, silently.
+///
+/// CLAUDE.md is canonical. An edit to AGENTS.md alone is left for pre-commit to report.
+fn sync_agents_md_after_edit() {
+    if !git_lines(&["status", "--porcelain", "--", "CLAUDE.md"]).is_empty() && agents_md_stale() {
+        let _ = mirror_claude_md();
+    }
+}
+
+/// pre-commit: a staged CLAUDE.md carries AGENTS.md into the same commit.
+///
+/// The `git add` inherits git's hook environment on purpose: `GIT_INDEX_FILE` is the
+/// index this commit is being built from.
+fn sync_agents_md_staged() {
+    if git_lines(&["diff", "--cached", "--name-only", "--", "CLAUDE.md"]).is_empty()
+        || !agents_md_stale()
+    {
+        return;
+    }
+    let staged = mirror_claude_md()
+        .map_err(|e| e.to_string())
+        .and_then(|()| run_tool("git", &["git", "add", "--", "AGENTS.md"]));
+    if let Err(reason) = staged {
+        println!("  {RED}\u{2717}{RESET} sync-agents-md: {reason}");
+        std::process::exit(1);
+    }
+    println!("  {GREEN}\u{2713}{RESET} sync-agents-md: AGENTS.md \u{2190} CLAUDE.md (staged)");
+}
+
 // ── Stages ──────────────────────────────────────────────────────────
 
-/// Warn when Claude/Codex Stop hook wiring is missing.
-fn check_stop_hooks_present() {
-    for rel in [".claude/settings.json", ".codex/hooks.json"] {
+/// Warn when the Claude/Codex Stop or Claude `PostToolUse` wiring is missing.
+fn check_hooks_present() {
+    let wirings = [
+        (".claude/settings.json", "Stop", "stop-hook"),
+        (".claude/settings.json", "PostToolUse", "post-edit --hook"),
+        (".codex/hooks.json", "Stop", "stop-hook"),
+    ];
+    for (rel, event, marker) in wirings {
         let text = fs::read_to_string(root().join(rel)).unwrap_or_default();
-        if text.contains("Stop") && text.contains("stop-hook") {
-            println!("  {GREEN}\u{2713}{RESET} Stop hook wiring ({rel})");
+        if text.contains(event) && text.contains(marker) {
+            println!("  {GREEN}\u{2713}{RESET} {event} hook wiring ({rel})");
         } else {
-            println!("  {RED}\u{26a0}{RESET} Missing Stop hook wiring: {rel}");
+            println!("  {RED}\u{26a0}{RESET} Missing {event} hook wiring: {rel}");
         }
     }
 }
@@ -1561,12 +2090,11 @@ fn cmd_agents_md_drift() {
 
 /// Overwrite AGENTS.md with CLAUDE.md contents.
 fn cmd_sync_agents_md() {
-    let claude_path = root().join("CLAUDE.md");
-    let Ok(bytes) = fs::read(&claude_path) else {
+    if !root().join("CLAUDE.md").exists() {
         println!("  {RED}\u{2717}{RESET} sync-agents-md: CLAUDE.md not found");
         std::process::exit(1);
-    };
-    if let Err(e) = fs::write(root().join("AGENTS.md"), &bytes) {
+    }
+    if let Err(e) = mirror_claude_md() {
         println!("  {RED}\u{2717}{RESET} sync-agents-md: {e}");
         std::process::exit(1);
     }
@@ -1596,7 +2124,7 @@ fn cmd_check() {
         check_agents_md_drift(true),
     ];
 
-    check_stop_hooks_present();
+    check_hooks_present();
     check_arch_config_guard(true, false, false);
     results.push(RunResult { ok: check_suppressions_baseline(true), output: String::new() });
 
@@ -1612,19 +2140,25 @@ fn cmd_check() {
     println!("{GREEN}OK{RESET} {passed} passed {DIM}({elapsed:.1}s){RESET}");
 }
 
+/// Fix/format, and mirror a staged CLAUDE.md; tests run at pre-push.
 fn cmd_pre_commit() {
     println!("\n{BLUE}[pre-commit]{RESET}\n");
     check_arch_config_guard(true, true, false);
+    sync_agents_md_staged();
 
     let files = staged_rs_files();
+    // A commit that touches only a hand-edited AGENTS.md must fail too.
+    let docs_staged =
+        !git_lines(&["diff", "--cached", "--name-only", "--", "AGENTS.md", "CLAUDE.md"]).is_empty();
+    if !files.is_empty() || docs_staged {
+        check_agents_md_drift(false);
+    }
     if files.is_empty() {
         println!("No staged Rust files \u{2014} skipping checks");
         return;
     }
 
     cmd_fix();
-    check_agents_md_drift(false);
-    cmd_test();
 }
 
 fn cmd_ci() {
@@ -1656,12 +2190,23 @@ fn cmd_ci() {
     }
 }
 
-/// Read-only push gate: the offline checks pre-commit and stop-hook do not run.
-/// pre-commit covers fix/format/test on staged files; stop-hook adds complexity.
+/// The test suite, outside git's hook environment (see `strip_git_env`).
+fn test_gate() -> Gate {
+    Gate {
+        extract: Some(extract_test_summary),
+        without_git_env: true,
+        ..Gate::new("Tests", &["cargo", "test"])
+    }
+}
+
+/// Push gate: the offline checks pre-commit and stop-hook do not run.
+/// pre-commit covers fix/format on staged files; stop-hook covers the change's delta.
 /// This fills the gap with the deterministic, offline gates none of them run —
-/// clippy (strict), format check, acceptance, arch, agents-md-drift — validating
-/// the whole pushed tree (after merges/rebases/--no-verify) before it leaves the
-/// machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
+/// tests, clippy (strict), format check, acceptance, arch, agents-md-drift —
+/// validating the whole pushed tree (after merges/rebases/--no-verify) before it
+/// leaves the machine. Tests run first and alone: they write to `target/`; the rest
+/// is a read-only parallel batch. Network (audit) and advisory (coverage/CRAP) gates
+/// stay in ci.
 fn cmd_pre_push() {
     println!("\n{BLUE}[pre-push]{RESET}\n");
     // Branch guard first, and it short-circuits: on refusal (or incomplete
@@ -1672,10 +2217,11 @@ fn cmd_pre_push() {
     }
     let arch_config_ok = check_arch_config_guard(false, false, true);
     let agents_md_drift_ok = check_agents_md_drift(true).ok;
+    let tests_ok = print_gate_result(&run_capture(&test_gate()), true);
     let mut gates = vec![lint_gate(), format_check_gate()];
     gates.extend(acceptance_gates_or_warn());
     gates.extend(arch_gates_or_warn());
-    if !run_gates_parallel(&gates) || !arch_config_ok || !agents_md_drift_ok {
+    if !run_gates_parallel(&gates) || !arch_config_ok || !agents_md_drift_ok || !tests_ok {
         std::process::exit(1);
     }
 }
@@ -1687,12 +2233,7 @@ fn git_hook_path(name: &str) -> PathBuf {
     let fallback = || root().join(".git").join("hooks").join(name);
     let mut cmd = Command::new("git");
     cmd.args(["rev-parse", "--git-path", &format!("hooks/{name}")]).current_dir(root());
-    cmd.env_clear();
-    for (key, value) in env::vars() {
-        if !key.starts_with("GIT_") {
-            cmd.env(key, value);
-        }
-    }
+    strip_git_env(&mut cmd);
     let Ok(out) = cmd.output() else { return fallback() };
     if !out.status.success() {
         return fallback();
@@ -1729,23 +2270,11 @@ fn cmd_hooks() {
     install_git_hook("pre-commit");
     install_git_hook("pre-push");
     println!("Installed pre-commit and pre-push git hooks");
-    // The runner is std-only (no JSON parser), so it verifies the Stop wiring
+    // The runner is std-only (no JSON parser), so it verifies the hook wiring
     // rather than injecting into settings that may carry other hooks. The template
     // ships .claude/settings.json and .codex/hooks.json already wired; copy them in
     // (cp -r the template's .claude / .codex) if this warns.
-    check_stop_hook_present();
-}
-
-fn check_stop_hook_present() {
-    let root = root();
-    for rel in [".claude/settings.json", ".codex/hooks.json"] {
-        let content = fs::read_to_string(root.join(rel)).unwrap_or_default();
-        if content.contains("Stop") && content.contains("stop-hook") {
-            println!("  {GREEN}\u{2713}{RESET} Stop hook wiring ({rel})");
-        } else {
-            println!("  {RED}\u{26a0}{RESET} Missing Stop hook wiring: {rel}");
-        }
-    }
+    check_hooks_present();
 }
 
 fn cmd_clean() {
@@ -1818,8 +2347,6 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-
     use super::*;
 
     #[test]
@@ -1932,7 +2459,7 @@ mod tests {
             r#"7,16,45,2,20,"risky@12-31@src/lib.rs",src/lib.rs,risky,"fn risky(a, b)",12,31"#;
         assert_eq!(
             parse_lizard_csv_row(row),
-            Some((16, "risky".to_string(), 12, 31, "src/lib.rs".to_string())),
+            Some(([16, 2, 20], "risky".to_string(), 12, 31, "src/lib.rs".to_string())),
         );
     }
 
@@ -2133,6 +2660,167 @@ mod tests {
     #[test]
     fn parallel_gates_empty_batch_passes() {
         assert!(run_gates_parallel(&[]));
+    }
+
+    // ── Stop hook ──
+
+    const DIFF: &str = "diff --git a/src/app.py b/src/app.py\n\
+        index 1..2 100644\n\
+        --- a/src/app.py\n\
+        +++ b/src/app.py\n\
+        @@ -1,0 +2 @@ x\n\
+        +y\n\
+        @@ -10,2 +11,3 @@ def f():\n\
+        +++ looks like a header but is an added line\n\
+        +b\n\
+        +c\n\
+        @@ -20,4 +22,0 @@\n\
+        -gone\n\
+        diff --git a/old.py b/old.py\n\
+        deleted file mode 100644\n\
+        --- a/old.py\n\
+        +++ /dev/null\n\
+        @@ -1,2 +0,0 @@\n\
+        -x\n\
+        diff --git a/sp ace.py b/sp ace.py\n\
+        new file mode 100644\n\
+        --- /dev/null\n\
+        +++ b/sp ace.py\t\n\
+        @@ -0,0 +1,4 @@\n\
+        +a\n\
+        diff --git a/only_deleted.py b/only_deleted.py\n\
+        --- a/only_deleted.py\n\
+        +++ b/only_deleted.py\n\
+        @@ -3 +2,0 @@\n\
+        -x\n";
+
+    #[test]
+    fn parse_diff_ranges_per_file() {
+        let expected = Scope::from([
+            ("src/app.py".to_string(), vec![(2, 2), (11, 13)]),
+            ("sp ace.py".to_string(), vec![(1, 4)]),
+            ("only_deleted.py".to_string(), vec![]),
+        ]);
+        assert_eq!(parse_diff_ranges(DIFF), expected);
+    }
+
+    #[test]
+    fn stop_hook_exit_codes() {
+        let active = r#"{"session_id": "s", "stop_hook_active" : true}"#;
+        let cases = [
+            ("", 0, "", 0),
+            ("", 1, active, 1),
+            ("P", 0, "", 2),
+            ("P", 1, "", 2),     // a crashed gate never hides another gate's findings
+            ("P", 0, active, 1), // already continuing from a block: never loop
+            ("P", 1, active, 1),
+            ("P", 0, r#"{"stop_hook_active":false}"#, 2),
+            ("P", 0, r#"{"stop_hook_active": "true"}"#, 2),
+            ("P", 0, "not json", 2),
+        ];
+        for (payload, failed, event, expected) in cases {
+            assert_eq!(
+                stop_hook_exit(payload, failed, event),
+                expected,
+                "{payload:?} {failed} {event}"
+            );
+        }
+    }
+
+    fn found(gate: &'static str, findings: Vec<String>) -> DeltaResult {
+        DeltaResult { gate, outcome: Ok(findings) }
+    }
+
+    fn numbered(count: usize) -> Vec<String> {
+        (1..=count).map(|n| format!("a.rs:{n}: x")).collect()
+    }
+
+    #[test]
+    fn payload_names_failed_gates_and_caps_findings() {
+        let busy = vec!["b.rs:1: busy CCN 16 (limit 15)".to_string()];
+        let results = [found("Lint", numbered(23)), found("Complexity", busy)];
+        let payload = stop_hook_payload(&results, false);
+        let lines: Vec<&str> = payload.lines().collect();
+        assert_eq!(lines.len(), 22);
+        assert_eq!(lines[0], "stop-hook failed: Lint, Complexity");
+        assert_eq!(lines[20], "a.rs:20: x");
+        assert_eq!(lines[21], "… +4 more — run `cargo harness stop-hook --verbose`");
+        assert_eq!(stop_hook_payload(&results, true).lines().count(), 25, "verbose lifts the cap");
+        assert_eq!(stop_hook_payload(&[found("Lint", numbered(20))], false).lines().count(), 21);
+        let failed = DeltaResult { gate: "Complexity", outcome: Err("boom".to_string()) };
+        assert_eq!(stop_hook_payload(&[found("Lint", vec![]), failed], false), "");
+    }
+
+    #[test]
+    fn only_touched_functions_over_a_limit_are_findings() {
+        let csv = "NLOC,CCN,token,PARAM,length,location,file,function,long_name,start,end\n\
+            9,16,45,9,101,\"busy@10-110@src/a.rs\",\"src/a.rs\",\"busy\",\"busy( a , b )\",10,110\n\
+            9,20,45,1,20,\"legacy@120-139@src/a.rs\",\"src/a.rs\",\"legacy\",\"legacy( )\",120,139\n\
+            9,15,45,8,100,\"fine@140-239@src/a.rs\",\"src/a.rs\",\"fine\",\"fine( )\",140,239\n\
+            9,30,45,1,5,\"other@1-5@src/b.rs\",\"src/b.rs\",\"other\",\"other( )\",1,5\n";
+        let scope = Scope::from([("src/a.rs".to_string(), vec![(1, 10), (150, 150)])]);
+        assert_eq!(
+            touched_over_limit(csv, &scope),
+            [
+                "src/a.rs:10: busy CCN 16 (limit 15)",
+                "src/a.rs:10: busy args 9 (limit 8)",
+                "src/a.rs:10: busy length 101 (limit 100)",
+            ]
+        );
+    }
+
+    #[test]
+    fn clippy_findings_read_both_forms_on_changed_lines() {
+        let report = [
+            "    Checking stub v0.1.0",
+            "warning: unused variable: `x`",
+            " --> src/a.rs:3:9",
+            "note: the lint level is defined here",
+            " --> src/a.rs:2:9",
+            "error[E0425]: cannot find value `y`",
+            "  --> src/a.rs:40:5",
+            "src/a.rs:2:5: warning: unneeded `return` statement",
+            "src/a.rs:9:5: warning: old",
+            "warning: `stub` (lib) generated 2 warnings",
+        ]
+        .join("\n");
+        let scope = Scope::from([("src/a.rs".to_string(), vec![(2, 3)])]);
+        assert_eq!(
+            clippy_findings(&report, &scope),
+            [
+                "src/a.rs:3: warning: unused variable: `x`",
+                "src/a.rs:2: warning: unneeded `return` statement",
+            ]
+        );
+    }
+
+    #[test]
+    fn hook_target_resolves_inside_the_project_only() {
+        let tmp = env::temp_dir().join(format!("rust-hook-target-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let project = tmp.join("project");
+        for file in ["src/app.rs", "src/data.txt", "target/debug/build.rs"] {
+            fs::create_dir_all(project.join(file).parent().unwrap()).unwrap();
+            fs::write(project.join(file), "").unwrap();
+        }
+        fs::write(tmp.join("elsewhere.rs"), "").unwrap();
+        let absolute = project.join("src/app.rs").to_string_lossy().replace('\\', "\\\\");
+        let event = |path: &str| format!(r#"{{"tool_input": {{"file_path": "{path}"}}}}"#);
+        let cases = [
+            (event(&absolute), Some("src/app.rs")),
+            (event("src/app.rs"), Some("src/app.rs")),
+            (event(r"src\/app.rs"), Some("src/app.rs")),
+            (event("src/data.txt"), None),
+            (event("target/debug/build.rs"), None),
+            (event("../elsewhere.rs"), None),
+            (event(r"src\u0061pp.rs"), None), // escapes past \\ \" \/ are not read
+            ("{not json".to_string(), None),
+            (String::new(), None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(hook_target(&input, &project).as_deref(), expected, "{input}");
+        }
+        fs::remove_dir_all(&tmp).unwrap();
     }
 }
 

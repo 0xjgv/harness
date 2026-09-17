@@ -6,7 +6,20 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd $CLAUDE_PROJECT_DIR && bun harness.ts stop-hook"
+            "command": "cd $CLAUDE_PROJECT_DIR && bun harness.ts stop-hook",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd $CLAUDE_PROJECT_DIR && bun harness.ts post-edit --hook",
+            "timeout": 60
           }
         ]
       }

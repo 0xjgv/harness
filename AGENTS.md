@@ -15,8 +15,8 @@ Two things live here, and they're easy to conflate:
 
 This root directory is the meta-repo, not one of the templates. It now dogfoods a
 small meta-harness: root `AGENTS.md` and `CLAUDE.md` are byte-identical, root Stop
-hooks run `make stop-hook`, and root git hooks can run `make pre-commit` /
-`make pre-push`. Each template subdirectory remains a fully independent copy-paste
+hooks run `make -s stop-hook`, the root PostToolUse hook runs `make -s post-edit-hook`,
+and root git hooks can run `make pre-commit` / `make pre-push`. Each template subdirectory remains a fully independent copy-paste
 unit; there is no shared code or dependency between `python/`, `bun/`, `go/`,
 `rust/`, and `monorepo/`.
 
@@ -31,20 +31,27 @@ The root `Makefile` manages repo-level dogfooding and skill deployment:
 - `make agents-md-drift` — fail if root `AGENTS.md` differs from `CLAUDE.md`
 - `make sync-agents-md` — copy root `CLAUDE.md` → `AGENTS.md`
 - `make arch-config-guard ARGS=--warn` — warn on protected arch config changes
-- `make stop-hook` — root Stop hook: sync derived root docs/skills when needed, warn on
-  arch config changes, and dispatch `stop-hook` into dirty language templates
+- `make stop-hook` — root Stop hook: sync derived root docs/skills when needed, then
+  run each dirty language template's `stop-hook` and answer as one hook JSON object
+  (`make` flattens exit codes, so the dispatch speaks JSON; see
+  `skills/harness/reference/settings-json.md`)
+- `make post-edit-hook` — root PostToolUse hook: forward the edited file to the template
+  that owns it (`<runner> post-edit --hook`)
+- `make sync-derived` — `sync-agents-md` when `CLAUDE.md` has uncommitted edits, and
+  `sync-skills` when `skills/harness/` does
 - `make branch-guard` — refuse direct pushes to, or deletions of, `main`/`master`. Runs before every other gate in `make pre-push`; a refusal stops the run. Reads
   `HARNESS_PRE_PUSH_REFS`, else git pre-push stdin (1s deadline; partial input fails),
   else the current branch; `HARNESS_ALLOW_PROTECTED_PUSH=1` overrides. Runs first in
   `make pre-push`, which then exports the refs to every template's `pre-push`.
 - `make setup-hooks` — install root `.git/hooks/pre-commit` and `.git/hooks/pre-push`,
-  then verify root Claude/Codex Stop hook wiring
+  then verify root Claude Stop/PostToolUse and Codex Stop hook wiring
 - `make help` — list targets
 
 **After editing anything under `skills/harness/`, always run `make sync-skills`**, then
-`make check` to confirm no drift remains. After editing root `CLAUDE.md`, run
-`make sync-agents-md`; the root `post-edit` helper also does this automatically during
-`make stop-hook`.
+`make check` to confirm no drift remains (root `pre-commit` no longer checks skill
+drift; `make check` and `ci` fail on it, root `pre-push` only prints it). After editing root `CLAUDE.md`, run
+`make sync-agents-md`; `make stop-hook` does it automatically, and root `pre-commit`
+copies and stages `AGENTS.md` when `CLAUDE.md` is staged.
 
 ## Commands (inside a template)
 
@@ -64,12 +71,12 @@ cd monorepo && make check           # dispatches check to every subproject copie
 | Script | When | Does | Fixes code? |
 |---|---|---|---|
 | `check` | after edits | fix, format, typecheck, test, suppression ratchet | yes |
-| `pre-commit` | git pre-commit hook | same, staged files only | yes |
-| `pre-push` | git pre-push hook | branch guard, then read-only: lint, format check, acceptance, arch, over the whole tree, in parallel | no |
+| `pre-commit` | git pre-commit hook | fix, format, typecheck on staged files; syncs a staged `CLAUDE.md` into `AGENTS.md` (no tests) | yes |
+| `pre-push` | git pre-push hook | branch guard, then read-only: tests, lint, format check, acceptance, arch, over the whole tree | no |
 | `ci` | CI pipeline | read-only gates (lint, typecheck, dep audit, complexity, deadcode, acceptance, arch) in parallel, then coverage + advisory CRAP | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
-| `post-edit` | Stop hook helper | fix + format changed source files (rust: clippy `--fix` + fmt) | yes |
-| `stop-hook` | agent Stop hook | `post-edit` + complexity (+ deadcode where shipped) | yes |
+| `post-edit` | Stop hook helper; `--hook` = PostToolUse on one file | fix + format changed source files | yes |
+| `stop-hook` | agent Stop hook | `post-edit`, then lint left on changed lines, over-limit functions the change touched (+ deadcode on changed lines where shipped); silent on success, exit 2 with ≤20 `path:line` findings | yes |
 
 Other standalone subcommands every template exposes: `complexity`, `crap`, `acceptance`,
 `coverage` (Go also keeps `test-cov`), `mutation`, `arch`, `arch-config-guard`,
@@ -104,7 +111,7 @@ templates copied inside it as subprojects (`cp -r python/ api`), not edited stan
 - **Layer 2 — behavior contract** (greenfield: automatic; ported into an existing repo:
   opt-in only): instruction text in `AGENTS.md` and `CLAUDE.md` for plan-first tasks,
   human-owned merges, and specify-what-is-worth-specifying, plus two portable guards:
-  `arch-config-guard` warns during `check`/`pre-commit`/`stop-hook` and blocks
+  `arch-config-guard` warns during `check`/`pre-commit` and blocks
   `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review;
   `branch-guard` makes `pre-push` refuse direct pushes to `main`/`master` unless
   `HARNESS_ALLOW_PROTECTED_PUSH=1` is set. Full design: `skills/harness/reference/behavior-contract.md`.
@@ -153,7 +160,7 @@ are documentation *about* this repo's contract, not code that runs here.
 <important if="you want to edit a template's arch config">
 - Each language template has its own arch config: `.importlinter` (python), `.dependency-cruiser.json` (bun), `.go-arch-lint.yml` (go), `arch.toml` (rust).
 - Do not silently edit an arch config to silence a violation. Architectural violations imply a design decision — put the config change in its own commit whose message states the rationale, so the reviewer sees it isolated.
-- The root and template harnesses warn about arch config changes during `check`/`pre-commit`/`stop-hook` and block `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. Expect the push to be refused; report it and let the human review.
+- The root and template harnesses warn about arch config changes during `check`/`pre-commit` and block `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. Expect the push to be refused; report it and let the human review.
 </important>
 
 ## Adding a new language template
@@ -168,14 +175,19 @@ tables. Use `python/` or `go/` as the reference implementation.
 
 - Zero external dependencies in the runner — stdlib/runtime APIs only.
 - Quiet by default — one line per successful step; full output only on failure;
-  `--verbose` is the escape hatch.
+  `--verbose` is the escape hatch. Agent hooks print nothing at all on success.
+- Gate the change, not the codebase, at agent stop. `stop-hook` blocks only on what the
+  change touched (lint on changed lines, over-limit functions the change touched,
+  dead code on changed lines); untouched debt surfaces in `check`/`ci`. A tool that
+  cannot run exits 1 and never blocks the agent.
 - `check`/`pre-commit`/`post-edit` fix what they can; `pre-push`/`ci`/`audit` are
   strictly read-only.
 - Tools own everything checkable. Formatting, lint, types, dead code, drift, and
   complexity are decided by deterministic tools and auto-fixed where the tool can; the
   agent never judges or reports them by hand.
 - Quality gates are hard; permission gates are exactly two. Lint, types, arch boundaries,
-  complexity, the suppression ratchet, dead code, dependency audit, and drift block. Only
+  complexity, the suppression ratchet, dead code, dependency audit, and drift block
+  (at stop, only on the change; the whole tree in `pre-push`/`ci`). Only
   `arch-config-guard` (pre-push/ci) and `branch-guard` (pre-push) need a human to unblock.
 - Gameable metrics are advisory. CRAP and mutation point at the next test or split and
   are never gates; the coverage floor is a ratchet from `.harness-baseline`, raised by a
