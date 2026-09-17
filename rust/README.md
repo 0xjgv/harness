@@ -8,7 +8,7 @@ Rust project template with built-in harness: linting, formatting, testing, accep
 
 ```bash
 cargo build                          # Build the project
-cargo harness setup-hooks            # Install git pre-commit + pre-push hooks; verify Claude/Codex Stop wiring
+cargo harness setup-hooks            # Install git pre-commit + pre-push hooks; verify Claude/Codex agent hook wiring
 ```
 
 The acceptance, coverage, mutation, and arch gates depend on external cargo
@@ -37,8 +37,9 @@ See the [5-script contract](../README.md#the-5-script-contract) for the full rat
 
 ```bash
 cargo harness check                # Fix + format + lint + tests (after editing)
-cargo harness pre-commit           # Staged checks + tests (runs via git hook; arch config warns)
-cargo harness pre-push             # Branch guard + read-only push gate: clippy, format check, acceptance, arch (runs via git hook)
+cargo harness pre-commit           # Fix + format when Rust files are staged; mirrors a staged CLAUDE.md (runs via git hook; arch config warns)
+cargo harness pre-push             # Branch guard + tests + read-only push gate: clippy, format check, acceptance, arch (runs via git hook)
+cargo harness stop-hook            # post-edit, then changed-lines lint, complexity delta; silent on success, exit 2 with findings
 cargo harness ci                   # Full verification (see below)
 ```
 
@@ -46,7 +47,18 @@ cargo harness ci                   # Full verification (see below)
 
 `harness ci` runs the read-only gates — strict clippy (`-D warnings`), format check, complexity (lizard, CCN 15, args 8), acceptance (cucumber), arch (cargo-modules) — **in parallel**: each is captured and printed in submission order, and the batch runs to completion so one pass surfaces every failure. It then runs agents-md-drift as a separate hard check, dep audit, streams tests + coverage (cargo-llvm-cov, default threshold from `.harness-baseline`), and the advisory CRAP.
 
-`pre-push` is the offline push gate — a branch guard that refuses direct pushes to (or deletions of) `main`/`master` (override: `HARNESS_ALLOW_PROTECTED_PUSH=1`) and short-circuits on refusal, printing only that and exiting before anything else runs; otherwise the arch config guard, then agents-md-drift as a separate hard check, then clippy, format check, acceptance, arch run in parallel over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip).
+`pre-push` is the offline push gate — a branch guard that refuses direct pushes to (or deletions of) `main`/`master` (override: `HARNESS_ALLOW_PROTECTED_PUSH=1`) and short-circuits on refusal, printing only that and exiting before anything else runs; otherwise the arch config guard, then agents-md-drift as a separate hard check, then the test suite (alone, without git's `GIT_*` hook variables: it writes `target/`, and a test that runs `git init` would otherwise write into this repository), then clippy, format check, acceptance, arch run in parallel over the whole pushed tree (the deterministic checks pre-commit and stop-hook skip). `pre-commit` no longer runs the tests.
+
+### Agent hooks
+
+The Claude/Codex Stop hook runs `stop-hook` after every agent turn and judges the change, not the tree. It formats changed `.rs` files with rustfmt, copies an uncommitted `CLAUDE.md` edit to `AGENTS.md`, then runs two read-only gates in parallel over the lines changed since the merge-base with the base branch (`HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`, then origin/HEAD, origin/main, origin/master, main, master; never fetched), plus untracked files:
+
+- **Lint** — `cargo clippy --message-format=json`; a warning or error blocks when its primary span sits on a changed line (rustc's `dead_code` arrives this way).
+- **Complexity** — lizard over changed files in `src/` + `tests/`, now and at the base; a function blocks when it is over a limit and new, or worse than at the base.
+
+Pre-existing debt never blocks. Clean: no output, exit 0. Findings: exit 2 with `stop-hook failed: <gates>` and at most 20 `path:line: message` lines on stderr (`--verbose` lifts the cap). A tool that cannot run (a build that fails away from the changed lines included): exit 1, which the Claude and Codex wiring treat as non-blocking. When the agent is already continuing from a stop and the findings have not changed, the hook exits 1 instead of blocking again.
+
+The Claude PostToolUse hook runs `post-edit --hook` on the file an Edit/Write touched: rustfmt only (never `cargo clippy --fix`, which rewrites the whole crate), and when the file changed it prints an `additionalContext` line asking the agent to re-read it. It never blocks.
 
 Dead code needs no separate gate — rust's `dead_code` lint is on by default and the strict clippy (`-D warnings`) denies unused functions, fields, and variants; unused dependencies surface via `cargo`'s own warnings (or `cargo-machete`).
 
@@ -95,7 +107,8 @@ cargo harness fix                  # Fix lint errors (clippy --fix) + format
 cargo harness lint                 # Lint + format check (read-only)
 cargo harness test                 # Run tests
 cargo harness pre-push             # Branch guard + read-only push gate: clippy, format check, acceptance, arch
-cargo harness setup-hooks          # Install git pre-commit + pre-push hooks; verify Claude/Codex Stop wiring (std-only)
+cargo harness post-edit            # rustfmt on uncommitted .rs files (--hook: the file a PostToolUse event names)
+cargo harness setup-hooks          # Install git pre-commit + pre-push hooks; verify Claude/Codex agent hook wiring (std-only)
 cargo harness clean                # Remove build artifacts
 ```
 
@@ -117,10 +130,11 @@ arch.toml             Architecture rules (cargo-modules)
 - **Plan then execute**: open with the sub-tasks and the files each touches, then do the work in the same turn.
 - **Human-is-engineer**: commit and push on a feature branch; the human merges. The `pre-push` branch guard refuses direct pushes to (or deletions of) `main`/`master` unless `HARNESS_ALLOW_PROTECTED_PUSH=1` — it stops accidents, not `--no-verify`. It reads `HARNESS_PRE_PUSH_REFS`, else the hook's stdin refs, else the current branch.
 - **Specify what is worth specifying**: `.feature` scenarios for user-visible flows, law-like rules, and cross-component contracts; unit tests suffice for the rest.
-- **Arch config guard**: `arch.toml` changes warn during `check`/`pre-commit`/`stop-hook` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+- **Arch config guard**: `arch.toml` changes warn during `check`/`pre-commit` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 
 Stop hooks are wired via `.claude/settings.json` for Claude and
-`.codex/hooks.json` for Codex.
+`.codex/hooks.json` for Codex; the Claude PostToolUse hook lives in
+`.claude/settings.json` too.
 
 ## Architecture gate
 

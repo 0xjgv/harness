@@ -1,2 +1,6 @@
 [alias]
-harness = "run --quiet --bin harness --"
+# `build.warnings='allow'` silences only this build of the harness binary. The bin
+# depends on the crate's lib, so cargo would otherwise replay every cached lib
+# warning ahead of each hook's output. ci's strict clippy stays the gate. Older
+# cargo ignores the key (1.96 does; 1.98 honors it).
+harness = ["run", "--quiet", "--config", "build.warnings='allow'", "--bin", "harness", "--"]
