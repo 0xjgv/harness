@@ -49,7 +49,7 @@ The root `Makefile` manages repo-level dogfooding and skill deployment:
 
 **After editing anything under `skills/harness/`, always run `make sync-skills`**, then
 `make check` to confirm no drift remains (root `pre-commit` no longer checks skill
-drift; `make check`, `pre-push`, and `ci` still do). After editing root `CLAUDE.md`, run
+drift; `make check` and `ci` fail on it, root `pre-push` only prints it). After editing root `CLAUDE.md`, run
 `make sync-agents-md`; `make stop-hook` does it automatically, and root `pre-commit`
 copies and stages `AGENTS.md` when `CLAUDE.md` is staged.
 
