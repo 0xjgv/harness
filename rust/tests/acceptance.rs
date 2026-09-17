@@ -3,10 +3,9 @@
 //! Run via `cargo harness acceptance` (or `cargo test --test acceptance`).
 //! Declared in Cargo.toml with `harness = false` so cucumber owns the output.
 
-use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use cucumber::gherkin::Step;
@@ -220,7 +219,7 @@ fn branch_with_earlier_arch_deletion(world: &mut CrateWorld) {
     commit(&dir, "unrelated");
 }
 
-fn commit(dir: &Path, message: &str) {
+fn commit(dir: &PathBuf, message: &str) {
     git(dir, &["add", "-A"]);
     git(
         dir,
@@ -240,14 +239,14 @@ fn commit(dir: &Path, message: &str) {
     );
 }
 
-fn git_out(dir: &Path, args: &[&str]) -> String {
+fn git_out(dir: &PathBuf, args: &[&str]) -> String {
     let output =
         isolated(Command::new("git")).args(args).current_dir(dir).output().expect("spawn git");
     assert!(output.status.success(), "git {args:?} failed in {dir:?}");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-fn git(dir: &Path, args: &[&str]) {
+fn git(dir: &PathBuf, args: &[&str]) {
     let status =
         isolated(Command::new("git")).args(args).current_dir(dir).status().expect("spawn git");
     assert!(status.success(), "git {args:?} failed in {dir:?}");
@@ -260,25 +259,30 @@ fn i_run(world: &mut CrateWorld, cmd: String) {
     if !argv.is_empty() && argv[0] == "harness" {
         argv.remove(0);
     }
-    let tmp = world.tmp.as_ref().expect("tmp dir not initialised");
+    let dir = world.project.clone().or_else(|| world.tmp.clone()).expect("tmp dir not initialised");
     let mut command = isolated(Command::new(HARNESS_BIN));
     command
         .args(&argv)
-        // Null stdin keeps commands that read git pre-push refs deterministic.
-        .stdin(Stdio::null())
+        // Stdin carries the hook input and then closes, so commands that read git
+        // pre-push refs stay deterministic.
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         // A crate under test builds into its own target dir, never a shared one.
-        .env("CARGO_TARGET_DIR", tmp.join("target"))
-        .current_dir(tmp);
+        .env("CARGO_TARGET_DIR", dir.join("target"))
+        .current_dir(&dir);
     for (key, value) in &world.env {
         command.env(key, value);
     }
-    let output = command.output().expect("spawn harness binary");
+    let mut child = command.spawn().expect("spawn harness binary");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    stdin.write_all(world.hook_input.as_bytes()).expect("write hook input");
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait for harness binary");
     world.exit_code = output.status.code();
-    world.output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    world.stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    world.stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    world.output = format!("{}{}", world.stdout, world.stderr);
 }
 
 #[then(expr = "the exit code is {int}")]
@@ -304,25 +308,11 @@ fn output_does_not_contain(world: &mut CrateWorld, text: String) {
 
 // ── Stop hook, post-edit hook, AGENTS.md mirror ────────────────────
 
-const CRATE_TOML: &str = "[package]
-name = \"stub\"
-version = \"0.1.0\"
-edition = \"2024\"
-";
-
-/// A formatted function every crate starts with (lines 1-3).
-const HELPER_RS: &str = "pub fn helper() -> i32 {
-    1
-}
-";
-
 /// A formatted function whose CCN is `branches + 1`.
 fn branchy(name: &str, branches: usize) -> String {
-    let mut body = String::new();
-    for i in 0..branches {
-        writeln!(body, "    if value == {i} {{\n        return {i};\n    }}")
-            .expect("write to String");
-    }
+    let body: String = (0..branches)
+        .map(|i| format!("    if value == {i} {{\n        return {i};\n    }}\n"))
+        .collect();
     format!("pub fn {name}(value: i32) -> i32 {{\n{body}    -1\n}}\n")
 }
 
@@ -337,18 +327,10 @@ impl CrateWorld {
         self.project.clone().expect("project not initialised")
     }
 
-    fn repo(&self) -> PathBuf {
-        self.tmp.clone().expect("tmp dir not initialised")
-    }
-
     fn write(&self, relative: &str, text: &str) {
         let path = self.project().join(relative);
         fs::create_dir_all(path.parent().expect("file has a parent")).expect("create parent");
         fs::write(path, text).expect("write file");
-    }
-
-    fn read(&self, relative: &str) -> String {
-        fs::read_to_string(self.project().join(relative)).expect("read file")
     }
 }
 
@@ -358,27 +340,20 @@ fn crate_in(world: &mut CrateWorld, subdir: String) {
     git(&repo, &["init", "-q", "-b", "main"]);
     world.project = Some(repo.join(subdir));
     world.tmp = Some(repo);
-    world.write("Cargo.toml", CRATE_TOML);
+    world.write(
+        "Cargo.toml",
+        "[package]\nname = \"stub\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
     world.write(".gitignore", "/target/\n");
     world.write("CLAUDE.md", "docs\n");
     world.write("AGENTS.md", "docs\n");
-    world.write("src/lib.rs", HELPER_RS);
+    world.write("src/lib.rs", "pub fn helper() -> i32 {\n    1\n}\n"); // lines 1-3
 }
 
-#[given("a repo whose CLAUDE.md and AGENTS.md agree")]
-fn docs_repo(world: &mut CrateWorld) {
-    let repo = tempdir();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    world.project = Some(repo.clone());
-    world.tmp = Some(repo.clone());
-    world.write("CLAUDE.md", "v1\n");
-    world.write("AGENTS.md", "v1\n");
-    commit(&repo, "docs");
-}
-
-#[given(expr = "{string} has {string} with {int} branches")]
-fn file_has_branchy(world: &mut CrateWorld, file: String, name: String, branches: usize) {
-    world.write(&file, &format!("{HELPER_RS}\n{}", branchy(&name, branches)));
+#[given(expr = "{string} gains {string} with {int} branches")]
+fn file_gains_branchy(world: &mut CrateWorld, file: String, name: String, branches: usize) {
+    let text = fs::read_to_string(world.project().join(&file)).expect("read file");
+    world.write(&file, &format!("{text}\n{}", branchy(&name, branches)));
 }
 
 #[given(expr = "{string} is written as:")]
@@ -386,15 +361,9 @@ fn file_written(world: &mut CrateWorld, file: String, step: &Step) {
     world.write(&file, &docstring(step));
 }
 
-#[given(expr = "a line is appended to {string}")]
-fn line_appended(world: &mut CrateWorld, file: String) {
-    let text = world.read(&file);
-    world.write(&file, &format!("{text}\npub const VALUE: i32 = 2;\n"));
-}
-
 #[given("the base is committed on main")]
 fn base_committed(world: &mut CrateWorld) {
-    let repo = world.repo();
+    let repo = world.project(); // git works from a subdirectory too
     commit(&repo, "base");
     git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
     git(&repo, &["checkout", "-q", "-b", "feature"]);
@@ -402,7 +371,7 @@ fn base_committed(world: &mut CrateWorld) {
 
 #[given("the change is committed")]
 fn change_committed(world: &mut CrateWorld) {
-    commit(&world.repo(), "change");
+    commit(&world.project(), "change");
 }
 
 #[given(expr = "{string} is staged")]
@@ -415,85 +384,27 @@ fn hook_input_is(world: &mut CrateWorld, input: String) {
     world.hook_input = input;
 }
 
-fn names(world: &mut CrateWorld, path: &Path) {
+#[given(expr = "the hook input names {string}")]
+fn hook_input_names(world: &mut CrateWorld, file: String) {
+    let path = world.project().join(file);
     let path = path.to_str().expect("utf-8 path");
     world.hook_input = format!(r#"{{"tool_input":{{"file_path":"{path}"}}}}"#);
 }
 
-#[given(expr = "the hook input names {string}")]
-fn hook_input_names(world: &mut CrateWorld, file: String) {
-    let path = world.project().join(file);
-    names(world, &path);
-}
-
-#[given("the hook input names a file outside the crate")]
-fn hook_input_names_outside(world: &mut CrateWorld) {
-    names(world, &Path::new(env!("CARGO_MANIFEST_DIR")).join("harness.rs"));
-}
-
-#[when(expr = "I run the hook {string}")]
-fn run_hook(world: &mut CrateWorld, cmd: String) {
-    let project = world.project();
-    let mut command = isolated(Command::new(HARNESS_BIN));
-    command
-        .args(cmd.split_whitespace().skip(1))
-        .current_dir(&project)
-        .env("CARGO_TARGET_DIR", project.join("target"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn harness binary");
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    stdin.write_all(world.hook_input.as_bytes()).expect("write hook input");
-    drop(stdin);
-    let output = child.wait_with_output().expect("wait for harness binary");
-    world.exit_code = output.status.code();
-    world.stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    world.stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    world.output = format!("{}{}", world.stdout, world.stderr);
-}
-
-fn assert_hook(world: &CrateWorld, code: i32, stdout: &str, stderr: &str) {
-    let actual = (world.exit_code, world.stdout.as_str(), world.stderr.as_str());
-    assert_eq!(actual, (Some(code), stdout, stderr), "hook result differs");
-}
-
 #[then(expr = "the hook exits {int} silently")]
 fn hook_exits_silently(world: &mut CrateWorld, code: i32) {
-    assert_hook(world, code, "", "");
+    assert_eq!((world.exit_code, world.output.as_str()), (Some(code), ""));
 }
 
-#[then(expr = "the hook exits {int} with stderr:")]
-fn hook_exits_with_stderr(world: &mut CrateWorld, code: i32, step: &Step) {
-    assert_hook(world, code, "", &docstring(step));
-}
-
-#[then(expr = "the hook exits {int} with stdout:")]
-fn hook_exits_with_stdout(world: &mut CrateWorld, code: i32, step: &Step) {
-    assert_hook(world, code, &docstring(step), "");
-}
-
-#[then(expr = "the stderr starts with {string}")]
-fn stderr_starts_with(world: &mut CrateWorld, prefix: String) {
-    assert!(world.stderr.starts_with(&prefix), "stderr:\n{}", world.stderr);
-}
-
-#[then(expr = "{string} reads:")]
-fn file_reads(world: &mut CrateWorld, file: String, step: &Step) {
-    assert_eq!(world.read(&file), docstring(step), "{file} differs");
-}
-
-#[then(expr = "the loop guard holds {string}")]
-fn loop_guard_holds(world: &mut CrateWorld, expected: String) {
-    let state =
-        Path::new(&git_out(&world.repo(), &["rev-parse", "--absolute-git-dir"])).join("harness");
-    let mut files: Vec<String> = fs::read_dir(state)
-        .map(|entries| {
-            entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()
-        })
-        .unwrap_or_default();
-    files.sort();
-    assert_eq!(files.join(" "), expected);
+/// The named stream holds exactly the docstring; the other one is empty.
+#[then(expr = "the hook exits {int} with {word}:")]
+fn hook_exits_with(world: &mut CrateWorld, code: i32, stream: String, step: &Step) {
+    let (named, other) = match stream.as_str() {
+        "stdout" => (&world.stdout, &world.stderr),
+        _ => (&world.stderr, &world.stdout),
+    };
+    let actual = (world.exit_code, named.as_str(), other.as_str());
+    assert_eq!(actual, (Some(code), docstring(step).as_str(), ""), "{stream} differs");
 }
 
 #[then(expr = "the staged files are {string}")]

@@ -24,36 +24,28 @@ paraphrase (it drifts). Two sections:
   tests. A staged `CLAUDE.md` is copied to `AGENTS.md` and staged with it; a
   hand edit to `AGENTS.md` alone fails the drift check.
   `pre-push` is the offline push gate: after `branch-guard` refuses
-  `main`/`master`, it runs the test suite (alone, with git's `GIT_*` hook
-  variables stripped, since the suite builds a binary and runs `git init` in
-  temp dirs), then `lint` (golangci-lint covers format), `acceptance`, `arch`,
+  `main`/`master`, it runs the test suite (git's `GIT_*` hook variables
+  stripped, since tests run `git init` in temp dirs; a failure stops the
+  push), then `lint` (golangci-lint covers format), `acceptance`, `arch`,
   and strict `arch-config-guard` over the whole pushed tree (the
   deterministic checks pre-commit and stop-hook skip).
-  `stop-hook` runs post-edit, then changed-lines lint and complexity delta
-  (no separate dead-code delta: golangci-lint's `unused` reports through the
-  lint). It prints nothing on success and exits 2 with findings on stderr (at
-  most 20 lines). Post-edit formats the changed Go files with
-  `golangci-lint fmt` and runs `golangci-lint run --fix --new-from-rev=HEAD`
-  over their packages only, never `./...`. Changed lines come from
-  `git diff -U0` against the merge-base with the base branch
-  (`HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`, then `origin/HEAD`, `origin/main`,
-  `origin/master`, `main`, `master`; never fetched), plus untracked files.
-  Lint residue runs `golangci-lint run --new-from-rev=<merge-base>` (JSON
-  output, `--allow-serial-runners`) over the packages holding changed files
-  and keeps findings on changed lines. It drops `gocyclo`: that linter only
-  sees whether the declaration line changed, so a moved or re-signed legacy
-  function would block; the complexity delta owns that dimension. Compile
-  errors (`typecheck`) block wherever they sit, because they stop every other
-  linter in the package.
-  The complexity delta runs `lizard --csv` on changed non-test files (not
-  `harness.go`), now and at the base (`git show <base>:./<path>`). It keys
-  functions by `long_name`, falling back to the name when it is unique in both
-  versions. A function blocks only when it is over a limit and new or worse
-  than at the base. Exit 1 means a tool could not run, or the same payload
-  came back with `stop_hook_active: true` (loop guard, state under
-  `git rev-parse --git-path harness`). An uncommitted `CLAUDE.md` edit is
-  copied to `AGENTS.md`. No arch-config warning and no whole-tree gates at
-  stop.
+  `stop-hook` runs post-edit (`golangci-lint fmt` on the changed Go files,
+  `golangci-lint run --fix --new-from-rev=HEAD` over their packages only),
+  then two read-only gates over the lines changed since the merge-base with
+  the base branch (`HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`, then
+  `origin/HEAD`, `origin/main`, `origin/master`, `main`, `master`; never
+  fetched) plus untracked files. Lint: `golangci-lint run
+  --new-from-rev=<merge-base>` (JSON) over the changed packages, kept to
+  changed lines; `unused` covers dead code, `gocyclo` is left to the
+  complexity gate, and compile errors (`typecheck`) always block.
+  Complexity: `lizard --csv` on changed non-test files; any function over a
+  limit whose line span overlaps a changed range blocks, so touching an
+  over-limit function means leaving it better, and untouched debt never
+  blocks. It prints nothing on success and exits 2 with findings on stderr
+  (at most 20 lines). Exit 1 means a tool could not run, or the event has
+  `stop_hook_active: true` (this stop already blocked once). An uncommitted
+  `CLAUDE.md` edit is copied to `AGENTS.md`. No arch-config warning and no
+  whole-tree gates at stop.
   `post-edit --hook` (Claude PostToolUse) formats and fixes the one file the
   event names and prints one `additionalContext` line when it changed. It
   never blocks. There is **no** `deadcode` target — golangci-lint's
@@ -91,8 +83,9 @@ Requires Go 1.24+. This brings `AGENTS.md`/`CLAUDE.md` (Layer 2),
 
 `.claude/settings.json` wires the Claude Stop hook (`timeout` 300) and the
 Claude PostToolUse hook (`matcher` `Edit|Write`, `timeout` 60);
-`.codex/hooks.json` wires the Codex Stop hook only. `setup-hooks` installs all
-three idempotently, and `check` warns when any is missing. Full shape:
+`.codex/hooks.json` wires the Codex Stop hook only. `setup-hooks` installs the
+two Stop hooks idempotently; the PostToolUse hook ships in the checked-in
+settings file. `check` warns when any of the three is missing. Full shape:
 [settings-json.md](settings-json.md).
 The Stop commands build the runner and run the binary. `go run` exits 1 for
 any non-zero exit of the program (and prints `exit status 2`), so

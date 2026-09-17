@@ -39,7 +39,7 @@ See the [5-script contract](../README.md#the-5-script-contract) for the full rat
 cargo harness check                # Fix + format + lint + tests (after editing)
 cargo harness pre-commit           # Fix + format when Rust files are staged; mirrors a staged CLAUDE.md (runs via git hook; arch config warns)
 cargo harness pre-push             # Branch guard + tests + read-only push gate: clippy, format check, acceptance, arch (runs via git hook)
-cargo harness stop-hook            # post-edit, then changed-lines lint, complexity delta; silent on success, exit 2 with findings
+cargo harness stop-hook            # post-edit, then changed-lines lint, touched-function complexity; silent on success, exit 2 with findings
 cargo harness ci                   # Full verification (see below)
 ```
 
@@ -53,10 +53,10 @@ cargo harness ci                   # Full verification (see below)
 
 The Claude/Codex Stop hook runs `stop-hook` after every agent turn and judges the change, not the tree. It formats changed `.rs` files with rustfmt, copies an uncommitted `CLAUDE.md` edit to `AGENTS.md`, then runs two read-only gates in parallel over the lines changed since the merge-base with the base branch (`HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`, then origin/HEAD, origin/main, origin/master, main, master; never fetched), plus untracked files:
 
-- **Lint** — `cargo clippy --message-format=json`; a warning or error blocks when its primary span sits on a changed line (rustc's `dead_code` arrives this way).
-- **Complexity** — lizard over changed files in `src/` + `tests/`, now and at the base; a function blocks when it is over a limit and new, or worse than at the base.
+- **Lint** — `cargo clippy`; a warning or error on a changed `.rs` line blocks (rustc's `dead_code` arrives this way). Both the long and the short diagnostic forms are read, because cargo replays cached diagnostics in whichever form first rendered them.
+- **Complexity** — lizard over changed files in `src/` + `tests/`; a function blocks when it is over a limit and overlaps a changed line. Touching an over-limit function means leaving it under the limit; an untouched one never blocks.
 
-Pre-existing debt never blocks. Clean: no output, exit 0. Findings: exit 2 with `stop-hook failed: <gates>` and at most 20 `path:line: message` lines on stderr (`--verbose` lifts the cap). A tool that cannot run (a build that fails away from the changed lines included): exit 1, which the Claude and Codex wiring treat as non-blocking. When the agent is already continuing from a stop and the findings have not changed, the hook exits 1 instead of blocking again.
+Clean: no output, exit 0. Findings: exit 2 with `stop-hook failed: <gates>` and at most 20 `path:line: message` lines on stderr (`--verbose` lifts the cap). A tool that cannot run (a build that fails away from the changed lines included): exit 1, which the Claude and Codex wiring treat as non-blocking. When the hook event says `stop_hook_active: true` (the agent is already continuing from a block), findings exit 1: the hook blocks once per stop, never in a loop.
 
 The Claude PostToolUse hook runs `post-edit --hook` on the file an Edit/Write touched: rustfmt only (never `cargo clippy --fix`, which rewrites the whole crate), and when the file changed it prints an `additionalContext` line asking the agent to re-read it. It never blocks.
 

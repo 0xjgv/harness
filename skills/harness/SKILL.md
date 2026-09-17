@@ -76,7 +76,7 @@ wiring, then apply the smallest compatible fix.
 Claude/Codex hook shape and the `stop-hook` contract: [settings-json.md](reference/settings-json.md).
 The Stop hook runs `stop-hook`: `post-edit`, then read-only delta gates that
 block only on what the change introduced (lint left on changed lines,
-complexity new or worse than the merge-base, dead code on changed lines where
+over-limit functions the change touched, dead code on changed lines where
 the language ships a deadcode gate). Silent on success, exit 2 with findings,
 exit 1 when a tool cannot run. Claude's PostToolUse hook runs
 `post-edit --hook` on each edited file.
@@ -113,7 +113,7 @@ Apply these when deciding what a ported harness enforces:
 | `ci` | CI pipeline | read-only gates (lint + typecheck + dep audit + complexity + acceptance + arch) **run in parallel**, captured and printed in submission order; then tests/coverage + crap (advisory) | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
 | `post-edit` | Stop hook helper; `--hook` = Claude PostToolUse | fix + format changed source files (`--hook`: the edited file) | yes |
-| `stop-hook` | Agent Stop hook | post-edit, then lint on changed lines + complexity delta vs merge-base + deadcode on changed lines (python/bun); silent on success, exit 2 with ≤20 findings | yes |
+| `stop-hook` | Agent Stop hook | post-edit, then lint on changed lines + over-limit functions touched + deadcode on changed lines (python/bun); silent on success, exit 2 with ≤20 findings | yes |
 
 Quality subcommands also callable standalone: `complexity`, `crap`,
 `acceptance`, `coverage` (Go also keeps `test-cov`), `mutation`, `arch`,

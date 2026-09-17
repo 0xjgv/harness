@@ -31,25 +31,19 @@ not paraphrase (it drifts). Two sections:
   temp dirs), then `lint`, `format check`, `acceptance`, `arch`, and strict
   `arch-config-guard` over the whole pushed tree (the deterministic checks
   pre-commit and stop-hook skip).
-  `stop-hook` runs post-edit, then changed-lines lint, complexity delta, and
-  deadcode delta. It prints nothing on success and exits 2 with findings on
-  stderr (at most 20 lines). Changed lines come from `git diff -U0` against
-  the merge-base with the base branch (`HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`,
+  `stop-hook` runs post-edit, then lint, complexity, and dead code on the
+  change. It prints nothing on success and exits 2 with findings on stderr
+  (at most 20 lines). Changed lines come from `git diff -U0` against the
+  merge-base with the base branch (`HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`,
   then `origin/HEAD`, `origin/main`, `origin/master`, `main`, `master`; never
-  fetched), plus untracked files. Each delta gate keeps the targets of its
-  whole-tree counterpart. Lint residue runs `ruff check` JSON on changed
-  project files (`src/`, `harness.py`, `tests/`) and keeps findings on changed
-  lines. The complexity delta runs `lizard --csv` on changed `src/` and `tests/`
-  files, now and at the base (`git show <base>:./<path>`). It keys functions by
-  `long_name`. When a signature is missing at the base, it falls back to the
-  function name, but only if that name is unique in both the current and base
-  file. A function blocks only when it is over a limit and new or worse than at
-  the base. The dead-code delta runs vulture over `src/` as `ci` does, and only
-  when a `src/` file changed. It keeps the findings on changed lines. Exit 1 means a tool
-  could not run, or the same payload came back with `stop_hook_active: true`
-  (loop guard, state under `git rev-parse --git-path harness`). An
-  uncommitted `CLAUDE.md` edit is copied to `AGENTS.md`. No arch-config warning
-  and no whole-tree gates at stop.
+  fetched), plus untracked files. Each gate keeps the targets of its
+  whole-tree counterpart: `ruff check` and vulture findings count on changed
+  lines; `lizard --csv` reports a function over a limit when its lines
+  overlap a changed range, so touching an over-limit function blocks and an
+  untouched one never does. Exit 1 means a tool could not run, or the event
+  has `stop_hook_active: true` (the hook already blocked this stop). An
+  uncommitted `CLAUDE.md` edit is copied to `AGENTS.md`. No arch-config
+  warning and no whole-tree gates at stop.
   `post-edit --hook` (Claude PostToolUse) fixes and formats the one file the
   event names and prints one `additionalContext` line when it changed. It
   never blocks. `deadcode` runs vulture (pinned `2.16`) over `src/` only —
@@ -84,8 +78,8 @@ This brings `AGENTS.md`/`CLAUDE.md` (Layer 2), `.claude/settings.json`,
 
 `.claude/settings.json` wires the Claude Stop hook (`timeout` 300) and the
 Claude PostToolUse hook (`matcher` `Edit|Write`, `timeout` 60);
-`.codex/hooks.json` wires the Codex Stop hook only. `setup-hooks` installs all
-three idempotently, and `check` warns when any is missing. Full shape:
+`.codex/hooks.json` wires the Codex Stop hook only. `setup-hooks` installs the
+Stop wiring idempotently; `check` warns when any of the three is missing. Full shape:
 [settings-json.md](settings-json.md).
 Claude Stop command:
 `cd $CLAUDE_PROJECT_DIR && uv run harness stop-hook`.

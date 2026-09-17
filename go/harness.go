@@ -4,14 +4,11 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/csv"
-	"encoding/hex"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"math"
 	"os"
 	"os/exec"
@@ -83,7 +80,6 @@ type gate struct {
 	cmd         []string
 	extract     func(output string) string
 	hint        string
-	env         []string // nil inherits this process's environment
 }
 
 type gateResult struct {
@@ -101,7 +97,6 @@ type gateResult struct {
 func runCapture(g gate) gateResult {
 	c := exec.Command(g.cmd[0], g.cmd[1:]...)
 	c.Dir = root
-	c.Env = g.env
 	out, err := c.CombinedOutput()
 	output := string(out)
 	ok := err == nil
@@ -269,12 +264,15 @@ func stagedPackages(files []string) []string {
 	return pkgs
 }
 
-// packageDirs names the package directories holding files, for golangci-lint:
-// "." for the module root, "./dir" otherwise.
+// packageDirs names the package directories holding the golangci-lint targets
+// among files: "." for the module root, "./dir" otherwise.
 func packageDirs(files []string) []string {
 	seen := map[string]bool{}
 	var dirs []string
 	for _, f := range files {
+		if !isLintTarget(f) {
+			continue
+		}
 		dir := filepath.ToSlash(filepath.Dir(f))
 		if dir != "." {
 			dir = "./" + dir
@@ -286,16 +284,6 @@ func packageDirs(files []string) []string {
 	}
 	sort.Strings(dirs)
 	return dirs
-}
-
-func filterFiles(files []string, keep func(string) bool) []string {
-	var kept []string
-	for _, f := range files {
-		if keep(f) {
-			kept = append(kept, f)
-		}
-	}
-	return kept
 }
 
 // isGoSource reports whether path is a .go file that `./...` reaches: no path
@@ -312,15 +300,9 @@ func isGoSource(path string) bool {
 	return true
 }
 
-// isLintTarget is a Go source golangci-lint loads. harness.go is `//go:build
-// ignore`, so no package includes it.
+// isLintTarget is a Go source a package includes (harness.go is build-ignored).
 func isLintTarget(path string) bool {
 	return isGoSource(path) && path != "harness.go"
-}
-
-// isComplexityTarget matches the complexity gate: no tests, no runner.
-func isComplexityTarget(path string) bool {
-	return isLintTarget(path) && !strings.HasSuffix(path, "_test.go")
 }
 
 func isFile(path string) bool {
@@ -328,21 +310,10 @@ func isFile(path string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
-// porcelainPath extracts the current path from a `git status --porcelain` line.
-func porcelainPath(line string) string {
-	path := line[3:]
-	if i := strings.LastIndex(path, " -> "); i >= 0 {
-		return path[i+len(" -> "):]
-	}
-	return path
-}
-
-// changedGoFiles lists Go files with uncommitted changes, relative to this
-// project. Porcelain paths are repository-relative, so a project in a
-// subdirectory strips its prefix; `--untracked-files=all` lists new files
-// inside new directories.
+// changedGoFiles lists Go files with uncommitted changes (untracked included),
+// relative to this project: porcelain paths are repository-relative.
 func changedGoFiles() []string {
-	c := exec.Command("git", "-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=all", "--", ".")
+	c := exec.Command("git", "-c", "core.quotePath=false", "status", "--porcelain", "--no-renames", "--untracked-files=all", "--", ".")
 	c.Dir = root
 	out, err := c.Output()
 	if err != nil {
@@ -355,7 +326,7 @@ func changedGoFiles() []string {
 		if len(line) <= 3 || strings.Contains(line[:2], "D") {
 			continue
 		}
-		if f := normalizeChangedPath(porcelainPath(line), prefix); isGoSource(f) {
+		if f := normalizeChangedPath(line[3:], prefix); isGoSource(f) {
 			files = append(files, f)
 		}
 	}
@@ -424,27 +395,11 @@ func cmdAudit() {
 }
 
 // ── Agent hooks ─────────────────────────────────────────────────────
-// The stop hook runs after every agent turn and judges the change, not the
-// tree: lint left on changed lines, and functions pushed over (or further over)
-// a complexity limit. golangci-lint's `unused` linter reports dead code through
-// the lint residue. Pre-existing debt never blocks a stop; the whole-tree gates
-// stay in check / ci / pre-push. Exit contract: silent 0 when clean, 2 with a
-// stderr payload the agent reads, 1 when a tool could not run.
+// The stop hook judges the change, not the tree: lint left on changed lines
+// (`unused` covers dead code) and over-limit functions the change touches.
+// Whole-tree gates stay in check / ci / pre-push.
 
-const (
-	hookStdinTimeout = time.Second
-	// hookFindingLimit is how many finding lines a stop-hook payload carries;
-	// the rest are one command away.
-	hookFindingLimit = 20
-	stopHookRerun    = "go run harness.go stop-hook --verbose"
-	loopGuardNotice  = "harness: same findings as the previous stop; not blocking again"
-	postEditNotice   = "harness: reformatted %s; re-read it before editing it again"
-)
-
-// deltaBaseCandidates is where the stop hook's delta starts, after the
-// HARNESS_ARCH_BASE and GITHUB_BASE_REF overrides. Never fetched: a hook must
-// not touch the network.
-var deltaBaseCandidates = []string{"origin/HEAD", "origin/main", "origin/master", "main", "master"}
+const hookFindingLimit = 20 // finding lines per payload; `--verbose` lifts it
 
 // lineRange is an inclusive span of new-side line numbers.
 type lineRange struct{ start, end int }
@@ -454,150 +409,52 @@ type changedLines map[string][]lineRange
 
 var wholeFile = []lineRange{{1, math.MaxInt}}
 
-// complexityLinters judge what the complexity delta already judges, but only
-// by whether the declaration line changed: a moved or re-signed legacy function
-// would block. The stop hook leaves that dimension to the complexity delta.
-var complexityLinters = map[string]bool{"gocyclo": true}
+var hunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
 
-var (
-	hunkRe         = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
-	compileErrorRe = regexp.MustCompile(`^(.+?\.go):(\d+)(?::\d+)?: (.+)$`)
-	unsafeKeyRe    = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
-)
-
-type complexityLimit struct {
-	label string
-	value func(funcMetric) int
-	limit int
-}
-
-var complexityLimits = []complexityLimit{
-	{"CCN", func(m funcMetric) int { return m.ccn }, complexityMaxCCN},
-	{"args", func(m funcMetric) int { return m.args }, complexityMaxArgs},
-	{"length", func(m funcMetric) int { return m.length }, complexityMaxLength},
-}
-
-// deltaResult is one delta gate: findings block the stop; a problem means its
-// tool failed.
+// deltaResult is one delta gate: findings block the stop; err means its tool failed.
 type deltaResult struct {
 	gate     string
 	findings []string
-	problem  string
+	err      error
 }
 
-// runTool returns the command's stdout, or an error when the command cannot
-// start or exits with a code outside ok. dir "" is the working directory.
-func runTool(tool string, cmd []string, ok []int, dir string) (string, error) {
-	c := exec.Command(cmd[0], cmd[1:]...)
-	c.Dir = dir
-	var stdout, stderr bytes.Buffer
-	c.Stdout, c.Stderr = &stdout, &stderr
-	err := c.Run()
+// runTool returns the command's stdout; a non-zero exit is an error carrying
+// the last line of its stderr.
+func runTool(cmd ...string) (string, error) {
+	out, err := exec.Command(cmd[0], cmd[1:]...).Output()
 	var exitErr *exec.ExitError
-	if err != nil && !errors.As(err, &exitErr) {
-		return "", fmt.Errorf("%s not runnable: %w", tool, err)
+	if errors.As(err, &exitErr) {
+		detail := cmp.Or(strings.TrimSpace(string(exitErr.Stderr)), "no output")
+		err = fmt.Errorf("%s exited %d: %s", cmd[0], exitErr.ExitCode(), detail[strings.LastIndex(detail, "\n")+1:])
 	}
-	code := c.ProcessState.ExitCode()
-	if slices.Contains(ok, code) {
-		return stdout.String(), nil
-	}
-	reason := fmt.Sprintf("%s exited %d", tool, code)
-	detail := strings.TrimSpace(stderr.String())
-	if detail == "" {
-		detail = strings.TrimSpace(stdout.String())
-	}
-	if detail == "" {
-		return "", errors.New(reason)
-	}
-	lines := strings.Split(detail, "\n")
-	return "", fmt.Errorf("%s: %s", reason, strings.TrimSpace(lines[len(lines)-1]))
+	return string(out), err
 }
 
 func gitOutput(args ...string) (string, error) {
-	return runTool("git", append([]string{"git", "-c", "core.quotePath=false"}, args...), []int{0}, "")
+	return runTool(append([]string{"git", "-c", "core.quotePath=false"}, args...)...)
 }
 
 func hasCommits() bool {
 	return len(gitLines("rev-parse", "--verify", "--quiet", "HEAD")) > 0
 }
 
-// relativePath is path relative to base, with symlinks resolved on both sides
-// when both exist (macOS /tmp is /private/tmp). A relative path is taken as
-// already relative.
-func relativePath(base, path string) string {
-	if !filepath.IsAbs(path) {
-		return filepath.ToSlash(filepath.Clean(path))
-	}
-	realPath, pathErr := filepath.EvalSymlinks(path)
-	realBase, baseErr := filepath.EvalSymlinks(base)
-	if pathErr == nil && baseErr == nil {
-		path, base = realPath, realBase
-	}
-	rel, err := filepath.Rel(base, path)
-	if err != nil {
-		return filepath.ToSlash(path)
-	}
-	return filepath.ToSlash(rel)
-}
-
-// ── Changed lines ──
-
-// baseRef is the first base ref that resolves: env overrides, then
-// deltaBaseCandidates; "" when none does.
-func baseRef() string {
-	candidates := []string{os.Getenv("HARNESS_ARCH_BASE")}
-	if githubBase := os.Getenv("GITHUB_BASE_REF"); githubBase != "" {
-		candidates = append(candidates, "origin/"+githubBase)
-	}
-	for _, ref := range append(candidates, deltaBaseCandidates...) {
-		if ref != "" && len(gitLines("rev-parse", "--verify", "--quiet", ref+"^{commit}")) > 0 {
-			return ref
-		}
-	}
-	return ""
-}
-
-// deltaBase is merge-base(base ref, HEAD); HEAD without a base ref; "" before
-// the first commit.
+// deltaBase is the merge-base of HEAD with the first base ref that has one:
+// HARNESS_ARCH_BASE, GITHUB_BASE_REF, then the usual default branches, never
+// fetched. HEAD without one; "" before the first commit.
 func deltaBase() string {
 	if !hasCommits() {
 		return ""
 	}
-	if ref := baseRef(); ref != "" {
-		if mergeBase := gitLines("merge-base", ref, "HEAD"); len(mergeBase) > 0 {
+	refs := []string{os.Getenv("HARNESS_ARCH_BASE")}
+	if githubBase := os.Getenv("GITHUB_BASE_REF"); githubBase != "" {
+		refs = append(refs, "origin/"+githubBase)
+	}
+	for _, ref := range append(refs, "origin/HEAD", "origin/main", "origin/master", "main", "master") {
+		if mergeBase := gitLines("merge-base", ref, "HEAD"); ref != "" && len(mergeBase) > 0 {
 			return mergeBase[0]
 		}
 	}
 	return "HEAD"
-}
-
-// diffPath is the new-side path of a `+++ b/<path>` header; false for a
-// deleted file.
-func diffPath(header string) (string, bool) {
-	name := strings.TrimRight(strings.TrimPrefix(header, "+++ "), "\t")
-	if name == "/dev/null" {
-		return "", false
-	}
-	if len(name) > 1 && strings.HasPrefix(name, `"`) && strings.HasSuffix(name, `"`) {
-		name = name[1 : len(name)-1]
-	}
-	return strings.TrimPrefix(name, "b/"), true
-}
-
-func addHunk(ranges changedLines, path, header string) {
-	m := hunkRe.FindStringSubmatch(header)
-	if m == nil || path == "" {
-		return
-	}
-	count := 1
-	if m[2] != "" {
-		count, _ = strconv.Atoi(m[2])
-	}
-	if count == 0 {
-		return
-	}
-	start, _ := strconv.Atoi(m[1])
-	ranges[path] = append(ranges[path], lineRange{start, start + count - 1})
 }
 
 // parseDiffRanges reads the new-side line spans of a `git diff -U0` (a/ b/
@@ -608,27 +465,37 @@ func parseDiffRanges(diff string) changedLines {
 	ranges := changedLines{}
 	path, inHeader := "", false
 	for line := range strings.SplitSeq(diff, "\n") {
+		m := hunkRe.FindStringSubmatch(line)
 		switch {
 		case strings.HasPrefix(line, "diff --git "):
 			path, inHeader = "", true
 		case inHeader && strings.HasPrefix(line, "+++ "):
-			name, ok := diffPath(line)
-			path = name
-			if ok {
-				ranges[name] = []lineRange{}
+			path = strings.TrimPrefix(strings.Trim(strings.TrimRight(line[4:], "\t"), `"`), "b/")
+			if path == "/dev/null" {
+				path = ""
+			} else {
+				ranges[path] = []lineRange{}
+			}
+		case m != nil && path != "":
+			inHeader = false
+			start, _ := strconv.Atoi(m[1])
+			count, err := strconv.Atoi(m[2])
+			if err != nil {
+				count = 1 // `+N` without a count is one line
+			}
+			if count > 0 {
+				ranges[path] = append(ranges[path], lineRange{start, start + count - 1})
 			}
 		case strings.HasPrefix(line, "@@"):
 			inHeader = false
-			addHunk(ranges, path, line)
 		}
 	}
 	return ranges
 }
 
-// changedScope is the changed lines per path relative to this project: `git
-// diff <base>` plus untracked files. It covers work committed on the branch and
-// uncommitted work alike. Untracked files, and every file before the first
-// commit, are in scope whole. Renames count as new files.
+// changedScope is the changed lines per project-relative path: `git diff <base>`
+// (committed and uncommitted work; a rename is a new file) plus untracked files,
+// which, like every file before the first commit, are in scope whole.
 func changedScope(base string) (changedLines, error) {
 	scope := changedLines{}
 	listing := []string{"ls-files", "--others", "--exclude-standard", "--", "."}
@@ -654,9 +521,10 @@ func changedScope(base string) (changedLines, error) {
 	return scope, nil
 }
 
-func inRanges(line int, ranges []lineRange) bool {
+// touches reports whether the lines start..end overlap any of ranges.
+func touches(ranges []lineRange, start, end int) bool {
 	for _, r := range ranges {
-		if r.start <= line && line <= r.end {
+		if r.start <= end && start <= r.end {
 			return true
 		}
 	}
@@ -675,325 +543,105 @@ func scopedFiles(scope changedLines, keep func(string) bool) []string {
 	return files
 }
 
-// ── Lint residue ──
-
-// golangciIssue is the part of a golangci-lint JSON issue the stop hook reads.
-type golangciIssue struct {
-	FromLinter string
-	Text       string
-	Pos        struct {
-		Filename string
-		Line     int
-	}
-}
-
-type locatedMessage struct {
-	path    string
-	line    int
-	message string
-}
-
-// issueLocations places an issue. A typecheck issue can carry the compiler's
-// whole report in its text, one `path:line:col: message` per line; each line
-// becomes its own location.
-func issueLocations(issue golangciIssue, base string) []locatedMessage {
-	var located []locatedMessage
-	if issue.FromLinter == "typecheck" {
-		for line := range strings.SplitSeq(issue.Text, "\n") {
-			if m := compileErrorRe.FindStringSubmatch(line); m != nil {
-				n, _ := strconv.Atoi(m[2])
-				located = append(located, locatedMessage{relativePath(base, m[1]), n, m[3]})
-			}
-		}
-	}
-	if len(located) == 0 {
-		message := strings.ReplaceAll(strings.TrimSpace(issue.Text), "\n", " ")
-		located = append(located, locatedMessage{relativePath(base, issue.Pos.Filename), issue.Pos.Line, message})
-	}
-	return located
-}
-
-// golangciFindings turns a golangci-lint JSON report into `path:line: linter:
-// message` lines on changed lines, minus complexityLinters. Compile errors
-// (typecheck) are kept wherever they sit: they stop every other linter in
-// their package.
-func golangciFindings(data []byte, scope changedLines, base string) ([]string, error) {
-	var report struct{ Issues []golangciIssue }
-	if err := json.Unmarshal(data, &report); err != nil {
-		return nil, fmt.Errorf("unreadable golangci-lint output: %w", err)
-	}
-	var findings []string
-	for _, issue := range report.Issues {
-		if issue.Pos.Filename == "" || issue.FromLinter == "" {
-			return nil, errors.New("unreadable golangci-lint output: issue without a linter or file")
-		}
-		if complexityLinters[issue.FromLinter] {
-			continue
-		}
-		for _, at := range issueLocations(issue, base) {
-			if issue.FromLinter == "typecheck" || inRanges(at.line, scope[at.path]) {
-				findings = append(findings, fmt.Sprintf("%s:%d: %s: %s", at.path, at.line, issue.FromLinter, at.message))
-			}
-		}
-	}
-	return findings, nil
-}
-
-// lintResidue is the lint the fix pass could not fix, on changed lines of the
-// packages that hold changed files. golangci-lint filters to the delta itself
-// (`--new-from-rev`); the scope filter keeps the same line set every gate uses.
+// lintResidue is the lint the fix pass left on changed lines of the changed
+// packages. gocyclo is left to complexityResidue, which reports the same
+// functions. A compile error (typecheck) blocks wherever it sits: it stops
+// every other linter in its package.
 func lintResidue(scope changedLines, base string) ([]string, error) {
 	files := scopedFiles(scope, isLintTarget)
 	if len(files) == 0 {
 		return nil, nil
 	}
-	report, err := os.CreateTemp("", "harness-lint-*.json")
-	if err != nil {
-		return nil, err
-	}
-	_ = report.Close()
-	defer os.Remove(report.Name())
 	cmd := []string{
-		"golangci-lint", "run", "--allow-serial-runners", "--show-stats=false", "--path-mode=abs",
-		"--output.json.path=" + report.Name(), "--max-issues-per-linter=0", "--max-same-issues=0",
+		"golangci-lint", "run", "--allow-serial-runners", "--show-stats=false", "--issues-exit-code=0",
+		"--max-issues-per-linter=0", "--max-same-issues=0", "--output.text.path=stderr", "--output.json.path=stdout",
 	}
 	if base != "" {
 		cmd = append(cmd, "--new-from-rev="+base)
 	}
-	if _, err := runTool("golangci-lint", append(cmd, packageDirs(files)...), []int{0, 1}, ""); err != nil {
-		return nil, err
-	}
-	data, err := os.ReadFile(report.Name())
+	out, err := runTool(append(cmd, packageDirs(files)...)...)
 	if err != nil {
 		return nil, err
 	}
-	return golangciFindings(data, scope, root)
-}
-
-// ── Complexity delta ──
-
-// lizardRow reads one `lizard --csv` row. Columns: nloc, ccn, tokens, params,
-// length, location, file, name, long_name, start, end.
-func lizardRow(record []string) (funcMetric, bool) {
-	if len(record) < 11 {
-		return funcMetric{}, false
-	}
-	var n [5]int
-	for i, col := range []int{1, 3, 4, 9, 10} {
-		value, err := strconv.Atoi(record[col])
-		if err != nil {
-			return funcMetric{}, false
-		}
-		n[i] = value
-	}
-	return funcMetric{
-		file: record[6], name: record[7], key: record[8],
-		ccn: n[0], args: n[1], length: n[2], line: n[3], end: n[4],
-	}, true
-}
-
-// lizardRows reads every function row of `lizard --csv` output, in order.
-// Go signatures contain commas, so the columns need a real CSV reader.
-func lizardRows(text string) []funcMetric {
-	reader := csv.NewReader(strings.NewReader(text))
-	reader.FieldsPerRecord = -1
-	reader.LazyQuotes = true
-	var rows []funcMetric
-	for {
-		record, err := reader.Read()
-		var parseErr *csv.ParseError
-		if errors.As(err, &parseErr) {
-			continue
-		}
-		if err != nil {
-			return rows
-		}
-		if m, ok := lizardRow(record); ok {
-			rows = append(rows, m)
+	var report struct {
+		Issues []struct {
+			FromLinter, Text string
+			Pos              struct {
+				Filename string
+				Line     int
+			}
 		}
 	}
-}
-
-// parseLizardCSV groups lizard rows by file, keyed by long_name (the
-// signature): a signature survives a function moving within its file; a start
-// line does not. A repeated signature is keyed `#2`, `#3` in file order.
-func parseLizardCSV(text string) map[string][]funcMetric {
-	functions := map[string][]funcMetric{}
-	taken := map[[2]string]bool{}
-	for _, m := range lizardRows(text) {
-		longName := m.key
-		for n := 2; taken[[2]string{m.file, m.key}]; n++ {
-			m.key = fmt.Sprintf("%s#%d", longName, n)
-		}
-		taken[[2]string{m.file, m.key}] = true
-		functions[m.file] = append(functions[m.file], m)
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		return nil, fmt.Errorf("unreadable golangci-lint output: %w", err)
 	}
-	return functions
-}
-
-// baseTwin finds the base version of a current function: same signature, else
-// the same name when that name is unique on both sides. The name fallback keeps
-// a signature-only edit on a legacy function from reading as a new function.
-func baseTwin(now funcMetric, current, base []funcMetric) (funcMetric, bool) {
-	var twins []funcMetric
-	for _, fn := range base {
-		if fn.key == now.key {
-			return fn, true
-		}
-		if fn.name == now.name {
-			twins = append(twins, fn)
-		}
-	}
-	sameName := 0
-	for _, fn := range current {
-		if fn.name == now.name {
-			sameName++
-		}
-	}
-	if sameName == 1 && len(twins) == 1 {
-		return twins[0], true
-	}
-	return funcMetric{}, false
-}
-
-// functionRegressions is one line per limit now exceeds where the base version
-// is absent or measured lower.
-func functionRegressions(path string, now, was funcMetric, existed bool) []string {
-	name := now.name
-	if name == "" {
-		name = "(anonymous)"
-	}
-	var lines []string
-	for _, l := range complexityLimits {
-		value := l.value(now)
-		if value <= l.limit || (existed && value <= l.value(was)) {
-			continue
-		}
-		shown := "new"
-		if existed {
-			shown = strconv.Itoa(l.value(was))
-		}
-		lines = append(lines, fmt.Sprintf("%s:%d: %s %s %s→%d (limit %d)", path, now.line, name, l.label, shown, value, l.limit))
-	}
-	return lines
-}
-
-// complexityDelta lists functions over a limit now that are new, or worse than
-// their base version.
-func complexityDelta(current, base map[string][]funcMetric) []string {
 	var findings []string
-	for _, path := range slices.Sorted(maps.Keys(current)) {
-		for _, now := range current[path] {
-			was, existed := baseTwin(now, current[path], base[path])
-			findings = append(findings, functionRegressions(path, now, was, existed)...)
+	for _, issue := range report.Issues {
+		at := issue.Pos
+		if issue.FromLinter == "gocyclo" || (issue.FromLinter != "typecheck" && !touches(scope[at.Filename], at.Line, at.Line)) {
+			continue
+		}
+		message := strings.ReplaceAll(strings.TrimSpace(issue.Text), "\n", " ")
+		findings = append(findings, fmt.Sprintf("%s:%d: %s: %s", at.Filename, at.Line, issue.FromLinter, message))
+	}
+	return findings, nil
+}
+
+// complexityResidue measures the changed non-test files with lizard and
+// reports the over-limit functions the change touches.
+func complexityResidue(scope changedLines) ([]string, error) {
+	files := scopedFiles(scope, func(path string) bool {
+		return isLintTarget(path) && !strings.HasSuffix(path, "_test.go")
+	})
+	// lizard with no file arguments walks the working directory; never let it.
+	if len(files) == 0 {
+		return nil, nil
+	}
+	out, err := runTool(append([]string{"uvx", lizard, "--csv"}, files...)...)
+	if err != nil {
+		return nil, err
+	}
+	return touchedOverLimit(parseLizardCSV(out), scope), nil
+}
+
+// touchedOverLimit is one `path:line: name CCN 19 (limit 15)` line per limit
+// exceeded by a function whose span overlaps a changed range.
+func touchedOverLimit(functions []funcMetric, scope changedLines) []string {
+	var findings []string
+	for _, fn := range functions {
+		if !touches(scope[fn.file], fn.line, fn.end) {
+			continue
+		}
+		for _, m := range []struct {
+			label        string
+			value, limit int
+		}{{"CCN", fn.ccn, complexityMaxCCN}, {"args", fn.args, complexityMaxArgs}, {"length", fn.end - fn.line + 1, complexityMaxLength}} {
+			if m.value > m.limit {
+				findings = append(findings, fmt.Sprintf("%s:%d: %s %s %d (limit %d)",
+					fn.file, fn.line, cmp.Or(fn.name, "(anonymous)"), m.label, m.value, m.limit))
+			}
 		}
 	}
 	return findings
 }
 
-func lizardFunctions(files []string, dir string) (map[string][]funcMetric, error) {
-	// lizard with no file arguments walks the working directory; never let it.
-	if len(files) == 0 {
-		return map[string][]funcMetric{}, nil
-	}
-	out, err := runTool("lizard", append([]string{"uvx", lizard, "--csv"}, files...), []int{0}, dir)
-	if err != nil {
-		return nil, err
-	}
-	return parseLizardCSV(out), nil
-}
-
-// writeBaseSources writes each file's base version under dir and returns the
-// files that existed at base.
-func writeBaseSources(files []string, base, dir string) ([]string, error) {
-	var written []string
-	for _, path := range files {
-		shown, err := exec.Command("git", "show", base+":./"+path).Output()
-		if err != nil {
-			continue // absent at base: every function in it is new
-		}
-		target := filepath.Join(dir, filepath.FromSlash(path))
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return nil, err
-		}
-		if err := os.WriteFile(target, shown, 0o644); err != nil {
-			return nil, err
-		}
-		written = append(written, path)
-	}
-	return written, nil
-}
-
-// complexityRegressions is the complexity this change introduced or worsened,
-// over the complexity gate's targets.
-func complexityRegressions(scope changedLines, base string) ([]string, error) {
-	files := scopedFiles(scope, isComplexityTarget)
-	current, err := lizardFunctions(files, "")
-	if err != nil || len(current) == 0 {
-		return nil, err
-	}
-	tmp, err := os.MkdirTemp("", "harness-base-")
-	if err != nil {
-		return nil, err
-	}
-	defer os.RemoveAll(tmp)
-	var written []string
-	if base != "" {
-		if written, err = writeBaseSources(files, base, tmp); err != nil {
-			return nil, err
-		}
-	}
-	before, err := lizardFunctions(written, tmp)
-	if err != nil {
-		return nil, err
-	}
-	return complexityDelta(current, before), nil
-}
-
-// ── Stop-hook verdict ──
-
-type deltaGate struct {
-	name    string
-	measure func() ([]string, error)
-}
-
-// runDeltaGates runs lint residue and complexity delta, read-only, in parallel.
+// runDeltaGates runs lint residue and complexity, read-only, in parallel.
 func runDeltaGates(scope changedLines, base string) []deltaResult {
-	gates := []deltaGate{
-		{"Lint", func() ([]string, error) { return lintResidue(scope, base) }},
-		{"Complexity", func() ([]string, error) { return complexityRegressions(scope, base) }},
-	}
-	results := make([]deltaResult, len(gates))
-	var wg sync.WaitGroup
-	for i, g := range gates {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			findings, err := g.measure()
-			results[i] = deltaResult{gate: g.name, findings: findings}
-			if err != nil {
-				results[i] = deltaResult{gate: g.name, problem: err.Error()}
-			}
-		}()
-	}
-	wg.Wait()
-	return results
-}
-
-// capFindings keeps at most hookFindingLimit findings, then one line counting
-// the rest. `--verbose` lifts the cap, which is what that line says to run.
-func capFindings(findings []string) []string {
-	if verbose || len(findings) <= hookFindingLimit {
-		return findings
-	}
-	rest := len(findings) - hookFindingLimit
-	return append(slices.Clone(findings[:hookFindingLimit]), fmt.Sprintf("… +%d more — run `%s`", rest, stopHookRerun))
+	lint, complexity := deltaResult{gate: "Lint"}, deltaResult{gate: "Complexity"}
+	done := make(chan struct{})
+	go func() {
+		lint.findings, lint.err = lintResidue(scope, base)
+		close(done)
+	}()
+	complexity.findings, complexity.err = complexityResidue(scope)
+	<-done
+	return []deltaResult{lint, complexity}
 }
 
 // stopHookPayload is the stderr block an agent reads: the failed gates, then
-// their findings; "" when clean.
+// their findings, capped; "" when clean.
 func stopHookPayload(results []deltaResult) string {
-	var gates, findings []string
+	gates, findings := []string{}, []string{}
 	for _, r := range results {
 		if len(r.findings) > 0 {
 			gates = append(gates, r.gate)
@@ -1003,131 +651,55 @@ func stopHookPayload(results []deltaResult) string {
 	if len(gates) == 0 {
 		return ""
 	}
-	header := "stop-hook failed: " + strings.Join(gates, ", ")
-	return strings.Join(append([]string{header}, capFindings(findings)...), "\n")
-}
-
-func payloadDigest(payload string) string {
-	sum := sha256.Sum256([]byte(payload))
-	return hex.EncodeToString(sum[:])
-}
-
-// stopHookExit is 2 to block on findings, 1 for a tool failure or a repeated
-// block, 0 when clean. A repeat is the stored digest of the same payload while
-// the agent is already continuing because of a stop hook (`stop_hook_active`):
-// blocking again would loop. A payload that changed blocks again.
-func stopHookExit(payload string, failedTools int, event map[string]any, stored string) int {
-	if payload != "" {
-		if active, _ := event["stop_hook_active"].(bool); active && stored == payloadDigest(payload) {
-			return 1
-		}
-		return 2
+	if rest := len(findings) - hookFindingLimit; rest > 0 && !verbose {
+		findings = append(findings[:hookFindingLimit], fmt.Sprintf("… +%d more — run `go run harness.go stop-hook --verbose`", rest))
 	}
-	if failedTools > 0 {
+	return "stop-hook failed: " + strings.Join(gates, ", ") + "\n" + strings.Join(findings, "\n")
+}
+
+// stopHookExit is 2 to block on findings, 0 when clean, and 1 for a tool
+// failure or for findings on a stop that already blocked once
+// (`stop_hook_active`): blocking again could loop.
+func stopHookExit(payload string, failedTools int, active bool) int {
+	switch {
+	case payload != "" && !active:
+		return 2
+	case payload != "" || failedTools > 0:
 		return 1
 	}
 	return 0
 }
 
-// loopGuardKey is a file-name-safe key for this project within its repository.
-func loopGuardKey(prefix string) string {
-	if key := strings.Trim(unsafeKeyRe.ReplaceAllString(prefix, "-"), "-"); key != "" {
-		return key
-	}
-	return "root"
+// hookEvent is the part of a Claude/Codex hook event the runner reads.
+type hookEvent struct {
+	StopHookActive bool `json:"stop_hook_active"`
+	ToolInput      struct {
+		FilePath string `json:"file_path"`
+	} `json:"tool_input"`
 }
 
-func loopGuardPath() string {
-	lines := gitLines("rev-parse", "--git-path", "harness")
-	if len(lines) == 0 {
-		return ""
+// readHookEvent reads the hook JSON from stdin with the pre-push reader's 1s
+// deadline. A terminal is never read; empty or invalid input is an empty event.
+func readHookEvent() hookEvent {
+	var event hookEvent
+	info, err := os.Stdin.Stat()
+	if err != nil || info.Mode()&os.ModeCharDevice != 0 {
+		return event
 	}
-	dir, err := filepath.Abs(lines[0])
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(dir, "stop-hook-"+loopGuardKey(gitPrefix()))
-}
-
-func readDigest(path string) string {
-	if path == "" {
-		return ""
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
-}
-
-// updateLoopGuard remembers a block's digest and forgets it once a stop is clean.
-func updateLoopGuard(path string, code int, payload string) {
-	if path == "" {
-		return
-	}
-	switch code {
-	case 2:
-		_ = os.MkdirAll(filepath.Dir(path), 0o755)
-		_ = os.WriteFile(path, []byte(payloadDigest(payload)), 0o644)
-	case 0:
-		_ = os.Remove(path)
-	}
-}
-
-// reportStopHook prints the verdict to stderr (nothing when clean) and returns
-// the exit code. The loop-guard digest covers only the payload.
-func reportStopHook(results []deltaResult, event map[string]any) int {
-	payload := stopHookPayload(results)
-	var problems []string
-	for _, r := range results {
-		if r.problem != "" {
-			problems = append(problems, fmt.Sprintf("stop-hook: %s could not run: %s", r.gate, r.problem))
-		}
-	}
-	guard := loopGuardPath()
-	code := stopHookExit(payload, len(problems), event, readDigest(guard))
-	for _, line := range problems {
-		fmt.Fprintln(os.Stderr, line)
-	}
-	if payload != "" {
-		fmt.Fprintln(os.Stderr, payload)
-	}
-	if payload != "" && code == 1 {
-		fmt.Fprintln(os.Stderr, loopGuardNotice)
-	}
-	updateLoopGuard(guard, code, payload)
-	return code
-}
-
-// parseHookEvent reads the agent's hook JSON; {} for empty or invalid input.
-func parseHookEvent(text string) map[string]any {
-	var event map[string]any
-	if err := json.Unmarshal([]byte(text), &event); err != nil || event == nil {
-		return map[string]any{}
-	}
+	// JSON strings hold no raw newlines, so the non-empty lines rejoin losslessly.
+	input := readRefsWithDeadline(os.Stdin, time.Second)
+	_ = json.Unmarshal([]byte(strings.Join(input.lines, "\n")), &event)
 	return event
 }
 
-// hookEvent reads the hook JSON from stdin under hookStdinTimeout; a terminal
-// is never read.
-func hookEvent() map[string]any {
-	info, err := os.Stdin.Stat()
-	if err != nil || info.Mode()&os.ModeCharDevice != 0 {
-		return map[string]any{}
-	}
-	text, _ := readWithDeadline(os.Stdin, hookStdinTimeout)
-	return parseHookEvent(text)
-}
-
-// postEditCommands formats the given files, then applies lint fixes in the
-// packages that hold them, never `./...`. `--new-from-rev=HEAD` keeps the fixes
-// on uncommitted code, so an untouched file in the same package stays as is.
+// postEditCommands formats files, then fixes lint in their packages (never
+// `./...`), only on uncommitted code.
 func postEditCommands(files []string) [][]string {
 	if len(files) == 0 {
 		return nil
 	}
 	cmds := [][]string{append([]string{"golangci-lint", "fmt"}, files...)}
-	pkgs := packageDirs(filterFiles(files, isLintTarget))
+	pkgs := packageDirs(files)
 	if len(pkgs) == 0 {
 		return cmds
 	}
@@ -1138,8 +710,7 @@ func postEditCommands(files []string) [][]string {
 	return append(cmds, append(fix, pkgs...))
 }
 
-// fixAndFormat runs postEditCommands silently; what is left surfaces as lint
-// residue.
+// fixAndFormat runs postEditCommands silently; what is left is lint residue.
 func fixAndFormat(files []string) {
 	for _, cmd := range postEditCommands(files) {
 		c := exec.Command(cmd[0], cmd[1:]...)
@@ -1148,40 +719,31 @@ func fixAndFormat(files []string) {
 	}
 }
 
-func agentsMdStale() bool {
+// staleClaudeMd is CLAUDE.md's content and whether AGENTS.md differs from it.
+func staleClaudeMd() ([]byte, bool) {
 	claude, err := os.ReadFile(filepath.Join(root, "CLAUDE.md"))
 	if err != nil {
-		return false
+		return nil, false
 	}
 	agents, err := os.ReadFile(filepath.Join(root, "AGENTS.md"))
-	return err != nil || !bytes.Equal(agents, claude)
+	return claude, err != nil || !bytes.Equal(agents, claude)
 }
 
-func mirrorClaudeMd() error {
-	data, err := os.ReadFile(filepath.Join(root, "CLAUDE.md"))
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(root, "AGENTS.md"), data, 0o644)
-}
-
-// syncAgentsMdAfterEdit carries an uncommitted CLAUDE.md edit into AGENTS.md,
-// silently. CLAUDE.md is canonical; an edit to AGENTS.md alone is left for
-// pre-commit to report.
+// syncAgentsMdAfterEdit copies an uncommitted CLAUDE.md edit into AGENTS.md; an
+// edit to AGENTS.md alone is left for pre-commit to report.
 func syncAgentsMdAfterEdit() {
-	if len(gitLines("status", "--porcelain", "--", "CLAUDE.md")) > 0 && agentsMdStale() {
-		_ = mirrorClaudeMd()
+	if len(gitLines("status", "--porcelain", "--", "CLAUDE.md")) == 0 {
+		return
+	}
+	if claude, stale := staleClaudeMd(); stale {
+		_ = os.WriteFile(filepath.Join(root, "AGENTS.md"), claude, 0o644)
 	}
 }
 
-// cmdStopHook runs post-edit, then changed-lines lint and complexity delta.
-// Silent on success. Findings exit 2 with a capped stderr payload; a tool that
-// could not run exits 1; the same findings on a stop the agent is already
-// continuing from exit 1 (loop guard). `check` and `ci` keep the whole-tree
-// gates. The hook wiring runs a built binary: `go run` turns every non-zero
-// exit into 1.
+// cmdStopHook runs post-edit, then the delta gates; silent when clean (see
+// stopHookExit). The hooks run a built binary: `go run` turns exit 2 into 1.
 func cmdStopHook() {
-	event := hookEvent() // stdin belongs to the hook event; read it before anything else
+	event := readHookEvent() // stdin belongs to the hook event; read it before anything else
 	fixAndFormat(changedGoFiles())
 	syncAgentsMdAfterEdit()
 	base := deltaBase()
@@ -1190,72 +752,60 @@ func cmdStopHook() {
 		fmt.Fprintf(os.Stderr, "stop-hook: changed lines could not run: %v\n", err)
 		os.Exit(1)
 	}
-	code := reportStopHook(runDeltaGates(scope, base), event)
-	if verbose && code == 0 {
-		shown := base
-		if shown == "" {
-			shown = "no commits"
+	results := runDeltaGates(scope, base)
+	failed := 0
+	for _, r := range results {
+		if r.err != nil {
+			failed++
+			fmt.Fprintf(os.Stderr, "stop-hook: %s could not run: %v\n", r.gate, r.err)
 		}
-		fmt.Printf("stop-hook: clean (%d changed path(s) vs %s)\n", len(scope), shown)
 	}
-	if code != 0 {
-		os.Exit(code)
+	payload := stopHookPayload(results)
+	code := stopHookExit(payload, failed, event.StopHookActive)
+	if payload != "" && code == 1 {
+		payload += "\nharness: already blocked once on this stop; not blocking again"
 	}
+	if payload != "" {
+		fmt.Fprintln(os.Stderr, payload)
+	}
+	os.Exit(code)
 }
 
-// hookTarget is the project Go file a PostToolUse event names, relative to
-// base; "" for anything else.
-func hookTarget(event map[string]any, base string) string {
-	input, _ := event["tool_input"].(map[string]any)
-	filePath, _ := input["file_path"].(string)
-	if filePath == "" {
-		return ""
-	}
+// hookTarget is the project Go file at filePath, relative to base; "" for
+// anything else. Symlinks resolve on both sides (macOS /tmp is /private/tmp);
+// isGoSource rejects "." and `..` paths.
+func hookTarget(filePath, base string) string {
 	if !filepath.IsAbs(filePath) {
 		filePath = filepath.Join(base, filePath)
 	}
-	rel := relativePath(base, filePath)
-	if rel == ".." || strings.HasPrefix(rel, "../") || filepath.IsAbs(rel) {
-		return "" // outside this project: another harness owns it
+	realPath, pathErr := filepath.EvalSymlinks(filePath)
+	realBase, baseErr := filepath.EvalSymlinks(base)
+	if pathErr == nil && baseErr == nil {
+		filePath, base = realPath, realBase
 	}
-	if !isGoSource(rel) || !isFile(filepath.Join(base, rel)) {
+	rel, err := filepath.Rel(base, filePath)
+	rel = filepath.ToSlash(rel)
+	if err != nil || !isGoSource(rel) || !isFile(filepath.Join(base, rel)) {
 		return ""
 	}
 	return rel
 }
 
-func printHookContext(context string) {
-	var out struct {
-		HookSpecificOutput struct {
-			HookEventName     string `json:"hookEventName"`
-			AdditionalContext string `json:"additionalContext"`
-		} `json:"hookSpecificOutput"`
-	}
-	out.HookSpecificOutput.HookEventName = "PostToolUse"
-	out.HookSpecificOutput.AdditionalContext = context
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetEscapeHTML(false)
-	_ = encoder.Encode(out)
-}
-
-// postEditHook fixes and formats the one file a PostToolUse event names. It
-// never blocks, and prints one additionalContext line when the file changed so
-// the agent re-reads it before its next edit.
+// postEditHook fixes and formats the file a PostToolUse event names. It never
+// blocks; when the file changed it asks the agent to re-read it.
 func postEditHook() {
-	target := hookTarget(hookEvent(), root)
+	target := hookTarget(readHookEvent().ToolInput.FilePath, root)
 	if target == "" {
 		return
 	}
-	before, err := os.ReadFile(target)
-	if err != nil {
-		return
-	}
+	before, errBefore := os.ReadFile(target)
 	fixAndFormat([]string{target})
-	after, err := os.ReadFile(target)
-	if err != nil || bytes.Equal(before, after) {
+	after, errAfter := os.ReadFile(target)
+	if errBefore != nil || errAfter != nil || bytes.Equal(before, after) {
 		return
 	}
-	printHookContext(fmt.Sprintf(postEditNotice, target))
+	context, _ := json.Marshal("harness: reformatted " + target + "; re-read it before editing it again")
+	fmt.Printf("{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":%s}}\n", context)
 }
 
 // cmdPostEdit formats and fixes files with uncommitted changes; `--hook`: the
@@ -1265,9 +815,8 @@ func cmdPostEdit() {
 		postEditHook()
 		return
 	}
-	labels := []string{"Format changed files", "Fix changed packages"}
-	for i, cmd := range postEditCommands(changedGoFiles()) {
-		run(labels[i], cmd, &runOpts{noExit: true})
+	for _, cmd := range postEditCommands(changedGoFiles()) {
+		run(strings.Join(cmd[:2], " "), cmd, &runOpts{noExit: true})
 	}
 }
 
@@ -1472,21 +1021,10 @@ func readPrePushRefs() prePushRefs {
 	return prePushRefsResult
 }
 
-// readRefsWithDeadline reads the hook's ref lines under limit. A deadline with
-// nothing received is an idle pipe (an agent tool, not a hook) — no refs; a
-// deadline with bytes received is incomplete input.
+// readRefsWithDeadline reads r to EOF, bounding the whole read by limit. A
+// deadline with nothing received is an idle pipe (an agent tool, not a hook) —
+// no refs; a deadline with bytes received is incomplete input.
 func readRefsWithDeadline(r io.Reader, limit time.Duration) prePushRefs {
-	text, complete := readWithDeadline(r, limit)
-	if !complete {
-		return prePushRefs{incomplete: text != ""}
-	}
-	return prePushRefs{lines: refLinesOf(text)}
-}
-
-// readWithDeadline reads r to EOF, bounding the whole read (not just the first
-// byte) by limit, so an idle pipe cannot hang the caller. It returns what
-// arrived and whether EOF did.
-func readWithDeadline(r io.Reader, limit time.Duration) (string, bool) {
 	var (
 		mu   sync.Mutex
 		buf  strings.Builder
@@ -1507,15 +1045,16 @@ func readWithDeadline(r io.Reader, limit time.Duration) (string, bool) {
 			}
 		}
 	}()
-	complete := true
 	select {
 	case <-done:
 	case <-time.After(limit):
-		complete = false
+		mu.Lock()
+		defer mu.Unlock()
+		return prePushRefs{incomplete: buf.Len() > 0}
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	return buf.String(), complete
+	return prePushRefs{lines: refLinesOf(buf.String())}
 }
 
 // reportIncompleteRefs fails a guard that cannot trust its input.
@@ -1741,19 +1280,19 @@ func cmdMutation() {
 	fmt.Printf("  %s✓%s Mutation (gremlins)\n", green, reset)
 }
 
-// funcMetric is one function as `lizard --csv` measured it. CRAP computes
-// coverage at join time from per-line hit counts; the stop hook's complexity
-// delta matches functions by key.
+// funcMetric pairs a function's location with its cyclomatic complexity.
+// Coverage is computed at join time in cmdCrap from per-line hit counts.
 type funcMetric struct {
-	file   string
-	key    string // long_name (the signature); a repeat in one file gets #2, #3
-	name   string
-	line   int
-	end    int
-	ccn    int
-	args   int
-	length int
+	file string
+	line int
+	end  int
+	name string
+	ccn  int
+	args int
 }
+
+// lizard --csv location field: "name@start-end@path" (quoted, may contain commas in sig).
+var lizardLocRe = regexp.MustCompile(`"([^"@]*)@(\d+)-(\d+)@([^"]+)"`)
 
 // cmdCrap computes CRAP = CCN² × (1-cov)³ + CCN per function. Advisory.
 //
@@ -1930,18 +1469,41 @@ func complexityMetrics() []funcMetric {
 		return nil
 	}
 	var metrics []funcMetric
-	for _, m := range lizardRows(string(out)) {
-		m.file = strings.TrimPrefix(m.file, "./")
-		base := filepath.Base(m.file)
-		if base == "harness.go" || strings.HasSuffix(base, "_test.go") {
-			continue
-		}
-		// Skip anonymous closures: per-function coverage attribution would
-		// roll into the enclosing function and mis-score the closure itself.
-		if m.name == "" {
+	for _, m := range parseLizardCSV(string(out)) {
+		// Skip the runner, tests, and anonymous closures: per-function coverage
+		// attribution would roll a closure into its enclosing function.
+		if base := filepath.Base(m.file); base == "harness.go" || strings.HasSuffix(base, "_test.go") || m.name == "" {
 			continue
 		}
 		metrics = append(metrics, m)
+	}
+	return metrics
+}
+
+// parseLizardCSV reads the function rows of `lizard --csv` output.
+func parseLizardCSV(out string) []funcMetric {
+	var metrics []funcMetric
+	for row := range strings.SplitSeq(out, "\n") {
+		cols := strings.SplitN(row, ",", 11)
+		if len(cols) < 11 {
+			continue
+		}
+		ccn, err := strconv.Atoi(cols[1])
+		if err != nil {
+			continue
+		}
+		m := lizardLocRe.FindStringSubmatch(row)
+		if m == nil {
+			continue
+		}
+		name := m[1]
+		ln, _ := strconv.Atoi(m[2])
+		end, _ := strconv.Atoi(m[3])
+		path := strings.TrimPrefix(m[4], "./")
+		args, _ := strconv.Atoi(cols[3])
+		metrics = append(metrics, funcMetric{
+			file: path, line: ln, end: end, name: name, ccn: ccn, args: args,
+		})
 	}
 	return metrics
 }
@@ -1951,13 +1513,20 @@ func complexityMetrics() []funcMetric {
 // checkStopHooksPresent warns when the Claude/Codex Stop or the Claude
 // PostToolUse wiring is missing.
 func checkStopHooksPresent() {
-	for _, w := range hookWirings {
-		label := w.event + " hook wiring"
-		if hookWired(w) {
-			fmt.Printf("  %s✓%s %s (%s)\n", green, reset, label, w.path)
+	for _, rel := range []string{".claude/settings.json", ".codex/hooks.json"} {
+		data, _ := os.ReadFile(filepath.Join(root, rel))
+		text := string(data)
+		if strings.Contains(text, "Stop") && strings.Contains(text, "stop-hook") {
+			fmt.Printf("  %s✓%s Stop hook wiring (%s)\n", green, reset, rel)
 		} else {
-			fmt.Printf("  %s⚠%s Missing %s: %s\n", red, reset, label, w.path)
+			fmt.Printf("  %s⚠%s Missing Stop hook wiring: %s\n", red, reset, rel)
 		}
+	}
+	data, _ := os.ReadFile(filepath.Join(root, ".claude/settings.json"))
+	if strings.Contains(string(data), "PostToolUse") && strings.Contains(string(data), "post-edit --hook") {
+		fmt.Printf("  %s✓%s PostToolUse hook wiring (.claude/settings.json)\n", green, reset)
+	} else {
+		fmt.Printf("  %s⚠%s Missing PostToolUse hook wiring: .claude/settings.json\n", red, reset)
 	}
 }
 
@@ -2012,36 +1581,32 @@ func cmdAgentsMdDrift() { checkAgentsMdDrift(false) }
 
 // cmdSyncAgentsMd overwrites AGENTS.md with CLAUDE.md contents.
 func cmdSyncAgentsMd() {
-	if !isFile(filepath.Join(root, "CLAUDE.md")) {
+	claudePath := filepath.Join(root, "CLAUDE.md")
+	a, err := os.ReadFile(claudePath)
+	if err != nil {
 		fmt.Printf("  %s✗%s sync-agents-md: CLAUDE.md not found\n", red, reset)
 		os.Exit(1)
 	}
-	if err := mirrorClaudeMd(); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), a, 0o644); err != nil {
 		fmt.Printf("  %s✗%s sync-agents-md: %v\n", red, reset, err)
 		os.Exit(1)
 	}
 	fmt.Printf("  %s✓%s sync-agents-md: AGENTS.md ← CLAUDE.md\n", green, reset)
 }
 
-// syncAgentsMdStaged carries AGENTS.md into the commit of a staged CLAUDE.md.
-// The `git add` keeps git's hook environment on purpose: GIT_INDEX_FILE is the
-// index this commit is built from.
+// syncAgentsMdStaged carries AGENTS.md into the commit of a staged CLAUDE.md;
+// `git add` keeps git's hook env: GIT_INDEX_FILE is this commit's index.
 func syncAgentsMdStaged() {
-	if len(gitLines("diff", "--cached", "--name-only", "--", "CLAUDE.md")) == 0 || !agentsMdStale() {
+	if _, stale := staleClaudeMd(); !stale || len(gitLines("diff", "--cached", "--name-only", "--", "CLAUDE.md")) == 0 {
 		return
 	}
-	if err := mirrorClaudeMd(); err != nil {
-		fmt.Printf("  %s✗%s sync-agents-md: %v\n", red, reset, err)
-		os.Exit(1)
-	}
+	cmdSyncAgentsMd()
 	c := exec.Command("git", "add", "--", "AGENTS.md")
 	c.Dir = root
 	if out, err := c.CombinedOutput(); err != nil {
-		fmt.Printf("  %s✗%s sync-agents-md: git add AGENTS.md failed\n", red, reset)
-		fmt.Print(string(out))
+		fmt.Printf("  %s✗%s sync-agents-md: git add AGENTS.md failed\n%s", red, reset, out)
 		os.Exit(1)
 	}
-	fmt.Printf("  %s✓%s sync-agents-md: AGENTS.md ← CLAUDE.md (staged)\n", green, reset)
 }
 
 func cmdCheck() {
@@ -2085,9 +1650,8 @@ func cmdCheck() {
 	fmt.Printf("%sOK%s %d passed %s(%.1fs)%s\n", green, reset, passed, dim, elapsed, reset)
 }
 
-// cmdPreCommit fixes and formats staged packages and mirrors a staged
-// CLAUDE.md; tests run at pre-push. The drift check also runs when only the
-// docs are staged, so a hand edit to AGENTS.md alone fails.
+// cmdPreCommit fixes and formats staged packages and mirrors a staged CLAUDE.md;
+// tests run at pre-push. A hand edit to AGENTS.md alone fails the drift check.
 func cmdPreCommit() {
 	fmt.Printf("\n%s[pre-commit]%s\n\n", blue, reset)
 	checkArchConfigGuard(true, true, false)
@@ -2129,38 +1693,13 @@ func cmdCi() {
 	}
 }
 
-// envWithoutGit is this environment minus the GIT_* variables git exports to
-// hooks.
-func envWithoutGit() []string {
-	var env []string
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "GIT_") {
-			env = append(env, kv)
-		}
-	}
-	return env
-}
-
-// checkTests runs the suite captured, outside git's hook environment: git
-// exports GIT_DIR (and, for commits, GIT_INDEX_FILE) to hooks, and a test that
-// runs `git init` in a temp dir would otherwise write into this repository.
-func checkTests() bool {
-	return printGateResult(runCapture(gate{
-		description: "Tests",
-		cmd:         []string{"go", "test", "./..."},
-		extract:     extractTestSummary,
-		env:         envWithoutGit(),
-	}), true)
-}
-
 // cmdPrePush is the read-only push gate: the offline checks pre-commit and
 // stop-hook do not run. pre-commit covers fix/format on staged files;
-// stop-hook covers the change's delta. This fills the gap with the
-// deterministic, offline gates none of them run — tests, lint (golangci-lint
-// covers format), agents-md drift, acceptance, arch — validating the whole
-// pushed tree (after merges/rebases/--no-verify) before it leaves the machine.
-// Tests run first and alone: they build a binary next to the sources. Network
-// (audit) and advisory (coverage/CRAP) gates stay in ci.
+// stop-hook covers the change. This fills the gap with the deterministic, offline
+// gates none of them run — tests, lint (golangci-lint covers format), agents-md drift,
+// acceptance, arch — validating the whole pushed tree (after merges/rebases/
+// --no-verify) before it leaves the machine. Network (audit) and advisory
+// (coverage/CRAP) gates stay in ci.
 // The branch guard runs first and short-circuits: on refusal (or incomplete
 // refs) it prints and exits before the arch guard, drift check, or the
 // parallel batch run at all — it is the gate that keeps merge authority with
@@ -2171,13 +1710,20 @@ func cmdPrePush() {
 		os.Exit(1)
 	}
 	archConfigOk := checkArchConfigGuard(false, false, true)
-	testsOk := checkTests()
+	// Tests go first and alone (they build a binary next to the sources), without
+	// git's hook variables: a test's `git init` would otherwise hit this repository.
+	for _, kv := range os.Environ() {
+		if name, _, _ := strings.Cut(kv, "="); strings.HasPrefix(name, "GIT_") {
+			_ = os.Unsetenv(name)
+		}
+	}
+	cmdTest()
 	gates := []gate{lintGate(nil)}
 	gates = append(gates, acceptanceGatesOrWarn()...)
 	gates = append(gates, archGatesOrWarn()...)
 	allOk := runGatesParallel(gates)
 	driftOk := checkAgentsMdDrift(true).ok
-	if !allOk || !driftOk || !archConfigOk || !testsOk {
+	if !allOk || !driftOk || !archConfigOk {
 		os.Exit(1)
 	}
 }
@@ -2208,53 +1754,42 @@ func cmdComplexity() {
 // ── Hook wiring (installed by `setup-hooks`) ────────────────────────
 // Claude reads .claude/settings.json and runs the harness directly; Codex reads
 // .codex/hooks.json and goes through the codex-stop-hook.sh wrapper (which turns
-// the exit code into the block/continue JSON Codex expects). PostToolUse is
-// Claude-only: it formats the file an Edit/Write just touched.
-//
-// The Stop commands build the runner and run the binary: `go run` exits 1 for
-// any non-zero exit of the program (and prints "exit status 2"), which would
-// turn the stop hook's blocking exit 2 into a non-blocking 1. A failed build
-// exits 1, which is the non-blocking outcome a broken runner deserves. The
-// `harness` binary is gitignored. post-edit --hook always exits 0, so `go run`
-// is fine there.
+// the exit code into the block/continue JSON Codex expects). The Stop commands
+// build the runner and run the binary: `go run` exits 1 for any non-zero exit,
+// which would turn the blocking exit 2 into a non-blocking 1. The checked-in
+// .claude/settings.json also carries the PostToolUse hook (`post-edit --hook`).
 const (
-	claudeSettings        = ".claude/settings.json"
-	codexHooks            = ".codex/hooks.json"
-	claudeSettingsSchema  = "https://json.schemastore.org/claude-code-settings.json"
-	claudeStopCommand     = "cd $CLAUDE_PROJECT_DIR && go build -o harness harness.go && ./harness stop-hook"
-	claudePostEditCommand = "cd $CLAUDE_PROJECT_DIR && go run harness.go post-edit --hook"
-	codexStopCommand      = `cd "$(git rev-parse --show-toplevel)" && go build -o harness harness.go && .codex/hooks/codex-stop-hook.sh ./harness stop-hook`
+	claudeSettingsSchema = "https://json.schemastore.org/claude-code-settings.json"
+	claudeStopCommand    = "cd $CLAUDE_PROJECT_DIR && go build -o harness harness.go && ./harness stop-hook"
+	codexStopCommand     = `cd "$(git rev-parse --show-toplevel)" && go build -o harness harness.go && .codex/hooks/codex-stop-hook.sh ./harness stop-hook`
 )
 
-// hookWiring is one harness hook in an agent settings file; marker identifies
-// its handler on reinstall.
-type hookWiring struct {
-	path    string
-	event   string
-	marker  string
-	matcher string
-	handler map[string]any
+func claudeStopHook() map[string]any {
+	return map[string]any{"type": "command", "command": claudeStopCommand, "timeout": 300}
 }
 
-var hookWirings = []hookWiring{
-	{path: claudeSettings, event: "Stop", marker: "stop-hook", handler: map[string]any{
-		"type": "command", "command": claudeStopCommand, "timeout": 300,
-	}},
-	{path: claudeSettings, event: "PostToolUse", marker: "post-edit --hook", matcher: "Edit|Write", handler: map[string]any{
-		"type": "command", "command": claudePostEditCommand, "timeout": 60,
-	}},
-	{path: codexHooks, event: "Stop", marker: "stop-hook", handler: map[string]any{
-		"type": "command", "command": codexStopCommand, "timeout": 300, "statusMessage": "Running stop-hook checks",
-	}},
+func codexStopHook() map[string]any {
+	return map[string]any{
+		"type":          "command",
+		"command":       codexStopCommand,
+		"timeout":       300,
+		"statusMessage": "Running stop-hook checks",
+	}
 }
 
 // gitHookPath resolves a git hook path via `git rev-parse` so worktrees and
 // core.hooksPath land in the right place. GIT_* env is stripped so an ambient
 // GIT_DIR from a parent process can't redirect us.
 func gitHookPath(name string) string {
+	var env []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "GIT_") {
+			env = append(env, kv)
+		}
+	}
 	c := exec.Command("git", "rev-parse", "--git-path", "hooks/"+name)
 	c.Dir = root
-	c.Env = envWithoutGit()
+	c.Env = env
 	if out, err := c.Output(); err == nil {
 		if p := strings.TrimSpace(string(out)); p != "" {
 			if filepath.IsAbs(p) {
@@ -2279,46 +1814,13 @@ func installGitHook(name string) {
 	}
 }
 
-// isHarnessHandler reports whether handler is a command that already runs this
-// harness hook (any form).
-func isHarnessHandler(handler any, marker string) bool {
+func isStopHookHandler(handler any) bool {
 	m, ok := handler.(map[string]any)
 	if !ok || m["type"] != "command" {
 		return false
 	}
 	cmd, ok := m["command"].(string)
-	return ok && strings.Contains(cmd, marker)
-}
-
-// readJSONObject reads a settings file; a missing or empty file is {}.
-func readJSONObject(rel string) (map[string]any, error) {
-	data := map[string]any{}
-	raw, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
-	if err != nil || strings.TrimSpace(string(raw)) == "" {
-		return data, nil
-	}
-	return data, json.Unmarshal(raw, &data)
-}
-
-// hookWired reports whether the settings file has a handler for this hook
-// under its event.
-func hookWired(w hookWiring) bool {
-	data, err := readJSONObject(w.path)
-	if err != nil {
-		return false
-	}
-	hooks, _ := data["hooks"].(map[string]any)
-	groups, _ := hooks[w.event].([]any)
-	for _, group := range groups {
-		groupMap, _ := group.(map[string]any)
-		handlers, _ := groupMap["hooks"].([]any)
-		for _, handler := range handlers {
-			if isHarnessHandler(handler, w.marker) {
-				return true
-			}
-		}
-	}
-	return false
+	return ok && strings.Contains(cmd, "stop-hook")
 }
 
 func jsonObjectChild(data map[string]any, key, label string) map[string]any {
@@ -2341,11 +1843,32 @@ func cloneMap(m map[string]any) map[string]any {
 	return out
 }
 
-// replaceHarnessHandler swaps the first handler carrying the wiring's marker
-// for the current one and drops any duplicates. Returns whether it found one.
-func replaceHarnessHandler(groups []any, w hookWiring) bool {
+// installStopHook injects/refreshes the Stop hook in a settings file, preserving
+// every other hook. Idempotent: an existing stop-hook handler (current or legacy)
+// is replaced in place and duplicates are dropped, so re-running never accumulates
+// entries. (encoding/json sorts object keys, so the file is rewritten in a stable
+// order — cosmetic, and identical on every subsequent run.)
+func installStopHook(rel string, hook map[string]any, claudeSettings bool) {
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	data := map[string]any{}
+	if raw, err := os.ReadFile(path); err == nil {
+		if trimmed := strings.TrimSpace(string(raw)); trimmed != "" {
+			if err := json.Unmarshal([]byte(trimmed), &data); err != nil {
+				fmt.Fprintf(os.Stderr, "%s: invalid JSON: %v\n", rel, err)
+				os.Exit(1)
+			}
+		}
+	}
+	if claudeSettings {
+		if _, ok := data["$schema"]; !ok {
+			data["$schema"] = claudeSettingsSchema
+		}
+	}
+
+	hooks := jsonObjectChild(data, "hooks", rel)
+	stopGroups, _ := hooks["Stop"].([]any)
 	installed := false
-	for _, group := range groups {
+	for _, group := range stopGroups {
 		groupMap, ok := group.(map[string]any)
 		if !ok {
 			continue
@@ -2356,59 +1879,33 @@ func replaceHarnessHandler(groups []any, w hookWiring) bool {
 		}
 		next := []any{}
 		for _, handler := range groupHooks {
-			if !isHarnessHandler(handler, w.marker) {
-				next = append(next, handler)
-			} else if !installed {
-				next = append(next, cloneMap(w.handler))
-				installed = true
+			if isStopHookHandler(handler) {
+				if !installed {
+					next = append(next, cloneMap(hook))
+					installed = true
+				}
+				continue
 			}
+			next = append(next, handler)
 		}
 		groupMap["hooks"] = next
 	}
-	return installed
-}
-
-func writeJSONObject(path string, data map[string]any) error {
-	var out bytes.Buffer
-	encoder := json.NewEncoder(&out)
-	encoder.SetEscapeHTML(false)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(data); err != nil {
-		return err
+	if !installed {
+		stopGroups = append(stopGroups, map[string]any{"hooks": []any{cloneMap(hook)}})
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, out.Bytes(), 0o644)
-}
+	hooks["Stop"] = stopGroups
 
-// installHook injects/refreshes one hook in its settings file, preserving every
-// other hook. Idempotent: an existing handler carrying the wiring's marker
-// (current or legacy) is replaced in place and duplicates are dropped, so
-// re-running never accumulates entries. (encoding/json sorts object keys, so
-// the file is rewritten in a stable order — cosmetic, and identical on every
-// subsequent run.)
-func installHook(w hookWiring) {
-	data, err := readJSONObject(w.path)
+	out, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: invalid JSON: %v\n", w.path, err)
+		fmt.Fprintf(os.Stderr, "%s: marshal failed: %v\n", rel, err)
 		os.Exit(1)
 	}
-	if _, ok := data["$schema"]; !ok && w.path == claudeSettings {
-		data["$schema"] = claudeSettingsSchema
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
 	}
-	hooks := jsonObjectChild(data, "hooks", w.path)
-	groups, _ := hooks[w.event].([]any)
-	if !replaceHarnessHandler(groups, w) {
-		group := map[string]any{"hooks": []any{cloneMap(w.handler)}}
-		if w.matcher != "" {
-			group["matcher"] = w.matcher
-		}
-		groups = append(groups, group)
-	}
-	hooks[w.event] = groups
-	if err := writeJSONObject(filepath.Join(root, filepath.FromSlash(w.path)), data); err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", w.path, err)
+	if err := os.WriteFile(path, append(out, '\n'), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 }
@@ -2416,10 +1913,9 @@ func installHook(w hookWiring) {
 func cmdHooks() {
 	installGitHook("pre-commit")
 	installGitHook("pre-push")
-	for _, w := range hookWirings {
-		installHook(w)
-	}
-	fmt.Println("Installed pre-commit, pre-push, Claude/Codex Stop, and Claude PostToolUse hooks")
+	installStopHook(".codex/hooks.json", codexStopHook(), false)
+	installStopHook(".claude/settings.json", claudeStopHook(), true)
+	fmt.Println("Installed pre-commit, pre-push, and Claude/Codex Stop hooks")
 }
 
 func cmdClean() {
@@ -2489,9 +1985,9 @@ var tasks = []task{
 	{"pre-commit", cmdPreCommit, "Staged fix/format; mirrors a staged CLAUDE.md"},
 	{"pre-push", cmdPrePush, "Read-only push gate: branch guard, tests, lint, agents-md drift, acceptance, arch"},
 	{"ci", cmdCi, "Full verification: lint, audit, complexity, agents-md drift, acceptance, coverage, crap, arch"},
-	{"setup-hooks", cmdHooks, "Install git pre-commit + pre-push hooks and Claude/Codex agent hook wiring"},
+	{"setup-hooks", cmdHooks, "Install git pre-commit + pre-push hooks and Claude/Codex Stop wiring"},
 	{"post-edit", cmdPostEdit, "Format changed files (--hook: the file a PostToolUse names)"},
-	{"stop-hook", cmdStopHook, "post-edit, then changed-lines lint, complexity delta; silent on success, exit 2 with findings"},
+	{"stop-hook", cmdStopHook, "post-edit, then changed-lines lint, touched-function complexity; silent on success, exit 2 with findings"},
 	{"agents-md-drift", cmdAgentsMdDrift, "Fail if AGENTS.md differs from CLAUDE.md"},
 	{"sync-agents-md", cmdSyncAgentsMd, "Overwrite AGENTS.md from CLAUDE.md"},
 	{"clean", cmdClean, "Remove coverage and test cache"},

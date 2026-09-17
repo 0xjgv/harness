@@ -41,7 +41,7 @@ go run harness.go setup-hooks
 | `go run harness.go ci` | CI pipeline | Read-only verification (see below) | No |
 | `go run harness.go audit` | CI pipeline | Dependency vulnerability audit | No |
 | `go run harness.go post-edit` | Stop hook helper; `--hook` is the Claude PostToolUse hook | Format changed files, fix their packages; `--hook`: the one edited file, never blocks | Yes |
-| `go run harness.go stop-hook` | Stop hook entrypoint | post-edit, then changed-lines lint, complexity delta; silent on success, exit 2 with findings | Yes |
+| `go run harness.go stop-hook` | Stop hook entrypoint | post-edit, then changed-lines lint and touched-function complexity; silent on success, exit 2 with findings | Yes |
 
 ### `ci` pipeline
 
@@ -53,8 +53,8 @@ default threshold from `.harness-baseline`) and the
 advisory CRAP.
 
 `pre-push` is the offline push gate — the branch guard (no pushes to `main`/`master`),
-then the test suite (run alone and without git's `GIT_*` hook variables, since the tests
-build a binary and create temp git repos), then lint (golangci-lint covers format),
+then the test suite (without git's `GIT_*` hook variables, since the tests create temp
+git repos; a failure stops the push), then lint (golangci-lint covers format),
 agents-md drift, acceptance, arch over the whole pushed tree (the deterministic checks
 pre-commit and stop-hook skip). `pre-commit` no longer runs tests.
 
@@ -106,8 +106,8 @@ Every command is also a `make` target — `make check`, `make ci`, `make pre-pus
 | `go run harness.go pre-push` | Push gate: branch guard, tests, lint, agents-md drift, acceptance, arch |
 | `go run harness.go branch-guard` | Refuse pushes to main/master |
 | `go run harness.go ci` | Full verification pipeline |
-| `go run harness.go setup-hooks` | Install git pre-commit + pre-push hooks, the Claude/Codex Stop wiring, and the Claude PostToolUse wiring |
-| `go run harness.go stop-hook` | post-edit, then changed-lines lint, complexity delta; silent on success, exit 2 with findings |
+| `go run harness.go setup-hooks` | Install git pre-commit + pre-push hooks and the Claude/Codex Stop wiring |
+| `go run harness.go stop-hook` | post-edit, then changed-lines lint and touched-function complexity; silent on success, exit 2 with findings |
 | `go run harness.go post-edit` | Format changed files and fix their packages (`--hook`: the file a PostToolUse names) |
 | `go run harness.go clean` | Remove coverage and test cache |
 
@@ -135,26 +135,23 @@ harness.go           Development task runner (zero dependencies; //go:build igno
 - **Arch config guard**: `.go-arch-lint.yml` changes warn during `check`/`pre-commit` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. Note `.golangci.yaml` is deliberately *not* protected — it is the general lint config, and protecting it would block all lint-config edits.
 
 Stop hooks are wired via `.claude/settings.json` for Claude and
-`.codex/hooks.json` for Codex; Claude also gets a PostToolUse hook
-(`post-edit --hook`, Edit|Write) that formats the edited file. The Stop commands
-run `go build -o harness harness.go && ./harness stop-hook` (the `harness` binary is
-gitignored): `go run` reports any non-zero exit as 1, which would turn the blocking
-exit 2 into a non-blocking error.
+`.codex/hooks.json` for Codex; `setup-hooks` installs them. The checked-in
+`.claude/settings.json` also carries a PostToolUse hook (`post-edit --hook`,
+Edit|Write) that formats the edited file; `check` warns when either wiring is missing.
+The Stop commands run `go build -o harness harness.go && ./harness stop-hook` (the
+binary is gitignored): `go run` reports any non-zero exit as 1, so exit 2 would never
+block.
 
 `stop-hook` judges the change, not the tree. Its scope is `git diff` against the
 merge-base with the base branch (`HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`, then
 origin/HEAD, origin/main, origin/master, main, master; never fetched) plus untracked
-files. It first formats the changed files (`golangci-lint fmt`) and applies lint fixes in
-their packages only (`golangci-lint run --fix --new-from-rev=HEAD`). It blocks (exit 2,
-findings on stderr, at most 20 lines) on lint left on changed lines
-(`golangci-lint run --new-from-rev=<merge-base>` over the changed packages, which
-includes `unused` for dead code; `gocyclo` is left to the complexity delta, which
-matches functions by signature; compile errors block wherever they sit) and on a
-non-test function that is over a lizard limit and new or worse than at the base.
-Pre-existing debt never blocks. It prints nothing on success. Exit 1 means a tool could
-not run, or the same findings came back while the agent was already continuing from a
-stop (the loop guard, state under `git rev-parse --git-path harness`). An uncommitted
-`CLAUDE.md` edit is copied to `AGENTS.md`.
+files. It formats the changed files, fixes lint in their packages, then blocks (exit 2,
+at most 20 findings on stderr) on lint left on changed lines (`unused` covers dead
+code; compile errors always block) and on any non-test function over a lizard limit
+whose lines the change touches. Touching an over-limit function blocks, so leave what
+you touch better; untouched debt never blocks. It prints nothing on success. Exit 1
+means a tool could not run, or this stop already blocked once (`stop_hook_active`). An
+uncommitted `CLAUDE.md` edit is copied to `AGENTS.md`.
 
 ## Thresholds: start at 0, ratchet up
 

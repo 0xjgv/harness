@@ -22,14 +22,14 @@ Every template wires two Claude hooks and one Codex hook:
 ## The `stop-hook` contract
 
 The Stop hook is a feedback loop for the agent, not a report on the
-repository. Pre-existing debt never blocks a stop; `check` and `ci` keep the
+repository. Untouched debt never blocks a stop (touching an over-limit function does); `check` and `ci` keep the
 whole-tree gates.
 
 | Check at stop | Scope | Result |
 |---|---|---|
 | fix + format (`post-edit`) | changed files | never blocks |
 | lint left after the fix | changed lines | blocks |
-| complexity (lizard) | functions new, or worse than at the merge-base | blocks |
+| complexity (lizard) | over-limit functions overlapping changed lines | blocks |
 | dead code (python: vulture; bun: knip exports) | changed lines | blocks |
 | arch config, whole-tree gates, tests | — | not run at stop |
 
@@ -61,11 +61,11 @@ The Stop command must preserve exit code 2. `go run` reports any failing
 program as exit 1, so the Go template builds `./harness` (gitignored) and runs
 the binary; `uv run`, `bun`, and `cargo run` pass the code through.
 
-Loop guard: the hook reads the event from stdin. When `stop_hook_active` is
-true and the findings are byte-identical to the previous stop's, it prints
-them with `harness: same findings as the previous stop; not blocking again`
-and exits 1. Findings that changed (one of three fixed) block again. The
-previous payload's hash lives under `$(git rev-parse --git-path harness)/`.
+Block once per stop: the hook reads the event from stdin. When
+`stop_hook_active` is true (the agent is already continuing from a block), it
+prints the findings with `harness: already blocked once on this stop; not
+blocking again` and exits 1, so the human sees them and the agent is not
+looped. No state is kept.
 
 ## Claude hooks
 

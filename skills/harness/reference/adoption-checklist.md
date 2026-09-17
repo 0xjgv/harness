@@ -103,7 +103,7 @@ The repo must expose these commands through its chosen runner:
 | `ci` | Full read-only verification. Read-only gates run in parallel and print in submission order; then coverage and advisory CRAP run. Must not mutate tracked files. |
 | `audit` | Dependency vulnerability audit. Must not mutate. |
 | `post-edit` | Stop hook helper. Formats source files when changed. May mutate formatting only. `--hook` is the Claude PostToolUse handler for one file. |
-| `stop-hook` | Agent Stop hook entrypoint. Runs `post-edit`, then read-only delta gates: lint on changed lines, complexity new or worse than the merge-base, deadcode on changed lines where applicable. |
+| `stop-hook` | Agent Stop hook entrypoint. Runs `post-edit`, then read-only delta gates: lint on changed lines, over-limit functions the change touched, deadcode on changed lines where applicable. |
 | `setup-hooks` | Installs or refreshes pre-commit, pre-push, Claude Stop/PostToolUse, and Codex Stop hook wiring. |
 | `suppressions` | Shows suppression counts; `--update-baseline` is the only writer and needs human sign-off. |
 | `coverage` | Enforces the `.harness-baseline` `coverage.min` floor unless overridden. |
@@ -256,15 +256,15 @@ Must:
 - Run `post-edit` first.
 - Then run read-only delta gates that report only what the change introduced,
   measured against the merge-base with the default branch plus uncommitted and
-  untracked files: lint left on changed lines, complexity new or worse than the
-  base version of the function, and deadcode on changed lines where applicable.
+  untracked files: lint left on changed lines, over-limit functions whose span
+  overlaps a changed line, and deadcode on changed lines where applicable.
 - Use Python/Bun deadcode gates (`vulture`/`knip`).
 - Use lint-based deadcode coverage for Go/Rust; do not invent a standalone
   `deadcode` command there.
 - Not run `arch-config-guard`, whole-tree gates, or tests.
 - Print nothing on success; exit 2 with at most 20 `path:line` findings on
-  stderr; exit 1 when a tool cannot run; stop re-blocking on byte-identical
-  findings when `stop_hook_active` is set.
+  stderr; exit 1 when a tool cannot run; exit 1 instead of 2 when
+  `stop_hook_active` is set (block once per stop).
 - Be wired into Claude and Codex Stop hooks.
 
 Gap examples:
@@ -334,12 +334,12 @@ Must:
 - Use lizard pinned through `uvx` where the templates do.
 - Enforce CCN<=15, args<=8, length<=100.
 - Run in `ci` over the whole tree, and in `stop-hook` as a delta (functions
-  over a limit that are new or worse than at the merge-base).
+  over a limit whose span overlaps a changed line).
 
 Fix suggestions:
 
 - Add the `complexity` command and call it from `ci`; add the delta to
-  `stop-hook` with `lizard --csv` keyed by `long_name`.
+  `stop-hook`: `lizard --csv` on the changed files, filtered by line span.
 - Capture successful lizard output; print details only on failure.
 
 ### Deadcode

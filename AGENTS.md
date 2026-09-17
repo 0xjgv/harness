@@ -76,7 +76,7 @@ cd monorepo && make check           # dispatches check to every subproject copie
 | `ci` | CI pipeline | read-only gates (lint, typecheck, dep audit, complexity, deadcode, acceptance, arch) in parallel, then coverage + advisory CRAP | no |
 | `audit` | CI pipeline | dependency vulnerability audit | no |
 | `post-edit` | Stop hook helper; `--hook` = PostToolUse on one file | fix + format changed source files | yes |
-| `stop-hook` | agent Stop hook | `post-edit`, then lint left on changed lines, complexity new or worse than the merge-base (+ deadcode on changed lines where shipped); silent on success, exit 2 with ≤20 `path:line` findings | yes |
+| `stop-hook` | agent Stop hook | `post-edit`, then lint left on changed lines, over-limit functions the change touched (+ deadcode on changed lines where shipped); silent on success, exit 2 with ≤20 `path:line` findings | yes |
 
 Other standalone subcommands every template exposes: `complexity`, `crap`, `acceptance`,
 `coverage` (Go also keeps `test-cov`), `mutation`, `arch`, `arch-config-guard`,
@@ -177,8 +177,8 @@ tables. Use `python/` or `go/` as the reference implementation.
 - Quiet by default — one line per successful step; full output only on failure;
   `--verbose` is the escape hatch. Agent hooks print nothing at all on success.
 - Gate the change, not the codebase, at agent stop. `stop-hook` blocks only on what the
-  change introduced (lint on changed lines, complexity new or worse than the merge-base,
-  dead code on changed lines); pre-existing debt surfaces in `check`/`ci`. A tool that
+  change touched (lint on changed lines, over-limit functions the change touched,
+  dead code on changed lines); untouched debt surfaces in `check`/`ci`. A tool that
   cannot run exits 1 and never blocks the agent.
 - `check`/`pre-commit`/`post-edit` fix what they can; `pre-push`/`ci`/`audit` are
   strictly read-only.

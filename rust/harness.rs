@@ -4,12 +4,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
-use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -40,36 +39,11 @@ const PRE_PUSH_REFS_ENV: &str = "HARNESS_PRE_PUSH_REFS";
 const ARCH_BASE_ENV: &str = "HARNESS_ARCH_BASE";
 const LIZARD: &str = "lizard@1.22.2";
 const COMPLEXITY_TARGETS: [&str; 2] = ["src", "tests"];
-const COMPLEXITY_MAX_CCN: u32 = 15;
-const COMPLEXITY_MAX_ARGS: u32 = 8;
-const COMPLEXITY_MAX_LENGTH: u32 = 100;
-/// Where the stop hook's delta starts: env overrides first (`ARCH_BASE_ENV`, then
-/// `GITHUB_BASE_REF`), then these. Never fetched — a hook must not touch the network.
-const DELTA_BASE_CANDIDATES: [&str; 5] =
-    ["origin/HEAD", "origin/main", "origin/master", "main", "master"];
-const HOOK_STDIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// lizard's limits as (finding label, flag, max): CCN, parameters, function length.
+const COMPLEXITY_LIMITS: [(&str, &str, u32); 3] =
+    [("CCN", "-C", 15), ("args", "-a", 8), ("length", "-L", 100)];
 /// Finding lines a stop-hook payload carries; the rest are one command away.
 const HOOK_FINDING_LIMIT: usize = 20;
-
-// ── Hook wiring (verified by `setup-hooks` and `check`) ────────────
-// Claude reads .claude/settings.json and runs the harness directly; Codex reads
-// .codex/hooks.json and goes through the codex-stop-hook.sh wrapper. PostToolUse is
-// Claude-only: it formats the file an Edit/Write just touched. The runner is std-only
-// with no JSON writer, so it verifies these files rather than rewriting them (they
-// may carry other hooks); copy the template's `.claude` / `.codex` if it warns.
-
-/// One harness hook in an agent settings file; `marker` identifies its command.
-struct HookWiring {
-    path: &'static str,
-    event: &'static str,
-    marker: &'static str,
-}
-
-const HOOK_WIRINGS: [HookWiring; 3] = [
-    HookWiring { path: ".claude/settings.json", event: "Stop", marker: "stop-hook" },
-    HookWiring { path: ".claude/settings.json", event: "PostToolUse", marker: "post-edit --hook" },
-    HookWiring { path: ".codex/hooks.json", event: "Stop", marker: "stop-hook" },
-];
 
 // ── Runner ──────────────────────────────────────────────────────────
 
@@ -640,37 +614,9 @@ fn is_project_rs_file(path: &str) -> bool {
 }
 
 /// Project `.rs` files with uncommitted changes (untracked included), relative to this crate.
-///
-/// Porcelain paths are repository-relative, so a crate in a subdirectory strips its
-/// prefix; `--untracked-files=all` lists new files inside new directories.
 fn changed_rs_files() -> Vec<String> {
-    let Ok(status) =
-        git_output(&["status", "--porcelain", "-z", "--untracked-files=all", "--", "."])
-    else {
-        return Vec::new();
-    };
-    let prefix = git_prefix();
-    porcelain_paths(&status)
-        .iter()
-        .map(|path| normalize_changed_path(path, &prefix))
-        .filter(|path| is_project_rs_file(path))
-        .collect()
-}
-
-/// Current paths of a `git status --porcelain -z` listing; deleted files left out.
-fn porcelain_paths(status: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut entries = status.split('\0');
-    while let Some(entry) = entries.next() {
-        let (Some(code), Some(path)) = (entry.get(..2), entry.get(3..)) else { continue };
-        if code.contains(['R', 'C']) {
-            entries.next(); // the rename or copy source comes next
-        }
-        if !code.contains('D') && !path.is_empty() {
-            paths.push(path.to_string());
-        }
-    }
-    paths
+    let scope = changed_scope(head_commit().as_deref()).unwrap_or_default();
+    scope.into_keys().filter(|path| is_project_rs_file(path)).collect()
 }
 
 // ── Commands ────────────────────────────────────────────────────────
@@ -758,11 +704,11 @@ fn cmd_post_edit() {
     }
 }
 
-/// Post-edit, then changed-lines lint and complexity delta.
+/// Post-edit, then changed-lines lint and touched over-limit functions.
 ///
 /// Silent on success. Findings exit 2 with a capped stderr payload; a tool that could
-/// not run exits 1; the same findings on a stop the agent is already continuing from
-/// exit 1 (loop guard). `check` and `ci` keep the whole-tree gates.
+/// not run exits 1; findings on a stop the agent is already continuing from exit 1
+/// (loop guard). `check` and `ci` keep the whole-tree gates.
 fn cmd_stop_hook() {
     let event = hook_event(); // stdin belongs to the hook event; read it before anything else
     format_files(&changed_rs_files());
@@ -772,7 +718,7 @@ fn cmd_stop_hook() {
         eprintln!("stop-hook: changed lines could not run: {reason}");
         std::process::exit(1);
     });
-    let code = report_stop_hook(&run_delta_gates(&scope, base.as_deref()), &event);
+    let code = report_stop_hook(&run_delta_gates(&scope), &event);
     if is_verbose() && code == 0 {
         let against = base.as_deref().unwrap_or("no commits");
         println!("stop-hook: clean ({} changed path(s) vs {against})", scope.len());
@@ -1288,11 +1234,11 @@ fn cmd_branch_guard() {
 
 /// Run lizard as a cyclomatic-complexity gate. Mirrors bun/python invocation.
 fn complexity_gate() -> Gate {
-    let limits =
-        [COMPLEXITY_MAX_CCN, COMPLEXITY_MAX_ARGS, COMPLEXITY_MAX_LENGTH].map(|n| n.to_string());
+    let limits = COMPLEXITY_LIMITS.map(|(_, flag, max)| format!("{flag}{max}"));
     let mut cmd = vec!["uvx", LIZARD, "-l", "rust"];
     cmd.extend(COMPLEXITY_TARGETS);
-    cmd.extend(["-C", &limits[0], "-a", &limits[1], "-L", &limits[2], "-i", "0"]);
+    cmd.extend(limits.iter().map(String::as_str));
+    cmd.extend(["-i", "0"]);
     Gate::new("Complexity (lizard)", &cmd).with_hint(
         "extract helpers or flatten branches until CCN <= 15; do not raise the threshold",
     )
@@ -1394,7 +1340,7 @@ fn cmd_crap() {
     let mut offenders: Vec<CrapFn> = Vec::new();
     for row in lz_stdout.lines() {
         let Some(parsed) = parse_lizard_csv_row(row) else { continue };
-        let (ccn, name, start, end, path) = parsed;
+        let ([ccn, ..], name, start, end, path) = parsed;
         let normalized = path.trim_start_matches("./").to_string();
         let abs_key = format!("{abs_root}/{normalized}");
         let lines = cov_map
@@ -1524,19 +1470,19 @@ fn parse_lcov_str(text: &str) -> HashMap<String, HashMap<u32, u32>> {
     map
 }
 
-/// Parse one `lizard --csv` row into (ccn, name, start, end, path).
+/// Parse one `lizard --csv` row into ([ccn, params, length], name, start, end, path).
 ///
 /// Lizard columns: nloc,ccn,token,param,length,location,file,name,sig,start,end.
 /// The location column is the only one whose value is self-contained:
 /// `"name@start-end@path"`. Signatures can contain commas, so we extract
 /// the location field directly rather than splitting the whole row.
-fn parse_lizard_csv_row(row: &str) -> Option<(u32, String, u32, u32, String)> {
+fn parse_lizard_csv_row(row: &str) -> Option<([u32; 3], String, u32, u32, String)> {
     let mut iter = row.splitn(6, ',');
     let _nloc = iter.next()?;
     let ccn: u32 = iter.next()?.parse().ok()?;
     let _token = iter.next()?;
-    let _param = iter.next()?;
-    let _length = iter.next()?;
+    let args: u32 = iter.next()?.parse().ok()?;
+    let length: u32 = iter.next()?.parse().ok()?;
     let rest = iter.next()?;
     let after_q = rest.strip_prefix('"')?;
     let end_q = after_q.find('"')?;
@@ -1551,7 +1497,7 @@ fn parse_lizard_csv_row(row: &str) -> Option<(u32, String, u32, u32, String)> {
     let start: u32 = after_at1[..dash].parse().ok()?;
     let end: u32 = after_dash[..at2].parse().ok()?;
     let path = after_dash[at2 + 1..].to_string();
-    Some((ccn, name, start, end, path))
+    Some(([ccn, args, length], name, start, end, path))
 }
 
 /// True when `cargo <subcommand> --version` succeeds (the subcommand is installed).
@@ -1576,365 +1522,64 @@ fn arg_flag(name: &str) -> bool {
     env::args().skip(1).any(|a| a == name)
 }
 
-// ── JSON (read-only, std-only) ──────────────────────────────────────
-// Enough JSON to read clippy's diagnostics, an agent hook's stdin, and the agent
-// settings files. Numbers stay text; callers parse the ones they need.
-
-const JSON_MAX_DEPTH: usize = 64;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Json {
-    Null,
-    Bool(bool),
-    Number(String),
-    Str(String),
-    Array(Vec<Self>),
-    Object(Vec<(String, Self)>),
-}
-
-impl Json {
-    /// An object's member (the last one, for a repeated key); None otherwise.
-    fn get(&self, key: &str) -> Option<&Self> {
-        match self {
-            Self::Object(fields) => {
-                fields.iter().rev().find(|(name, _)| name == key).map(|(_, v)| v)
-            }
-            _ => None,
-        }
-    }
-
-    fn as_str(&self) -> Option<&str> {
-        match self {
-            Self::Str(text) => Some(text),
-            _ => None,
-        }
-    }
-
-    /// An array's items; empty for anything else.
-    fn items(&self) -> &[Self] {
-        match self {
-            Self::Array(items) => items,
-            _ => &[],
-        }
-    }
-
-    fn as_usize(&self) -> Option<usize> {
-        match self {
-            Self::Number(text) => digits(text),
-            _ => None,
-        }
-    }
-}
-
-/// `text` as a non-negative integer, digits only (no sign, no spaces).
-fn digits<T: std::str::FromStr>(text: &str) -> Option<T> {
-    if text.bytes().all(|b| b.is_ascii_digit()) { text.parse().ok() } else { None }
-}
-
-/// The JSON document `text` holds; None unless it is exactly one JSON value.
-fn parse_json(text: &str) -> Option<Json> {
-    let mut reader = JsonReader { text, pos: 0 };
-    let value = reader.value(0)?;
-    reader.skip_whitespace();
-    (reader.pos == text.len()).then_some(value)
-}
-
-struct JsonReader<'a> {
-    text: &'a str,
-    pos: usize,
-}
-
-impl JsonReader<'_> {
-    fn peek(&self) -> Option<u8> {
-        self.text.as_bytes().get(self.pos).copied()
-    }
-
-    fn skip_whitespace(&mut self) {
-        while self.peek().is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-    }
-
-    /// Consume `byte` (after whitespace) when it is next.
-    fn eat(&mut self, byte: u8) -> bool {
-        self.skip_whitespace();
-        let found = self.peek() == Some(byte);
-        if found {
-            self.pos += 1;
-        }
-        found
-    }
-
-    fn value(&mut self, depth: usize) -> Option<Json> {
-        self.skip_whitespace();
-        if depth > JSON_MAX_DEPTH {
-            return None;
-        }
-        match self.peek()? {
-            b'{' => self.object(depth),
-            b'[' => self.array(depth),
-            b'"' => self.string().map(Json::Str),
-            b't' => self.word("true", Json::Bool(true)),
-            b'f' => self.word("false", Json::Bool(false)),
-            b'n' => self.word("null", Json::Null),
-            _ => self.number(),
-        }
-    }
-
-    fn word(&mut self, word: &str, value: Json) -> Option<Json> {
-        if !self.text[self.pos..].starts_with(word) {
-            return None;
-        }
-        self.pos += word.len();
-        Some(value)
-    }
-
-    fn number(&mut self) -> Option<Json> {
-        let start = self.pos;
-        while self.peek().is_some_and(|b| b.is_ascii_digit() || b"+-.eE".contains(&b)) {
-            self.pos += 1;
-        }
-        let text = &self.text[start..self.pos];
-        text.parse::<f64>().ok()?;
-        Some(Json::Number(text.to_string()))
-    }
-
-    fn array(&mut self, depth: usize) -> Option<Json> {
-        self.pos += 1;
-        let mut items = Vec::new();
-        if self.eat(b']') {
-            return Some(Json::Array(items));
-        }
-        loop {
-            items.push(self.value(depth + 1)?);
-            if self.eat(b']') {
-                return Some(Json::Array(items));
-            }
-            if !self.eat(b',') {
-                return None;
-            }
-        }
-    }
-
-    fn object(&mut self, depth: usize) -> Option<Json> {
-        self.pos += 1;
-        let mut fields = Vec::new();
-        if self.eat(b'}') {
-            return Some(Json::Object(fields));
-        }
-        loop {
-            self.skip_whitespace();
-            if self.peek() != Some(b'"') {
-                return None;
-            }
-            let key = self.string()?;
-            if !self.eat(b':') {
-                return None;
-            }
-            fields.push((key, self.value(depth + 1)?));
-            if self.eat(b'}') {
-                return Some(Json::Object(fields));
-            }
-            if !self.eat(b',') {
-                return None;
-            }
-        }
-    }
-
-    /// The unescaped string whose opening quote is at the cursor.
-    fn string(&mut self) -> Option<String> {
-        self.pos += 1;
-        let mut out = String::new();
-        loop {
-            let rest = &self.text[self.pos..];
-            let stop = rest.find(['"', '\\'])?;
-            out.push_str(&rest[..stop]);
-            self.pos += stop + 1;
-            if rest.as_bytes()[stop] == b'"' {
-                return Some(out);
-            }
-            out.push(self.escape()?);
-        }
-    }
-
-    /// The character an escape stands for; the cursor sits just past its backslash.
-    fn escape(&mut self) -> Option<char> {
-        let code = self.peek()?;
-        self.pos += 1;
-        let ch = match code {
-            b'"' => '"',
-            b'\\' => '\\',
-            b'/' => '/',
-            b'b' => '\u{8}',
-            b'f' => '\u{c}',
-            b'n' => '\n',
-            b'r' => '\r',
-            b't' => '\t',
-            b'u' => return self.unicode_escape(),
-            _ => return None,
-        };
-        Some(ch)
-    }
-
-    /// A `\uXXXX` escape (the `\u` already read), joining a UTF-16 surrogate pair.
-    fn unicode_escape(&mut self) -> Option<char> {
-        let high = self.hex4()?;
-        if !(0xD800..0xDC00).contains(&high) {
-            return char::from_u32(high); // a lone low surrogate is not a char: None
-        }
-        if !self.text[self.pos..].starts_with("\\u") {
-            return None;
-        }
-        self.pos += 2;
-        let low = self.hex4()?;
-        if !(0xDC00..0xE000).contains(&low) {
-            return None;
-        }
-        char::from_u32(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00))
-    }
-
-    fn hex4(&mut self) -> Option<u32> {
-        let hex = self.text.get(self.pos..self.pos + 4)?;
-        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        self.pos += 4;
-        u32::from_str_radix(hex, 16).ok()
-    }
-}
-
-/// `text` as a JSON string literal.
-fn json_string(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if u32::from(ch) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", u32::from(ch));
-            }
-            ch => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
-}
-
 // ── Agent hooks ─────────────────────────────────────────────────────
 // The stop hook runs after every agent turn and judges the change, not the tree:
-// lint left on changed lines, and functions pushed over (or further over) a lizard
-// limit. There is no dead-code gate: rustc's `dead_code` reaches the agent through
-// the lint residue. Pre-existing debt never blocks a stop; the whole-tree gates stay
-// in check / ci / pre-push. Exit contract: silent 0 when clean, 2 with a stderr
-// payload the agent reads, 1 when a tool could not run.
+// lint left on changed lines, and over-limit functions the change touched. There is
+// no dead-code gate: rustc's `dead_code` reaches the agent through the lint. The
+// whole-tree gates stay in check / ci / pre-push. Exit contract: silent 0 when clean,
+// 2 with a stderr payload the agent reads, 1 when a tool could not run.
 
-/// Inclusive (start, end) line spans.
-type LineRanges = Vec<(usize, usize)>;
-/// Changed lines per path relative to this crate.
-type Scope = BTreeMap<String, LineRanges>;
-/// Functions per file as lizard measured them: (signature key, metrics) in file order.
-type Functions = BTreeMap<String, Vec<(String, FunctionMetrics)>>;
+/// Changed lines per path relative to this crate: inclusive (start, end) spans.
+type Scope = BTreeMap<String, Vec<(usize, usize)>>;
 
 const WHOLE_FILE: (usize, usize) = (1, usize::MAX);
-const STOP_HOOK_RERUN: &str = "cargo harness stop-hook --verbose";
-const LOOP_GUARD_NOTICE: &str = "harness: same findings as the previous stop; not blocking again";
-/// Every diagnostic clippy and rustc emit, as JSON lines on stdout. `-D warnings`
-/// is left out: it stops at the first target that fails, and every warning- and
-/// error-level diagnostic counts as a finding already.
-const CLIPPY_JSON: [&str; 3] = ["cargo", "clippy", "--message-format=json"];
 
-/// One delta gate: findings block the stop; a problem means its tool failed.
+/// One delta gate: findings block the stop; an error means its tool failed.
 struct DeltaResult {
     gate: &'static str,
-    findings: Vec<String>,
-    problem: String,
-}
-
-/// One function as `lizard --csv` measured it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FunctionMetrics {
-    name: String,
-    line: u32,
-    ccn: u32,
-    args: u32,
-    length: u32,
-}
-
-impl FunctionMetrics {
-    /// (label, value, limit) for each lizard limit the complexity gate enforces.
-    const fn measured(&self) -> [(&'static str, u32, u32); 3] {
-        [
-            ("CCN", self.ccn, COMPLEXITY_MAX_CCN),
-            ("args", self.args, COMPLEXITY_MAX_ARGS),
-            ("length", self.length, COMPLEXITY_MAX_LENGTH),
-        ]
-    }
-}
-
-/// A fresh directory under the system temp dir, removed on drop.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(prefix: &str) -> io::Result<Self> {
-        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let dir = env::temp_dir().join(format!("{prefix}-{}-{nanos}-{count}", std::process::id()));
-        fs::create_dir(&dir)?;
-        Ok(Self(dir))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
+    outcome: Result<Vec<String>, String>,
 }
 
 /// A tool's captured output; Err only when it cannot start.
-fn tool_output(tool: &str, cmd: &[&str], cwd: &Path) -> Result<Output, String> {
+fn tool_output(tool: &str, cmd: &[&str]) -> Result<Output, String> {
     Command::new(cmd[0])
         .args(&cmd[1..])
-        .current_dir(cwd)
+        .current_dir(root())
         .output()
         .map_err(|e| format!("{tool} not runnable: {e}"))
 }
 
-/// The tool's stdout when its exit code is in `ok`; otherwise why not, from its last line.
-fn expect_exit(tool: &str, output: &Output, ok: &[i32]) -> Result<String, String> {
-    let code = output.status.code().unwrap_or(-1);
-    if ok.contains(&code) {
+/// The tool's stdout when it succeeded; otherwise why not, from its first `error`
+/// line or else its last line.
+fn expect_success(tool: &str, output: &Output) -> Result<String, String> {
+    if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let detail =
         if stderr.trim().is_empty() { String::from_utf8_lossy(&output.stdout) } else { stderr };
-    let reason = format!("{tool} exited {code}");
-    Err(match detail.lines().map(str::trim).rfind(|line| !line.is_empty()) {
-        Some(last) => format!("{reason}: {last}"),
+    let lines: Vec<&str> = detail.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    let reason = format!("{tool} exited {}", output.status.code().unwrap_or(-1));
+    Err(match lines.iter().find(|line| line.starts_with("error")).or_else(|| lines.last()) {
+        Some(line) => format!("{reason}: {line}"),
         None => reason,
     })
 }
 
-fn run_tool(tool: &str, cmd: &[&str], ok: &[i32], cwd: &Path) -> Result<String, String> {
-    expect_exit(tool, &tool_output(tool, cmd, cwd)?, ok)
+fn run_tool(tool: &str, cmd: &[&str]) -> Result<String, String> {
+    expect_success(tool, &tool_output(tool, cmd)?)
 }
 
 fn git_output(args: &[&str]) -> Result<String, String> {
     let mut cmd = vec!["git", "-c", "core.quotePath=false"];
     cmd.extend(args);
-    run_tool("git", &cmd, &[0], root())
+    run_tool("git", &cmd)
 }
 
 // ── Changed lines ──
 
-/// The first base ref that resolves: env overrides, then `DELTA_BASE_CANDIDATES`.
+/// The first base ref that resolves: env overrides, then the usual default branches.
+/// Never fetched — a hook must not touch the network.
 fn base_ref() -> Option<String> {
     let mut candidates = vec![env::var(ARCH_BASE_ENV).unwrap_or_default()];
     if let Ok(github_base) = env::var("GITHUB_BASE_REF")
@@ -1942,7 +1587,9 @@ fn base_ref() -> Option<String> {
     {
         candidates.push(format!("origin/{github_base}"));
     }
-    candidates.extend(DELTA_BASE_CANDIDATES.map(String::from));
+    candidates.extend(
+        ["origin/HEAD", "origin/main", "origin/master", "main", "master"].map(String::from),
+    );
     candidates.into_iter().find(|candidate| {
         !candidate.is_empty()
             && !git_lines(&["rev-parse", "--verify", "--quiet", &format!("{candidate}^{{commit}}")])
@@ -1950,14 +1597,16 @@ fn base_ref() -> Option<String> {
     })
 }
 
+fn head_commit() -> Option<String> {
+    git_lines(&["rev-parse", "--verify", "--quiet", "HEAD"]).into_iter().next()
+}
+
 /// merge-base(base ref, HEAD); HEAD without a base ref; None before the first commit.
 fn delta_base() -> Option<String> {
-    if git_lines(&["rev-parse", "--verify", "--quiet", "HEAD"]).is_empty() {
-        return None;
-    }
+    let head = head_commit()?;
     let merge_base =
         base_ref().and_then(|base| git_lines(&["merge-base", &base, "HEAD"]).into_iter().next());
-    Some(merge_base.unwrap_or_else(|| "HEAD".to_string()))
+    Some(merge_base.unwrap_or(head))
 }
 
 /// The new-side path of a `+++ b/<path>` header; None for a deleted file.
@@ -1976,13 +1625,10 @@ fn diff_path(header: &str) -> Option<String> {
 
 /// (start, count) of a `@@ -a[,b] +c[,d] @@` hunk header's new side; count defaults to 1.
 fn parse_hunk(line: &str) -> Option<(usize, usize)> {
-    let (old, rest) = line.strip_prefix("@@ -")?.split_once(" +")?;
+    let (_, rest) = line.strip_prefix("@@ -")?.split_once(" +")?;
     let (new, _) = rest.split_once(" @@")?;
-    let (old_start, old_count) = old.split_once(',').unwrap_or((old, "0"));
-    digits::<usize>(old_start)?;
-    digits::<usize>(old_count)?;
     let (start, count) = new.split_once(',').unwrap_or((new, "1"));
-    Some((digits(start)?, digits(count)?))
+    Some((start.parse().ok()?, count.parse().ok()?))
 }
 
 /// `{path: [(start, end)]}` of the new-side lines in a `git diff -U0` (a/ b/ prefixes).
@@ -2045,8 +1691,9 @@ fn changed_scope(base: Option<&str>) -> Result<Scope, String> {
     Ok(scope)
 }
 
-fn in_ranges(line: usize, ranges: &[(usize, usize)]) -> bool {
-    ranges.iter().any(|&(start, end)| start <= line && line <= end)
+/// True when lines `start..=end` share a line with any of `ranges`.
+fn overlaps(start: usize, end: usize, ranges: &[(usize, usize)]) -> bool {
+    ranges.iter().any(|&(from, to)| from <= end && start <= to)
 }
 
 /// Changed `.rs` files under `targets` (directories) that still exist.
@@ -2065,364 +1712,202 @@ fn scoped_files(scope: &Scope, targets: &[&str]) -> Vec<String> {
 
 // ── Lint residue ──
 
-/// `path` relative to this crate when cargo reports it absolute.
-fn crate_relative(path: &str) -> String {
-    Path::new(path)
-        .strip_prefix(root())
-        .map_or_else(|_| path.to_string(), |relative| relative.to_string_lossy().into_owned())
+fn is_diagnostic(text: &str) -> bool {
+    ["warning:", "warning[", "error:", "error["].iter().any(|level| text.starts_with(level))
 }
 
-/// (crate-relative path, line) where a diagnostic's primary span starts.
-fn primary_location(message: &Json) -> Option<(String, usize)> {
-    let primary = Json::Bool(true);
-    let spans = message.get("spans")?.items();
-    let span = spans.iter().find(|span| span.get("is_primary") == Some(&primary))?;
-    Some((crate_relative(span.get("file_name")?.as_str()?), span.get("line_start")?.as_usize()?))
-}
-
-/// `path:line: code message` for a warning or error whose primary span is on a changed line.
-fn diagnostic_finding(message: &Json, scope: &Scope) -> Option<String> {
-    let level = message.get("level")?.as_str()?;
-    if level != "warning" && level != "error" {
-        return None;
-    }
-    let (path, line) = primary_location(message)?;
-    if !in_ranges(line, scope.get(&path)?) {
-        return None;
-    }
-    let text = message.get("message")?.as_str()?;
-    let code = message.get("code").and_then(|code| code.get("code")).and_then(Json::as_str);
-    Some(code.map_or_else(
-        || format!("{path}:{line}: {text}"),
-        |code| format!("{path}:{line}: {code} {text}"),
-    ))
-}
-
-/// Findings from `cargo clippy --message-format=json` output, changed lines only.
-fn clippy_findings(report: &str, scope: &Scope) -> Result<Vec<String>, String> {
+/// `path:line: level: message` for each clippy warning or error on a changed line.
+///
+/// cargo replays a cached diagnostic in the format that first rendered it, so both
+/// forms are read: long (`warning: m`, then ` --> path:line:col`) and short
+/// (`path:line:col: warning: m`).
+fn clippy_findings(report: &str, scope: &Scope) -> Vec<String> {
     let mut findings = Vec::new();
-    for line in report.lines().filter(|line| line.starts_with('{')) {
-        let event = parse_json(line).ok_or("unreadable clippy output: invalid JSON line")?;
-        if event.get("reason").and_then(Json::as_str) != Some("compiler-message") {
-            continue;
-        }
-        let message = event.get("message").ok_or("unreadable clippy output: no message")?;
-        findings.extend(diagnostic_finding(message, scope));
-    }
-    Ok(findings)
-}
-
-/// Lint the fix pass left, on changed lines. clippy checks the whole crate either way.
-fn lint_residue(scope: &Scope) -> Result<Vec<String>, String> {
-    if !scope.keys().any(|path| is_project_rs_file(path)) {
-        return Ok(Vec::new());
-    }
-    let output = tool_output("clippy", &CLIPPY_JSON, root())?;
-    let findings = clippy_findings(&String::from_utf8_lossy(&output.stdout), scope)?;
-    if findings.is_empty() {
-        // A build that failed away from the changed lines is a tool failure, not a pass.
-        expect_exit("clippy", &output, &[0])?;
-    }
-    Ok(findings)
-}
-
-// ── Complexity delta ──
-
-/// The fields of one CSV row; a quoted field may hold commas and doubled quotes.
-fn csv_fields(row: &str) -> Vec<String> {
-    let (mut fields, mut field, mut quoted) = (Vec::new(), String::new(), false);
-    let mut chars = row.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if quoted && chars.next_if_eq(&'"').is_some() => field.push('"'),
-            '"' => quoted = !quoted,
-            ',' if !quoted => fields.push(std::mem::take(&mut field)),
-            _ => field.push(ch),
-        }
-    }
-    fields.push(field);
-    fields
-}
-
-/// (file, `long_name`, metrics) from one `lizard --csv` row; None for anything else.
-///
-/// Columns: nloc, ccn, tokens, params, length, location, file, name, `long_name`, start, end.
-fn lizard_row(row: &str) -> Option<(String, String, FunctionMetrics)> {
-    let fields = csv_fields(row);
-    if fields.len() < 11 {
-        return None;
-    }
-    let metrics = FunctionMetrics {
-        name: fields[7].clone(),
-        line: digits(&fields[9])?,
-        ccn: digits(&fields[1])?,
-        args: digits(&fields[3])?,
-        length: digits(&fields[4])?,
-    };
-    Some((fields[6].clone(), fields[8].clone(), metrics))
-}
-
-/// `{file: [(key, metrics)]}` from `lizard --csv`, keyed by `long_name` (the signature).
-///
-/// A signature survives a function moving within its file; a start line does not. A
-/// repeated signature (two impls' `new`) is keyed `#2`, `#3` in file order.
-fn parse_lizard_csv(text: &str) -> Functions {
-    let mut functions = Functions::new();
-    for (path, long_name, metrics) in text.lines().filter_map(lizard_row) {
-        let in_file = functions.entry(path).or_default();
-        let (mut key, mut copy) = (long_name.clone(), 1);
-        while in_file.iter().any(|(existing, _)| *existing == key) {
-            copy += 1;
-            key = format!("{long_name}#{copy}");
-        }
-        in_file.push((key, metrics));
-    }
-    functions
-}
-
-/// The base version of a current function: same signature, else the same unique name.
-///
-/// The name fallback keeps a signature-only edit on a legacy function from reading as a
-/// brand-new function.
-fn base_twin<'a>(
-    key: &str,
-    now: &FunctionMetrics,
-    current: &[(String, FunctionMetrics)],
-    base: &'a [(String, FunctionMetrics)],
-) -> Option<&'a FunctionMetrics> {
-    if let Some((_, was)) = base.iter().find(|(base_key, _)| base_key == key) {
-        return Some(was);
-    }
-    let unique_now = current.iter().filter(|(_, f)| f.name == now.name).count() == 1;
-    let mut twins = base.iter().filter(|(_, f)| f.name == now.name);
-    match (twins.next(), twins.next()) {
-        (Some((_, twin)), None) if unique_now => Some(twin),
-        _ => None,
-    }
-}
-
-/// One line per limit `now` exceeds where `was` is absent or measured lower.
-fn function_regressions(
-    path: &str,
-    now: &FunctionMetrics,
-    was: Option<&FunctionMetrics>,
-) -> Vec<String> {
-    let before = was.map(FunctionMetrics::measured);
-    let mut lines = Vec::new();
-    for (index, (label, value, limit)) in now.measured().into_iter().enumerate() {
-        let previous = before.map(|metrics| metrics[index].1);
-        if value > limit && previous.is_none_or(|previous| value > previous) {
-            let shown = previous.map_or_else(|| "new".to_string(), |previous| previous.to_string());
-            lines.push(format!(
-                "{path}:{}: {} {label} {shown}→{value} (limit {limit})",
-                now.line, now.name
-            ));
-        }
-    }
-    lines
-}
-
-/// Functions over a limit now that are new, or worse than their base version.
-fn complexity_delta(current: &Functions, base: &Functions) -> Vec<String> {
-    let mut findings = Vec::new();
-    for (path, functions) in current {
-        let base_functions = base.get(path).map_or(&[][..], Vec::as_slice);
-        for (key, now) in functions {
-            let was = base_twin(key, now, functions, base_functions);
-            findings.extend(function_regressions(path, now, was));
+    let mut header = None; // a long-form diagnostic waiting for its ` --> ` line
+    for line in report.lines() {
+        let located = if let Some(location) = line.trim_start().strip_prefix("--> ") {
+            header.take().map(|message| (location, message))
+        } else if line.starts_with(char::is_whitespace) {
+            None
+        } else {
+            header = is_diagnostic(line).then_some(line);
+            line.split_once(": ").filter(|(_, message)| is_diagnostic(message))
+        };
+        let Some((location, message)) = located else { continue };
+        let mut parts = location.rsplitn(3, ':').skip(1);
+        let (Some(line_no), Some(path)) = (parts.next(), parts.next()) else { continue };
+        // Only `.rs` lines: a broken Cargo.toml means clippy could not run.
+        if let (Ok(line_no), Some(ranges)) = (line_no.parse(), scope.get(path))
+            && is_rs_path(path)
+            && overlaps(line_no, line_no, ranges)
+        {
+            findings.push(format!("{path}:{line_no}: {message}"));
         }
     }
     findings
 }
 
-fn lizard_functions(files: &[String], cwd: &Path) -> Result<Functions, String> {
+/// Lint on changed lines. clippy checks the whole crate either way.
+fn lint_residue(scope: &Scope) -> Result<Vec<String>, String> {
+    if !scope.keys().any(|path| is_project_rs_file(path)) {
+        return Ok(Vec::new());
+    }
+    let output = tool_output("clippy", &["cargo", "clippy"])?;
+    let findings = clippy_findings(&String::from_utf8_lossy(&output.stderr), scope);
+    if findings.is_empty() {
+        // A build that failed away from the changed lines is a tool failure, not a pass.
+        expect_success("clippy", &output)?;
+    }
+    Ok(findings)
+}
+
+// ── Complexity ──
+
+/// `path:start: name CCN 19 (limit 15)` for each limit a function in `lizard --csv`
+/// output exceeds, when the function overlaps a changed line.
+///
+/// Touching an over-limit function blocks until it is back under; an untouched one
+/// never does.
+fn touched_over_limit(csv: &str, scope: &Scope) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (measured, name, start, end, path) in csv.lines().filter_map(parse_lizard_csv_row) {
+        let span = (start as usize, end as usize);
+        if !scope.get(&path).is_some_and(|ranges| overlaps(span.0, span.1, ranges)) {
+            continue;
+        }
+        for ((label, _, limit), value) in COMPLEXITY_LIMITS.into_iter().zip(measured) {
+            if value > limit {
+                findings.push(format!("{path}:{start}: {name} {label} {value} (limit {limit})"));
+            }
+        }
+    }
+    findings
+}
+
+/// Over-limit functions this change touched, over the complexity gate's targets.
+fn complexity_residue(scope: &Scope) -> Result<Vec<String>, String> {
+    let files = scoped_files(scope, &COMPLEXITY_TARGETS);
     // lizard with no file arguments walks the working directory; never let it.
     if files.is_empty() {
-        return Ok(Functions::new());
+        return Ok(Vec::new());
     }
     let mut cmd = vec!["uvx", LIZARD, "-l", "rust", "--csv"];
     cmd.extend(files.iter().map(String::as_str));
-    Ok(parse_lizard_csv(&run_tool("lizard", &cmd, &[0], cwd)?))
-}
-
-/// Write each file's `base` version under `dir`; returns those that existed at base.
-fn write_base_sources(files: &[String], base: &str, dir: &Path) -> Result<Vec<String>, String> {
-    let mut written = Vec::new();
-    for path in files {
-        let shown = tool_output("git", &["git", "show", &format!("{base}:./{path}")], root())?;
-        if !shown.status.success() {
-            continue; // absent at base: every function in it is new
-        }
-        let target = dir.join(path);
-        target
-            .parent()
-            .map_or(Ok(()), fs::create_dir_all)
-            .and_then(|()| fs::write(&target, &shown.stdout))
-            .map_err(|e| format!("cannot write the base of {path}: {e}"))?;
-        written.push(path.clone());
-    }
-    Ok(written)
-}
-
-/// Complexity this change introduced or worsened, over the complexity gate's targets.
-fn complexity_regressions(scope: &Scope, base: Option<&str>) -> Result<Vec<String>, String> {
-    let files = scoped_files(scope, &COMPLEXITY_TARGETS);
-    let current = lizard_functions(&files, root())?;
-    let (false, Some(base)) = (current.is_empty(), base) else {
-        return Ok(complexity_delta(&current, &Functions::new()));
-    };
-    let dir = TempDir::new("harness-base").map_err(|e| format!("no temp dir: {e}"))?;
-    let written = write_base_sources(&files, base, &dir.0)?;
-    Ok(complexity_delta(&current, &lizard_functions(&written, &dir.0)?))
+    Ok(touched_over_limit(&run_tool("lizard", &cmd)?, scope))
 }
 
 // ── Stop-hook verdict ──
 
-fn delta_result(gate: &'static str, measured: Result<Vec<String>, String>) -> DeltaResult {
-    match measured {
-        Ok(findings) => DeltaResult { gate, findings, problem: String::new() },
-        Err(problem) => DeltaResult { gate, findings: Vec::new(), problem },
-    }
-}
-
-/// Lint residue and complexity delta; read-only, in parallel.
-fn run_delta_gates(scope: &Scope, base: Option<&str>) -> Vec<DeltaResult> {
+/// Lint residue and complexity; read-only, in parallel.
+fn run_delta_gates(scope: &Scope) -> Vec<DeltaResult> {
     let panicked = |_| Err("the gate panicked".to_string());
     std::thread::scope(|threads| {
         let lint = threads.spawn(|| lint_residue(scope));
-        let complexity = threads.spawn(|| complexity_regressions(scope, base));
+        let complexity = threads.spawn(|| complexity_residue(scope));
         vec![
-            delta_result("Lint", lint.join().unwrap_or_else(panicked)),
-            delta_result("Complexity", complexity.join().unwrap_or_else(panicked)),
+            DeltaResult { gate: "Lint", outcome: lint.join().unwrap_or_else(panicked) },
+            DeltaResult { gate: "Complexity", outcome: complexity.join().unwrap_or_else(panicked) },
         ]
     })
 }
 
-/// At most `HOOK_FINDING_LIMIT` findings, then one line counting the rest.
-///
-/// `verbose` lifts the cap, which is what the counting line tells the reader to run.
-fn cap_findings(findings: &[String], verbose: bool) -> Vec<String> {
-    if verbose || findings.len() <= HOOK_FINDING_LIMIT {
-        return findings.to_vec();
-    }
-    let rest = findings.len() - HOOK_FINDING_LIMIT;
-    let mut capped = findings[..HOOK_FINDING_LIMIT].to_vec();
-    capped.push(format!("\u{2026} +{rest} more \u{2014} run `{STOP_HOOK_RERUN}`"));
-    capped
-}
-
 /// The stderr block an agent reads: failed gates, then their findings; "" when clean.
+///
+/// At most `HOOK_FINDING_LIMIT` findings, then one line counting the rest; `verbose`
+/// lifts the cap, which is what that line tells the reader to run.
 fn stop_hook_payload(results: &[DeltaResult], verbose: bool) -> String {
-    let failed: Vec<&DeltaResult> = results.iter().filter(|r| !r.findings.is_empty()).collect();
+    let failed: Vec<(&str, &Vec<String>)> = results
+        .iter()
+        .filter_map(|r| r.outcome.as_ref().ok().filter(|f| !f.is_empty()).map(|f| (r.gate, f)))
+        .collect();
     if failed.is_empty() {
         return String::new();
     }
-    let gates: Vec<&str> = failed.iter().map(|result| result.gate).collect();
-    let findings: Vec<String> = failed.iter().flat_map(|result| result.findings.clone()).collect();
+    let gates: Vec<&str> = failed.iter().map(|(gate, _)| *gate).collect();
+    let findings: Vec<&String> = failed.iter().flat_map(|(_, findings)| *findings).collect();
+    let shown = if verbose { findings.len() } else { findings.len().min(HOOK_FINDING_LIMIT) };
     let mut lines = vec![format!("stop-hook failed: {}", gates.join(", "))];
-    lines.extend(cap_findings(&findings, verbose));
+    lines.extend(findings[..shown].iter().map(ToString::to_string));
+    if shown < findings.len() {
+        let rest = findings.len() - shown;
+        lines.push(format!(
+            "\u{2026} +{rest} more \u{2014} run `cargo harness stop-hook --verbose`"
+        ));
+    }
     lines.join("\n")
 }
 
-/// A stable digest of a payload (64-bit FNV-1a). std has no SHA-256, and the loop
-/// guard only compares two runs of this harness for equality.
-fn payload_digest(payload: &str) -> String {
-    let hash = payload.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-    });
-    format!("{hash:016x}")
-}
-
-/// 2 blocks on findings; 1 for a tool failure or a repeated block; 0 when clean.
+/// 2 blocks on findings; 1 for a tool failure; 0 when clean.
 ///
-/// A repeat is the stored digest of the same payload while the agent is already
-/// continuing because of a stop hook (`stop_hook_active`): blocking again would loop.
-/// A payload that changed blocks again.
-fn stop_hook_exit(payload: &str, failed_tools: usize, event: &Json, stored: &str) -> i32 {
+/// Findings on a stop the agent is already continuing from (`"stop_hook_active": true`
+/// in the hook `event`) exit 1: the hook blocks once per stop, never in a loop.
+fn stop_hook_exit(payload: &str, failed_tools: usize, event: &str) -> i32 {
     if payload.is_empty() {
-        return i32::from(failed_tools > 0);
-    }
-    let active = event.get("stop_hook_active") == Some(&Json::Bool(true));
-    if active && stored == payload_digest(payload) { 1 } else { 2 }
-}
-
-/// A file-name-safe key for this crate within its repository.
-fn loop_guard_key(prefix: &str) -> String {
-    let (mut key, mut in_run) = (String::new(), false);
-    for ch in prefix.chars() {
-        let allowed = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-');
-        if allowed {
-            key.push(ch);
-        } else if !in_run {
-            key.push('-');
-        }
-        in_run = !allowed;
-    }
-    let key = key.trim_matches('-');
-    if key.is_empty() { "root".to_string() } else { key.to_string() }
-}
-
-/// `$(git rev-parse --git-path harness)/stop-hook-<key>`. git prints that path relative
-/// to the cwd in a plain checkout and absolute in a worktree; `join` keeps an absolute
-/// path as is, so both land in the right git dir.
-fn loop_guard_path() -> Option<PathBuf> {
-    let git_path = git_lines(&["rev-parse", "--git-path", "harness"]).into_iter().next()?;
-    Some(root().join(git_path).join(format!("stop-hook-{}", loop_guard_key(&git_prefix()))))
-}
-
-/// Remember a block's digest; forget it once the stop is clean.
-fn update_loop_guard(path: Option<&Path>, code: i32, payload: &str) {
-    let Some(path) = path else { return };
-    if code == 2 {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(path, payload_digest(payload));
-    } else if code == 0 {
-        let _ = fs::remove_file(path);
+        i32::from(failed_tools > 0)
+    } else if json_value(event, "stop_hook_active").is_some_and(|v| v.starts_with("true")) {
+        1
+    } else {
+        2
     }
 }
 
 /// Print the verdict to stderr (nothing when clean) and return the exit code.
-fn report_stop_hook(results: &[DeltaResult], event: &Json) -> i32 {
-    let payload = stop_hook_payload(results, is_verbose());
-    let problems: Vec<String> = results
-        .iter()
-        .filter(|result| !result.problem.is_empty())
-        .map(|result| format!("stop-hook: {} could not run: {}", result.gate, result.problem))
-        .collect();
-    let guard = loop_guard_path();
-    let stored =
-        guard.as_deref().and_then(|path| fs::read_to_string(path).ok()).unwrap_or_default();
-    let code = stop_hook_exit(&payload, problems.len(), event, stored.trim());
-    for line in &problems {
-        eprintln!("{line}");
+fn report_stop_hook(results: &[DeltaResult], event: &str) -> i32 {
+    let mut failed_tools = 0;
+    for result in results {
+        if let Err(problem) = &result.outcome {
+            eprintln!("stop-hook: {} could not run: {problem}", result.gate);
+            failed_tools += 1;
+        }
     }
+    let payload = stop_hook_payload(results, is_verbose());
+    let code = stop_hook_exit(&payload, failed_tools, event);
     if !payload.is_empty() {
         eprintln!("{payload}");
         if code == 1 {
-            eprintln!("{LOOP_GUARD_NOTICE}");
+            eprintln!("harness: already blocked once on this stop; not blocking again");
         }
     }
-    update_loop_guard(guard.as_deref(), code, &payload);
     code
 }
 
-/// A hook's stdin as a JSON object; `{}` for a terminal or empty/invalid input.
-fn parse_hook_event(input: &[u8]) -> Json {
-    std::str::from_utf8(input)
-        .ok()
-        .and_then(parse_json)
-        .filter(|event| matches!(event, Json::Object(_)))
-        .unwrap_or(Json::Object(Vec::new()))
+// ── Hook input ──
+
+/// The agent's hook JSON from stdin, read under a deadline; empty for a terminal.
+fn hook_event() -> String {
+    if io::stdin().is_terminal() {
+        return String::new();
+    }
+    let (input, _) = read_with_deadline(io::stdin(), Duration::from_secs(1));
+    String::from_utf8_lossy(&input).into_owned()
 }
 
-/// The agent's hook JSON from stdin, read under a deadline; `{}` for a terminal.
-fn hook_event() -> Json {
-    if io::stdin().is_terminal() {
-        return Json::Object(Vec::new());
+/// What follows `"key":` in a hook's JSON (first occurrence); None without the key.
+fn json_value<'a>(event: &'a str, key: &str) -> Option<&'a str> {
+    let (_, rest) = event.split_once(&format!("\"{key}\""))?;
+    rest.trim_start().strip_prefix(':').map(str::trim_start)
+}
+
+/// The first `"file_path"` string of a hook event; None for any escape but `\\ \" \/`.
+fn hook_file_path(event: &str) -> Option<String> {
+    let mut chars = json_value(event, "file_path")?.strip_prefix('"')?.chars();
+    let mut path = String::new();
+    loop {
+        match chars.next()? {
+            '"' => return Some(path),
+            '\\' => path.push(chars.next().filter(|c| matches!(c, '\\' | '"' | '/'))?),
+            c => path.push(c),
+        }
     }
-    parse_hook_event(&read_with_deadline(io::stdin(), HOOK_STDIN_TIMEOUT).0)
+}
+
+/// The project `.rs` file a `PostToolUse` event names, relative to `dir`; else None.
+fn hook_target(event: &str, dir: &Path) -> Option<String> {
+    let resolved = dir.join(hook_file_path(event)?).canonicalize().ok()?;
+    // Outside this crate: another harness owns it.
+    let relative =
+        resolved.strip_prefix(dir.canonicalize().ok()?).ok()?.to_str()?.replace('\\', "/");
+    (is_project_rs_file(&relative) && resolved.is_file()).then_some(relative)
 }
 
 // ── Formatting ──
@@ -2479,16 +1964,6 @@ fn format_files(files: &[String]) -> Vec<String> {
     files.iter().filter(|path| format_file(path).is_none()).cloned().collect()
 }
 
-/// The project `.rs` file a `PostToolUse` event names, relative to `dir`; else None.
-fn hook_target(event: &Json, dir: &Path) -> Option<String> {
-    let file_path = event.get("tool_input")?.get("file_path")?.as_str()?;
-    let resolved = dir.join(file_path).canonicalize().ok()?;
-    // Outside this crate: another harness owns it.
-    let relative =
-        resolved.strip_prefix(dir.canonicalize().ok()?).ok()?.to_str()?.replace('\\', "/");
-    (is_project_rs_file(&relative) && resolved.is_file()).then_some(relative)
-}
-
 /// Format the one file a `PostToolUse` event names. Never blocks.
 ///
 /// Prints one additionalContext line when the file changed, so the agent re-reads it
@@ -2496,10 +1971,9 @@ fn hook_target(event: &Json, dir: &Path) -> Option<String> {
 fn post_edit_hook() {
     let Some(target) = hook_target(&hook_event(), root()) else { return };
     if format_file(&target) == Some(true) {
-        let notice = format!("harness: reformatted {target}; re-read it before editing it again");
+        let path = target.replace('\\', "\\\\").replace('"', "\\\"");
         println!(
-            "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PostToolUse\",\"additionalContext\":{}}}}}",
-            json_string(&notice)
+            "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"harness: reformatted {path}; re-read it before editing it again\"}}}}"
         );
     }
 }
@@ -2537,7 +2011,7 @@ fn sync_agents_md_staged() {
     }
     let staged = mirror_claude_md()
         .map_err(|e| e.to_string())
-        .and_then(|()| run_tool("git", &["git", "add", "--", "AGENTS.md"], &[0], root()));
+        .and_then(|()| run_tool("git", &["git", "add", "--", "AGENTS.md"]));
     if let Err(reason) = staged {
         println!("  {RED}\u{2717}{RESET} sync-agents-md: {reason}");
         std::process::exit(1);
@@ -2547,32 +2021,19 @@ fn sync_agents_md_staged() {
 
 // ── Stages ──────────────────────────────────────────────────────────
 
-/// True when the settings file under `dir` has a handler for this hook under its event.
-fn hook_wired(dir: &Path, wiring: &HookWiring) -> bool {
-    let text = fs::read_to_string(dir.join(wiring.path)).unwrap_or_default();
-    let Some(settings) = parse_json(&text) else { return false };
-    let groups = settings.get("hooks").and_then(|hooks| hooks.get(wiring.event));
-    groups
-        .map_or(&[][..], Json::items)
-        .iter()
-        .flat_map(|group| group.get("hooks").map_or(&[][..], Json::items))
-        .any(|handler| {
-            handler.get("type").and_then(Json::as_str) == Some("command")
-                && handler
-                    .get("command")
-                    .and_then(Json::as_str)
-                    .is_some_and(|command| command.contains(wiring.marker))
-        })
-}
-
 /// Warn when the Claude/Codex Stop or Claude `PostToolUse` wiring is missing.
 fn check_hooks_present() {
-    for wiring in &HOOK_WIRINGS {
-        let label = format!("{} hook wiring", wiring.event);
-        if hook_wired(root(), wiring) {
-            println!("  {GREEN}\u{2713}{RESET} {label} ({})", wiring.path);
+    let wirings = [
+        (".claude/settings.json", "Stop", "stop-hook"),
+        (".claude/settings.json", "PostToolUse", "post-edit --hook"),
+        (".codex/hooks.json", "Stop", "stop-hook"),
+    ];
+    for (rel, event, marker) in wirings {
+        let text = fs::read_to_string(root().join(rel)).unwrap_or_default();
+        if text.contains(event) && text.contains(marker) {
+            println!("  {GREEN}\u{2713}{RESET} {event} hook wiring ({rel})");
         } else {
-            println!("  {RED}\u{26a0}{RESET} Missing {label}: {}", wiring.path);
+            println!("  {RED}\u{26a0}{RESET} Missing {event} hook wiring: {rel}");
         }
     }
 }
@@ -2809,7 +2270,10 @@ fn cmd_hooks() {
     install_git_hook("pre-commit");
     install_git_hook("pre-push");
     println!("Installed pre-commit and pre-push git hooks");
-    // Verified, not injected: see the hook wiring note at the top of this file.
+    // The runner is std-only (no JSON parser), so it verifies the hook wiring
+    // rather than injecting into settings that may carry other hooks. The template
+    // ships .claude/settings.json and .codex/hooks.json already wired; copy them in
+    // (cp -r the template's .claude / .codex) if this warns.
     check_hooks_present();
 }
 
@@ -2995,7 +2459,7 @@ mod tests {
             r#"7,16,45,2,20,"risky@12-31@src/lib.rs",src/lib.rs,risky,"fn risky(a, b)",12,31"#;
         assert_eq!(
             parse_lizard_csv_row(row),
-            Some((16, "risky".to_string(), 12, 31, "src/lib.rs".to_string())),
+            Some(([16, 2, 20], "risky".to_string(), 12, 31, "src/lib.rs".to_string())),
         );
     }
 
@@ -3198,11 +2662,7 @@ mod tests {
         assert!(run_gates_parallel(&[]));
     }
 
-    // ── Stop hook: pure helpers ──
-
-    fn owned(items: &[&str]) -> Vec<String> {
-        items.iter().map(ToString::to_string).collect()
-    }
+    // ── Stop hook ──
 
     const DIFF: &str = "diff --git a/src/app.py b/src/app.py\n\
         index 1..2 100644\n\
@@ -3245,377 +2705,122 @@ mod tests {
     }
 
     #[test]
-    fn porcelain_paths_skip_deletions_and_rename_sources() {
-        let status = " M src/a.rs\0?? new dir/b.rs\0 D gone.rs\0R  new.rs\0old.rs\0D  staged.rs\0";
-        assert_eq!(porcelain_paths(status), owned(&["src/a.rs", "new dir/b.rs", "new.rs"]));
-    }
-
-    const LIZARD_CSV: &str = "NLOC,CCN,token,PARAM,length,location,file,function,long_name,start,end\n\
-        3,1,66,3,4,\"run@97-100@src/a.py\",\"src/a.py\",\"run\",\"run( a : int , b : str | None = None )\",97,100\n\
-        2,1,13,1,2,\"ok@4-5@src/a.py\",\"src/a.py\",\"ok\",\"ok( self )\",4,5\n\
-        2,2,13,1,2,\"ok@9-10@src/a.py\",\"src/a.py\",\"ok\",\"ok( self )\",9,10\n\
-        garbage\n";
-
-    #[test]
-    fn lizard_csv_keys_by_long_name_and_numbers_repeats() {
-        let parsed = parse_lizard_csv(LIZARD_CSV);
-        let functions = &parsed["src/a.py"];
-        let keys: Vec<&str> = functions.iter().map(|(key, _)| key.as_str()).collect();
-        assert_eq!(keys, ["run( a : int , b : str | None = None )", "ok( self )", "ok( self )#2"]);
-        assert_eq!(functions[0].1, fm("run", 97, 1, 3, 4));
-        assert_eq!(functions[2].1.ccn, 2);
-    }
-
-    #[test]
-    fn csv_fields_honour_quotes() {
-        assert_eq!(
-            csv_fields(r#"a,"b, c","say ""hi""",,"#),
-            owned(&["a", "b, c", "say \"hi\"", "", ""])
-        );
-    }
-
-    fn fm(name: &str, line: u32, ccn: u32, args: u32, length: u32) -> FunctionMetrics {
-        FunctionMetrics { name: name.to_string(), line, ccn, args, length }
-    }
-
-    fn busy(ccn: u32) -> FunctionMetrics {
-        fm("busy", 1, ccn, 1, 5)
-    }
-
-    fn delta(now: FunctionMetrics, was: Option<FunctionMetrics>, now_key: &str) -> Vec<String> {
-        let current = Functions::from([("a.rs".to_string(), vec![(now_key.to_string(), now)])]);
-        let base = was.map_or_else(Functions::new, |was| {
-            Functions::from([("a.rs".to_string(), vec![("busy( v )".to_string(), was)])])
-        });
-        complexity_delta(&current, &base)
-    }
-
-    #[test]
-    fn complexity_new_function_over_limit() {
-        let now = fm("busy", 3, 17, 1, 5);
-        assert_eq!(delta(now, None, "busy( v )"), ["a.rs:3: busy CCN new→17 (limit 15)"]);
-    }
-
-    #[test]
-    fn complexity_worse_than_base() {
-        assert_eq!(
-            delta(busy(17), Some(busy(14)), "busy( v )"),
-            ["a.rs:1: busy CCN 14→17 (limit 15)"]
-        );
-        assert_eq!(
-            delta(busy(21), Some(busy(20)), "busy( v )"),
-            ["a.rs:1: busy CCN 20→21 (limit 15)"]
-        );
-    }
-
-    #[test]
-    fn complexity_unchanged_better_or_under_limit_pass() {
-        assert!(delta(busy(20), Some(busy(20)), "busy( v )").is_empty());
-        assert!(delta(busy(18), Some(busy(20)), "busy( v )").is_empty());
-        assert!(delta(busy(15), None, "busy( v )").is_empty());
-    }
-
-    #[test]
-    fn complexity_args_and_length_limits() {
-        assert_eq!(
-            delta(fm("busy", 1, 1, 9, 101), None, "busy( v )"),
-            ["a.rs:1: busy args new→9 (limit 8)", "a.rs:1: busy length new→101 (limit 100)"]
-        );
-    }
-
-    #[test]
-    fn complexity_signature_edit_falls_back_to_the_unique_name() {
-        assert!(delta(busy(20), Some(busy(20)), "busy( v : int )").is_empty());
-    }
-
-    #[test]
-    fn complexity_ambiguous_name_counts_as_new() {
-        let current = Functions::from([(
-            "a.rs".to_string(),
-            vec![("busy( v : int )".to_string(), busy(20)), ("busy( self )".to_string(), busy(2))],
-        )]);
-        let base =
-            Functions::from([("a.rs".to_string(), vec![("busy( v )".to_string(), busy(20))])]);
-        assert_eq!(complexity_delta(&current, &base), ["a.rs:1: busy CCN new→20 (limit 15)"]);
-    }
-
-    fn scope() -> Scope {
-        Scope::from([
-            ("src/a.rs".to_string(), vec![(2, 3)]),
-            ("src/new.rs".to_string(), vec![WHOLE_FILE]),
-        ])
-    }
-
-    fn compiler_message(path: &str, line: usize, code: &str, message: &str) -> String {
-        let code = if code.is_empty() {
-            "null".to_string()
-        } else {
-            format!(r#"{{"code":"{code}","explanation":null}}"#)
-        };
-        format!(
-            r#"{{"reason":"compiler-message","message":{{"rendered":"x","children":[{{"spans":[{{"file_name":"src/a.rs","line_start":2,"is_primary":true}}]}}],"code":{code},"level":"warning","message":"{message}","spans":[{{"file_name":"other.rs","line_start":{line},"is_primary":false}},{{"file_name":"{path}","line_start":{line},"is_primary":true}}]}}}}"#
-        )
-    }
-
-    #[test]
-    fn clippy_findings_keep_changed_lines() {
-        let absolute = root().join("src/new.rs").to_string_lossy().into_owned();
-        let report = [
-            compiler_message("src/a.rs", 3, "clippy::needless_return", "unneeded `return` statement"),
-            compiler_message("src/a.rs", 9, "unused_variables", "old"),
-            compiler_message(&absolute, 1, "", "cannot find value `x`"),
-            r#"{"reason":"compiler-artifact","target":{}}"#.to_string(),
-            r#"{"reason":"compiler-message","message":{"level":"error","message":"aborting","spans":[]}}"#.to_string(),
-            r#"{"reason":"build-finished","success":false}"#.to_string(),
-            "not json, not a JSON line".to_string(),
-        ]
-        .join("\n");
-        assert_eq!(
-            clippy_findings(&report, &scope()),
-            Ok(owned(&[
-                "src/a.rs:3: clippy::needless_return unneeded `return` statement",
-                "src/new.rs:1: cannot find value `x`",
-            ]))
-        );
-    }
-
-    #[test]
-    fn unreadable_clippy_output_is_a_tool_error() {
-        for report in ["{not json", r#"{"reason":"compiler-message"}"#] {
-            assert!(clippy_findings(report, &scope()).is_err(), "{report}");
-        }
-    }
-
-    #[test]
-    fn missing_tool_is_a_tool_error() {
-        let error = run_tool("nope", &["/nonexistent/harness-tool"], &[0], root()).unwrap_err();
-        assert!(error.starts_with("nope not runnable"), "{error}");
-    }
-
-    #[test]
-    fn unexpected_exit_names_the_last_stderr_line() {
-        let cmd = ["sh", "-c", "printf 'a\\nboom\\n\\n' >&2; exit 4"];
-        assert_eq!(run_tool("sh", &cmd, &[0], root()), Err("sh exited 4: boom".to_string()));
-        assert_eq!(run_tool("sh", &cmd, &[4], root()), Ok(String::new()));
-    }
-
-    fn result(gate: &'static str, findings: Vec<String>, problem: &str) -> DeltaResult {
-        DeltaResult { gate, findings, problem: problem.to_string() }
-    }
-
-    #[test]
-    fn payload_names_failed_gates_and_caps_findings() {
-        let results = [
-            result("Lint", (1..24).map(|n| format!("a.rs:{n}: E1 x")).collect(), ""),
-            result("Complexity", vec!["b.rs:1: busy CCN new→16 (limit 15)".to_string()], ""),
-        ];
-        let payload = stop_hook_payload(&results, false);
-        let lines: Vec<&str> = payload.lines().collect();
-        assert_eq!(lines[0], "stop-hook failed: Lint, Complexity");
-        assert_eq!(lines.len(), 22);
-        assert_eq!(lines[20], "a.rs:20: E1 x");
-        assert_eq!(lines[21], "… +4 more — run `cargo harness stop-hook --verbose`");
-    }
-
-    #[test]
-    fn verbose_lifts_the_cap() {
-        let findings: Vec<String> = (0..30).map(|n| format!("a.rs:{n}: x")).collect();
-        assert_eq!(cap_findings(&findings, true), findings);
-    }
-
-    #[test]
-    fn twenty_findings_need_no_more_line() {
-        let findings: Vec<String> = (0..20).map(|n| format!("a.rs:{n}: x")).collect();
-        assert_eq!(cap_findings(&findings, false), findings);
-    }
-
-    #[test]
-    fn clean_results_have_no_payload() {
-        let results = [result("Lint", vec![], ""), result("Complexity", vec![], "boom")];
-        assert_eq!(stop_hook_payload(&results, false), "");
-    }
-
-    #[test]
     fn stop_hook_exit_codes() {
-        let digest = payload_digest("P");
-        let none = Json::Object(vec![]);
-        let active = parse_json(r#"{"stop_hook_active": true}"#).unwrap();
-        let quoted = parse_json(r#"{"stop_hook_active": "true"}"#).unwrap();
+        let active = r#"{"session_id": "s", "stop_hook_active" : true}"#;
         let cases = [
-            ("", 0, &none, "", 0),
-            ("", 1, &none, "", 1),
-            ("P", 0, &none, "", 2),
-            ("P", 1, &none, "", 2), // a crashed gate never hides another gate's findings
-            ("P", 0, &active, "", 2),
-            ("P", 0, &none, digest.as_str(), 2), // a new turn blocks again on the same findings
-            ("P", 0, &active, digest.as_str(), 1),
-            ("Q", 0, &active, digest.as_str(), 2), // the findings changed: block again
-            ("P", 0, &quoted, digest.as_str(), 2),
+            ("", 0, "", 0),
+            ("", 1, active, 1),
+            ("P", 0, "", 2),
+            ("P", 1, "", 2),     // a crashed gate never hides another gate's findings
+            ("P", 0, active, 1), // already continuing from a block: never loop
+            ("P", 1, active, 1),
+            ("P", 0, r#"{"stop_hook_active":false}"#, 2),
+            ("P", 0, r#"{"stop_hook_active": "true"}"#, 2),
+            ("P", 0, "not json", 2),
         ];
-        for (payload, failed, event, stored, expected) in cases {
+        for (payload, failed, event, expected) in cases {
             assert_eq!(
-                stop_hook_exit(payload, failed, event, stored),
+                stop_hook_exit(payload, failed, event),
                 expected,
-                "payload={payload:?} failed={failed} event={event:?} stored={stored:?}"
+                "{payload:?} {failed} {event}"
             );
         }
     }
 
-    #[test]
-    fn payload_digest_is_stable() {
-        assert_eq!(payload_digest(""), "cbf29ce484222325");
-        assert_eq!(payload_digest("a"), "af63dc4c8601ec8c");
+    fn found(gate: &'static str, findings: Vec<String>) -> DeltaResult {
+        DeltaResult { gate, outcome: Ok(findings) }
+    }
+
+    fn numbered(count: usize) -> Vec<String> {
+        (1..=count).map(|n| format!("a.rs:{n}: x")).collect()
     }
 
     #[test]
-    fn loop_guard_keys() {
-        assert_eq!(loop_guard_key(""), "root");
-        assert_eq!(loop_guard_key("rust"), "rust");
-        assert_eq!(loop_guard_key("apps/my app"), "apps-my-app");
+    fn payload_names_failed_gates_and_caps_findings() {
+        let busy = vec!["b.rs:1: busy CCN 16 (limit 15)".to_string()];
+        let results = [found("Lint", numbered(23)), found("Complexity", busy)];
+        let payload = stop_hook_payload(&results, false);
+        let lines: Vec<&str> = payload.lines().collect();
+        assert_eq!(lines.len(), 22);
+        assert_eq!(lines[0], "stop-hook failed: Lint, Complexity");
+        assert_eq!(lines[20], "a.rs:20: x");
+        assert_eq!(lines[21], "… +4 more — run `cargo harness stop-hook --verbose`");
+        assert_eq!(stop_hook_payload(&results, true).lines().count(), 25, "verbose lifts the cap");
+        assert_eq!(stop_hook_payload(&[found("Lint", numbered(20))], false).lines().count(), 21);
+        let failed = DeltaResult { gate: "Complexity", outcome: Err("boom".to_string()) };
+        assert_eq!(stop_hook_payload(&[found("Lint", vec![]), failed], false), "");
+    }
+
+    #[test]
+    fn only_touched_functions_over_a_limit_are_findings() {
+        let csv = "NLOC,CCN,token,PARAM,length,location,file,function,long_name,start,end\n\
+            9,16,45,9,101,\"busy@10-110@src/a.rs\",\"src/a.rs\",\"busy\",\"busy( a , b )\",10,110\n\
+            9,20,45,1,20,\"legacy@120-139@src/a.rs\",\"src/a.rs\",\"legacy\",\"legacy( )\",120,139\n\
+            9,15,45,8,100,\"fine@140-239@src/a.rs\",\"src/a.rs\",\"fine\",\"fine( )\",140,239\n\
+            9,30,45,1,5,\"other@1-5@src/b.rs\",\"src/b.rs\",\"other\",\"other( )\",1,5\n";
+        let scope = Scope::from([("src/a.rs".to_string(), vec![(1, 10), (150, 150)])]);
+        assert_eq!(
+            touched_over_limit(csv, &scope),
+            [
+                "src/a.rs:10: busy CCN 16 (limit 15)",
+                "src/a.rs:10: busy args 9 (limit 8)",
+                "src/a.rs:10: busy length 101 (limit 100)",
+            ]
+        );
+    }
+
+    #[test]
+    fn clippy_findings_read_both_forms_on_changed_lines() {
+        let report = [
+            "    Checking stub v0.1.0",
+            "warning: unused variable: `x`",
+            " --> src/a.rs:3:9",
+            "note: the lint level is defined here",
+            " --> src/a.rs:2:9",
+            "error[E0425]: cannot find value `y`",
+            "  --> src/a.rs:40:5",
+            "src/a.rs:2:5: warning: unneeded `return` statement",
+            "src/a.rs:9:5: warning: old",
+            "warning: `stub` (lib) generated 2 warnings",
+        ]
+        .join("\n");
+        let scope = Scope::from([("src/a.rs".to_string(), vec![(2, 3)])]);
+        assert_eq!(
+            clippy_findings(&report, &scope),
+            [
+                "src/a.rs:3: warning: unused variable: `x`",
+                "src/a.rs:2: warning: unneeded `return` statement",
+            ]
+        );
     }
 
     #[test]
     fn hook_target_resolves_inside_the_project_only() {
-        let tmp = TempDir::new("rust-hook-target").unwrap();
-        let project = tmp.0.join("project");
+        let tmp = env::temp_dir().join(format!("rust-hook-target-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let project = tmp.join("project");
         for file in ["src/app.rs", "src/data.txt", "target/debug/build.rs"] {
             fs::create_dir_all(project.join(file).parent().unwrap()).unwrap();
             fs::write(project.join(file), "").unwrap();
         }
-        fs::write(tmp.0.join("elsewhere.rs"), "").unwrap();
-        let absolute = project.join("src/app.rs").to_string_lossy().into_owned();
+        fs::write(tmp.join("elsewhere.rs"), "").unwrap();
+        let absolute = project.join("src/app.rs").to_string_lossy().replace('\\', "\\\\");
+        let event = |path: &str| format!(r#"{{"tool_input": {{"file_path": "{path}"}}}}"#);
         let cases = [
-            (
-                format!(r#"{{"tool_input": {{"file_path": {}}}}}"#, json_string(&absolute)),
-                Some("src/app.rs"),
-            ),
-            (r#"{"tool_input": {"file_path": "src/app.rs"}}"#.to_string(), Some("src/app.rs")),
-            (r#"{"tool_input": {"file_path": "src/missing.rs"}}"#.to_string(), None),
-            (r#"{"tool_input": {"file_path": "src/data.txt"}}"#.to_string(), None),
-            (r#"{"tool_input": {"file_path": "target/debug/build.rs"}}"#.to_string(), None),
-            (r#"{"tool_input": {"file_path": "../elsewhere.rs"}}"#.to_string(), None),
-            (r#"{"tool_input": {"file_path": ""}}"#.to_string(), None),
-            (r#"{"tool_input": {"file_path": 3}}"#.to_string(), None),
-            (r#"{"tool_input": "src/app.rs"}"#.to_string(), None),
-            ("{}".to_string(), None),
+            (event(&absolute), Some("src/app.rs")),
+            (event("src/app.rs"), Some("src/app.rs")),
+            (event(r"src\/app.rs"), Some("src/app.rs")),
+            (event("src/data.txt"), None),
+            (event("target/debug/build.rs"), None),
+            (event("../elsewhere.rs"), None),
+            (event(r"src\u0061pp.rs"), None), // escapes past \\ \" \/ are not read
+            ("{not json".to_string(), None),
+            (String::new(), None),
         ];
-        for (event, expected) in cases {
-            let target = hook_target(&parse_hook_event(event.as_bytes()), &project);
-            assert_eq!(target.as_deref(), expected, "{event}");
+        for (input, expected) in cases {
+            assert_eq!(hook_target(&input, &project).as_deref(), expected, "{input}");
         }
-    }
-
-    #[test]
-    fn hook_event_tolerates_bad_input() {
-        let empty = Json::Object(vec![]);
-        let active = Json::Object(vec![("stop_hook_active".to_string(), Json::Bool(true))]);
-        assert_eq!(parse_hook_event(br#"{"stop_hook_active": true}"#), active);
-        let inputs: [&[u8]; 4] = [b"", b"not json", b"[1, 2]", b"\xff{}"];
-        for input in inputs {
-            assert_eq!(parse_hook_event(input), empty, "{input:?}");
-        }
-    }
-
-    #[test]
-    fn hook_event_read_does_not_wait_on_an_idle_pipe() {
-        let (input, complete) =
-            read_with_deadline(StalledReader { sent: true }, Duration::from_millis(100));
-        assert!(input.is_empty() && !complete);
-    }
-
-    #[test]
-    fn json_reads_nested_values_and_escapes() {
-        let text =
-            r#" {"a": [1, -2.5e3, true, false, null], "s": "q\"\\\/\b\f\n\r\té😀", "a": {}} "#;
-        let value = parse_json(text).unwrap();
-        assert_eq!(value.get("a"), Some(&Json::Object(vec![])), "the last repeated key wins");
-        assert_eq!(value.get("s").and_then(Json::as_str), Some("q\"\\/\u{8}\u{c}\n\r\té😀"));
-        let Json::Object(fields) = &value else { panic!("not an object") };
-        assert_eq!(
-            fields[0].1.items(),
-            [
-                Json::Number("1".into()),
-                Json::Number("-2.5e3".into()),
-                Json::Bool(true),
-                Json::Bool(false),
-                Json::Null
-            ]
-        );
-        assert_eq!(Json::Number("12".into()).as_usize(), Some(12));
-        assert_eq!(Json::Number("-1".into()).as_usize(), None);
-    }
-
-    #[test]
-    fn json_rejects_malformed_input() {
-        let deep = "[".repeat(JSON_MAX_DEPTH + 2) + &"]".repeat(JSON_MAX_DEPTH + 2);
-        for text in [
-            "",
-            "{",
-            "[1,]",
-            r#"{"a" 1}"#,
-            "{1: 2}",
-            "tru",
-            "1 2",
-            r#""\x""#,
-            r#""\ud83d""#,
-            r#""\u+abc""#,
-            "\"open",
-            "-",
-            deep.as_str(),
-        ] {
-            assert_eq!(parse_json(text), None, "{text}");
-        }
-    }
-
-    #[test]
-    fn json_string_escapes_what_json_requires() {
-        assert_eq!(json_string("a\"b\\c\nd\te\u{1}é"), r#""a\"b\\c\nd\te\u0001é""#);
-    }
-
-    #[test]
-    fn committed_settings_carry_every_hook_wiring() {
-        for wiring in &HOOK_WIRINGS {
-            assert!(hook_wired(root(), wiring), "{} {}", wiring.path, wiring.event);
-        }
-    }
-
-    #[test]
-    fn hook_wiring_check_flags_what_is_missing() {
-        let tmp = TempDir::new("rust-hook-wiring").unwrap();
-        fs::create_dir_all(tmp.0.join(".claude")).unwrap();
-        fs::create_dir_all(tmp.0.join(".codex")).unwrap();
-        let stop_only = r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "cargo harness stop-hook"}]}],
-            "PostToolUse": [{"matcher": "Edit", "hooks": [{"type": "command", "command": "echo post-edit"}]}]}}"#;
-        fs::write(tmp.0.join(".claude/settings.json"), stop_only).unwrap();
-        fs::write(tmp.0.join(".codex/hooks.json"), "not json stop-hook Stop").unwrap();
-        let wired: Vec<bool> =
-            HOOK_WIRINGS.iter().map(|wiring| hook_wired(&tmp.0, wiring)).collect();
-        assert_eq!(wired, [true, false, false]);
-    }
-
-    #[test]
-    fn stripped_env_has_no_git_variables() {
-        let mut cmd = Command::new("true");
-        cmd.env("GIT_DIR", "/repo/.git").env("GIT_INDEX_FILE", "/repo/.git/index");
-        strip_git_env(&mut cmd);
-        let keys: Vec<String> =
-            cmd.get_envs().map(|(key, _)| key.to_string_lossy().into_owned()).collect();
-        assert!(keys.iter().all(|key| !key.starts_with("GIT_")), "{keys:?}");
-        assert_eq!(env::var_os("PATH").is_some(), keys.iter().any(|key| key == "PATH"));
-    }
-
-    #[test]
-    fn pre_push_tests_run_outside_the_git_hook_env() {
-        let gate = test_gate();
-        assert!(gate.without_git_env);
-        assert_eq!(gate.cmd, ["cargo", "test"]);
-    }
-
-    #[test]
-    fn complexity_gate_uses_the_shared_limits() {
-        let cmd = complexity_gate().cmd;
-        assert_eq!(cmd[..6], ["uvx", LIZARD, "-l", "rust", "src", "tests"]);
-        assert_eq!(cmd[6..], ["-C", "15", "-a", "8", "-L", "100", "-i", "0"]);
+        fs::remove_dir_all(&tmp).unwrap();
     }
 }
 
@@ -3626,6 +2831,8 @@ mod tests {
 // Examples pin known cases; properties pin the law.
 #[cfg(test)]
 mod property_tests {
+    use std::fmt::Write as _;
+
     use proptest::prelude::*;
 
     use super::*;
@@ -3701,33 +2908,6 @@ mod property_tests {
                 text.push_str("end_of_record\n");
             }
             prop_assert_eq!(parse_lcov_str(&text), cov);
-        }
-
-        #[test]
-        fn hunk_headers_round_trip(
-            hunks in prop::collection::vec((1usize..=10_000, 0usize..=50), 0..20),
-        ) {
-            let mut body = String::new();
-            for (start, count) in &hunks {
-                writeln!(body, "@@ -1 +{start},{count} @@").unwrap();
-            }
-            let diff = format!("diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n{body}");
-            let expected: LineRanges = hunks
-                .iter()
-                .filter(|(_, count)| *count > 0)
-                .map(|&(start, count)| (start, start + count - 1))
-                .collect();
-            prop_assert_eq!(parse_diff_ranges(&diff), Scope::from([("f.rs".to_string(), expected)]));
-        }
-
-        #[test]
-        fn json_strings_round_trip(text in any::<String>()) {
-            prop_assert_eq!(parse_json(&json_string(&text)), Some(Json::Str(text)));
-        }
-
-        #[test]
-        fn json_reader_total_on_arbitrary_text(text in ".*") {
-            let _value = parse_json(&text);
         }
 
         #[test]

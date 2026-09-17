@@ -19,7 +19,7 @@ used by the agent Stop hook:
 | `ci` | CI pipeline | Read-only gates (lint, typecheck, dep audit, complexity, acceptance, arch) run in parallel, then coverage + advisory CRAP | No |
 | `audit` | CI pipeline | Audit dependencies for known vulnerabilities | No |
 | `post-edit` | Stop hook helper; `--hook` = PostToolUse | Fix and format changed source files (`--hook`: the one file just edited) | Yes |
-| `stop-hook` | Agent Stop hook | Run `post-edit`, then gate only the change: lint left on changed lines, complexity new or worse than the merge-base (+ deadcode on changed lines where shipped). Silent on success; exit 2 with ≤20 `path:line` findings | Yes |
+| `stop-hook` | Agent Stop hook | Run `post-edit`, then gate only the change: lint left on changed lines, over-limit functions the change touched (+ deadcode on changed lines where shipped). Silent on success; exit 2 with ≤20 `path:line` findings | Yes |
 
 **`check`** is the one you run constantly. It auto-fixes what it can so you stay in flow. It also ratchets suppression comments (`# noqa`, `// @ts-ignore`, `//nolint`, `#[allow]`, etc.) against `.harness-baseline`: new suppressions fail unless a human signs off on `suppressions --update-baseline`.
 **`pre-commit`** fixes, formats, and typechecks staged files, installed as a git hook. Tests moved to `pre-push`: agents commit often, and a commit on a feature branch is not an integration point.
@@ -28,7 +28,7 @@ For Go and Bun, the lint gate subsumes format checking.
 **`ci`** is the read-only gate — no fixes, just verification. Its read-only gates run in parallel (captured, printed in submission order, run to completion), then coverage streams and CRAP runs advisory.
 **`audit`** audits dependencies for known vulnerabilities.
 **`post-edit`** runs the template's fixer on source files changed by an agent: format, plus the linter's auto-fix where the tool has one and can be scoped to those files (ruff, biome, golangci-lint `--fix` on the changed packages). `post-edit --hook` is the Claude PostToolUse handler: it fixes and formats the one file just edited and tells the agent to re-read it when it changed.
-**`stop-hook`** is the Stop hook entrypoint. It runs `post-edit`, then gates only what the change introduced, measured against the merge-base with the default branch: lint the fixer left on changed lines, functions whose complexity is over the limit and new or worse, and dead code on changed lines (python/bun). Pre-existing debt never blocks an agent stop; `check` and `ci` still see the whole tree. It prints nothing on success, exits 2 with at most 20 `path:line` findings on stderr, exits 1 (never blocking) when a tool cannot run, and stops re-blocking on byte-identical findings. Contract: [settings-json.md](skills/harness/reference/settings-json.md).
+**`stop-hook`** is the Stop hook entrypoint. It runs `post-edit`, then gates only the lines the change touched (vs the merge-base with the default branch): lint the fixer left there, over-limit functions that overlap them, and dead code on them (python/bun). Untouched debt never blocks an agent stop; `check` and `ci` still see the whole tree. It prints nothing on success, exits 2 with at most 20 `path:line` findings on stderr, exits 1 (never blocking) when a tool cannot run, and blocks at most once per stop (`stop_hook_active`). Contract: [settings-json.md](skills/harness/reference/settings-json.md).
 
 ## Available Templates
 

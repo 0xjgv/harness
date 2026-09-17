@@ -17,7 +17,7 @@
 - Agents drift: `make agents-md-drift` — fail if any subproject's AGENTS.md differs from its CLAUDE.md (root pair included). Scope: `make agents-md-drift-<sub>`
 - Sync: `make sync-agents-md` — overwrite each subproject's AGENTS.md from its CLAUDE.md. Scope: `make sync-agents-md-<sub>`
 - Setup: `make bootstrap` — per-language install + install the root git hook
-- Stop hook: `make -s stop-hook` runs each dirty subproject's `stop-hook` (fix + format, then lint on changed lines, complexity new or worse than the merge-base, dead code on changed lines where shipped) and answers as one hook JSON object; pre-existing debt never blocks a stop
+- Stop hook: `make -s stop-hook` runs each dirty subproject's `stop-hook` (fix + format, then lint on changed lines, over-limit functions the change touched, dead code on changed lines where shipped) and answers as one hook JSON object; pre-existing debt never blocks a stop
 - PostToolUse hook: `make -s post-edit-hook` fixes and formats each edited file in its subproject
 
 ## Definition of done

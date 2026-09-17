@@ -8,7 +8,7 @@ Bun project template with built-in harness: linting, formatting, type-checking, 
 
 ```bash
 bun install                         # Install dependencies
-bun run setup-hooks                 # Install git pre-commit + pre-push hooks, the Claude/Codex Stop wiring, and the Claude PostToolUse wiring
+bun run setup-hooks                 # Install git pre-commit + pre-push hooks and the Claude/Codex Stop wiring
 ```
 
 ## Development
@@ -19,7 +19,7 @@ See the [5-script contract](../README.md#the-5-script-contract) for the full rat
 bun run check                      # Fix + format + typecheck + tests/no-test warning (after editing)
 bun run pre-commit                 # Staged fix/format + typecheck; mirrors a staged CLAUDE.md into AGENTS.md (runs via git hook)
 bun harness.ts pre-push            # Branch guard + tests + read-only push gate: lint, acceptance, arch (runs via git hook)
-bun harness.ts stop-hook           # post-edit, then changed-lines lint, complexity delta, deadcode delta; silent on success, exit 2 with findings (agent Stop hook)
+bun harness.ts stop-hook           # post-edit, then lint/complexity/dead code on the change; silent on success, exit 2 with findings (agent Stop hook)
 bun harness.ts post-edit --hook    # Fix + format the file a Claude PostToolUse event names; never blocks
 bun run ci                         # Full verification (see below)
 ```
@@ -91,19 +91,20 @@ cucumber.json              Acceptance runner config (cucumber)
 - **Arch config guard**: `.dependency-cruiser.json` changes warn during `check`/`pre-commit` and fail `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 
 Stop hooks are wired via `.claude/settings.json` for Claude and
-`.codex/hooks.json` for Codex; Claude also gets a PostToolUse hook
-(`post-edit --hook`, Edit|Write) that formats the edited file.
+`.codex/hooks.json` for Codex; the committed `.claude/settings.json` also carries a
+PostToolUse hook (`post-edit --hook`, Edit|Write) that formats the edited file.
+`check` warns when any of the three is missing.
 
 `stop-hook` judges the change, not the tree. Its scope is `git diff` against the
 merge-base with the base branch (`HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`, then
 origin/HEAD, origin/main, origin/master, main, master; never fetched) plus untracked
-files. It blocks (exit 2, findings on stderr, at most 20 lines) on biome errors left on
-changed lines, on a function in `src/` or `tests/` that is over a lizard limit and new
-or worse than at the base, and on knip unused exports, types, and members on changed
-lines. Pre-existing debt never blocks. It prints nothing on success. Exit 1 means a tool
-could not run, or the same findings came back while the agent was already continuing
-from a stop (the loop guard, state under `git rev-parse --git-path harness`). An
-uncommitted `CLAUDE.md` edit is copied to `AGENTS.md`.
+files. It blocks (exit 2, findings on stderr, at most 20 lines) on biome errors and
+knip unused exports, types, and members on changed lines, and on any function in
+`src/` or `tests/` that is over a lizard limit and overlaps a changed line. Touching an
+over-limit function means leaving it under the limits; untouched debt never blocks. It
+prints nothing on success. Exit 1 means a tool could not run, or the hook already
+blocked this stop (`stop_hook_active`). An uncommitted `CLAUDE.md` edit is copied to
+`AGENTS.md`.
 
 ## Thresholds: start at 0, ratchet up
 

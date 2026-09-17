@@ -29,30 +29,28 @@ paraphrase (it drifts). Two sections:
   temp dirs), then `clippy`, `format check`, `acceptance`, `arch`, and strict
   `arch-config-guard` over the whole pushed tree (the deterministic checks
   pre-commit and stop-hook skip).
-  `stop-hook` runs post-edit, then changed-lines lint and complexity delta, in
-  parallel. It prints nothing on success and exits 2 with findings on stderr
-  (at most 20 lines; `--verbose` lifts the cap). Changed lines come from
-  `git diff -U0` against the merge-base with the base branch
+  `stop-hook` runs post-edit, then changed-lines lint and touched-function
+  complexity, in parallel. It prints nothing on success and exits 2 with
+  findings on stderr (at most 20 lines; `--verbose` lifts the cap). Changed
+  lines come from `git diff -U0` against the merge-base with the base branch
   (`HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`, then `origin/HEAD`, `origin/main`,
   `origin/master`, `main`, `master`; never fetched), plus untracked files.
   Post-edit is rustfmt only, on uncommitted `.rs` files, through stdin so it
   never follows `mod` into untouched files; `cargo clippy --fix` is
-  crate-wide and stays in `check`/`fix`/`pre-commit`. Lint residue runs
-  `cargo clippy --message-format=json` (the `[lints]` from `Cargo.toml`,
-  without `-D warnings`, which would stop at the first failing target) and
-  keeps warnings and errors whose primary span sits on a changed line; a
-  build that fails with nothing on a changed line is a tool failure. The
-  complexity delta runs `lizard --csv` on changed `src/` and `tests/` files,
-  now and at the base (`git show <base>:./<path>`), keyed by `long_name`
-  with a unique-name fallback; a function blocks only when it is over a
-  limit and new or worse than at the base. There is no dead-code delta:
-  rustc's `dead_code` reaches the agent through lint residue. Exit 1 means a
-  tool could not run, or the same payload came back with
-  `stop_hook_active: true` (loop guard, state under
-  `git rev-parse --git-path harness`, keyed by a 64-bit FNV-1a digest
-  because std has no SHA-256). An uncommitted `CLAUDE.md` edit is copied to
-  `AGENTS.md`. No arch-config warning and no whole-tree gates at stop. The
-  hook JSON is read by a small std-only JSON reader in `harness.rs`.
+  crate-wide and stays in `check`/`fix`/`pre-commit`. Lint runs plain
+  `cargo clippy` (no `-D warnings`, which would stop at the first failing
+  target) and keeps warnings and errors on changed `.rs` lines, reading both
+  the long and the short diagnostic form: cargo replays cached diagnostics in
+  the form that first rendered them. A build that fails with nothing on a
+  changed line is a tool failure. Complexity runs `lizard --csv` on changed
+  `src/` and `tests/` files and reports each function over a limit whose
+  lines overlap a changed line (`path:line: name CCN 19 (limit 15)`), so
+  touching an over-limit function blocks until it is back under. There is no
+  dead-code gate: rustc's `dead_code` reaches the agent through lint. Exit 1
+  means a tool could not run, or findings came with `stop_hook_active: true`
+  (the hook blocks once per stop; no state file). An uncommitted `CLAUDE.md`
+  edit is copied to `AGENTS.md`. No arch-config warning and no whole-tree
+  gates at stop. The hook stdin is read with string scans, not a JSON parser.
   `post-edit --hook` (Claude PostToolUse) formats the one `.rs` file the
   event names and prints one `additionalContext` line when it changed. It
   never blocks.
@@ -93,10 +91,10 @@ This brings `AGENTS.md`/`CLAUDE.md` (Layer 2), `.claude/settings.json`,
 
 `.claude/settings.json` wires the Claude Stop hook (`timeout` 300) and the
 Claude PostToolUse hook (`matcher` `Edit|Write`, `timeout` 60);
-`.codex/hooks.json` wires the Codex Stop hook only. The runner is std-only
-with no JSON writer, so `setup-hooks` and `check` verify all three wirings
-and warn when one is missing instead of rewriting the files; copy the
-template's `.claude`/`.codex` to fix. Full shape:
+`.codex/hooks.json` wires the Codex Stop hook only. The runner is std-only,
+so `setup-hooks` and `check` check each file for the event name and the
+harness command and warn when one is missing instead of rewriting the files;
+copy the template's `.claude`/`.codex` to fix. Full shape:
 [settings-json.md](settings-json.md).
 Claude Stop command:
 `cd $CLAUDE_PROJECT_DIR && cargo harness stop-hook`.
