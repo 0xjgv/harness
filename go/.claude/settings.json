@@ -6,7 +6,20 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd $CLAUDE_PROJECT_DIR && go run harness.go stop-hook"
+            "command": "cd $CLAUDE_PROJECT_DIR && go build -o harness harness.go && ./harness stop-hook",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd $CLAUDE_PROJECT_DIR && go run harness.go post-edit --hook",
+            "timeout": 60
           }
         ]
       }
