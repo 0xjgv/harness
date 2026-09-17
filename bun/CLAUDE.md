@@ -3,11 +3,11 @@
 ## Commands
 
 - After edits: `bun run check` — fix, format, typecheck, test (warns/skips when no tests exist), hook-drift + suppression ratchet
-- Pre-commit: `bun run pre-commit` — staged files only; arch config changes warn, never fail (auto via git hook)
-- Pre-push: `bun run harness.ts pre-push` — branch guard (refuses pushes to `main`/`master` unless `HARNESS_ALLOW_PROTECTED_PUSH=1`), then a read-only push gate over the whole tree: lint (biome covers format), agents-md drift, acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
+- Pre-commit: `bun run pre-commit` — staged files only (auto via git hook): fix, format, typecheck. A staged `CLAUDE.md` is copied to `AGENTS.md` and staged with it; a hand edit to `AGENTS.md` alone fails. Arch config changes warn, never fail. Tests run at pre-push.
+- Pre-push: `bun run harness.ts pre-push` — branch guard (refuses pushes to `main`/`master` unless `HARNESS_ALLOW_PROTECTED_PUSH=1`), then the test suite (alone, without git's `GIT_*` hook variables, because the suite creates temp git repos), then a read-only push gate over the whole tree: lint (biome covers format), agents-md drift, acceptance, arch (the offline checks pre-commit and stop-hook skip; runs them in parallel). Auto via git pre-push hook.
 - CI: `bun run ci` — read-only gates (lint, typecheck, audit, agents-md drift, complexity, deadcode, acceptance, arch) run in parallel — captured, printed in submission order, run to completion — then coverage (streams) + crap. CRAP is advisory (warns only — pass `--enforce` to hard-fail). Requires `uvx` on PATH.
 - Complexity: `bun run harness.ts complexity` — lizard@1.22.2 CC gate (CCN≤15, args≤8, length≤100) over src + tests
-- Deadcode: `bun run harness.ts deadcode` — knip (via bunx, no devDep) flags unused files/exports/deps; `knip.json` lists the cucumber step entries and ignores tool devDeps invoked as binaries. Runs in ci + stop-hook.
+- Deadcode: `bun run harness.ts deadcode` — knip (via bunx, no devDep) flags unused files/exports/deps; `knip.json` lists the cucumber step entries and ignores tool devDeps invoked as binaries. Runs in ci; stop-hook reports only unused exports, types, and members on changed lines.
 - Audit: `bun run audit` — audit dependencies for known vulnerabilities (via bun audit)
 - Acceptance: `bun run acceptance` — run cucumber against `tests/features/`
 - Coverage: `bun run coverage --min=0` — `bun test` coverage (LCOV) with threshold; default comes from `.harness-baseline` `coverage.min`; warns and skips when no tests exist
@@ -15,19 +15,20 @@
 - CRAP (advisory): `bun run crap --max=30` — complexity × coverage gate. Add `--enforce` to exit 1 on offenders (default exits 0 with warning). Warns and skips when no tests or coverage artifact exist.
 - Suppressions: `bun harness.ts suppressions` — full suppression breakdown; `--update-baseline` requires human sign-off and updates `.harness-baseline`
 - Arch: `bun run arch` — dependency-cruiser against `.dependency-cruiser.json`
-- Arch config guard: `bun harness.ts arch-config-guard` — warns in check/pre-commit/stop-hook, blocks pre-push/CI on unreviewed `.dependency-cruiser.json` changes; use `HARNESS_ALLOW_ARCH_CONFIG=1` after review
+- Arch config guard: `bun harness.ts arch-config-guard` — warns in check/pre-commit, blocks pre-push/CI on unreviewed `.dependency-cruiser.json` changes; use `HARNESS_ALLOW_ARCH_CONFIG=1` after review
 - Branch guard: `bun harness.ts branch-guard` — refuses pushes to (or deletions of) `main`/`master`; reads `HARNESS_PRE_PUSH_REFS`, else git pre-push stdin (1s deadline; partial input fails), else the current branch; `HARNESS_ALLOW_PROTECTED_PUSH=1` overrides
 - Agents drift: `bun run harness.ts agents-md-drift` — fail if AGENTS.md differs from CLAUDE.md
 - Sync: `bun run harness.ts sync-agents-md` — overwrite AGENTS.md from CLAUDE.md
-- Setup: `bun run setup-hooks` installs git pre-commit + pre-push hooks (path resolved via `git rev-parse`, worktree-safe) and idempotently installs the Claude/Codex Stop wiring
-- Stop hook: auto-formats/fixes changed files, then runs complexity and deadcode in parallel (`stop-hook`)
+- Setup: `bun run setup-hooks` installs git pre-commit + pre-push hooks (path resolved via `git rev-parse`, worktree-safe) and idempotently installs the Claude/Codex Stop wiring and the Claude PostToolUse wiring
+- Stop hook: `bun harness.ts stop-hook` — post-edit, then changed-lines lint, complexity delta, deadcode delta; silent on success, exit 2 with findings. Changed lines = `git diff` against the merge-base with the base branch (`HARNESS_ARCH_BASE`, `GITHUB_BASE_REF`, then origin/HEAD, origin/main, origin/master, main, master; never fetched) plus untracked files. Lint blocks on biome errors on changed lines; a function blocks only when it is over a lizard limit and new or worse than at the base (`src/` + `tests/`); dead code blocks only on changed lines; pre-existing debt never blocks. Findings go to stderr (at most 20 lines); exit 1 means a tool could not run, or the same findings came back while the agent was already continuing from a stop (loop guard). An uncommitted `CLAUDE.md` edit is copied to `AGENTS.md`. Whole-tree gates stay in check/pre-push/ci.
+- Post-edit: `bun harness.ts post-edit` — fix + format source files with uncommitted changes. `--hook` (Claude PostToolUse) does the same for the one edited file and, when it changed, prints an `additionalContext` line asking the agent to re-read it; it never blocks.
 
 ## Definition of done
 
 - `bun run check` passes clean — never stop with check failing.
 - Behavior worth specifying → a `.feature` scenario exists and acceptance passes; other behavior changes have unit tests.
 - No new suppressions: additions above `.harness-baseline` fail check; suppress only with the human's sign-off, stating why.
-- Arch config changes are integration-blocked: `check`/`pre-commit`/`stop-hook` warn, and `pre-push`/`ci` fail unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
+- Arch config changes are integration-blocked: `check`/`pre-commit` warn, and `pre-push`/`ci` fail unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review.
 - `pre-push`/`ci` must pass on your branch before you open or update a PR. Merge is the human's.
 - Never spend a turn on what a tool checks: formatting, lint, types, dead code, drift, and complexity come back as `check`/`stop-hook` output. Read the output, fix the code, never the gate.
 
@@ -54,5 +55,5 @@
 
 <important if="you want to edit `.dependency-cruiser.json` (arch config)">
 - Do not silently edit the arch config to silence a violation. Architectural violations imply a design decision — put the config change in its own commit whose message states the rationale, so the reviewer sees it isolated.
-- The harness warns about `.dependency-cruiser.json` changes during `check`/`pre-commit`/`stop-hook` and blocks `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. Expect the push to be refused; report it and let the human review.
+- The harness warns about `.dependency-cruiser.json` changes during `check`/`pre-commit` and blocks `pre-push`/`ci` unless `HARNESS_ALLOW_ARCH_CONFIG=1` is set after review. Expect the push to be refused; report it and let the human review.
 </important>

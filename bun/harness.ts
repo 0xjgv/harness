@@ -6,7 +6,8 @@
  *   bun harness.ts                  # full pre-flight (default)
  *   bun harness.ts check            # full pre-flight
  *   bun harness.ts fix              # fix lint errors + format
- *   bun harness.ts pre-commit       # staged checks + tests
+ *   bun harness.ts pre-commit       # staged fix/format + typecheck
+ *   bun harness.ts stop-hook        # agent Stop hook: delta gates, silent when clean
  *   bun harness.ts ci               # CI verification
  *   bun harness.ts acceptance       # cucumber scenarios
  *   bun harness.ts coverage --min=N # tests with coverage threshold
@@ -23,7 +24,10 @@ const QUALITY_SOURCES = ['src', 'harness.ts'] as const;
 const TEST_DIR = 'tests';
 const LIZARD = 'lizard@1.22.2';
 const KNIP = 'knip@5.88.1';
+const COMPLEXITY_MAX_CCN = 15;
 const COMPLEXITY_MAX_ARGS = 8;
+const COMPLEXITY_MAX_LENGTH = 100;
+const SOURCE_EXTENSIONS = ['.ts', '.tsx', '.js'] as const;
 const ROOT = import.meta.dir;
 const BASELINE_FILE = '.harness-baseline';
 const SUPPRESSION_BASELINE_PREFIX = 'suppressions.';
@@ -33,23 +37,59 @@ const PROTECTED_BRANCHES = ['main', 'master'] as const;
 const PROTECTED_PUSH_ALLOW_ENV = 'HARNESS_ALLOW_PROTECTED_PUSH';
 const PRE_PUSH_REFS_ENV = 'HARNESS_PRE_PUSH_REFS';
 const PRE_PUSH_STDIN_WAIT_MS = 1000;
+const ARCH_BASE_ENV = 'HARNESS_ARCH_BASE';
+// Where the stop hook's delta starts: env overrides first (ARCH_BASE_ENV, then
+// GITHUB_BASE_REF), then these. Never fetched — a hook must not touch the network.
+const DELTA_BASE_CANDIDATES = ['origin/HEAD', 'origin/main', 'origin/master', 'main', 'master'];
+const HOOK_STDIN_WAIT_MS = 1000;
+// Finding lines a stop-hook payload carries; the rest are one command away.
+const HOOK_FINDING_LIMIT = 20;
 
 // ── Hook wiring (installed by `setup-hooks`) ────────────────────────
 // Claude reads .claude/settings.json and runs the harness directly; Codex reads
 // .codex/hooks.json and goes through the codex-stop-hook.sh wrapper (which turns
 // the exit code into the block/continue JSON Codex expects). Keep both in sync
 // with the committed template files so re-running the installer is a no-op.
+// PostToolUse is Claude-only: it formats the file an Edit/Write just touched.
+const CLAUDE_SETTINGS = '.claude/settings.json';
 const CLAUDE_SETTINGS_SCHEMA = 'https://json.schemastore.org/claude-code-settings.json';
 const CLAUDE_STOP_COMMAND = 'cd $CLAUDE_PROJECT_DIR && bun harness.ts stop-hook';
+const CLAUDE_POST_EDIT_COMMAND = 'cd $CLAUDE_PROJECT_DIR && bun harness.ts post-edit --hook';
 const CODEX_STOP_COMMAND =
   'cd "$(git rev-parse --show-toplevel)" && .codex/hooks/codex-stop-hook.sh bun harness.ts stop-hook';
-const CLAUDE_STOP_HOOK = { type: 'command', command: CLAUDE_STOP_COMMAND };
+export const CLAUDE_STOP_HOOK = { type: 'command', command: CLAUDE_STOP_COMMAND, timeout: 300 };
+export const CLAUDE_POST_EDIT_HOOK = {
+  type: 'command',
+  command: CLAUDE_POST_EDIT_COMMAND,
+  timeout: 60,
+};
 const CODEX_STOP_HOOK = {
   type: 'command',
   command: CODEX_STOP_COMMAND,
   timeout: 300,
   statusMessage: 'Running stop-hook checks',
 };
+
+/** One harness hook in an agent settings file; `marker` identifies it on reinstall. */
+export interface HookWiring {
+  path: string;
+  event: string;
+  marker: string;
+  handler: Record<string, unknown>;
+  matcher?: string;
+}
+
+export const HOOK_WIRINGS: readonly HookWiring[] = [
+  { path: CLAUDE_SETTINGS, event: 'Stop', marker: 'stop-hook', handler: CLAUDE_STOP_HOOK },
+  {
+    path: CLAUDE_SETTINGS,
+    event: 'PostToolUse',
+    marker: 'post-edit --hook',
+    handler: CLAUDE_POST_EDIT_HOOK,
+    matcher: 'Edit|Write',
+  },
+  { path: '.codex/hooks.json', event: 'Stop', marker: 'stop-hook', handler: CODEX_STOP_HOOK },
+];
 
 // ── Output ──────────────────────────────────────────────────────────
 
@@ -119,7 +159,7 @@ export async function hasTests(base = ROOT): Promise<boolean> {
 }
 
 function matchesTsTarget(path: string, targets: readonly string[]): boolean {
-  if (!path.endsWith('.ts')) return false;
+  if (!SOURCE_EXTENSIONS.some((extension) => path.endsWith(extension))) return false;
   return targets.some((target) => {
     if (target.endsWith('.ts')) return path === target;
     return path.startsWith(`${target}/`);
@@ -153,6 +193,7 @@ export interface Gate {
   cmd: string[];
   extract?: (output: string) => string | undefined;
   hint?: string;
+  env?: Record<string, string>;
 }
 
 interface GateResult {
@@ -167,7 +208,7 @@ interface GateResult {
 
 /** Run a command with output captured (no printing, no exit): the unit the batch runs. */
 async function runCapture(gate: Gate): Promise<GateResult> {
-  const proc = Bun.spawn(gate.cmd, { cwd: ROOT, stdout: 'pipe', stderr: 'pipe' });
+  const proc = Bun.spawn(gate.cmd, { cwd: ROOT, env: gate.env, stdout: 'pipe', stderr: 'pipe' });
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -511,19 +552,25 @@ async function stagedTsFiles(): Promise<string[]> {
     .filter((f) => isProjectTsFile(f));
 }
 
+/**
+ * Project source files with uncommitted changes, relative to this project.
+ *
+ * Porcelain paths are repository-relative, so a project in a subdirectory strips
+ * its prefix; `--untracked-files=all` lists new files inside new directories.
+ */
 async function changedTsFiles(): Promise<string[]> {
-  const proc = Bun.spawn(['git', 'status', '--porcelain'], {
+  const proc = Bun.spawn(['git', 'status', '--porcelain', '--untracked-files=all', '--', '.'], {
     cwd: ROOT,
     stdout: 'pipe',
     stderr: 'pipe',
   });
   const stdout = await new Response(proc.stdout).text();
   await proc.exited;
+  const prefix = await gitPrefix();
   return stdout
-    .trim()
     .split('\n')
     .filter((line) => line.length > 3 && !line.slice(0, 2).includes('D'))
-    .map(porcelainPath)
+    .map((line) => normalizeChangedPath(porcelainPath(line), prefix))
     .filter((f) => isProjectTsFile(f));
 }
 
@@ -568,6 +615,35 @@ async function cmdTest(): Promise<void> {
     return;
   }
   await run('Tests', ['bun', 'test'], { extract: extractTestSummary });
+}
+
+/** This environment minus the GIT_* variables git exports to hooks. */
+function envWithoutGit(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined && !key.startsWith('GIT_')) env[key] = value;
+  }
+  return env;
+}
+
+/**
+ * Run the test suite captured, outside git's hook environment.
+ *
+ * git exports GIT_DIR (and, for commits, GIT_INDEX_FILE) to hooks; a test that runs
+ * `git init` in a temp dir would otherwise write into this repository.
+ */
+async function checkTests(): Promise<boolean> {
+  if (!(await hasTests())) {
+    warn(`Tests: no ${TEST_DIR}/*.test.ts or *.spec.ts files; skipped`);
+    return true;
+  }
+  const gate: Gate = {
+    description: 'Tests',
+    cmd: ['bun', 'test'],
+    extract: extractTestSummary,
+    env: envWithoutGit(),
+  };
+  return printGateResult(await runCapture(gate), { noExit: true });
 }
 
 function auditGate(): Gate {
@@ -731,21 +807,17 @@ type PrePushRefs = { state: 'refs'; text: string } | { state: 'none' } | { state
 let prePushRefsCache: PrePushRefs | null = null;
 
 // Agent tools and CI hand the process an open, silent stdin pipe, so a plain read
-// would hang. The deadline bounds the whole read, and partial input is a hard
-// failure: half a ref list would silently under-report what is being pushed.
-function readRefsFromStdin(): Promise<PrePushRefs> {
+// would hang. The deadline bounds the whole read, not just the first byte.
+function readStdin(waitMs: number): Promise<{ text: string; complete: boolean }> {
   return new Promise((resolve) => {
     const chunks: string[] = [];
     let timer: ReturnType<typeof setTimeout>;
     const finish = (timedOut: boolean): void => {
       clearTimeout(timer);
       process.stdin.pause();
-      const text = chunks.join('');
-      if (timedOut && text !== '') resolve({ state: 'incomplete' });
-      else if (text.trim() === '') resolve({ state: 'none' });
-      else resolve({ state: 'refs', text });
+      resolve({ text: chunks.join(''), complete: !timedOut });
     };
-    timer = setTimeout(() => finish(true), PRE_PUSH_STDIN_WAIT_MS);
+    timer = setTimeout(() => finish(true), waitMs);
     // Bun gives redirected stdin a stream without unref; guard the call.
     (process.stdin as { unref?: () => void }).unref?.();
     process.stdin.setEncoding('utf8');
@@ -753,6 +825,15 @@ function readRefsFromStdin(): Promise<PrePushRefs> {
     process.stdin.on('end', () => finish(false));
     process.stdin.on('error', () => finish(false));
   });
+}
+
+// Partial input is a hard failure: half a ref list would silently under-report
+// what is being pushed.
+async function readRefsFromStdin(): Promise<PrePushRefs> {
+  const { text, complete } = await readStdin(PRE_PUSH_STDIN_WAIT_MS);
+  if (!complete && text !== '') return { state: 'incomplete' };
+  if (text.trim() === '') return { state: 'none' };
+  return { state: 'refs', text };
 }
 
 async function prePushRefs(): Promise<PrePushRefs> {
@@ -1049,26 +1130,16 @@ async function cmdCrap(): Promise<void> {
     return;
   }
 
-  // lizard --csv: column 1 is CCN; the quoted location field encodes
-  // `name@start-end@path`. Signatures can contain commas, so derive the
-  // location (and thus path/start/end) from that self-contained field.
-  // Name may be empty for anonymous arrows/IIFEs — match but skip cleanly.
-  const locRe = /"([^"@]*)@(\d+)-(\d+)@([^"]+)"/;
   const offenders: CrapFn[] = [];
-  for (const row of lzOut.split('\n')) {
-    const cols = row.split(',');
-    if (cols.length < 11) continue;
-    const ccn = Number(cols[1]);
-    if (!Number.isFinite(ccn)) continue;
-    const lm = locRe.exec(row);
-    if (!lm) continue;
-    const [, name, startS, endS, path] = lm;
+  for (const line of lzOut.split('\n')) {
+    const row = lizardRow(line);
+    if (row === null) continue;
+    const { name, line: start, ccn } = row.metrics;
+    const { end, file: path } = row;
     // Anonymous functions: lizard emits an empty name. They share their
     // parent's coverage attribution in LCOV, so a per-function join cannot
     // score them fairly — skip rather than silently misattribute.
     if (!name) continue;
-    const start = Number(startS);
-    const end = Number(endS);
     const location = `${name}@${start}-${end}@${path}`;
 
     const lines = covMap[path] ?? covMap[path.replace(/^\.\//, '')] ?? {};
@@ -1113,15 +1184,15 @@ async function complexityGatesOrWarn(): Promise<Gate[]> {
         LIZARD,
         ...targets,
         '-C',
-        '15',
+        String(COMPLEXITY_MAX_CCN),
         '-a',
         String(COMPLEXITY_MAX_ARGS),
         '-L',
-        '100',
+        String(COMPLEXITY_MAX_LENGTH),
         '-i',
         '0',
       ],
-      hint: 'extract helpers or flatten branches until CCN <= 15; do not raise the threshold',
+      hint: `extract helpers or flatten branches until CCN <= ${COMPLEXITY_MAX_CCN}; do not raise the threshold`,
     },
   ];
 }
@@ -1148,39 +1219,776 @@ async function cmdDeadcode(): Promise<void> {
   await run(gate.description, gate.cmd);
 }
 
+// ── Agent hooks ─────────────────────────────────────────────────────
+// The stop hook runs after every agent turn and judges the change, not the tree:
+// lint left on changed lines, functions pushed over (or further over) a complexity
+// limit, dead code on changed lines. Pre-existing debt never blocks a stop; the
+// whole-tree gates stay in check / ci / pre-push. Exit contract: silent 0 when
+// clean, 2 with a stderr payload the agent reads, 1 when a tool could not run.
+
+/** Inclusive [start, end] line spans. */
+type LineRanges = [number, number][];
+/** Changed lines per path, relative to this project. */
+type ChangedScope = Map<string, LineRanges>;
+/** `lizard --csv` functions: file → key (long_name, `#2` for repeats) → metrics. */
+type LizardFunctions = Map<string, Map<string, FunctionMetrics>>;
+
+export const WHOLE_FILE: LineRanges = [[1, Number.MAX_SAFE_INTEGER]];
+const STOP_HOOK_RERUN = 'bun harness.ts stop-hook --verbose';
+export const LOOP_GUARD_NOTICE = 'harness: same findings as the previous stop; not blocking again';
+const COMPLEXITY_LIMITS = [
+  ['CCN', 'ccn', COMPLEXITY_MAX_CCN],
+  ['args', 'args', COMPLEXITY_MAX_ARGS],
+  ['length', 'length', COMPLEXITY_MAX_LENGTH],
+] as const;
+const HUNK_RE = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+// biome's `check` fails on these; warnings and infos never block the whole-tree gate either.
+const BLOCKING_SEVERITIES = new Set(['error', 'fatal']);
+// knip issue types that name a symbol on a line; unused files and dependencies stay in ci.
+const KNIP_SYMBOL_ISSUES = [
+  ['exports', 'unused export'],
+  ['types', 'unused exported type'],
+  ['nsExports', 'unused export in namespace'],
+  ['nsTypes', 'unused exported type in namespace'],
+] as const;
+const KNIP_MEMBER_ISSUES = [
+  ['enumMembers', 'unused enum member'],
+  ['classMembers', 'unused class member'],
+] as const;
+
+/** A gate's tool could not run, or printed output the gate cannot read. */
+export class ToolError extends Error {}
+
+/** One delta gate: findings block the stop; a problem means its tool failed. */
+export interface DeltaResult {
+  gate: string;
+  findings: string[];
+  problem?: string;
+}
+
+/** One function as `lizard --csv` measured it. */
+export interface FunctionMetrics {
+  name: string;
+  line: number;
+  ccn: number;
+  args: number;
+  length: number;
+}
+
+async function capture(
+  cmd: string[],
+  cwd: string,
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  const proc = Bun.spawn(cmd, { cwd, stdout: 'pipe', stderr: 'pipe' });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { stdout, stderr, code };
+}
+
+/**
+ * The command's stdout; ToolError when it cannot start or exits outside `ok`.
+ *
+ * A non-zero `ok` code means "findings", which always come with a report: the same
+ * code with nothing on stdout is a failure (biome exits 1 on a broken config too).
+ */
+export async function runTool(
+  tool: string,
+  cmd: string[],
+  opts: { ok?: number[]; cwd?: string } = {},
+): Promise<string> {
+  const result = await capture(cmd, opts.cwd ?? ROOT).catch((error: unknown) => {
+    throw new ToolError(`${tool} not runnable: ${errorMessage(error)}`);
+  });
+  const reported = result.code === 0 || result.stdout.trim() !== '';
+  if ((opts.ok ?? [0]).includes(result.code) && reported) return result.stdout;
+  const detail = (result.stderr.trim() || result.stdout.trim()).split('\n');
+  const reason = `${tool} exited ${result.code}`;
+  const last = detail.at(-1)?.trim();
+  throw new ToolError(last ? `${reason}: ${last}` : reason);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function gitOutput(args: string[]): Promise<string> {
+  return await runTool('git', ['git', '-c', 'core.quotePath=false', ...args]);
+}
+
+// ── Changed lines ──
+
+/** The first base ref that resolves: env overrides, then DELTA_BASE_CANDIDATES. */
+async function baseRef(): Promise<string | null> {
+  const candidates = [process.env[ARCH_BASE_ENV] ?? ''];
+  const githubBase = process.env.GITHUB_BASE_REF;
+  if (githubBase) candidates.push(`origin/${githubBase}`);
+  candidates.push(...DELTA_BASE_CANDIDATES);
+  for (const ref of candidates) {
+    if (!ref) continue;
+    if ((await gitLines(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`])).length > 0) {
+      return ref;
+    }
+  }
+  return null;
+}
+
+/** merge-base(base ref, HEAD); HEAD without a base ref; null before the first commit. */
+async function deltaBase(): Promise<string | null> {
+  if ((await gitLines(['rev-parse', '--verify', '--quiet', 'HEAD'])).length === 0) return null;
+  const ref = await baseRef();
+  const [mergeBase] = ref === null ? [] : await gitLines(['merge-base', ref, 'HEAD']);
+  return mergeBase ?? 'HEAD';
+}
+
+/** The new-side path of a `+++ b/<path>` header; null for a deleted file. */
+function diffPath(header: string): string | null {
+  let name = header.slice('+++ '.length).replace(/\t+$/, '');
+  if (name === '/dev/null') return null;
+  if (name.length > 1 && name.startsWith('"') && name.endsWith('"')) name = name.slice(1, -1);
+  return name.startsWith('b/') ? name.slice(2) : name;
+}
+
+function addHunk(ranges: ChangedScope, path: string | null, header: string): void {
+  const match = HUNK_RE.exec(header);
+  if (match === null || path === null) return;
+  const count = match[2] === undefined ? 1 : Number(match[2]);
+  const start = Number(match[1]);
+  if (count > 0) ranges.get(path)?.push([start, start + count - 1]);
+}
+
+/**
+ * `{path: [[start, end]]}` of the new-side lines in a `git diff -U0` (a/ b/ prefixes).
+ *
+ * File headers are read only between `diff --git` and the first hunk, so an added line
+ * whose text starts with `++ ` is never taken for one. A pure deletion (`+N,0`) adds no
+ * range, but its file is still listed.
+ */
+export function parseDiffRanges(diff: string): ChangedScope {
+  const ranges: ChangedScope = new Map();
+  let path: string | null = null;
+  let inHeader = false;
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      path = null;
+      inHeader = true;
+    } else if (inHeader && line.startsWith('+++ ')) {
+      path = diffPath(line);
+      if (path !== null) ranges.set(path, []);
+    } else if (line.startsWith('@@')) {
+      inHeader = false;
+      addHunk(ranges, path, line);
+    }
+  }
+  return ranges;
+}
+
+/**
+ * Changed lines per path relative to this project: `git diff <base>` plus untracked.
+ *
+ * Covers work committed on the branch and uncommitted work alike. Untracked files, and
+ * every file before the first commit, are in scope whole. Renames count as new files.
+ */
+async function changedScope(base: string | null): Promise<ChangedScope> {
+  const listing = ['ls-files', '--others', '--exclude-standard', '--', '.'];
+  let scope: ChangedScope = new Map();
+  if (base === null) {
+    listing.splice(1, 0, '--cached');
+  } else {
+    const diff = await gitOutput([
+      'diff',
+      '-U0',
+      '--no-color',
+      '--no-ext-diff',
+      '--no-renames',
+      '--relative',
+      '--src-prefix=a/',
+      '--dst-prefix=b/',
+      base,
+      '--',
+      '.',
+    ]);
+    scope = parseDiffRanges(diff);
+  }
+  for (const path of (await gitOutput(listing)).split('\n')) {
+    if (path) scope.set(path, [...WHOLE_FILE]);
+  }
+  return scope;
+}
+
+function inRanges(line: number, ranges: LineRanges = []): boolean {
+  return ranges.some(([start, end]) => start <= line && line <= end);
+}
+
+/** Changed paths `keep` accepts that are still files, sorted. */
+async function scopedFiles(
+  scope: ChangedScope,
+  keep: (path: string) => boolean,
+): Promise<string[]> {
+  const { statSync } = await import('node:fs');
+  const isFile = (path: string): boolean =>
+    statSync(`${ROOT}/${path}`, { throwIfNoEntry: false })?.isFile() ?? false;
+  return [...scope.keys()].filter((path) => keep(path) && isFile(path)).sort();
+}
+
+// ── Lint residue ──
+
+function biomeFinding(item: unknown, scope: ChangedScope): string | null {
+  const diagnostic = asObject(item);
+  if (!diagnostic) throw new ToolError('unreadable biome output: a diagnostic is not an object');
+  if (typeof diagnostic.severity !== 'string' || !BLOCKING_SEVERITIES.has(diagnostic.severity)) {
+    return null;
+  }
+  const location = asObject(diagnostic.location);
+  const path = location?.path;
+  const line = asObject(location?.start)?.line;
+  if (typeof path !== 'string' || typeof line !== 'number') {
+    throw new ToolError('unreadable biome output: a diagnostic has no path and line');
+  }
+  // Line 0 is a whole-file diagnostic (a format diff, a skipped format): no changed line.
+  const relative = normalizeChangedPath(path, '');
+  if (!inRanges(line, scope.get(relative))) return null;
+  const category = typeof diagnostic.category === 'string' ? `${diagnostic.category} ` : '';
+  return `${relative}:${line}: ${category}${String(diagnostic.message)}`;
+}
+
+/** `path:line: category message` for each blocking biome diagnostic on a changed line. */
+export function biomeFindings(report: string, scope: ChangedScope): string[] {
+  let diagnostics: unknown;
+  try {
+    diagnostics = asObject(JSON.parse(report))?.diagnostics;
+  } catch (error) {
+    throw new ToolError(`unreadable biome output: ${errorMessage(error)}`);
+  }
+  if (!Array.isArray(diagnostics)) {
+    throw new ToolError('unreadable biome output: no diagnostics list');
+  }
+  return diagnostics.flatMap((item) => biomeFinding(item, scope) ?? []);
+}
+
+/**
+ * Lint the fix pass could not fix, on changed lines of changed files.
+ *
+ * The whole-tree gate lints `.`, so every changed file goes to biome, which skips
+ * what it ignores or cannot read.
+ */
+async function lintResidue(scope: ChangedScope): Promise<string[]> {
+  const files = await scopedFiles(scope, () => true);
+  if (files.length === 0) return [];
+  const cmd = [
+    'bunx',
+    'biome',
+    'check',
+    '--reporter=json',
+    '--max-diagnostics=none',
+    '--files-ignore-unknown=true',
+    '--no-errors-on-unmatched',
+    ...files,
+  ];
+  return biomeFindings(await runTool('biome', cmd, { ok: [0, 1] }), scope);
+}
+
+// ── Complexity delta ──
+
+/** Split one CSV row; quoted fields may hold commas (lizard signatures do). */
+export function splitCsvRow(row: string): string[] {
+  const cells: string[] = [];
+  let cell = '';
+  let quoted = false;
+  for (let i = 0; i < row.length; i++) {
+    const char = row[i];
+    if (quoted && char === '"' && row[i + 1] === '"') {
+      cell += '"';
+      i++;
+    } else if (char === '"') {
+      quoted = !quoted;
+    } else if (char === ',' && !quoted) {
+      cells.push(cell);
+      cell = '';
+    } else {
+      cell += char;
+    }
+  }
+  cells.push(cell);
+  return cells;
+}
+
+/**
+ * One `lizard --csv` row; null for a header or anything else.
+ *
+ * Columns: nloc, ccn, tokens, params, length, location, file, name, long_name, start, end.
+ */
+function lizardRow(
+  line: string,
+): { file: string; longName: string; end: number; metrics: FunctionMetrics } | null {
+  const row = splitCsvRow(line);
+  const numeric = [1, 3, 4, 9, 10];
+  if (row.length < 11 || !numeric.every((i) => /^\d+$/.test(row[i]))) return null;
+  const [ccn, args, length, start, end] = numeric.map((i) => Number(row[i]));
+  const metrics = { name: row[7], line: start, ccn, args, length };
+  return { file: row[6], longName: row[8], end, metrics };
+}
+
+/**
+ * `{file: {key: metrics}}` from `lizard --csv`, keyed by long_name (the signature).
+ *
+ * A signature survives a function moving within its file; a start line does not. A
+ * repeated signature (two classes' `run ( a )`) is keyed `#2`, `#3` in file order.
+ */
+export function parseLizardCsv(text: string): LizardFunctions {
+  const functions: LizardFunctions = new Map();
+  for (const line of text.split('\n')) {
+    const row = lizardRow(line);
+    if (row === null) continue;
+    const inFile = functions.get(row.file) ?? new Map<string, FunctionMetrics>();
+    functions.set(row.file, inFile);
+    let key = row.longName;
+    for (let copy = 2; inFile.has(key); copy++) key = `${row.longName}#${copy}`;
+    inFile.set(key, row.metrics);
+  }
+  return functions;
+}
+
+/**
+ * The base version of a current function: same signature, else the same unique name.
+ *
+ * The name fallback keeps a signature-only edit (a new parameter type) on a legacy
+ * function from reading as a brand-new function.
+ */
+function baseTwin(
+  key: string,
+  now: FunctionMetrics,
+  current: Map<string, FunctionMetrics>,
+  base: Map<string, FunctionMetrics>,
+): FunctionMetrics | undefined {
+  const exact = base.get(key);
+  if (exact) return exact;
+  const named = (functions: Map<string, FunctionMetrics>) =>
+    [...functions.values()].filter((fn) => fn.name === now.name);
+  const twins = named(base);
+  return named(current).length === 1 && twins.length === 1 ? twins[0] : undefined;
+}
+
+/** One line per limit `now` exceeds where `was` is absent or measured lower. */
+function functionRegressions(path: string, now: FunctionMetrics, was?: FunctionMetrics): string[] {
+  const lines: string[] = [];
+  for (const [label, field, limit] of COMPLEXITY_LIMITS) {
+    const value = now[field];
+    const before = was?.[field];
+    if (value > limit && (before === undefined || value > before)) {
+      const shown = before ?? 'new';
+      lines.push(`${path}:${now.line}: ${now.name} ${label} ${shown}→${value} (limit ${limit})`);
+    }
+  }
+  return lines;
+}
+
+/** Functions over a limit now that are new, or worse than their base version. */
+export function complexityDelta(current: LizardFunctions, base: LizardFunctions): string[] {
+  const findings: string[] = [];
+  for (const [path, functions] of current) {
+    const baseFunctions = base.get(path) ?? new Map<string, FunctionMetrics>();
+    for (const [key, now] of functions) {
+      const was = baseTwin(key, now, functions, baseFunctions);
+      findings.push(...functionRegressions(path, now, was));
+    }
+  }
+  return findings;
+}
+
+async function lizardFunctions(files: string[], cwd = ROOT): Promise<LizardFunctions> {
+  // lizard with no file arguments walks the working directory; never let it.
+  if (files.length === 0) return new Map();
+  return parseLizardCsv(await runTool('lizard', ['uvx', LIZARD, '--csv', ...files], { cwd }));
+}
+
+/** Write each file's `base` version under `root`; returns those that existed at base. */
+async function writeBaseSources(files: string[], base: string, root: string): Promise<string[]> {
+  const written: string[] = [];
+  for (const path of files) {
+    const proc = Bun.spawn(['git', 'show', `${base}:./${path}`], {
+      cwd: ROOT,
+      stdout: 'pipe',
+      stderr: 'ignore',
+    });
+    const [bytes, code] = await Promise.all([new Response(proc.stdout).arrayBuffer(), proc.exited]);
+    if (code !== 0) continue; // absent at base: every function in it is new
+    await Bun.write(`${root}/${path}`, bytes);
+    written.push(path);
+  }
+  return written;
+}
+
+function isComplexityTarget(path: string): boolean {
+  return matchesTsTarget(path, [...APP_SOURCES, TEST_DIR]);
+}
+
+/** Complexity this change introduced or worsened, over the complexity gate's targets. */
+async function complexityRegressions(scope: ChangedScope, base: string | null): Promise<string[]> {
+  const files = await scopedFiles(scope, isComplexityTarget);
+  const current = await lizardFunctions(files);
+  if (current.size === 0) return [];
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const tmp = await mkdtemp(join(tmpdir(), 'harness-base-'));
+  try {
+    const written = base === null ? [] : await writeBaseSources(files, base, tmp);
+    return complexityDelta(current, await lizardFunctions(written, tmp));
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+}
+
+// ── Dead-code delta ──
+
+type KnipSymbol = { line: number; name: string };
+
+function knipSymbols(value: unknown): KnipSymbol[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const symbol = asObject(item);
+    return typeof symbol?.line === 'number'
+      ? [{ line: symbol.line, name: String(symbol.name) }]
+      : [];
+  });
+}
+
+/** `[line, message]` for every symbol-level issue in one knip JSON file row. */
+function knipIssueLines(issue: JsonObject): [number, string][] {
+  const lines: [number, string][] = [];
+  for (const [type, label] of KNIP_SYMBOL_ISSUES) {
+    for (const { line, name } of knipSymbols(issue[type])) lines.push([line, `${label} ${name}`]);
+  }
+  for (const [type, label] of KNIP_MEMBER_ISSUES) {
+    for (const [parent, members] of Object.entries(asObject(issue[type]) ?? {})) {
+      for (const { line, name } of knipSymbols(members)) {
+        lines.push([line, `${label} ${parent}.${name}`]);
+      }
+    }
+  }
+  for (const group of Array.isArray(issue.duplicates) ? issue.duplicates : []) {
+    const names = (Array.isArray(group) ? group : []).map((item) => asObject(item)?.name);
+    const [first] = knipSymbols(group);
+    if (first) lines.push([first.line, `duplicate export ${names.join(', ')}`]);
+  }
+  return lines;
+}
+
+/** `path:line: message` for each knip symbol finding on a changed line. */
+export function knipFindings(report: string, scope: ChangedScope): string[] {
+  let issues: unknown;
+  try {
+    issues = asObject(JSON.parse(report))?.issues;
+  } catch (error) {
+    throw new ToolError(`unreadable knip output: ${errorMessage(error)}`);
+  }
+  if (!Array.isArray(issues)) throw new ToolError('unreadable knip output: no issues list');
+  const findings: string[] = [];
+  for (const item of issues) {
+    const issue = asObject(item);
+    if (typeof issue?.file !== 'string') {
+      throw new ToolError('unreadable knip output: an issue has no file');
+    }
+    const ranges = scope.get(issue.file);
+    for (const [line, message] of knipIssueLines(issue)) {
+      if (inRanges(line, ranges)) findings.push(`${issue.file}:${line}: ${message}`);
+    }
+  }
+  return findings;
+}
+
+/** Dead code on changed lines. knip still reads the whole project: deadness is global. */
+async function deadcodeResidue(scope: ChangedScope): Promise<string[]> {
+  if ((await scopedFiles(scope, isQualityTsFile)).length === 0) return [];
+  const cmd = [...deadcodeGate().cmd, '--reporter', 'json'];
+  return knipFindings(await runTool('knip', cmd, { ok: [0, 1] }), scope);
+}
+
+// ── Stop-hook verdict ──
+
+async function deltaResult(gate: string, measure: () => Promise<string[]>): Promise<DeltaResult> {
+  try {
+    return { gate, findings: await measure() };
+  } catch (error) {
+    return { gate, findings: [], problem: errorMessage(error) };
+  }
+}
+
+/** Lint residue, complexity delta, and dead-code delta; read-only, in parallel. */
+async function runDeltaGates(scope: ChangedScope, base: string | null): Promise<DeltaResult[]> {
+  return await Promise.all([
+    deltaResult('Lint', () => lintResidue(scope)),
+    deltaResult('Complexity', () => complexityRegressions(scope, base)),
+    deltaResult('Dead code', () => deadcodeResidue(scope)),
+  ]);
+}
+
+/**
+ * At most HOOK_FINDING_LIMIT findings, then one line counting the rest.
+ *
+ * `--verbose` lifts the cap, which is what the counting line tells the reader to run.
+ */
+export function capFindings(findings: string[], verbose = VERBOSE): string[] {
+  if (verbose || findings.length <= HOOK_FINDING_LIMIT) return [...findings];
+  const rest = findings.length - HOOK_FINDING_LIMIT;
+  return [...findings.slice(0, HOOK_FINDING_LIMIT), `… +${rest} more — run \`${STOP_HOOK_RERUN}\``];
+}
+
+/** The stderr block an agent reads: failed gates, then their findings; '' when clean. */
+export function stopHookPayload(results: DeltaResult[]): string {
+  const failed = results.filter((result) => result.findings.length > 0);
+  if (failed.length === 0) return '';
+  const header = `stop-hook failed: ${failed.map((result) => result.gate).join(', ')}`;
+  return [header, ...capFindings(failed.flatMap((result) => result.findings))].join('\n');
+}
+
+export function payloadDigest(payload: string): string {
+  return new Bun.CryptoHasher('sha256').update(payload).digest('hex');
+}
+
+/**
+ * 2 blocks on findings; 1 for a tool failure or a repeated block; 0 when clean.
+ *
+ * A repeat is the stored digest of the same payload while the agent is already
+ * continuing because of a stop hook (`stop_hook_active`): blocking again would loop.
+ * A payload that changed blocks again.
+ */
+export function stopHookExit(
+  payload: string,
+  failedTools: number,
+  event: JsonObject,
+  stored: string,
+): number {
+  if (payload) {
+    const repeat = event.stop_hook_active === true && stored === payloadDigest(payload);
+    return repeat ? 1 : 2;
+  }
+  return failedTools ? 1 : 0;
+}
+
+/** A file-name-safe key for this project within its repository. */
+export function loopGuardKey(prefix: string): string {
+  return prefix.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'root';
+}
+
+async function loopGuardPath(): Promise<string | null> {
+  const [gitPath] = await gitLines(['rev-parse', '--git-path', 'harness']);
+  if (gitPath === undefined) return null;
+  const { resolve } = await import('node:path');
+  return resolve(ROOT, gitPath, `stop-hook-${loopGuardKey(await gitPrefix())}`);
+}
+
+async function readDigest(path: string | null): Promise<string> {
+  if (path === null) return '';
+  try {
+    return (await Bun.file(path).text()).trim();
+  } catch {
+    return '';
+  }
+}
+
+/** Remember a block's digest; forget it once the stop is clean. */
+async function updateLoopGuard(path: string | null, code: number, payload: string): Promise<void> {
+  if (path === null) return;
+  const { rm } = await import('node:fs/promises');
+  if (code === 2) await Bun.write(path, payloadDigest(payload));
+  else if (code === 0) await rm(path, { force: true });
+}
+
+/** Print the verdict to stderr (nothing when clean) and return the exit code. */
+async function reportStopHook(results: DeltaResult[], event: JsonObject): Promise<number> {
+  const payload = stopHookPayload(results);
+  const problems = results
+    .filter((result) => result.problem)
+    .map((result) => `stop-hook: ${result.gate} could not run: ${result.problem}`);
+  const guard = await loopGuardPath();
+  const code = stopHookExit(payload, problems.length, event, await readDigest(guard));
+  const lines = [...problems];
+  if (payload) lines.push(payload);
+  if (payload && code === 1) lines.push(LOOP_GUARD_NOTICE);
+  if (lines.length > 0) await Bun.write(Bun.stderr, `${lines.join('\n')}\n`);
+  await updateLoopGuard(guard, code, payload);
+  return code;
+}
+
+/** The agent's hook JSON; `{}` for empty or invalid input. */
+export function parseHookEvent(text: string): JsonObject {
+  try {
+    return asObject(JSON.parse(text)) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+/** The hook event on stdin; `{}` for a terminal. */
+async function hookEvent(): Promise<JsonObject> {
+  if (process.stdin.isTTY) return {};
+  return parseHookEvent((await readStdin(HOOK_STDIN_WAIT_MS)).text);
+}
+
+/** Fix, then format, `files` in place, silently; what is left surfaces as lint residue. */
+async function fixAndFormat(files: string[]): Promise<void> {
+  if (files.length === 0) return;
+  const cmd = ['bunx', 'biome', 'check', '--write', '--no-errors-on-unmatched', ...files];
+  await capture(cmd, ROOT).catch(() => null);
+}
+
+/** True when CLAUDE.md exists and AGENTS.md is missing or differs from it. */
+async function agentsMdStale(): Promise<boolean> {
+  const { existsSync, readFileSync } = await import('node:fs');
+  const claude = `${ROOT}/CLAUDE.md`;
+  const agents = `${ROOT}/AGENTS.md`;
+  if (!existsSync(claude)) return false;
+  return !existsSync(agents) || !readFileSync(agents).equals(readFileSync(claude));
+}
+
+async function mirrorClaudeMd(): Promise<void> {
+  const { readFileSync, writeFileSync } = await import('node:fs');
+  writeFileSync(`${ROOT}/AGENTS.md`, readFileSync(`${ROOT}/CLAUDE.md`));
+}
+
+/**
+ * Stop hook: an uncommitted CLAUDE.md edit carries into AGENTS.md, silently.
+ *
+ * CLAUDE.md is canonical. An edit to AGENTS.md alone is left for pre-commit to report.
+ */
+async function syncAgentsMdAfterEdit(): Promise<void> {
+  const edited = await gitLines(['status', '--porcelain', '--', 'CLAUDE.md']);
+  if (edited.length > 0 && (await agentsMdStale())) await mirrorClaudeMd();
+}
+
+/**
+ * Post-edit, then changed-lines lint, complexity delta, dead-code delta.
+ *
+ * Silent on success. Findings exit 2 with a capped stderr payload; a tool that could
+ * not run exits 1; the same findings on a stop the agent is already continuing from
+ * exit 1 (loop guard). `check` and `ci` keep the whole-tree gates.
+ */
+async function cmdStopHook(): Promise<void> {
+  const event = await hookEvent(); // stdin belongs to the hook event; read it first
+  await fixAndFormat(await changedTsFiles());
+  await syncAgentsMdAfterEdit();
+  const base = await deltaBase();
+  let scope: ChangedScope;
+  try {
+    scope = await changedScope(base);
+  } catch (error) {
+    await Bun.write(Bun.stderr, `stop-hook: changed lines could not run: ${errorMessage(error)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const code = await reportStopHook(await runDeltaGates(scope, base), event);
+  if (VERBOSE && code === 0) {
+    console.log(`stop-hook: clean (${scope.size} changed path(s) vs ${base ?? 'no commits'})`);
+  }
+  process.exitCode = code;
+}
+
+async function realpathOrNull(path: string): Promise<string | null> {
+  const { realpath } = await import('node:fs/promises');
+  return await realpath(path).catch(() => null);
+}
+
+/** The project source file a PostToolUse event names, relative to `root`; else null. */
+export async function hookTarget(event: JsonObject, root: string): Promise<string | null> {
+  const filePath = asObject(event.tool_input)?.file_path;
+  if (typeof filePath !== 'string' || filePath === '') return null;
+  const { statSync } = await import('node:fs');
+  const { isAbsolute, relative, resolve, sep } = await import('node:path');
+  const [real, realRoot] = await Promise.all([
+    realpathOrNull(resolve(root, filePath)),
+    realpathOrNull(root),
+  ]);
+  if (real === null || realRoot === null) return null;
+  const rel = relative(realRoot, real);
+  // outside this project: another harness owns it
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
+  const path = rel.split(sep).join('/');
+  return isProjectTsFile(path) && statSync(real).isFile() ? path : null;
+}
+
+/**
+ * Fix and format the one file a PostToolUse event names. Never blocks.
+ *
+ * Prints one additionalContext line when the file changed, so the agent re-reads it
+ * before its next edit; otherwise nothing.
+ */
+async function postEditHook(): Promise<void> {
+  const target = await hookTarget(await hookEvent(), ROOT);
+  if (target === null) return;
+  const { readFileSync } = await import('node:fs');
+  const path = `${ROOT}/${target}`;
+  let changed: boolean;
+  try {
+    const before = readFileSync(path);
+    await fixAndFormat([target]);
+    changed = !readFileSync(path).equals(before);
+  } catch {
+    return;
+  }
+  if (!changed) return;
+  const context = {
+    hookEventName: 'PostToolUse',
+    additionalContext: `harness: reformatted ${target}; re-read it before editing it again`,
+  };
+  console.log(JSON.stringify({ hookSpecificOutput: context }));
+}
+
+/** Format source files with uncommitted changes; `--hook`: the file a hook event names. */
 async function cmdPostEdit(): Promise<void> {
+  if (process.argv.includes('--hook')) {
+    await postEditHook();
+    return;
+  }
   const files = await changedTsFiles();
   if (files.length === 0) return;
   await run('Fix & format', ['bunx', 'biome', 'check', '--write', ...files], { noExit: true });
 }
 
-async function cmdStopHook(): Promise<void> {
-  console.log('\n=== Stop Hook Checks ===\n');
-  await cmdPostEdit(); // mutating — sequential, first
-  await checkArchConfigGuard({ warnOnly: true });
-  // read-only batch: complexity + dead code
-  const allOk = await runGatesParallel([...(await complexityGatesOrWarn()), deadcodeGate()]);
-  if (!allOk) process.exit(1);
-}
-
 // ── Stages ──────────────────────────────────────────────────────────
 
-async function checkStopHooksPresent(): Promise<void> {
-  // Warn when Claude/Codex Stop hook wiring is missing.
-  const { existsSync } = await import('node:fs');
-  const { readFile } = await import('node:fs/promises');
-  for (const rel of ['.claude/settings.json', '.codex/hooks.json']) {
-    const full = `${ROOT}/${rel}`;
-    const text = existsSync(full) ? await readFile(full, 'utf8') : '';
-    if (text.includes('Stop') && text.includes('stop-hook')) {
-      console.log(`  ${GREEN}✓${RESET} Stop hook wiring (${rel})`);
+/** True when the settings file has a handler for this hook under its event. */
+export async function hookWired(wiring: HookWiring, root = ROOT): Promise<boolean> {
+  let data: JsonObject;
+  try {
+    data = await readJsonObject(`${root}/${wiring.path}`, wiring.path);
+  } catch {
+    return false;
+  }
+  const groups = asObject(data.hooks)?.[wiring.event];
+  if (!Array.isArray(groups)) return false;
+  return groups.some((group) => {
+    const handlers = asObject(group)?.hooks;
+    return Array.isArray(handlers) && handlers.some((h) => isHarnessHandler(h, wiring.marker));
+  });
+}
+
+/** Warn when the Claude/Codex Stop or Claude PostToolUse wiring is missing. */
+export async function checkStopHooksPresent(root = ROOT): Promise<void> {
+  for (const wiring of HOOK_WIRINGS) {
+    const label = `${wiring.event} hook wiring`;
+    if (await hookWired(wiring, root)) {
+      console.log(`  ${GREEN}✓${RESET} ${label} (${wiring.path})`);
     } else {
-      console.log(`  ${RED}⚠${RESET} Missing Stop hook wiring: ${rel}`);
+      console.log(`  ${RED}⚠${RESET} Missing ${label}: ${wiring.path}`);
     }
   }
 }
 
 type JsonObject = Record<string, unknown>;
+
+async function readJsonObject(path: string, label: string): Promise<JsonObject> {
+  const { existsSync, readFileSync } = await import('node:fs');
+  if (!existsSync(path)) return {};
+  const text = readFileSync(path, 'utf8').trim();
+  if (!text) return {};
+  const obj = asObject(JSON.parse(text));
+  if (!obj) throw new Error(`${label} must contain a JSON object`);
+  return obj;
+}
 
 function asObject(value: unknown): JsonObject | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -1201,25 +2009,22 @@ function jsonListChild(data: JsonObject, key: string, label: string): unknown[] 
   return data[key] as unknown[];
 }
 
-function isStopHookHandler(handler: unknown): boolean {
+/** True for a command handler that already runs this harness hook (any form). */
+function isHarnessHandler(handler: unknown, marker: string): boolean {
   const obj = asObject(handler);
   return obj !== null && obj.type === 'command' && typeof obj.command === 'string'
-    ? obj.command.includes('stop-hook')
+    ? obj.command.includes(marker)
     : false;
 }
 
 async function gitHookPath(name: string): Promise<string> {
   // Resolve via git so worktrees / core.hooksPath land in the right place. Strip
   // GIT_* env so an ambient GIT_DIR from a parent process can't redirect us.
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined && !key.startsWith('GIT_')) env[key] = value;
-  }
   const proc = Bun.spawn(['git', 'rev-parse', '--git-path', `hooks/${name}`], {
     cwd: ROOT,
     stdout: 'pipe',
     stderr: 'pipe',
-    env,
+    env: envWithoutGit(),
   });
   const out = (await new Response(proc.stdout).text()).trim();
   const code = await proc.exited;
@@ -1237,40 +2042,32 @@ async function installGitHook(name: string): Promise<void> {
   chmodSync(path, 0o755);
 }
 
-async function installStopHook(
-  rel: string,
-  hook: JsonObject,
-  claudeSettings = false,
-): Promise<void> {
-  // Inject/refresh the Stop hook, preserving every other hook. Idempotent: an
-  // existing stop-hook handler (current or legacy) is replaced and duplicates
-  // dropped, so re-running never accumulates entries.
-  const { existsSync, readFileSync, writeFileSync, mkdirSync } = await import('node:fs');
+/**
+ * Inject/refresh one hook in its settings file, preserving every other hook.
+ *
+ * Idempotent: an existing handler carrying the wiring's marker (current or legacy) is
+ * replaced in place and duplicates dropped, so re-running never accumulates entries.
+ */
+export async function installHook(wiring: HookWiring, root = ROOT): Promise<void> {
+  const { writeFileSync, mkdirSync } = await import('node:fs');
   const { dirname } = await import('node:path');
-  const path = `${ROOT}/${rel}`;
-  let data: JsonObject = {};
-  if (existsSync(path)) {
-    const text = readFileSync(path, 'utf8').trim();
-    if (text) {
-      const parsed: unknown = JSON.parse(text);
-      const obj = asObject(parsed);
-      if (!obj) throw new Error(`${rel} must contain a JSON object`);
-      data = obj;
-    }
+  const path = `${root}/${wiring.path}`;
+  const data = await readJsonObject(path, wiring.path);
+  if (wiring.path === CLAUDE_SETTINGS && !('$schema' in data)) {
+    data.$schema = CLAUDE_SETTINGS_SCHEMA;
   }
-  if (claudeSettings && !('$schema' in data)) data.$schema = CLAUDE_SETTINGS_SCHEMA;
 
-  const hooks = jsonObjectChild(data, 'hooks', rel);
-  const stopGroups = jsonListChild(hooks, 'Stop', rel);
+  const hooks = jsonObjectChild(data, 'hooks', wiring.path);
+  const eventGroups = jsonListChild(hooks, wiring.event, wiring.path);
   let installed = false;
-  for (const group of stopGroups) {
+  for (const group of eventGroups) {
     const groupObj = asObject(group);
     if (!groupObj || !Array.isArray(groupObj.hooks)) continue;
     const next: unknown[] = [];
     for (const handler of groupObj.hooks) {
-      if (isStopHookHandler(handler)) {
+      if (isHarnessHandler(handler, wiring.marker)) {
         if (!installed) {
-          next.push({ ...hook });
+          next.push({ ...wiring.handler });
           installed = true;
         }
         continue;
@@ -1279,7 +2076,10 @@ async function installStopHook(
     }
     groupObj.hooks = next;
   }
-  if (!installed) stopGroups.push({ hooks: [{ ...hook }] });
+  if (!installed) {
+    const matcher = wiring.matcher === undefined ? {} : { matcher: wiring.matcher };
+    eventGroups.push({ ...matcher, hooks: [{ ...wiring.handler }] });
+  }
 
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`);
@@ -1322,14 +2122,32 @@ async function checkAgentsMdDrift(noExit = false): Promise<RunResult> {
 }
 
 async function cmdSyncAgentsMd(): Promise<void> {
-  const { existsSync, readFileSync, writeFileSync } = await import('node:fs');
-  const claudePath = `${ROOT}/CLAUDE.md`;
-  if (!existsSync(claudePath)) {
+  const { existsSync } = await import('node:fs');
+  if (!existsSync(`${ROOT}/CLAUDE.md`)) {
     console.log(`  ${RED}✗${RESET} sync-agents-md: CLAUDE.md not found`);
     process.exit(1);
   }
-  writeFileSync(`${ROOT}/AGENTS.md`, readFileSync(claudePath));
+  await mirrorClaudeMd();
   console.log(`  ${GREEN}✓${RESET} sync-agents-md: AGENTS.md ← CLAUDE.md`);
+}
+
+/**
+ * pre-commit: a staged CLAUDE.md carries AGENTS.md into the same commit.
+ *
+ * The `git add` inherits git's hook environment on purpose: GIT_INDEX_FILE is the
+ * index this commit is being built from.
+ */
+async function syncAgentsMdStaged(): Promise<void> {
+  const staged = await gitLines(['diff', '--cached', '--name-only', '--', 'CLAUDE.md']);
+  if (staged.length === 0 || !(await agentsMdStale())) return;
+  await mirrorClaudeMd();
+  const added = await capture(['git', 'add', '--', 'AGENTS.md'], ROOT);
+  if (added.code !== 0) {
+    console.log(`  ${RED}✗${RESET} sync-agents-md: git add AGENTS.md failed`);
+    process.stdout.write(added.stderr);
+    process.exit(1);
+  }
+  console.log(`  ${GREEN}✓${RESET} sync-agents-md: AGENTS.md ← CLAUDE.md (staged)`);
 }
 
 async function cmdAgentsMdDrift(): Promise<void> {
@@ -1391,10 +2209,21 @@ async function cmdCheck(): Promise<void> {
 }
 
 async function cmdPreCommit(): Promise<void> {
+  // Fix/format staged files, typecheck, and mirror a staged CLAUDE.md; tests run at pre-push.
   console.log(`\n${BLUE}[pre-commit]${RESET}\n`);
   await checkArchConfigGuard({ warnOnly: true, staged: true });
+  await syncAgentsMdStaged();
 
   const files = await stagedTsFiles();
+  const stagedDocs = await gitLines([
+    'diff',
+    '--cached',
+    '--name-only',
+    '--',
+    'AGENTS.md',
+    'CLAUDE.md',
+  ]);
+  if (files.length > 0 || stagedDocs.length > 0) await checkAgentsMdDrift();
   if (files.length === 0) {
     console.log('No staged TypeScript files — skipping checks');
     return;
@@ -1402,11 +2231,6 @@ async function cmdPreCommit(): Promise<void> {
 
   await cmdFix(files);
   await cmdTypecheck();
-  await checkAgentsMdDrift();
-
-  if (files.some((f) => isQualityTsFile(f))) {
-    await cmdTest();
-  }
 }
 
 async function cmdCi(): Promise<void> {
@@ -1433,30 +2257,31 @@ async function cmdCi(): Promise<void> {
 
 async function cmdPrePush(): Promise<void> {
   // Read-only push gate: the offline checks pre-commit and stop-hook do not run.
-  // pre-commit covers fix/format/typecheck/test on staged files; stop-hook adds
-  // complexity. This fills the gap with the deterministic, offline gates none of
-  // them run — lint (biome covers format), agents-md drift, acceptance, arch —
+  // pre-commit covers fix/format/typecheck on staged files; stop-hook covers the
+  // change's delta. This fills the gap with the deterministic, offline gates none of
+  // them run — tests, lint (biome covers format), agents-md drift, acceptance, arch —
   // validating the whole pushed tree (after merges/rebases/--no-verify) before it
-  // leaves the machine. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
+  // leaves the machine. Tests run first and alone: they spawn processes and write temp
+  // repos. Network (audit) and advisory (coverage/CRAP) gates stay in ci.
   console.log(`\n${BLUE}[pre-push]${RESET}\n`);
   const refs = await prePushRefs();
   if (!(await checkBranchGuard(refs))) process.exit(1);
   const archConfigOk = await checkArchConfigGuard({ refs });
+  const testsOk = await checkTests();
   const gates: Gate[] = [
     lintGate(),
     agentsMdDriftGate(),
     ...(await acceptanceGatesOrWarn()),
     ...(await archGatesOrWarn()),
   ];
-  if (!(await runGatesParallel(gates)) || !archConfigOk) process.exit(1);
+  if (!(await runGatesParallel(gates)) || !archConfigOk || !testsOk) process.exit(1);
 }
 
 async function cmdHooks(): Promise<void> {
   await installGitHook('pre-commit');
   await installGitHook('pre-push');
-  await installStopHook('.codex/hooks.json', CODEX_STOP_HOOK);
-  await installStopHook('.claude/settings.json', CLAUDE_STOP_HOOK, true);
-  console.log('Installed pre-commit, pre-push, and Claude/Codex Stop hooks');
+  for (const wiring of HOOK_WIRINGS) await installHook(wiring);
+  console.log('Installed pre-commit, pre-push, Claude/Codex Stop, and Claude PostToolUse hooks');
 }
 
 async function cmdClean(): Promise<void> {
@@ -1494,15 +2319,22 @@ const TASKS: Record<string, [(() => Promise<void>) | ((f?: string[]) => Promise<
   'arch-config-guard': [cmdArchConfigGuard, 'Block unreviewed arch config changes'],
   'branch-guard': [cmdBranchGuard, 'Refuse pushes to main/master'],
   check: [cmdCheck, 'Full pre-flight: lockfile + fix + typecheck + tests'],
-  'pre-commit': [cmdPreCommit, 'Staged checks + tests'],
-  'pre-push': [cmdPrePush, 'Read-only push gate: branch guard, lint, acceptance, arch'],
+  'pre-commit': [cmdPreCommit, 'Staged fix/format + typecheck; mirrors a staged CLAUDE.md'],
+  'pre-push': [cmdPrePush, 'Read-only push gate: branch guard, tests, lint, acceptance, arch'],
   ci: [
     cmdCi,
     'Lint + typecheck + audit + complexity + deadcode + acceptance + coverage + crap + arch',
   ],
-  'setup-hooks': [cmdHooks, 'Install git pre-commit + pre-push hooks and Claude/Codex Stop wiring'],
-  'post-edit': [cmdPostEdit, 'Format if source files changed'],
-  'stop-hook': [cmdStopHook, 'Format changed files, then run stop-hook checks'],
+  'setup-hooks': [
+    cmdHooks,
+    'Install git pre-commit + pre-push hooks and Claude/Codex agent hook wiring',
+  ],
+  'post-edit': [cmdPostEdit, 'Format changed files (--hook: the file a PostToolUse names)'],
+  'stop-hook': [
+    cmdStopHook,
+    'post-edit, then changed-lines lint, complexity delta, deadcode delta; ' +
+      'silent on success, exit 2 with findings',
+  ],
   'agents-md-drift': [cmdAgentsMdDrift, 'Fail if AGENTS.md differs from CLAUDE.md'],
   'sync-agents-md': [cmdSyncAgentsMd, 'Overwrite AGENTS.md from CLAUDE.md'],
   clean: [cmdClean, 'Remove caches and build artifacts'],
