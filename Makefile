@@ -446,8 +446,12 @@ list: ## Show detected language templates
 	for d in $(SUBPROJECTS); do printf "  \033[36m%-12s\033[0m %s\n" "$$d" "$$(lang_of "$$d")"; done
 
 .PHONY: _run
+# A git hook in a linked worktree exports GIT_DIR, which tells git the current
+# directory is the top of the work tree; after `cd <subproject>` that makes
+# `--relative` and `--show-prefix` wrong. Unset it (git rediscovers the same
+# repo from the cwd; GIT_INDEX_FILE stays, so pre-commit still sees the index).
 _run:
-	@set -u -o pipefail; \
+	@set -u -o pipefail; unset GIT_DIR GIT_WORK_TREE; \
 	dirs="$(DIRS)"; cmd="$(CMD)"; args="$(ARGS)"; quiet="$(QUIET)"; \
 	[ -z "$$dirs" ] && { printf "$(DIM)No templates to run '%s'.$(RESET)\n" "$$cmd"; exit 0; }; \
 	eval "$$SH_LANG_HELPERS"; \

@@ -570,8 +570,12 @@ _scoped_run:
 	esac; \
 	$(MAKE) --no-print-directory _run CMD="$(CMD)" DIRS="$(DIR)" ARGS="$(ARGS)"
 
+# A git hook in a linked worktree exports GIT_DIR, which tells git the current
+# directory is the top of the work tree; after `cd <subproject>` that makes
+# `--relative` and `--show-prefix` wrong. Unset it (git rediscovers the same
+# repo from the cwd; GIT_INDEX_FILE stays, so pre-commit still sees the index).
 _run:
-	@set -u -o pipefail; \
+	@set -u -o pipefail; unset GIT_DIR GIT_WORK_TREE; \
 	dirs="$(DIRS)"; cmd="$(CMD)"; vf="$(if $(VERBOSE),--verbose)"; quiet="$(QUIET)"; args="$(ARGS)"; \
 	if [ -z "$$dirs" ]; then \
 	  printf "$(DIM)No subprojects to run '%s'.$(RESET)\n" "$$cmd"; \
